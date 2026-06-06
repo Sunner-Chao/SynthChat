@@ -633,10 +633,19 @@ def _setup_cli(_parser):
     return None
 
 def register(ctx):
+    def _handle_inject(raw_args):
+        ctx.inject_message("injected by plugin: " + raw_args)
+        return "plugin injected"
+
     ctx.register_command(
         "demo-plugin",
         handler=_handle,
         description="Demo command",
+    )
+    ctx.register_command(
+        "demo-inject",
+        handler=_handle_inject,
+        description="Demo injected command",
     )
     ctx.register_cli_command(
         "demo-cli",
@@ -682,6 +691,22 @@ def register(ctx):
     .unwrap()
     .unwrap();
     assert_eq!(reply.content, "plugin command handled: hello world");
+
+    let injected_reply = handle_agent_control_command(
+        &store,
+        &conversation,
+        &persona,
+        "/demo-inject hello injected",
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(injected_reply.content, "plugin injected");
+    let messages = store.messages(&conversation.id, None).unwrap();
+    assert!(messages.iter().any(|message| message.role == "user"
+        && message.content == "injected by plugin: hello injected"
+        && message.source == "python-plugin"));
 
     let cli_reply =
         handle_agent_control_command(&store, &conversation, &persona, "/demo-cli hello cli", None)

@@ -339,8 +339,17 @@ pub(super) async fn handle_agent_control_command(
     let argument_raw = raw_parts.next().unwrap_or("").trim();
     let argument = argument_raw.to_lowercase();
     let Some(command_spec) = resolve_agent_control_command(&command_input) else {
-        if let Some(reply) = run_python_plugin_command(store, &command_input, argument_raw).await? {
-            return Ok(Some(control_message(conversation, reply)));
+        if let Some(result) = run_python_plugin_command(store, &command_input, argument_raw).await?
+        {
+            for injected in result.injected_messages {
+                store.append_message(ChatMessage::new(
+                    conversation.id.clone(),
+                    &injected.role,
+                    injected.content,
+                    "python-plugin",
+                ))?;
+            }
+            return Ok(Some(control_message(conversation, result.reply)));
         }
         return Ok(None);
     };
