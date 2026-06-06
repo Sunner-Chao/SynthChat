@@ -1,0 +1,742 @@
+import { convertFileSrc as tauriConvertFileSrc, invoke } from "@tauri-apps/api/core";
+import type {
+  ActionResult,
+  AgentConfig,
+  AgentControlCommand,
+  AgentDefinition,
+  AgentQueuedRequest,
+  AgentRunRecord,
+  AgentTodoItem,
+  AppConfig,
+  BrowserProvider,
+  ChatAttachment,
+  ChatMessage,
+  Conversation,
+  EnvCheckResult,
+  ImageProvider,
+  LlmProvider,
+  MemoryEntry,
+  MemoryStatus,
+  Persona,
+  ProfileConfig,
+  SearchProvider,
+  ScheduledAgentJob,
+  ScheduledJobOutputRecord,
+  SendChatRequest,
+  StateSnapshotManifest,
+  StateSnapshotRestoreResult,
+  TokenUsageStats,
+  ToolArtifactRecord,
+  VideoProvider,
+  VisionProvider,
+  WorkspaceSnapshotManifest,
+  WorkspaceSnapshotRestoreResult
+} from "./types";
+
+const fallbackConfig: AppConfig = {
+  logLevel: "info",
+  chat: {
+    skipEnvCheck: true,
+    agentEngine: "standalone-mock",
+    maxContextRounds: 10,
+    shortContextMode: "messages",
+    shortContextTokenBudget: 8000,
+    shortContextAbortOnSummaryFailure: false,
+    shortContextSummaryProviderId: "",
+    shortContextSummaryModel: "",
+    busyInputMode: "queue",
+    autoTitleEnabled: true,
+    queueWaitSeconds: 7,
+    delegationMaxConcurrentChildren: 3,
+    delegationOrchestratorEnabled: true,
+    delegationSubagentAutoApprove: false,
+    delegationInheritMcpToolsets: true,
+    delegationSubagentProviderId: "",
+    delegationSubagentModel: "",
+    agentRunTimeoutSeconds: 600,
+    uiMessageLimit: 180,
+    artifactScanLimit: 80,
+    uiMessagePreviewChars: 12000,
+    uiStreamCharsPerSecond: 36,
+    thinkingMinVisibleMs: 1800,
+    bottomFollowThresholdPx: 180,
+    activePollIntervalMs: 1500,
+    idlePollIntervalMs: 3000,
+    intentAnalyzerMode: "embedding",
+    toolRouterMode: "llm_unified",
+    toolUseEnforcement: "auto",
+    toolParallelEnabled: true,
+    toolParallelLimit: 4,
+    toolApprovalMode: "risky",
+    cronApprovalMode: "deny",
+    trustedToolPatterns: [],
+    trustedCommandPatterns: [],
+    hooks: {},
+    hooksAutoAccept: false,
+    llmCredentialPoolStrategy: "fill_first",
+    toolEnvPassthrough: [],
+    toolMutationCheckpointEnabled: true,
+    llmRetryCount: 2,
+    llmRetryBackoffMs: 800,
+    responsesReasoningReplayEnabled: true,
+    toolCallRetryCount: 1,
+    toolCallRetryBackoffMs: 300,
+    toolGuardrailWarningsEnabled: true,
+    toolGuardrailHardStopEnabled: false,
+    toolGuardrailExactFailureWarnAfter: 2,
+    toolGuardrailSameToolFailureWarnAfter: 3,
+    toolGuardrailNoProgressWarnAfter: 2,
+    toolGuardrailExactFailureLimit: 5,
+    toolGuardrailSameToolFailureLimit: 8,
+    toolGuardrailNoProgressLimit: 5,
+    backgroundMemoryReviewEnabled: true,
+    backgroundMemoryReviewMinMessages: 4,
+    backgroundSkillReviewEnabled: true,
+    backgroundSkillReviewAutoCreateEnabled: false,
+    backgroundSkillCuratorEnabled: true,
+    backgroundSkillCuratorIntervalHours: 168,
+    skillHotReloadEnabled: true,
+    skillHotReloadIntervalSeconds: 3,
+    historyCleanupEnabled: true,
+    historyRetentionDays: 14,
+    maxStoredMessagesPerConversation: 300,
+    maxStoredAgentRuns: 50,
+    maxStoredToolTraces: 100
+  },
+  reply: {
+    typingDelayEnabled: true,
+    typingSpeed: 0.2,
+    typingSpeedRandomMin: 0.05,
+    typingSpeedRandomMax: 0.1,
+    splitByNewline: true,
+    showTypingIndicator: true
+  },
+  web: { port: 62000, password: "", publicEnabled: false, publicPort: 0, publicSecret: "" },
+  weather: { defaultLocation: "", qweatherApiHost: "", qweatherApiKey: "", timeoutSeconds: 15 },
+  moments: { autoReplyEnabled: false, publishers: [], repliers: [] },
+  videoSummary: {
+    enabled: false,
+    modelsDir: "",
+    transcriber: "auto",
+    ytDlpCommand: "yt-dlp",
+    cookie: "",
+    cookieFile: "",
+    ffmpegBinPath: "",
+    fasterWhisperModel: "small",
+    fasterWhisperModelDir: "",
+    fasterWhisperDevice: "cpu",
+    fasterWhisperComputeType: "int8",
+    senseVoiceModelDir: "",
+    senseVoiceDevice: "cpu",
+    timeoutSeconds: 30,
+    ytdlpInfoTimeoutSeconds: 120,
+    downloadTimeoutSeconds: 600,
+    outputDir: ""
+  },
+  telemetryEnabled: false
+};
+
+const fallbackProfile: ProfileConfig = { name: "用户", avatarPath: "" };
+
+const defaultPersona: Persona = {
+  id: "default",
+  name: "小可",
+  agentId: "default",
+  systemPrompt: "你是一个友好、稳定的聊天助手。",
+  systemInstructions: "请始终保持角色一致性。",
+  characterPrompt: "",
+  outputExamples: "",
+  llmProvider: "",
+  llmModel: "",
+  avatarPath: "",
+  temperature: 0.8,
+  maxTokens: 2048,
+  emojiEnabled: true,
+  emojiGroup: "default",
+  emojiSendProbability: 25,
+  toolPolicy: { enabled: true, timeoutSeconds: 30, maxIterations: 8, maxFailureReplans: 2, retryCount: 1, retryBackoffMs: 300 },
+  memory: { enabled: true, triggerRounds: 10, maxMemories: 50, includeInPrompt: true },
+  proactive: { enabled: false, minIdleHours: 1, maxIdleHours: 3, maxConsecutive: 3, prompt: "", quietHours: { enabled: true, start: "22:00", end: "08:00" } },
+  voiceReply: {
+    enabled: false,
+    engine: "chattts",
+    pythonPath: "",
+    modelDir: "",
+    sampleRate: 16000,
+    speed: 5,
+    oral: 5,
+    laugh: 0,
+    breakLevel: 3,
+    speakerSeed: 0,
+    speakerEmbedding: "",
+    temperature: 0.3,
+    topP: 0.7,
+    topK: 20,
+    refineTextEnabled: true,
+    refinePrompt: "",
+    refineTemperature: 0.7
+  },
+  imageGeneration: { enabled: false, provider: "", model: "", stylePrefix: "", artStyle: "", negativePrompt: "", negativeEnabled: false, refMode: "avatar" }
+};
+
+const defaultAgent = (): AgentDefinition => ({
+  id: "default",
+  name: "默认智能体",
+  description: "SynthChat Rust 对话智能体",
+  workspaceDir: "",
+  llmProvider: "",
+  llmModel: "",
+  enabled: true,
+  isDefault: true,
+  mcpEnabled: true,
+  skillsEnabled: true,
+  allowShell: true,
+  maxSubagents: 4,
+  maxSubagentDepth: 1,
+  maxToolIterations: 90,
+  skillsDir: "",
+  enabledSkills: [],
+  enabledMcpServers: [],
+  enabledToolsets: [],
+  disabledToolsets: [],
+  createdAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString()
+});
+
+export function isTauri(): boolean {
+  return typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window || "__TAURI__" in window);
+}
+
+async function call<T>(cmd: string, args: Record<string, unknown> = {}, fallback: () => T | Promise<T>): Promise<T> {
+  if (isTauri()) {
+    return invoke<T>(cmd, args);
+  }
+  return fallback();
+}
+
+function ok(message = "standalone mock"): ActionResult {
+  return { success: true, message };
+}
+
+export function convertFileSrc(path: string): string {
+  if (!path) return "";
+  return isTauri() ? tauriConvertFileSrc(path) : path;
+}
+
+export async function getConfig(): Promise<AppConfig> {
+  return call("get_config", {}, () => fallbackConfig);
+}
+
+export async function saveConfig(config: AppConfig): Promise<void> {
+  return call("save_config", { config }, () => undefined);
+}
+
+export async function addTrustedToolPattern(pattern: string): Promise<AppConfig> {
+  const normalized = pattern.trim();
+  return call("add_trusted_tool_pattern", { pattern: normalized }, () => ({
+    ...fallbackConfig,
+    chat: {
+      ...fallbackConfig.chat,
+      trustedToolPatterns: Array.from(new Set([...(fallbackConfig.chat.trustedToolPatterns ?? []), normalized].filter(Boolean)))
+    }
+  }));
+}
+
+export async function removeTrustedToolPattern(pattern: string): Promise<AppConfig> {
+  return call("remove_trusted_tool_pattern", { pattern }, () => ({
+    ...fallbackConfig,
+    chat: {
+      ...fallbackConfig.chat,
+      trustedToolPatterns: (fallbackConfig.chat.trustedToolPatterns ?? []).filter((item) => item !== pattern)
+    }
+  }));
+}
+
+export async function listStateSnapshots(): Promise<StateSnapshotManifest[]> {
+  return call("list_state_snapshots", {}, () => []);
+}
+
+export async function createStateSnapshot(label: string): Promise<StateSnapshotManifest> {
+  return call("create_state_snapshot", { label }, () => ({
+    id: `mock-${Date.now()}`,
+    label,
+    createdAt: new Date().toISOString(),
+    statePath: ""
+  }));
+}
+
+export async function pruneStateSnapshots(keep: number): Promise<number> {
+  return call("prune_state_snapshots", { keep }, () => 0);
+}
+
+export async function restoreStateSnapshot(snapshotId: string): Promise<StateSnapshotRestoreResult> {
+  return call("restore_state_snapshot", { snapshotId }, () => ({
+    restored: { id: snapshotId, label: "mock restore", createdAt: new Date().toISOString(), statePath: "" },
+    preRestore: { id: `pre-${Date.now()}`, label: `pre-restore ${snapshotId}`, createdAt: new Date().toISOString(), statePath: "" }
+  }));
+}
+
+export async function listWorkspaceSnapshots(): Promise<WorkspaceSnapshotManifest[]> {
+  return call("list_workspace_snapshots", {}, () => []);
+}
+
+export async function createWorkspaceSnapshot(label: string): Promise<WorkspaceSnapshotManifest> {
+  return call("create_workspace_snapshot", { label }, () => ({
+    id: `mock-ws-${Date.now()}`,
+    label,
+    createdAt: new Date().toISOString(),
+    root: "",
+    snapshotPath: "",
+    fileCount: 0,
+    totalBytes: 0,
+    skippedFiles: 0,
+    skippedDirs: 0
+  }));
+}
+
+export async function restoreWorkspaceSnapshot(snapshotId: string, deleteNewFiles: boolean): Promise<WorkspaceSnapshotRestoreResult> {
+  return call("restore_workspace_snapshot", { snapshotId, deleteNewFiles }, () => ({
+    restored: { id: snapshotId, label: "mock workspace restore", createdAt: new Date().toISOString(), root: "" },
+    preRestore: { id: `pre-ws-${Date.now()}`, label: `pre-restore ${snapshotId}`, createdAt: new Date().toISOString(), root: "" },
+    restoredFiles: 0,
+    removedNewFiles: 0,
+    deleteNewFiles
+  }));
+}
+
+export async function getProfile(): Promise<ProfileConfig> {
+  return call("get_profile", {}, () => fallbackProfile);
+}
+
+export async function saveProfile(profile: ProfileConfig): Promise<ProfileConfig> {
+  return call("save_profile", { profile }, () => profile);
+}
+
+export async function listPersonas(): Promise<Persona[]> {
+  return call("list_personas", {}, () => [defaultPersona]);
+}
+
+export async function getPersona(id: string): Promise<Persona> {
+  return call("get_persona", { id }, () => ({ ...defaultPersona, id }));
+}
+
+export async function savePersona(persona: Persona): Promise<Persona> {
+  return call("save_persona", { persona }, () => persona);
+}
+
+export async function listConversations(): Promise<Conversation[]> {
+  return call("list_conversations", {}, () => []);
+}
+
+export async function createConversation(title?: string, personaId?: string): Promise<Conversation> {
+  return call("create_conversation", { title, personaId }, () => ({
+    id: `conv-${Date.now()}`,
+    title: title || "新会话",
+    personaId: personaId || "default",
+    agentId: "default",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    lastMessage: ""
+  }));
+}
+
+export async function deleteConversation(id: string): Promise<void> {
+  return call("delete_conversation", { id }, () => undefined);
+}
+
+export async function renameConversation(id: string, title: string): Promise<void> {
+  return call("rename_conversation", { id, title }, () => undefined);
+}
+
+export async function listMessages(conversationId: string, limit?: number, previewChars?: number): Promise<ChatMessage[]> {
+  return call("list_messages", { conversationId, limit, previewChars }, () => []);
+}
+
+export async function sendChatMessage(request: SendChatRequest): Promise<ChatMessage[]> {
+  return call("send_chat_message", { request }, () => {
+    const conversationId = request.conversationId || `conv-${Date.now()}`;
+    const now = new Date().toISOString();
+    return [
+      { id: `msg-${Date.now()}`, conversationId, role: "user", content: request.content, createdAt: now, source: "desktop" },
+      { id: `msg-${Date.now() + 1}`, conversationId, role: "assistant", content: `收到：${request.content}`, createdAt: now, source: "desktop-stream" }
+    ];
+  });
+}
+
+export async function listLlmProviders(): Promise<LlmProvider[]> {
+  return call("list_llm_providers", {}, () => [{
+    id: "local-echo",
+    name: "本地回显",
+    providerType: "echo",
+    preset: "echo",
+    baseUrl: "",
+    appendChatPath: true,
+    apiKeyEnv: "",
+    apiKey: "",
+    model: "echo",
+    enabled: true,
+    timeoutSeconds: 60,
+    promptCacheMode: "auto",
+    promptCacheTtl: "5m",
+    promptCacheLayout: "auto"
+  }]);
+}
+
+export async function saveLlmProviders(providers: LlmProvider[]): Promise<void> {
+  return call("save_llm_providers", { providers }, () => undefined);
+}
+
+export async function getTokenUsageStats(): Promise<TokenUsageStats> {
+  return call("get_token_usage_stats", {}, () => ({ promptTokens: 0, completionTokens: 0, totalTokens: 0, callCount: 0 }));
+}
+
+export async function environmentCheck(): Promise<EnvCheckResult> {
+  return call("environment_check", {}, () => ({
+    items: [{ id: "frontend", name: "前端预览", status: "ok", detail: "Standalone mock mode." }],
+    allPassed: true
+  }));
+}
+
+const empty = async <T,>(): Promise<T[]> => [];
+const pass = async <T,>(value: T): Promise<T> => value;
+
+export const api: Record<string, any> = {
+  getConfig,
+  saveConfig,
+  addTrustedToolPattern,
+  removeTrustedToolPattern,
+  listStateSnapshots,
+  createStateSnapshot,
+  pruneStateSnapshots,
+  restoreStateSnapshot,
+  listWorkspaceSnapshots,
+  createWorkspaceSnapshot,
+  restoreWorkspaceSnapshot,
+  getProfile,
+  saveProfile,
+  listPersonas,
+  getPersona,
+  savePersona,
+  deletePersona: (id: string) => call("delete_persona", { id }, () => undefined),
+  listConversations,
+  createConversation,
+  deleteConversation,
+  renameConversation,
+  listMessages,
+  sendChatMessage,
+  deleteMessage: (messageId: string) => call("delete_message", { messageId }, () => undefined),
+  listLlmProviders,
+  saveLlmProviders,
+  listMcpServers: () => call("list_mcp_servers", {}, () => []),
+  saveMcpServers: (servers: unknown[]) => call("save_mcp_servers", { servers }, () => undefined),
+  listAgentRuns: () => call<AgentRunRecord[]>("list_agent_runs", {}, () => []),
+  listAgentControlCommands: () => call<AgentControlCommand[]>("list_agent_control_commands", {}, () => []),
+  listAgentQueue: () => call<AgentQueuedRequest[]>("list_agent_queue", {}, () => []),
+  cancelAgentQueueItem: (id: string) => call<AgentQueuedRequest>("cancel_agent_queue_item", { id }, () => ({
+    id,
+    conversationId: "",
+    personaId: "",
+    userMessageId: "",
+    content: "",
+    status: "canceled",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    completedAt: new Date().toISOString(),
+    error: "cancel_agent_queue_item unavailable"
+  })),
+  clearFinishedAgentQueueItems: () => call<AgentQueuedRequest[]>("clear_finished_agent_queue_items", {}, () => []),
+  listAgentTodos: () => call<AgentTodoItem[]>("list_agent_todos", {}, () => []),
+  listScheduledAgentJobs: () => call<ScheduledAgentJob[]>("list_scheduled_agent_jobs", {}, () => []),
+  listScheduledJobOutputs: (jobId: string) => call<ScheduledJobOutputRecord[]>("list_scheduled_job_outputs", { jobId }, () => []),
+  saveScheduledAgentJob: (job: ScheduledAgentJob) => call<ScheduledAgentJob>("save_scheduled_agent_job", { job }, () => job),
+  deleteScheduledAgentJob: (id: string) => call("delete_scheduled_agent_job", { id }, () => undefined),
+  setScheduledAgentJobEnabled: (id: string, enabled: boolean) => call<ScheduledAgentJob>("set_scheduled_agent_job_enabled", { id, enabled }, () => ({
+    id,
+    name: "",
+    personaId: "default",
+    prompt: "",
+    scheduleKind: "once",
+    enabledToolsets: [],
+    disabledToolsets: [],
+    enabled,
+    status: enabled ? "scheduled" : "paused",
+    lastCompletedAt: null,
+    lastRunStatus: null,
+    lastOutput: null,
+    lastOutputPath: null,
+    lastError: null,
+    runCount: 0,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  })),
+  tickScheduledAgentJobs: () => call<ScheduledAgentJob[]>("tick_scheduled_agent_jobs", {}, () => []),
+  exportAgentRunBundle: (runId: string) => call<string>("export_agent_run_bundle", { runId }, () => ""),
+  listToolArtifactsForRun: (runId: string) => call<ToolArtifactRecord[]>("list_tool_artifacts_for_run", { runId }, () => []),
+  drainAgentQueue: () => call<AgentQueuedRequest[]>("drain_agent_queue", {}, () => []),
+  startMattermostAdapter: () => call<Record<string, unknown>>("start_mattermost_adapter", {}, () => ({ platform: "mattermost", status: "unavailable" })),
+  stopMattermostAdapter: () => call<Record<string, unknown>>("stop_mattermost_adapter", {}, () => ({ platform: "mattermost", status: "stopped" })),
+  mattermostAdapterStatus: () => call<Record<string, unknown>>("mattermost_adapter_status", {}, () => ({ platform: "mattermost", status: "stopped" })),
+  startPlatformAdapter: (platform: string) => call<Record<string, unknown>>("start_platform_adapter", { platform }, () => ({ platform, status: "unavailable" })),
+  stopPlatformAdapter: (platform: string) => call<Record<string, unknown>>("stop_platform_adapter", { platform }, () => ({ platform, status: "stopped" })),
+  platformAdapterStatus: (platform?: string | null) => call<Record<string, unknown>>("platform_adapter_status", { platform }, () => ({ adapters: [] })),
+  resumeAgentRun: (runId: string, checkpointId?: string | null) => call<AgentRunRecord>("resume_agent_run", { runId, checkpointId }, () => ({
+    runId,
+    conversationId: "",
+    personaId: "",
+    agentId: "",
+    parentRunId: null,
+    subagentIndex: null,
+    subagentDepth: null,
+    subagentCanDelegate: null,
+    subagentRole: null,
+    subagentTask: null,
+    subagentToolsets: [],
+    userRequest: "",
+    state: "failed",
+    toolEvents: [],
+    phaseEvents: [],
+    checkpoints: [],
+    error: "resume_agent_run unavailable",
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    lastActivityAt: new Date().toISOString(),
+    lastActivityDesc: "resume fallback",
+    completedAt: null
+  })),
+  rerunAgentRun: (runId: string) => call<ChatMessage[]>("rerun_agent_run", { runId }, () => []),
+  diagnoseAgentRun: (runId: string) => call<ChatMessage>("diagnose_agent_run", { runId }, () => ({
+    id: `diagnosis-${Date.now()}`,
+    conversationId: "",
+    role: "assistant",
+    content: "diagnose_agent_run unavailable",
+    source: "standalone",
+    createdAt: new Date().toISOString()
+  })),
+  abortAgentRun: (runId: string, reason?: string) => call<AgentRunRecord>("abort_agent_run", { runId, reason }, () => ({
+    runId,
+    conversationId: "",
+    personaId: "",
+    agentId: "",
+    parentRunId: null,
+    subagentIndex: null,
+    subagentDepth: null,
+    subagentCanDelegate: null,
+    subagentRole: null,
+    subagentTask: null,
+    subagentToolsets: [],
+    userRequest: "",
+    state: "aborted",
+    toolEvents: [],
+    phaseEvents: [],
+    checkpoints: [],
+    error: reason ?? "abort_agent_run unavailable",
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    lastActivityAt: new Date().toISOString(),
+    lastActivityDesc: "abort fallback",
+    completedAt: new Date().toISOString()
+  })),
+  listAgents: () => call<AgentDefinition[]>("list_agents", {}, () => [defaultAgent()]),
+  saveAgent: (agent: AgentDefinition) => call("save_agent", { agent }, () => agent),
+  deleteAgent: (id: string) => call("delete_agent", { id }, () => undefined),
+  getAgentConfig: () => call<AgentConfig>("get_agent_config", {}, () => ({
+    enabled: true,
+    mcpEnabled: true,
+    skillsEnabled: true,
+    enabledMcpServers: [],
+    enabledToolsets: [],
+    disabledToolsets: [],
+    enabledSkills: [],
+    maxSubagents: 4,
+    maxSubagentDepth: 1,
+    maxToolIterations: 8,
+    allowShell: true,
+    skillsDir: ""
+  })),
+  saveAgentConfig: (config: AgentConfig) => call("save_agent_config", { config }, () => config),
+  listSkills: () => call("list_skills", {}, () => []),
+  listSkillsForAgent: (agentId: string) => call("list_skills_for_agent", { agentId }, () => []),
+  installBuiltinSkills: () => call("install_builtin_skills", {}, () => []),
+  listMemories: (personaId?: string) => call<MemoryEntry[]>("list_memories", { personaId }, () => []),
+  getMemoryStatus: (personaId?: string) => call<MemoryStatus>("get_memory_status", { personaId }, () => ({
+    personaId: personaId || "default",
+    personaName: "default",
+    enabled: true,
+    includeInPrompt: true,
+    triggerRounds: 10,
+    maxMemories: 50,
+    total: 0,
+    promptSafe: 0,
+    blockedBySecurityScan: 0,
+    promptInjected: 0
+  })),
+  saveMemory: (memory: MemoryEntry) => call("save_memory", { memory }, () => memory),
+  deleteMemory: (id: string) => call("delete_memory", { id }, () => undefined),
+  listWorldbooks: () => call("list_worldbooks", {}, () => []),
+  saveWorldbook: (book: unknown) => call("save_worldbook", { book }, () => book),
+  deleteWorldbook: (id: string) => call("delete_worldbook", { id }, () => undefined),
+  listThemes: () => call("list_themes", {}, () => [{
+    id: "default-light",
+    name: "默认浅色",
+    mode: "light",
+    css: "",
+    active: true,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  }]),
+  saveThemes: (themes: unknown[]) => call("save_themes", { themes }, () => themes),
+  getTokenUsageStats,
+  resetTokenUsage: () => ok("已重置"),
+  environmentCheck,
+  checkEnvironment: environmentCheck,
+  getShortContextState: (conversationId: string) => call("get_short_context_state", { conversationId }, () => ({
+    conversationId,
+    boundaryId: null,
+    summary: "",
+    summaryTokens: 0,
+    summaryMessages: 0
+  })),
+  getMessageContent: async (messageId: string) => messageId,
+  assetUrl: convertFileSrc,
+  convertFileSrc,
+  openLocalFile: (path: string) => call("open_local_file", { path }, () => undefined),
+  revealLocalFile: (path: string) => call("reveal_local_file", { path }, () => undefined),
+  uploadChatAttachment: (fileName: string, mimeType: string, bytes: number[]): Promise<ChatAttachment> => call<ChatAttachment>("upload_chat_attachment", { fileName, mimeType, bytes }, () => ({
+    id: `att-${Date.now()}`,
+    fileName,
+    mimeType,
+    fileSize: bytes.length,
+    path: fileName
+  })),
+  listMoments: () => empty(),
+  createMoment: (body: string) => pass({ id: `moment-${Date.now()}`, personaId: "default", body, likedBy: [], comments: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }),
+  updateMomentText: (_postId: string, body: string) => pass({ id: _postId, personaId: "default", body, likedBy: [], comments: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }),
+  addMomentComment: (postId: string, text: string) => pass({ id: postId, personaId: "default", body: "", likedBy: [], comments: [{ id: `comment-${Date.now()}`, personaId: "default", text, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }),
+  updateMomentComment: (postId: string) => pass({ id: postId, personaId: "default", body: "", likedBy: [], comments: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }),
+  deleteMoment: async () => undefined,
+  deleteMomentComment: (postId: string) => pass({ id: postId, personaId: "default", body: "", likedBy: [], comments: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }),
+  likeMoment: (postId: string) => pass({ id: postId, personaId: "default", body: "", likedBy: ["user"], comments: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }),
+  unlikeMoment: (postId: string) => pass({ id: postId, personaId: "default", body: "", likedBy: [], comments: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }),
+  uploadMomentCover: (postId: string) => pass({ id: postId, personaId: "default", body: "", coverPath: "", likedBy: [], comments: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }),
+  clearMomentCover: (postId: string) => pass({ id: postId, personaId: "default", body: "", likedBy: [], comments: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }),
+  listCapabilityAdapters: () => call("list_capability_adapters", {}, () => []),
+  saveCapabilityAdapters: (adapters: unknown[]) => call("save_capability_adapters", { adapters }, () => adapters),
+  listProactiveStatuses: () => empty(),
+  triggerProactiveOnce: async () => undefined,
+  listAccounts: () => empty(),
+  saveAccounts: async () => undefined,
+  linkWechatAccount: async () => [],
+  unlinkWechatAccount: async () => [],
+  listImageProviders: () => call<ImageProvider[]>("list_image_providers", {}, () => []),
+  saveImageProviders: (providers: ImageProvider[]) => call("save_image_providers", { providers }, () => undefined),
+  listVideoProviders: () => call<VideoProvider[]>("list_video_providers", {}, () => []),
+  saveVideoProviders: (providers: VideoProvider[]) => call("save_video_providers", { providers }, () => undefined),
+  listSearchProviders: () => call<SearchProvider[]>("list_search_providers", {}, () => []),
+  saveSearchProviders: (providers: SearchProvider[]) => call("save_search_providers", { providers }, () => undefined),
+  listVisionProviders: () => call<VisionProvider[]>("list_vision_providers", {}, () => []),
+  saveVisionProviders: (providers: VisionProvider[]) => call("save_vision_providers", { providers }, () => undefined),
+  listBrowserProviders: () => call<BrowserProvider[]>("list_browser_providers", {}, () => []),
+  saveBrowserProviders: (providers: BrowserProvider[]) => call("save_browser_providers", { providers }, () => undefined),
+  listEmojiGroups: () => empty(),
+  saveEmojiGroups: async () => undefined,
+  uploadEmojiImage: async () => [],
+  createEmojiGroup: async () => [],
+  renameEmojiGroup: async () => [],
+  deleteEmojiGroup: async () => [],
+  createEmojiEmotion: async () => [],
+  renameEmojiEmotion: async () => [],
+  deleteEmojiEmotion: async () => [],
+  renameEmojiImage: async () => [],
+  deleteEmojiImage: async () => [],
+  cleanupHistoricalResources: () => call("cleanup_historical_resources", {}, () => ({
+    skipped: true,
+    removedConversations: 0,
+    removedMessages: 0,
+    removedRuns: 0,
+    removedPlannerTraces: 0,
+    removedToolRouterTraces: 0,
+    removedToolTraces: 0,
+    removedStateSnapshots: 0,
+    removedWorkspaceSnapshots: 0
+  })),
+  listPlugins: () => call("list_plugins", {}, () => []),
+  togglePlugin: (pluginId: string, enabled: boolean) => call("toggle_plugin", { pluginId, enabled }, () => []),
+  listSkillBundles: () => call("list_skill_bundles", {}, () => []),
+  installSkillBundle: (bundleId: string, agentId?: string) => call("install_skill_bundle", { bundleId, agentId }, () => []),
+  listMarketplaceSkills: (query?: string) => call("list_marketplace_skills", { query }, () => []),
+  installMarketplaceSkill: (skillId: string, agentId?: string) => call("install_marketplace_skill", { skillId, agentId }, () => null),
+  auditSkills: (selector?: string) => call("audit_skills", { selector }, () => []),
+  curateSkills: () => call("curate_skills", {}, () => null),
+  getSkillCuratorState: () => call("get_skill_curator_state", {}, () => null),
+  setSkillCuratorPaused: (paused: boolean) => call("set_skill_curator_paused", { paused }, () => null),
+  pinSkillForCurator: (selector: string) => call("pin_skill_for_curator", { selector }, () => null),
+  unpinSkillForCurator: (selector: string) => call("unpin_skill_for_curator", { selector }, () => null),
+  archiveSkillForCurator: (selector: string, reason?: string) => call("archive_skill_for_curator", { selector, reason }, () => null),
+  restoreSkillForCurator: (selector: string) => call("restore_skill_for_curator", { selector }, () => null),
+  installExternalSkillFile: (sourcePath: string, name?: string, category?: string, agentId?: string, force?: boolean) =>
+    call("install_external_skill_file", { sourcePath, name, category, agentId, force }, () => null),
+  installExternalSkillUrl: (url: string, name?: string, category?: string, agentId?: string, force?: boolean) =>
+    call("install_external_skill_url", { url, name, category, agentId, force }, () => null),
+  listSkillInstallRecords: () => call("list_skill_install_records", {}, () => []),
+  listSkillAuditLog: (limit?: number) => call("list_skill_audit_log", { limit }, () => []),
+  listSkillTaps: () => call("list_skill_taps", {}, () => []),
+  addSkillTap: (repo: string, path?: string) => call("add_skill_tap", { repo, path }, () => null),
+  removeSkillTap: (repo: string) => call("remove_skill_tap", { repo }, () => false),
+  listSkillTapMarketplace: (query?: string) => call("list_skill_tap_marketplace", { query }, () => []),
+  searchSkillMarketplace: (query?: string, source?: string) => call("search_skill_marketplace", { query, source }, () => []),
+  checkSkillTaps: () => call("check_skill_taps", {}, () => []),
+  checkSkillUpdates: (selector?: string) => call("check_skill_updates", { selector }, () => []),
+  updateSkillsFromSources: (selector?: string, agentId?: string, force?: boolean) =>
+    call("update_skills_from_sources", { selector, agentId, force }, () => []),
+  checkRemoteSkillUpdates: (selector?: string) => call("check_remote_skill_updates", { selector }, () => []),
+  updateRemoteSkillsFromSources: (selector?: string, agentId?: string, force?: boolean) =>
+    call("update_remote_skills_from_sources", { selector, agentId, force }, () => []),
+  uninstallExternalSkills: (selector?: string, removeFiles?: boolean) =>
+    call("uninstall_external_skills", { selector, removeFiles }, () => []),
+  exportSkillSnapshot: (path: string) => call("export_skill_snapshot", { path }, () => ""),
+  importSkillSnapshot: (path: string) => call("import_skill_snapshot", { path }, () => 0),
+  saveSkillConfig: (agentId: string, skillId: string, config: Record<string, string>) => call("save_skill_config", { agentId, skillId, config }, () => undefined),
+  listMcpTools: (serverId: string, timeoutSeconds?: number) => call("list_mcp_tools", { serverId, timeoutSeconds }, () => ({ ok: true, timedOut: false, elapsedMs: 0, tools: [] })),
+  callMcpTool: (serverId: string, toolName: string, payload: unknown, timeoutSeconds?: number) => call("call_mcp_tool", { serverId, toolName, payload, timeoutSeconds }, () => ({ ok: true, timedOut: false, elapsedMs: 0, stdout: "", stderr: "" })),
+  listPlannerTraces: () => call("list_planner_traces", {}, () => []),
+  listToolRouterTraces: () => call("list_tool_router_traces", {}, () => []),
+  listToolTraces: () => call("list_tool_traces", {}, () => []),
+  listToolDefinitions: () => call("list_tool_definitions", {}, () => []),
+  listToolApprovals: () => call("list_tool_approvals", {}, () => []),
+  approveToolCall: (approvalId: string, timeoutSeconds?: number) => call("approve_tool_call", { approvalId, timeoutSeconds }, () => null),
+  approveToolCallAlways: (approvalId: string, timeoutSeconds?: number) => call("approve_tool_call_always", { approvalId, timeoutSeconds }, () => null),
+  approveToolCallServer: (approvalId: string, timeoutSeconds?: number) => call("approve_tool_call_server", { approvalId, timeoutSeconds }, () => null),
+  denyToolCall: (approvalId: string, reason?: string) => call("deny_tool_call", { approvalId, reason }, () => null),
+  refreshToolRegistry: () => call("refresh_tool_registry", {}, () => []),
+  saveProfileAvatar: async () => fallbackProfile,
+  uploadProfileAvatar: async () => fallbackProfile,
+  clearProfileAvatar: async () => fallbackProfile,
+  uploadPersonaAvatar: (personaId: string) => pass({ ...defaultPersona, id: personaId }),
+  clearPersonaAvatar: (personaId: string) => pass({ ...defaultPersona, id: personaId, avatarPath: "" }),
+  importThemeCss: async () => [],
+  exportThemesCss: async () => "",
+  pickFile: async () => null,
+  pickFolder: async () => null,
+  installDocker: async () => ok(),
+  startDockerDesktop: async () => ok(),
+  setupWsl2: async () => ok(),
+  installOllama: async () => ok(),
+  installPython: async () => ok(),
+  setupSearxng: async () => ok(),
+  startOllamaService: async () => ok(),
+  pullVisionModel: async () => ok(),
+  installChatttsDeps: async () => ok(),
+  installAllMissing: async () => ok(),
+  cancelEnvironmentAction: async () => ok(),
+  getWechatConfig: async () => ({ baseUrl: "", timeoutSeconds: 15 }),
+  saveWechatConfig: async () => undefined,
+  startWechatQr: async () => ({ qrcode: "", baseUrl: "", raw: null }),
+  checkWechatQrStatus: async () => ({ status: "idle", raw: null }),
+  wechatPollOnce: async () => ({ account: null, processed: [], receivedCount: 0, skippedCount: 0, updatedBuffer: false, raw: null }),
+  openai: {},
+  anthropic: {},
+  deepseek: {},
+  siliconflow: {},
+  qweather: {},
+  example: {}
+};

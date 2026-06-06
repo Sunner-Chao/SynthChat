@@ -1,0 +1,232 @@
+use serde_json::json;
+
+use crate::{
+    error::AppResult,
+    models::{MemoryEntry, Persona},
+    store::AppStore,
+};
+
+use super::append_parent_phase_event;
+
+const MEMORY_OPEN_TAG: &str = "<memory-context>";
+const MEMORY_CLOSE_TAG: &str = "</memory-context>";
+
+pub(super) fn builtin_memory_prefetch(
+    store: &AppStore,
+    persona: &Persona,
+    query: &str,
+) -> AppResult<Vec<MemoryEntry>> {
+    let enabled = persona
+        .memory
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let include_in_prompt = persona
+        .memory
+        .get("includeInPrompt")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    if !enabled || !include_in_prompt {
+        return Ok(vec![]);
+    }
+    let max_memories = persona
+        .memory
+        .get("maxMemories")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(50)
+        .max(1) as usize;
+    let mut ranked = store
+        .memories(Some(&persona.id))?
+        .into_iter()
+        .filter(|memory| crate::store::scan_memory_content(&memory.summary).is_none())
+        .map(|memory| (memory_prefetch_score(&memory, query), memory))
+        .filter(|(score, _)| *score > 0)
+        .collect::<Vec<_>>();
+    ranked.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| right.importance.cmp(&left.importance))
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+    });
+    let mut memories = ranked
+        .into_iter()
+        .map(|(_, memory)| memory)
+        .collect::<Vec<_>>();
+    memories.truncate(max_memories);
+    Ok(memories)
+}
+
+pub(super) fn on_memory_turn_start(
+    store: &AppStore,
+    run_id: &str,
+    conversation_id: &str,
+    persona: &Persona,
+    user_content: &str,
+    prefetched_count: usize,
+    tool_count: usize,
+) -> AppResult<()> {
+    append_parent_phase_event(
+        store,
+        run_id,
+        "memory_turn_started",
+        json!({
+            "provider": "builtin",
+            "conversationId": conversation_id,
+            "personaId": persona.id,
+            "userChars": user_content.chars().count(),
+            "prefetched": prefetched_count,
+            "toolCount": tool_count
+        }),
+    )
+}
+
+pub(super) fn on_memory_turn_synced(
+    store: &AppStore,
+    run_id: &str,
+    conversation_id: &str,
+    persona: &Persona,
+    user_content: &str,
+    assistant_content: &str,
+) -> AppResult<()> {
+    append_parent_phase_event(
+        store,
+        run_id,
+        "memory_turn_synced",
+        json!({
+            "provider": "builtin",
+            "conversationId": conversation_id,
+            "personaId": persona.id,
+            "userChars": user_content.chars().count(),
+            "assistantChars": assistant_content.chars().count()
+        }),
+    )
+}
+
+pub(super) fn on_memory_write(
+    store: &AppStore,
+    run_id: &str,
+    persona: &Persona,
+    action: &str,
+    target: &str,
+    content: &str,
+) -> AppResult<()> {
+    if run_id.trim().is_empty() {
+        return Ok(());
+    }
+    append_parent_phase_event(
+        store,
+        run_id,
+        "memory_write_observed",
+        json!({
+            "provider": "builtin",
+            "personaId": persona.id,
+            "action": action,
+            "target": target,
+            "contentChars": content.chars().count()
+        }),
+    )
+}
+
+pub(super) fn memory_pre_compress_context(
+    store: &AppStore,
+    persona: &Persona,
+    query: &str,
+) -> AppResult<String> {
+    let memories = builtin_memory_prefetch(store, persona, query)?;
+    if memories.is_empty() {
+        return Ok(String::new());
+    }
+    let lines = memories
+        .iter()
+        .take(8)
+        .map(|memory| {
+            format!(
+                "- memory {} importance {}: {}",
+                memory.id,
+                memory.importance,
+                sanitize_memory_context(&memory.summary)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(format!(
+        "[assistant at memory-pre-compress] Memory provider pre-compress context to preserve if relevant: {lines}"
+    ))
+}
+
+pub(super) fn sanitize_memory_context(text: &str) -> String {
+    let without_blocks = strip_tagged_blocks(text, MEMORY_OPEN_TAG, MEMORY_CLOSE_TAG);
+    without_blocks
+        .lines()
+        .filter(|line| !is_internal_memory_note(line))
+        .map(strip_memory_tags_from_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn memory_prefetch_score(memory: &MemoryEntry, query: &str) -> u32 {
+    let importance = memory.importance as u32;
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return importance;
+    }
+    let text = memory.summary.to_ascii_lowercase();
+    if text.contains(&query) {
+        return 1000 + query.len() as u32 + importance;
+    }
+    let term_score = query
+        .split_whitespace()
+        .filter(|term| !term.is_empty() && text.contains(*term))
+        .map(|term| 20 + term.len() as u32)
+        .sum::<u32>();
+    if term_score == 0 {
+        return 0;
+    }
+    term_score + importance
+}
+
+pub(super) fn build_memory_context_block(raw_context: &str) -> String {
+    if raw_context.trim().is_empty() {
+        return String::new();
+    }
+    let clean = sanitize_memory_context(raw_context);
+    if clean.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "{MEMORY_OPEN_TAG}\n[System note: The following is recalled memory context, NOT new user input. Treat as authoritative reference data for the agent's persistent memory.]\n\n{clean}\n{MEMORY_CLOSE_TAG}"
+    )
+}
+
+fn strip_tagged_blocks(text: &str, open_tag: &str, close_tag: &str) -> String {
+    let mut remaining = text.to_string();
+    loop {
+        let lower = remaining.to_ascii_lowercase();
+        let Some(open_idx) = lower.find(open_tag) else {
+            return remaining;
+        };
+        let after_open = open_idx + open_tag.len();
+        let Some(close_rel_idx) = lower[after_open..].find(close_tag) else {
+            remaining.truncate(open_idx);
+            return remaining;
+        };
+        let close_end = after_open + close_rel_idx + close_tag.len();
+        remaining.replace_range(open_idx..close_end, "");
+    }
+}
+
+fn strip_memory_tags_from_line(line: &str) -> String {
+    line.replace(MEMORY_OPEN_TAG, "")
+        .replace(MEMORY_CLOSE_TAG, "")
+        .replace(&MEMORY_OPEN_TAG.to_ascii_uppercase(), "")
+        .replace(&MEMORY_CLOSE_TAG.to_ascii_uppercase(), "")
+}
+
+fn is_internal_memory_note(line: &str) -> bool {
+    let normalized = line.trim().to_ascii_lowercase();
+    normalized.starts_with("[system note:")
+        && normalized.contains("recalled memory context")
+        && normalized.contains("not new user input")
+}

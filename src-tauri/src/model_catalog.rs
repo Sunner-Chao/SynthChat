@@ -1,0 +1,611 @@
+use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::{
+    error::{AppError, AppResult},
+    models::LlmProvider,
+};
+
+const MODELS_DEV_URL: &str = "https://models.dev/api.json";
+const MEMORY_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+
+static MODELS_DEV_CACHE: OnceLock<Mutex<Option<CachedCatalog>>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct CachedCatalog {
+    loaded_at: Instant,
+    data: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCapabilities {
+    pub provider_id: String,
+    pub model_id: String,
+    pub models_dev_provider_id: String,
+    pub supports_tools: bool,
+    pub supports_vision: bool,
+    pub supports_reasoning: bool,
+    pub supports_pdf: bool,
+    pub supports_audio_input: bool,
+    pub supports_structured_output: bool,
+    pub open_weights: bool,
+    pub input_modalities: Vec<String>,
+    pub output_modalities: Vec<String>,
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub model_family: String,
+    pub status: String,
+    pub knowledge_cutoff: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCatalogInfo {
+    pub id: String,
+    pub name: String,
+    pub api: String,
+    pub doc: String,
+    pub env: Vec<String>,
+    pub model_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogEntry {
+    pub id: String,
+    pub name: String,
+    pub family: String,
+    pub capabilities: ModelCapabilities,
+}
+
+fn provider_mapping() -> &'static HashMap<&'static str, &'static str> {
+    static MAPPING: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
+    MAPPING.get_or_init(|| {
+        HashMap::from([
+            ("openrouter", "openrouter"),
+            ("novita", "novita-ai"),
+            ("anthropic", "anthropic"),
+            ("openai", "openai"),
+            ("openai-codex", "openai"),
+            ("zai", "zai"),
+            ("kimi", "kimi-for-coding"),
+            ("kimi-coding", "kimi-for-coding"),
+            ("moonshot", "kimi-for-coding"),
+            ("stepfun", "stepfun"),
+            ("kimi-coding-cn", "kimi-for-coding"),
+            ("minimax", "minimax"),
+            ("minimax-oauth", "minimax"),
+            ("minimax-cn", "minimax-cn"),
+            ("deepseek", "deepseek"),
+            ("alibaba", "alibaba"),
+            ("qwen-oauth", "alibaba"),
+            ("copilot", "github-copilot"),
+            ("opencode-zen", "opencode"),
+            ("opencode-go", "opencode-go"),
+            ("kilocode", "kilo"),
+            ("fireworks", "fireworks-ai"),
+            ("huggingface", "huggingface"),
+            ("gemini", "google"),
+            ("google", "google"),
+            ("xai", "xai"),
+            ("xai-oauth", "xai"),
+            ("xiaomi", "xiaomi"),
+            ("nvidia", "nvidia"),
+            ("groq", "groq"),
+            ("mistral", "mistral"),
+            ("togetherai", "togetherai"),
+            ("perplexity", "perplexity"),
+            ("cohere", "cohere"),
+            ("ollama-cloud", "ollama-cloud"),
+            ("ollama", "ollama"),
+        ])
+    })
+}
+
+pub fn models_dev_provider_id(provider_id: &str) -> String {
+    let key = provider_id
+        .trim()
+        .split_once(":cred-")
+        .map(|(base, _)| base)
+        .unwrap_or(provider_id)
+        .to_ascii_lowercase();
+    provider_mapping()
+        .get(key.as_str())
+        .copied()
+        .unwrap_or(key.as_str())
+        .to_string()
+}
+
+fn catalog_cache_path() -> PathBuf {
+    let base = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("synthchat-data").join("models_dev_cache.json")
+}
+
+fn memory_cached_catalog() -> Option<Value> {
+    let cache = MODELS_DEV_CACHE.get_or_init(|| Mutex::new(None));
+    let guard = cache.lock().ok()?;
+    let cached = guard.as_ref()?;
+    if cached.loaded_at.elapsed() < MEMORY_CACHE_TTL {
+        Some(cached.data.clone())
+    } else {
+        None
+    }
+}
+
+fn set_memory_cache(data: Value) {
+    let cache = MODELS_DEV_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(CachedCatalog {
+            loaded_at: Instant::now(),
+            data,
+        });
+    }
+}
+
+fn load_disk_catalog() -> Option<Value> {
+    let bytes = fs::read(catalog_cache_path()).ok()?;
+    serde_json::from_slice::<Value>(&bytes).ok()
+}
+
+fn save_disk_catalog(data: &Value) -> AppResult<()> {
+    let path = catalog_cache_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| AppError::BadRequest(format!("cannot create model cache dir: {err}")))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec(data)
+        .map_err(|err| AppError::BadRequest(format!("cannot serialize model cache: {err}")))?;
+    fs::write(&tmp, bytes)
+        .map_err(|err| AppError::BadRequest(format!("cannot write model cache: {err}")))?;
+    fs::rename(&tmp, &path)
+        .map_err(|err| AppError::BadRequest(format!("cannot replace model cache: {err}")))?;
+    Ok(())
+}
+
+pub async fn fetch_models_dev_catalog(force_refresh: bool) -> AppResult<Value> {
+    if !force_refresh {
+        if let Some(data) = memory_cached_catalog() {
+            return Ok(data);
+        }
+        if let Some(data) = load_disk_catalog() {
+            set_memory_cache(data.clone());
+            return Ok(data);
+        }
+    }
+
+    let response = reqwest::Client::new()
+        .get(MODELS_DEV_URL)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|err| AppError::BadRequest(format!("cannot fetch models.dev catalog: {err}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(AppError::BadRequest(format!(
+            "models.dev catalog returned HTTP {status}"
+        )));
+    }
+    let data = response
+        .json::<Value>()
+        .await
+        .map_err(|err| AppError::BadRequest(format!("cannot parse models.dev catalog: {err}")))?;
+    if !data.is_object() {
+        return Err(AppError::BadRequest(
+            "models.dev catalog did not return an object".into(),
+        ));
+    }
+    save_disk_catalog(&data)?;
+    set_memory_cache(data.clone());
+    Ok(data)
+}
+
+fn catalog_for_lookup() -> Option<Value> {
+    memory_cached_catalog().or_else(load_disk_catalog)
+}
+
+fn provider_models<'a>(
+    catalog: &'a Value,
+    provider_id: &str,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    let mdev_id = models_dev_provider_id(provider_id);
+    catalog.get(&mdev_id)?.get("models")?.as_object()
+}
+
+fn find_model_entry<'a>(
+    models: &'a serde_json::Map<String, Value>,
+    model_id: &str,
+) -> Option<(&'a str, &'a Value)> {
+    if let Some(entry) = models.get_key_value(model_id) {
+        return Some((entry.0.as_str(), entry.1));
+    }
+    let lower = model_id.to_ascii_lowercase();
+    for (id, entry) in models {
+        if id.to_ascii_lowercase() == lower {
+            return Some((id.as_str(), entry));
+        }
+    }
+    for suffix in [":cloud", "-cloud"] {
+        let suffixed = format!("{model_id}{suffix}");
+        if let Some(entry) = models.get_key_value(&suffixed) {
+            return Some((entry.0.as_str(), entry.1));
+        }
+        let suffixed_lower = suffixed.to_ascii_lowercase();
+        for (id, entry) in models {
+            if id.to_ascii_lowercase() == suffixed_lower {
+                return Some((id.as_str(), entry));
+            }
+        }
+    }
+    None
+}
+
+fn string_vec(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn positive_u64(value: Option<&Value>) -> Option<u64> {
+    value
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .or_else(|| {
+            value
+                .and_then(Value::as_f64)
+                .filter(|value| *value > 0.0)
+                .map(|value| value as u64)
+        })
+}
+
+fn capabilities_from_entry(
+    provider_id: &str,
+    model_id: &str,
+    resolved_model_id: &str,
+    entry: &Value,
+    source: &str,
+) -> ModelCapabilities {
+    let input_modalities = string_vec(entry.pointer("/modalities/input"));
+    let output_modalities = string_vec(entry.pointer("/modalities/output"));
+    let supports_vision = if input_modalities.is_empty() {
+        entry
+            .get("attachment")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    } else {
+        input_modalities.iter().any(|item| item == "image")
+    };
+    let supports_pdf = input_modalities.iter().any(|item| item == "pdf");
+    let supports_audio_input = input_modalities.iter().any(|item| item == "audio");
+    ModelCapabilities {
+        provider_id: provider_id.to_string(),
+        model_id: resolved_model_id.to_string(),
+        models_dev_provider_id: models_dev_provider_id(provider_id),
+        supports_tools: entry
+            .get("tool_call")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        supports_vision,
+        supports_reasoning: entry
+            .get("reasoning")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        supports_pdf,
+        supports_audio_input,
+        supports_structured_output: entry
+            .get("structured_output")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        open_weights: entry
+            .get("open_weights")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        input_modalities,
+        output_modalities,
+        context_window: positive_u64(entry.pointer("/limit/context")),
+        max_output_tokens: positive_u64(entry.pointer("/limit/output")),
+        model_family: entry
+            .get("family")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        status: entry
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        knowledge_cutoff: entry
+            .get("knowledge")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        source: if resolved_model_id == model_id {
+            source.to_string()
+        } else {
+            format!("{source}:matched:{model_id}")
+        },
+    }
+}
+
+pub fn lookup_model_capabilities(provider_id: &str, model_id: &str) -> Option<ModelCapabilities> {
+    let catalog = catalog_for_lookup()?;
+    let models = provider_models(&catalog, provider_id)?;
+    let (resolved_id, entry) = find_model_entry(models, model_id)?;
+    Some(capabilities_from_entry(
+        provider_id,
+        model_id,
+        resolved_id,
+        entry,
+        "models.dev",
+    ))
+}
+
+pub fn infer_model_capabilities(provider: &LlmProvider) -> ModelCapabilities {
+    let provider_type = provider.provider_type.trim().to_ascii_lowercase();
+    let provider_id = if provider.id.trim().is_empty() {
+        provider_type.as_str()
+    } else {
+        provider.id.trim()
+    };
+    let model = provider.model.trim().to_ascii_lowercase();
+    let supports_vision = model.contains("vision")
+        || model.contains("gpt-4o")
+        || model.contains("gemini")
+        || model.contains("claude-3")
+        || model.contains("qwen-vl")
+        || model.contains("vl-");
+    let supports_reasoning = model.contains("reason")
+        || model.contains("thinking")
+        || model.contains("o1")
+        || model.contains("o3")
+        || model.contains("o4")
+        || model.contains("r1")
+        || model.contains("gpt-5")
+        || model.contains("claude-4")
+        || model.contains("gemini-2.5");
+    let supports_tools = !matches!(provider_type.as_str(), "echo" | "completion");
+    ModelCapabilities {
+        provider_id: provider_id.to_string(),
+        model_id: provider.model.clone(),
+        models_dev_provider_id: models_dev_provider_id(provider_id),
+        supports_tools,
+        supports_vision,
+        supports_reasoning,
+        supports_pdf: supports_vision,
+        supports_audio_input: false,
+        supports_structured_output: supports_tools,
+        open_weights: false,
+        input_modalities: if supports_vision {
+            vec!["text".into(), "image".into()]
+        } else {
+            vec!["text".into()]
+        },
+        output_modalities: vec!["text".into()],
+        context_window: None,
+        max_output_tokens: None,
+        model_family: String::new(),
+        status: String::new(),
+        knowledge_cutoff: String::new(),
+        source: "heuristic".into(),
+    }
+}
+
+pub fn provider_model_capabilities(provider: &LlmProvider) -> ModelCapabilities {
+    let provider_id = if provider.id.trim().is_empty() {
+        provider.provider_type.as_str()
+    } else {
+        provider.id.as_str()
+    };
+    lookup_model_capabilities(provider_id, &provider.model)
+        .or_else(|| lookup_model_capabilities(&provider.provider_type, &provider.model))
+        .unwrap_or_else(|| infer_model_capabilities(provider))
+}
+
+pub fn model_capability_prompt_block(provider: &LlmProvider) -> String {
+    let caps = provider_model_capabilities(provider);
+    let mut flags = Vec::new();
+    if caps.supports_tools {
+        flags.push("tools");
+    }
+    if caps.supports_reasoning {
+        flags.push("reasoning");
+    }
+    if caps.supports_vision {
+        flags.push("vision");
+    }
+    if caps.supports_pdf {
+        flags.push("pdf");
+    }
+    if caps.supports_audio_input {
+        flags.push("audio-input");
+    }
+    if caps.supports_structured_output {
+        flags.push("structured-output");
+    }
+    let context = caps
+        .context_window
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let output = caps
+        .max_output_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    format!(
+        "Current LLM model metadata: provider={}, model={}, source={}, capabilities={}, contextWindowTokens={}, maxOutputTokens={}.",
+        caps.provider_id,
+        caps.model_id,
+        caps.source,
+        if flags.is_empty() { "basic".into() } else { flags.join(",") },
+        context,
+        output
+    )
+}
+
+pub fn provider_catalog_info(provider_id: &str) -> Option<ProviderCatalogInfo> {
+    let catalog = catalog_for_lookup()?;
+    let mdev_id = models_dev_provider_id(provider_id);
+    let provider = catalog.get(&mdev_id)?.as_object()?;
+    let env = string_vec(provider.get("env"));
+    let model_count = provider
+        .get("models")
+        .and_then(Value::as_object)
+        .map(|models| models.len())
+        .unwrap_or(0);
+    Some(ProviderCatalogInfo {
+        id: mdev_id.clone(),
+        name: provider
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(&mdev_id)
+            .to_string(),
+        api: provider
+            .get("api")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        doc: provider
+            .get("doc")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        env,
+        model_count,
+    })
+}
+
+fn should_hide_from_provider_catalog(provider_id: &str, model_id: &str) -> bool {
+    let provider = provider_id.trim().to_ascii_lowercase();
+    let model = model_id.trim().to_ascii_lowercase();
+    if matches!(provider.as_str(), "gemini" | "google") {
+        matches!(
+            model.as_str(),
+            "gemini-1.5-flash"
+                | "gemini-1.5-pro"
+                | "gemini-1.5-flash-8b"
+                | "gemini-2.0-flash"
+                | "gemini-2.0-flash-lite"
+                | "gemma-4-31b-it"
+                | "gemma-4-26b-it"
+                | "gemma-4-26b-a4b-it"
+                | "gemma-3-1b"
+                | "gemma-3-1b-it"
+                | "gemma-3-2b"
+                | "gemma-3-2b-it"
+                | "gemma-3-4b"
+                | "gemma-3-4b-it"
+                | "gemma-3-12b"
+                | "gemma-3-12b-it"
+                | "gemma-3-27b"
+                | "gemma-3-27b-it"
+        )
+    } else {
+        false
+    }
+}
+
+fn looks_like_noise_model(model_id: &str) -> bool {
+    let model = model_id.to_ascii_lowercase();
+    model.contains("embedding")
+        || model.contains("-tts")
+        || model.contains("live-")
+        || model.contains("-image")
+        || model.contains("-customtools")
+        || model.contains("-preview-")
+        || model.contains("-exp-")
+}
+
+pub fn list_agentic_models(provider_id: &str) -> Vec<ModelCatalogEntry> {
+    let catalog = match catalog_for_lookup() {
+        Some(catalog) => catalog,
+        None => return Vec::new(),
+    };
+    let models = match provider_models(&catalog, provider_id) {
+        Some(models) => models,
+        None => return Vec::new(),
+    };
+    let mut entries = Vec::new();
+    for (model_id, entry) in models {
+        if should_hide_from_provider_catalog(provider_id, model_id)
+            || looks_like_noise_model(model_id)
+        {
+            continue;
+        }
+        if !entry
+            .get("tool_call")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let caps = capabilities_from_entry(provider_id, model_id, model_id, entry, "models.dev");
+        entries.push(ModelCatalogEntry {
+            id: model_id.clone(),
+            name: entry
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(model_id)
+                .to_string(),
+            family: entry
+                .get("family")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            capabilities: caps,
+        });
+    }
+    entries.sort_by(|left, right| left.id.cmp(&right.id));
+    entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn model_capabilities_parse_modalities_and_limits() {
+        let entry = json!({
+            "family": "gpt-4.1",
+            "reasoning": true,
+            "tool_call": true,
+            "structured_output": true,
+            "modalities": {"input": ["text", "image", "pdf"], "output": ["text"]},
+            "limit": {"context": 1048576, "output": 32768}
+        });
+        let caps = capabilities_from_entry("openai", "gpt-4.1", "gpt-4.1", &entry, "test");
+        assert!(caps.supports_tools);
+        assert!(caps.supports_vision);
+        assert!(caps.supports_pdf);
+        assert!(caps.supports_reasoning);
+        assert_eq!(caps.context_window, Some(1_048_576));
+        assert_eq!(caps.max_output_tokens, Some(32_768));
+    }
+
+    #[test]
+    fn provider_mapping_strips_credential_suffix() {
+        assert_eq!(models_dev_provider_id("openai:cred-2"), "openai");
+        assert_eq!(models_dev_provider_id("gemini"), "google");
+        assert_eq!(models_dev_provider_id("custom"), "custom");
+    }
+}
