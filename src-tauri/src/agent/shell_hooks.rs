@@ -40,6 +40,7 @@ class PluginContext:
         self.commands = {}
         self.tools = {}
         self.skills = {}
+        self.injected_messages = []
 
     def register_hook(self, hook_name, callback):
         self.hooks.setdefault(str(hook_name), []).append(callback)
@@ -116,8 +117,15 @@ class PluginContext:
     def register_auxiliary_task(self, *args, **kwargs):
         return None
 
-    def inject_message(self, *args, **kwargs):
-        return False
+    def inject_message(self, content, role="user"):
+        text = str(content or "").strip()
+        clean_role = str(role or "user").strip().lower()
+        if not text:
+            return False
+        if clean_role not in ("user", "assistant", "system", "tool"):
+            clean_role = "user"
+        self.injected_messages.append({"role": clean_role, "content": text})
+        return True
 
 def _jsonable(value):
     try:
@@ -212,7 +220,11 @@ async def main():
         result = command["handler"](raw_args)
         if inspect.isawaitable(result):
             result = await result
-        print(json.dumps({"handled": True, "result": _jsonable(result)}))
+        print(json.dumps({
+            "handled": True,
+            "result": _jsonable(result),
+            "injected_messages": ctx.injected_messages,
+        }))
         return
     if tool_name:
         clean_tool = str(tool_name).strip()
@@ -283,6 +295,18 @@ pub(super) struct PythonPluginSkillDefinition {
     pub(super) name: String,
     pub(super) path: PathBuf,
     pub(super) description: String,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PythonPluginInjectedMessage {
+    pub(super) role: String,
+    pub(super) content: String,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PythonPluginCommandResult {
+    pub(super) reply: String,
+    pub(super) injected_messages: Vec<PythonPluginInjectedMessage>,
 }
 
 #[derive(Debug, Clone)]
@@ -1238,7 +1262,7 @@ pub(super) async fn run_python_plugin_command(
     store: &AppStore,
     command_name: &str,
     raw_args: &str,
-) -> AppResult<Option<String>> {
+) -> AppResult<Option<PythonPluginCommandResult>> {
     let command_name = command_name
         .trim()
         .trim_start_matches('/')
@@ -1262,7 +1286,7 @@ pub(super) async fn run_python_plugin_command(
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            let result = output
+            let reply = output
                 .get("result")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
@@ -1272,7 +1296,42 @@ pub(super) async fn run_python_plugin_command(
                         .map(Value::to_string)
                         .unwrap_or_default()
                 });
-            return Ok(Some(result));
+            let injected_messages = output
+                .get("injected_messages")
+                .and_then(Value::as_array)
+                .map(|messages| {
+                    messages
+                        .iter()
+                        .filter_map(|message| {
+                            let content = message.get("content").and_then(Value::as_str)?.trim();
+                            if content.is_empty() {
+                                return None;
+                            }
+                            let role = message
+                                .get("role")
+                                .and_then(Value::as_str)
+                                .unwrap_or("user")
+                                .trim()
+                                .to_lowercase();
+                            Some(PythonPluginInjectedMessage {
+                                role: if matches!(
+                                    role.as_str(),
+                                    "user" | "assistant" | "system" | "tool"
+                                ) {
+                                    role
+                                } else {
+                                    "user".into()
+                                },
+                                content: content.to_string(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            return Ok(Some(PythonPluginCommandResult {
+                reply,
+                injected_messages,
+            }));
         }
     }
     Ok(None)
