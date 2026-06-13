@@ -222,6 +222,7 @@ fn is_idempotent_tool(tool_name: &str) -> bool {
             | "browser_console"
             | "browser_get_images"
             | "weather"
+            | "security_scan"
             | "ha_list_entities"
             | "ha_get_state"
             | "ha_list_services"
@@ -556,6 +557,7 @@ mod tests {
             "skills_list",
             "skill_view",
             "recall_memory",
+            "security_scan",
             "mcp_filesystem_read_file",
             "mcp_filesystem_list_directory",
             "mcp_filesystem_get_file_info",

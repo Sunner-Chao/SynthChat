@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, time::Instant};
 
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
@@ -53,6 +50,9 @@ pub(super) async fn complete_openai_compatible(
         "temperature": persona.temperature,
         "max_tokens": persona.max_tokens
     });
+    if options.fast_mode_enabled {
+        body["service_tier"] = json!("priority");
+    }
     if let Some(tools) = native_tools.filter(|tools| !tools.is_empty()) {
         body["tools"] = json!(openai_tool_schemas(tools));
         body["tool_choice"] = json!("auto");
@@ -64,18 +64,19 @@ pub(super) async fn complete_openai_compatible(
     }
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(provider.timeout_seconds.max(1)))
+        .timeout(provider_request_timeout_duration(provider, model))
         .default_headers(headers)
         .build()
         .map_err(|e| AppError::Llm(e.to_string()))?;
 
     let started_at = Instant::now();
-    let response = client
-        .post(url.clone())
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AppError::Llm(e.to_string()))?;
+    let response = send_llm_request_with_stale_timeout(
+        client.post(url.clone()).json(&body),
+        provider,
+        model,
+        "openai chat request",
+    )
+    .await?;
 
     let mut status = response.status();
     let mut response_headers = response.headers().clone();
@@ -90,12 +91,13 @@ pub(super) async fn complete_openai_compatible(
         if let Some(retry_body) = openai_unsupported_parameter_retry_body(&body, &text) {
             retry_count = 1;
             retry_reason = Some("unsupported_parameter_recovery".to_string());
-            let retry_response = client
-                .post(chat_url(provider))
-                .json(&retry_body)
-                .send()
-                .await
-                .map_err(|e| AppError::Llm(e.to_string()))?;
+            let retry_response = send_llm_request_with_stale_timeout(
+                client.post(chat_url(provider)).json(&retry_body),
+                provider,
+                model,
+                "openai chat retry request",
+            )
+            .await?;
             status = retry_response.status();
             response_headers = retry_response.headers().clone();
             let text = retry_response.text().await.map_err(|e| {
@@ -109,8 +111,8 @@ pub(super) async fn complete_openai_compatible(
             }
             let payload: Value = serde_json::from_str(&text).map_err(|error| {
                 AppError::Llm(format!(
-                    "invalid recovered llm response ({status}): {error}; body: {}",
-                    response_preview(&text)
+                    "invalid recovered llm response ({status}): {error}; {}",
+                    invalid_response_body_detail(&text, &response_headers)
                 ))
             })?;
             let transport = LlmTransportMetadata {
@@ -149,7 +151,12 @@ pub(super) async fn complete_openai_compatible(
     };
 
     if let Some(callback) = options.stream_delta_callback.as_ref() {
-        let reply = read_openai_sse_stream(response, callback).await?;
+        let reply = read_openai_sse_stream(
+            response,
+            callback,
+            provider_stream_stale_timeout_duration(provider, model),
+        )
+        .await?;
         return Ok(with_reply_metadata_and_transport(
             reply,
             provider,
@@ -176,8 +183,8 @@ pub(super) async fn complete_openai_compatible(
                 ));
             }
             return Err(AppError::Llm(format!(
-                "invalid llm response ({status}): {error}; body: {}",
-                response_preview(&text)
+                "invalid llm response ({status}): {error}; {}",
+                invalid_response_body_detail(&text, &response_headers)
             )));
         }
     };
@@ -196,6 +203,7 @@ pub(super) async fn complete_openai_compatible(
 async fn read_openai_sse_stream(
     response: reqwest::Response,
     callback: &LlmDeltaCallback,
+    stale_timeout: Option<std::time::Duration>,
 ) -> AppResult<LlmReply> {
     let mut buffer = String::new();
     let mut content = String::new();
@@ -205,7 +213,22 @@ async fn read_openai_sse_stream(
     let mut tool_calls = BTreeMap::<usize, OpenAiStreamToolCall>::new();
     let mut stream = response.bytes_stream();
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next_chunk = if let Some(timeout) = stale_timeout {
+            tokio::time::timeout(timeout, stream.next())
+                .await
+                .map_err(|_| {
+                    AppError::Llm(format!(
+                        "llm stream stale: no provider bytes for {}s",
+                        timeout.as_secs_f64()
+                    ))
+                })?
+        } else {
+            stream.next().await
+        };
+        let Some(chunk) = next_chunk else {
+            break;
+        };
         let chunk = chunk.map_err(|e| AppError::Llm(format!("failed to read llm stream: {e}")))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(newline) = buffer.find('\n') {
@@ -665,6 +688,9 @@ pub(super) fn openai_unsupported_parameter_retry_body(
         Some("parallel_tool_calls") => {
             object.remove("parallel_tool_calls")?;
         }
+        Some("service_tier") => {
+            object.remove("service_tier")?;
+        }
         _ => {
             if unsupported_parameter_error_mentions(&lower, "temperature") {
                 object.remove("temperature")?;
@@ -677,6 +703,8 @@ pub(super) fn openai_unsupported_parameter_retry_body(
                 }
             } else if unsupported_parameter_error_mentions(&lower, "parallel_tool_calls") {
                 object.remove("parallel_tool_calls")?;
+            } else if unsupported_parameter_error_mentions(&lower, "service_tier") {
+                object.remove("service_tier")?;
             } else {
                 return None;
             }

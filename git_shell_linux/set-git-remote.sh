@@ -75,19 +75,17 @@ fi
 
 if [ "$has_remote" = true ]; then
     echo -e "\033[36m[set-git-remote] 更新远程 $REMOTE_NAME -> $remote_url\033[0m"
-    git remote set-url "$REMOTE_NAME" "$remote_url"
-    if [ $? -ne 0 ]; then
+    if ! git remote set-url "$REMOTE_NAME" "$remote_url"; then
         echo "git remote set-url 失败" >&2
         exit 1
     fi
 else
     echo -e "\033[36m[set-git-remote] 新增远程 $REMOTE_NAME -> $remote_url\033[0m"
-    git remote add "$REMOTE_NAME" "$remote_url"
-    if [ $? -ne 0 ]; then
+    if ! git remote add "$REMOTE_NAME" "$remote_url"; then
         echo "git remote add 失败" >&2
         exit 1
     fi
 fi
 
 echo -e "\033[32m[set-git-remote] 当前远程配置：\033[0m"
-git remote -v
+git remote -v || true

@@ -15,6 +15,9 @@ use crate::{
 
 use super::{communication::send_message_external_targets, *};
 
+const HERMES_MAX_PLATFORM_DELIVERY_OUTPUT_CHARS: usize = 4000;
+const HERMES_TRUNCATED_PLATFORM_DELIVERY_VISIBLE_CHARS: usize = 3800;
+
 #[derive(Debug, Clone)]
 pub(super) struct ScheduledScriptRun {
     pub success: bool,
@@ -501,15 +504,31 @@ pub(super) async fn deliver_scheduled_job_result(
     if targets.is_empty() {
         return None;
     }
-    let content = scheduled_delivery_content(job, content, success);
+    let content = scheduled_delivery_content(store, job, content, success);
     if content.trim().is_empty() {
         return None;
     }
+    let platform_content = if targets
+        .iter()
+        .any(scheduled_delivery_payload_targets_platform)
+    {
+        match scheduled_platform_delivery_content(store, job, &content) {
+            Ok(content) => content,
+            Err(error) => return Some(error.to_string()),
+        }
+    } else {
+        content.clone()
+    };
     let mut errors = Vec::new();
     for payload in targets {
         let mut payload = payload;
+        let payload_content = if scheduled_delivery_payload_targets_platform(&payload) {
+            &platform_content
+        } else {
+            &content
+        };
         payload["action"] = json!("send");
-        payload["message"] = json!(content);
+        payload["message"] = json!(payload_content);
         payload["source"] = json!("scheduled-agent-job");
         match super::send_message_tool_async(
             store,
@@ -527,6 +546,48 @@ pub(super) async fn deliver_scheduled_job_result(
     } else {
         Some(errors.join("; "))
     }
+}
+
+pub(super) fn scheduled_platform_delivery_content(
+    store: &AppStore,
+    job: &ScheduledAgentJob,
+    content: &str,
+) -> AppResult<String> {
+    if content.chars().count() <= HERMES_MAX_PLATFORM_DELIVERY_OUTPUT_CHARS {
+        return Ok(content.to_string());
+    }
+    let saved_path = store.save_scheduled_agent_job_delivery_output(&job.id, content)?;
+    let visible = content
+        .chars()
+        .take(HERMES_TRUNCATED_PLATFORM_DELIVERY_VISIBLE_CHARS)
+        .collect::<String>();
+    Ok(format!(
+        "{}\n\n... [truncated, full output saved to {}]",
+        visible.trim_end(),
+        saved_path.to_string_lossy()
+    ))
+}
+
+pub(super) fn scheduled_delivery_payload_targets_platform(payload: &Value) -> bool {
+    let Some(target) = payload
+        .get("target")
+        .or_else(|| payload.get("platform"))
+        .or_else(|| payload.get("channel"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let platform = target
+        .split(':')
+        .next()
+        .unwrap_or(target)
+        .to_ascii_lowercase();
+    !matches!(
+        platform.as_str(),
+        "local" | "synthchat" | "desktop" | "current"
+    )
 }
 
 pub(super) fn resolve_scheduled_delivery_targets(
@@ -785,14 +846,56 @@ fn scheduled_origin_delivery_target(job: &ScheduledAgentJob) -> Option<Value> {
     Some(json!({ "target": target }))
 }
 
-fn scheduled_delivery_content(job: &ScheduledAgentJob, content: &str, success: bool) -> String {
-    if success {
-        return content.trim().to_string();
+pub(super) fn scheduled_delivery_content(
+    store: &AppStore,
+    job: &ScheduledAgentJob,
+    content: &str,
+    success: bool,
+) -> String {
+    let body = if success {
+        content.trim().to_string()
+    } else {
+        format!(
+            "Cron job '{}' failed:\n{}",
+            scheduled_job_context_label(job),
+            content.trim()
+        )
+    };
+    if !store
+        .config()
+        .map(|config| config.chat.runtime_footer_enabled)
+        .unwrap_or(false)
+    {
+        return body;
     }
+    append_scheduled_runtime_footer(job, &body, success)
+}
+
+fn append_scheduled_runtime_footer(job: &ScheduledAgentJob, body: &str, success: bool) -> String {
+    let status = if success { "success" } else { "failed" };
+    let model = job
+        .model
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("default");
+    let provider = job
+        .provider
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("default");
+    let workdir = job
+        .workdir
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("-");
     format!(
-        "Cron job '{}' failed:\n{}",
+        "{}\n\n---\nruntime: job={} · status={} · provider={} · model={} · cwd={}",
+        body.trim(),
         scheduled_job_context_label(job),
-        content.trim()
+        status,
+        provider,
+        model,
+        workdir
     )
 }
 

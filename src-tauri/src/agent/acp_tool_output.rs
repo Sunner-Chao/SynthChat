@@ -32,8 +32,10 @@ pub(super) fn acp_format_tool_output(
             acp_append_tool_output_suffix(acp_format_skill_manage_output(&data, raw_input), suffix)
         }
         "clarify" => acp_append_tool_output_suffix(acp_format_clarify_output(&data), suffix),
-        "kanban_create" | "kanban_list" | "kanban_show" | "kanban_complete" | "kanban_block"
-        | "kanban_unblock" | "kanban_heartbeat" | "kanban_comment" | "kanban_link" => {
+        "kanban_create" | "kanban_specify" | "kanban_list" | "kanban_show" | "kanban_complete"
+        | "kanban_block" | "kanban_unblock" | "kanban_heartbeat" | "kanban_update"
+        | "kanban_delete" | "kanban_comment" | "kanban_link" | "kanban_unlink"
+        | "kanban_bulk_update" => {
             acp_append_tool_output_suffix(acp_format_kanban_output(tool_name, &data), suffix)
         }
         "ha_list_entities" | "ha_get_state" | "ha_list_services" | "ha_call_service" => {
@@ -45,6 +47,7 @@ pub(super) fn acp_format_tool_output(
         "feishu_doc_read"
         | "feishu_drive_list_comments"
         | "feishu_drive_list_comment_replies"
+        | "feishu_drive_update_comment_reaction"
         | "feishu_drive_reply_comment"
         | "feishu_drive_add_comment" => acp_append_tool_output_suffix(
             acp_format_integration_output("Feishu", tool_name, &data),

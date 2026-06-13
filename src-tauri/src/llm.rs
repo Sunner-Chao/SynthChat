@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
-use reqwest::header::{HeaderMap, AUTHORIZATION};
+use std::time::Duration;
+
+use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
     error::{AppError, AppResult},
+    hermes_auth::{resolve_bitwarden_secret, resolve_hermes_runtime_credential},
     models::{ChatMessage, LlmProvider, Persona, ToolDefinition},
 };
 
@@ -53,6 +56,12 @@ pub struct LlmFailoverAttempt {
 }
 
 #[derive(Debug, Clone)]
+pub struct LlmCredentialBinding {
+    pub provider: LlmProvider,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct LlmReply {
     pub content: String,
     pub prompt_tokens: usize,
@@ -79,6 +88,7 @@ pub type LlmDeltaCallback = Arc<dyn Fn(&str) -> AppResult<()> + Send + Sync>;
 #[derive(Clone)]
 pub struct LlmCallOptions {
     pub responses_reasoning_replay_enabled: bool,
+    pub fast_mode_enabled: bool,
     pub stream_delta_callback: Option<LlmDeltaCallback>,
 }
 
@@ -89,6 +99,7 @@ impl std::fmt::Debug for LlmCallOptions {
                 "responses_reasoning_replay_enabled",
                 &self.responses_reasoning_replay_enabled,
             )
+            .field("fast_mode_enabled", &self.fast_mode_enabled)
             .field(
                 "stream_delta_callback",
                 &self.stream_delta_callback.as_ref().map(|_| true),
@@ -101,6 +112,7 @@ impl Default for LlmCallOptions {
     fn default() -> Self {
         Self {
             responses_reasoning_replay_enabled: true,
+            fast_mode_enabled: false,
             stream_delta_callback: None,
         }
     }
@@ -199,6 +211,87 @@ pub async fn complete_chat_with_options(
         options,
     )
     .await
+}
+
+pub fn provider_request_timeout_duration(provider: &LlmProvider, model: &str) -> Duration {
+    let seconds = provider_request_timeout_seconds(provider, model)
+        .unwrap_or(provider.timeout_seconds as f64)
+        .max(1.0);
+    Duration::from_secs_f64(seconds)
+}
+
+pub fn provider_request_timeout_seconds(provider: &LlmProvider, model: &str) -> Option<f64> {
+    if let Some(timeout) = provider_model_timeout(provider, model, "timeoutSeconds")
+        .or_else(|| provider_model_timeout(provider, model, "timeout_seconds"))
+    {
+        return Some(timeout);
+    }
+    coerce_positive_timeout(provider.request_timeout_seconds)
+}
+
+pub fn provider_stale_timeout_seconds(provider: &LlmProvider, model: &str) -> Option<f64> {
+    if let Some(timeout) = provider_model_timeout(provider, model, "staleTimeoutSeconds")
+        .or_else(|| provider_model_timeout(provider, model, "stale_timeout_seconds"))
+    {
+        return Some(timeout);
+    }
+    coerce_positive_timeout(provider.stale_timeout_seconds)
+}
+
+pub fn provider_stream_stale_timeout_duration(
+    provider: &LlmProvider,
+    model: &str,
+) -> Option<Duration> {
+    provider_stale_timeout_seconds(provider, model)
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .map(Duration::from_secs_f64)
+}
+
+pub async fn send_llm_request_with_stale_timeout(
+    request: reqwest::RequestBuilder,
+    provider: &LlmProvider,
+    model: &str,
+    label: &str,
+) -> AppResult<reqwest::Response> {
+    let send = request.send();
+    if let Some(timeout) = provider_stream_stale_timeout_duration(provider, model) {
+        tokio::time::timeout(timeout, send).await.map_err(|_| {
+            AppError::Llm(format!(
+                "{label} stale: no provider response for {}s",
+                timeout.as_secs_f64()
+            ))
+        })?
+    } else {
+        send.await
+    }
+    .map_err(|e| AppError::Llm(e.to_string()))
+}
+
+fn provider_model_timeout(provider: &LlmProvider, model: &str, key: &str) -> Option<f64> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    let model_config = provider.models.as_object()?.get(model)?.as_object()?;
+    coerce_timeout_value(model_config.get(key))
+}
+
+fn coerce_positive_timeout(timeout: Option<f64>) -> Option<f64> {
+    timeout.filter(|timeout| timeout.is_finite() && *timeout > 0.0)
+}
+
+fn coerce_timeout_value(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::Number(number) => coerce_positive_timeout(number.as_f64()),
+        Value::String(text) => text.trim().parse::<f64>().ok().and_then(|timeout| {
+            if timeout.is_finite() && timeout > 0.0 {
+                Some(timeout)
+            } else {
+                None
+            }
+        }),
+        _ => None,
+    }
 }
 
 pub async fn complete_text_prompt(
@@ -816,7 +909,42 @@ fn provider_base_url(provider: &LlmProvider) -> String {
                 .map(|value| value.trim().trim_end_matches('/').to_string())
                 .filter(|value| !value.is_empty())
         })
+        .or_else(|| {
+            resolve_hermes_runtime_credential(provider)
+                .and_then(|credential| credential.base_url)
+                .map(|value| value.trim().trim_end_matches('/').to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| provider_default_base_url(provider).map(str::to_string))
         .unwrap_or_default()
+}
+
+pub fn bind_runtime_credential_for_attempt(provider: &LlmProvider) -> LlmCredentialBinding {
+    if provider_has_inline_or_env_api_key(provider) || provider_env_api_key(provider).is_some() {
+        return LlmCredentialBinding {
+            provider: provider.clone(),
+            source: None,
+        };
+    }
+    let Some(credential) = resolve_hermes_runtime_credential(provider) else {
+        return LlmCredentialBinding {
+            provider: provider.clone(),
+            source: None,
+        };
+    };
+    let mut provider = provider.clone();
+    provider.api_key = Some(credential.api_key);
+    if provider.base_url.trim().is_empty() {
+        if let Some(base_url) = credential.base_url.as_deref().map(str::trim) {
+            if !base_url.is_empty() {
+                provider.base_url = base_url.trim_end_matches('/').to_string();
+            }
+        }
+    }
+    LlmCredentialBinding {
+        provider,
+        source: Some(credential.source),
+    }
 }
 
 fn provider_base_url_env_candidates(provider: &LlmProvider) -> Vec<&'static str> {
@@ -830,6 +958,9 @@ fn provider_base_url_env_candidates(provider: &LlmProvider) -> Vec<&'static str>
     let model = provider.model.to_ascii_lowercase();
     let haystack = format!("{id} {provider_type} {preset} {model}");
 
+    if haystack.contains("openrouter") {
+        return vec!["OPENROUTER_BASE_URL"];
+    }
     if haystack.contains("anthropic") || model.contains("claude") {
         return vec!["ANTHROPIC_BASE_URL"];
     }
@@ -851,16 +982,141 @@ fn provider_base_url_env_candidates(provider: &LlmProvider) -> Vec<&'static str>
     if haystack.contains("deepseek") {
         return vec!["DEEPSEEK_BASE_URL"];
     }
+    if haystack.contains("groq") {
+        return vec!["GROQ_BASE_URL"];
+    }
+    if haystack.contains("mistral") {
+        return vec!["MISTRAL_BASE_URL"];
+    }
     if haystack.contains("dashscope") || haystack.contains("alibaba") || haystack.contains("qwen") {
-        return vec!["DASHSCOPE_BASE_URL", "ALIBABA_CODING_PLAN_BASE_URL"];
+        return vec![
+            "HERMES_QWEN_BASE_URL",
+            "DASHSCOPE_BASE_URL",
+            "ALIBABA_CODING_PLAN_BASE_URL",
+        ];
     }
-    if haystack.contains("openrouter") {
-        return vec!["OPENROUTER_BASE_URL"];
+    if haystack.contains("stepfun") || haystack.contains("step-plan") {
+        return vec!["STEPFUN_BASE_URL"];
     }
-    if haystack.contains("openai") {
+    if haystack.contains("copilot-acp") {
+        return vec!["COPILOT_ACP_BASE_URL"];
+    }
+    if haystack.contains("opencode-go") {
+        return vec!["OPENCODE_GO_BASE_URL"];
+    }
+    if haystack.contains("opencode") {
+        return vec!["OPENCODE_ZEN_BASE_URL"];
+    }
+    if haystack.contains("kilo") {
+        return vec!["KILOCODE_BASE_URL"];
+    }
+    if haystack.contains("huggingface") || haystack.contains("hugging-face") {
+        return vec!["HF_BASE_URL"];
+    }
+    if haystack.contains("novita") {
+        return vec!["NOVITA_BASE_URL"];
+    }
+    if haystack.contains("nvidia") || haystack.contains("nemotron") {
+        return vec!["NVIDIA_BASE_URL"];
+    }
+    if haystack.contains("xiaomi") || haystack.contains("mimo") {
+        return vec!["XIAOMI_BASE_URL"];
+    }
+    if haystack.contains("tencent") || haystack.contains("tokenhub") {
+        return vec!["TOKENHUB_BASE_URL"];
+    }
+    if haystack.contains("arcee") {
+        return vec!["ARCEE_BASE_URL"];
+    }
+    if haystack.contains("gmi") {
+        return vec!["GMI_BASE_URL"];
+    }
+    if haystack.contains("ollama") {
+        return vec!["OLLAMA_BASE_URL"];
+    }
+    if haystack.contains("azure-foundry") {
+        return vec!["AZURE_FOUNDRY_BASE_URL"];
+    }
+    if haystack.contains("lmstudio") || haystack.contains("lm-studio") {
+        return vec!["LM_BASE_URL"];
+    }
+    if id.contains("openai") || preset.contains("openai") || provider_type == "openai" {
         return vec!["OPENAI_BASE_URL", "OPENROUTER_BASE_URL"];
     }
     Vec::new()
+}
+
+fn provider_default_base_url(provider: &LlmProvider) -> Option<&'static str> {
+    let id = provider.id.to_ascii_lowercase();
+    let provider_type = provider.provider_type.to_ascii_lowercase();
+    let preset = provider
+        .preset
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let model = provider.model.to_ascii_lowercase();
+    let haystack = format!("{id} {provider_type} {preset} {model}");
+
+    if haystack.contains("openrouter") {
+        return Some("https://openrouter.ai/api/v1");
+    }
+    if haystack.contains("openai-codex") {
+        return Some("https://chatgpt.com/backend-api/codex");
+    }
+    if id.contains("openai") || preset.contains("openai") {
+        return Some("https://api.openai.com/v1");
+    }
+    if haystack.contains("nous") {
+        return Some("https://inference-api.nousresearch.com/v1");
+    }
+    if haystack.contains("qwen-oauth") {
+        return Some("https://portal.qwen.ai/v1");
+    }
+    if haystack.contains("minimax-oauth") {
+        return Some("https://api.minimax.io/anthropic");
+    }
+    if haystack.contains("stepfun") || haystack.contains("step-plan") {
+        return Some("https://api.stepfun.ai/step_plan/v1");
+    }
+    if haystack.contains("lmstudio") || haystack.contains("lm-studio") {
+        return Some("http://127.0.0.1:1234/v1");
+    }
+    if haystack.contains("nvidia") || haystack.contains("nemotron") {
+        return Some("https://integrate.api.nvidia.com/v1");
+    }
+    if haystack.contains("arcee") {
+        return Some("https://api.arcee.ai/api/v1");
+    }
+    if haystack.contains("gmi") {
+        return Some("https://api.gmi-serving.com/v1");
+    }
+    if haystack.contains("ollama-cloud") {
+        return Some("https://ollama.com/v1");
+    }
+    if haystack.contains("xai") || haystack.contains("x.ai") || haystack.contains("grok") {
+        return Some("https://api.x.ai/v1");
+    }
+    if haystack.contains("deepseek") {
+        return Some("https://api.deepseek.com/v1");
+    }
+    if haystack.contains("groq") {
+        return Some("https://api.groq.com/openai/v1");
+    }
+    if haystack.contains("mistral") {
+        return Some("https://api.mistral.ai/v1");
+    }
+    if id == "gemini"
+        || id == "google"
+        || id.contains("google-gemini-cli")
+        || preset.contains("gemini")
+        || preset.contains("google")
+    {
+        return None;
+    }
+    if haystack.contains("anthropic") || haystack.contains("claude") {
+        return Some("https://api.anthropic.com");
+    }
+    None
 }
 
 fn resolve_api_key(provider: &LlmProvider) -> Option<String> {
@@ -885,7 +1141,36 @@ fn resolve_api_key(provider: &LlmProvider) -> Option<String> {
     };
     configured_env_key
         .or_else(|| provider_env_api_key(provider))
+        .or_else(|| {
+            resolve_hermes_runtime_credential(provider).map(|credential| credential.api_key)
+        })
+        .or_else(|| {
+            let candidates = provider_api_key_env_candidates(provider);
+            resolve_bitwarden_secret(&candidates)
+        })
         .or_else(|| resolve_claude_code_oauth_token(provider))
+}
+
+fn provider_has_inline_or_env_api_key(provider: &LlmProvider) -> bool {
+    if provider
+        .api_key
+        .as_ref()
+        .map(|value| value.trim())
+        .is_some_and(usable_secret_value)
+    {
+        return true;
+    }
+    let env_name = provider.api_key_env.trim();
+    if env_name.is_empty() {
+        return false;
+    }
+    if looks_like_inline_api_key(env_name) {
+        return usable_secret_value(env_name);
+    }
+    std::env::var(env_name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .is_some_and(|value| usable_secret_value(&value))
 }
 
 fn provider_env_api_key(provider: &LlmProvider) -> Option<String> {
@@ -911,6 +1196,9 @@ fn provider_api_key_env_candidates(provider: &LlmProvider) -> Vec<&'static str> 
     let model = provider.model.to_ascii_lowercase();
     let haystack = format!("{id} {provider_type} {preset} {base} {model}");
 
+    if haystack.contains("openrouter") {
+        return vec!["OPENROUTER_API_KEY", "OPENAI_API_KEY"];
+    }
     if haystack.contains("anthropic") || model.contains("claude") {
         return vec![
             "ANTHROPIC_API_KEY",
@@ -941,13 +1229,56 @@ fn provider_api_key_env_candidates(provider: &LlmProvider) -> Vec<&'static str> 
     if haystack.contains("deepseek") {
         return vec!["DEEPSEEK_API_KEY"];
     }
+    if haystack.contains("groq") {
+        return vec!["GROQ_API_KEY"];
+    }
+    if haystack.contains("mistral") {
+        return vec!["MISTRAL_API_KEY"];
+    }
+    if haystack.contains("stepfun") || haystack.contains("step-plan") {
+        return vec!["STEPFUN_API_KEY"];
+    }
+    if haystack.contains("copilot") || haystack.contains("github") {
+        return vec!["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
+    }
+    if haystack.contains("opencode") {
+        return vec!["OPENCODE_API_KEY"];
+    }
+    if haystack.contains("kilo") {
+        return vec!["KILOCODE_API_KEY"];
+    }
+    if haystack.contains("huggingface") || haystack.contains("hugging-face") {
+        return vec!["HF_TOKEN", "HF_API_KEY", "HUGGINGFACE_API_KEY"];
+    }
+    if haystack.contains("novita") {
+        return vec!["NOVITA_API_KEY"];
+    }
+    if haystack.contains("nvidia") || haystack.contains("nemotron") {
+        return vec!["NVIDIA_API_KEY"];
+    }
+    if haystack.contains("xiaomi") || haystack.contains("mimo") {
+        return vec!["XIAOMI_API_KEY"];
+    }
+    if haystack.contains("tencent") || haystack.contains("tokenhub") {
+        return vec!["TOKENHUB_API_KEY"];
+    }
+    if haystack.contains("arcee") {
+        return vec!["ARCEE_API_KEY"];
+    }
+    if haystack.contains("gmi") {
+        return vec!["GMI_API_KEY"];
+    }
+    if haystack.contains("cohere") {
+        return vec!["COHERE_API_KEY"];
+    }
     if haystack.contains("dashscope") || haystack.contains("alibaba") || haystack.contains("qwen") {
         return vec!["DASHSCOPE_API_KEY", "ALIBABA_CODING_PLAN_API_KEY"];
     }
-    if haystack.contains("openrouter") {
-        return vec!["OPENROUTER_API_KEY", "OPENAI_API_KEY"];
-    }
-    if haystack.contains("openai") {
+    if id.contains("openai")
+        || preset.contains("openai")
+        || base.contains("api.openai.com")
+        || provider_type == "openai"
+    {
         return vec!["OPENAI_API_KEY", "OPENROUTER_API_KEY"];
     }
     Vec::new()
@@ -1049,6 +1380,32 @@ fn usable_secret_value(value: &str) -> bool {
 fn response_preview(text: &str) -> String {
     let clean = text.replace('\n', " ").replace('\r', " ");
     clean.chars().take(500).collect()
+}
+
+fn invalid_response_body_detail(text: &str, headers: &HeaderMap) -> String {
+    let trimmed = text.trim_start();
+    let body_kind = if text.trim().is_empty() {
+        "empty"
+    } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        "json_like"
+    } else if trimmed.starts_with("<!DOCTYPE")
+        || trimmed.starts_with("<!doctype")
+        || trimmed.starts_with("<html")
+        || trimmed.starts_with("<HTML")
+    {
+        "html"
+    } else if trimmed.starts_with("data:") || trimmed.starts_with("event:") {
+        "sse_like"
+    } else {
+        "text"
+    };
+    let content_type = header_text(headers, "content-type").unwrap_or_else(|| "unknown".into());
+    format!(
+        "bodyKind={body_kind}; bodyBytes={}; contentType={}; preview={}",
+        text.as_bytes().len(),
+        response_preview(&content_type),
+        response_preview(text)
+    )
 }
 
 fn scrub_reasoning_blocks(content: &str) -> String {
@@ -1327,7 +1684,8 @@ fn with_reply_metadata_and_transport(
         Some(base_url)
     };
     reply.rate_limit_state = parse_rate_limit_headers(headers, &provider.provider_type);
-    reply.transport_diagnostics = llm_transport_diagnostics(headers, transport.as_ref());
+    reply.transport_diagnostics =
+        llm_transport_diagnostics(headers, transport.as_ref(), provider, model);
     let (amount, status, source) = estimate_usage_cost(
         &provider.provider_type,
         model,
@@ -1345,6 +1703,8 @@ fn with_reply_metadata_and_transport(
 fn llm_transport_diagnostics(
     headers: &HeaderMap,
     transport: Option<&LlmTransportMetadata>,
+    provider: &LlmProvider,
+    model: &str,
 ) -> Option<Value> {
     let mut captured = serde_json::Map::new();
     for name in [
@@ -1385,7 +1745,58 @@ fn llm_transport_diagnostics(
             diagnostics["retryReason"] = json!(reason);
         }
     }
+    diagnostics["timeoutPolicy"] = llm_timeout_policy_diagnostics(provider, model);
+    diagnostics["timeout_policy"] = llm_timeout_policy_diagnostics(provider, model);
     Some(diagnostics)
+}
+
+fn llm_timeout_policy_diagnostics(provider: &LlmProvider, model: &str) -> Value {
+    let request_timeout = provider_request_timeout_duration(provider, model).as_secs_f64();
+    let stale_timeout = provider_stale_timeout_seconds(provider, model);
+    json!({
+        "schema": "hermes_provider_timeout_policy_desktop_v1",
+        "requestTimeoutSeconds": request_timeout,
+        "request_timeout_seconds": request_timeout,
+        "staleTimeoutSeconds": stale_timeout,
+        "stale_timeout_seconds": stale_timeout,
+        "source": provider_timeout_source(provider, model, false),
+        "staleSource": provider_timeout_source(provider, model, true),
+        "stale_source": provider_timeout_source(provider, model, true)
+    })
+}
+
+fn provider_timeout_source(provider: &LlmProvider, model: &str, stale: bool) -> &'static str {
+    let model = model.trim();
+    if !model.is_empty() {
+        let model_config = provider.models.as_object().and_then(|models| {
+            models
+                .get(model)
+                .and_then(|model_config| model_config.as_object())
+        });
+        if let Some(model_config) = model_config {
+            let keys = if stale {
+                ["staleTimeoutSeconds", "stale_timeout_seconds"]
+            } else {
+                ["timeoutSeconds", "timeout_seconds"]
+            };
+            if keys
+                .iter()
+                .any(|key| coerce_timeout_value(model_config.get(*key)).is_some())
+            {
+                return "model";
+            }
+        }
+    }
+    if stale {
+        if coerce_positive_timeout(provider.stale_timeout_seconds).is_some() {
+            return "provider";
+        }
+        "unset"
+    } else if coerce_positive_timeout(provider.request_timeout_seconds).is_some() {
+        "provider"
+    } else {
+        "legacy_timeout_seconds"
+    }
 }
 
 fn safe_diagnostic_endpoint(url: &str) -> String {
@@ -1537,6 +1948,15 @@ mod tests {
     use super::*;
     use crate::models::ToolDefinition;
     use reqwest::header::HeaderMap;
+    use reqwest::header::AUTHORIZATION;
+
+    fn restore_env_var(name: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
 
     fn schema_test_tool(input_schema: Value) -> ToolDefinition {
         ToolDefinition {
@@ -1574,6 +1994,16 @@ mod tests {
         headers.insert("cf-ray", "ray-123".parse().unwrap());
         headers.insert("x-openrouter-provider", "upstream-a".parse().unwrap());
         headers.insert("authorization", "secret".parse().unwrap());
+        let mut provider = LlmProvider::default();
+        provider.timeout_seconds = 60;
+        provider.request_timeout_seconds = Some(45.0);
+        provider.stale_timeout_seconds = Some(30.0);
+        provider.models = json!({
+            "diagnostic-model": {
+                "timeout_seconds": 12,
+                "stale_timeout_seconds": 6
+            }
+        });
 
         let diagnostics = llm_transport_diagnostics(
             &headers,
@@ -1586,6 +2016,8 @@ mod tests {
                 retry_count: 1,
                 retry_reason: Some("unsupported_parameter_recovery".into()),
             }),
+            &provider,
+            "diagnostic-model",
         )
         .unwrap();
 
@@ -1604,7 +2036,33 @@ mod tests {
         assert_eq!(diagnostics["elapsedMs"], 42);
         assert_eq!(diagnostics["retryCount"], 1);
         assert_eq!(diagnostics["retryReason"], "unsupported_parameter_recovery");
+        assert_eq!(
+            diagnostics["timeoutPolicy"]["schema"],
+            "hermes_provider_timeout_policy_desktop_v1"
+        );
+        assert_eq!(diagnostics["timeoutPolicy"]["requestTimeoutSeconds"], 12.0);
+        assert_eq!(diagnostics["timeoutPolicy"]["staleTimeoutSeconds"], 6.0);
+        assert_eq!(diagnostics["timeoutPolicy"]["source"], "model");
+        assert_eq!(diagnostics["timeoutPolicy"]["staleSource"], "model");
         assert!(diagnostics["headers"].get("authorization").is_none());
+    }
+
+    #[test]
+    fn invalid_response_body_detail_classifies_common_provider_shapes() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/html".parse().unwrap());
+
+        let html = invalid_response_body_detail("<html>bad gateway</html>", &headers);
+        assert!(html.contains("bodyKind=html"));
+        assert!(html.contains("contentType=text/html"));
+        assert!(html.contains("preview=<html>bad gateway</html>"));
+
+        let empty = invalid_response_body_detail("   \n", &HeaderMap::new());
+        assert!(empty.contains("bodyKind=empty"));
+        assert!(empty.contains("contentType=unknown"));
+
+        let sse = invalid_response_body_detail("data: {\"delta\":\"partial\"}", &HeaderMap::new());
+        assert!(sse.contains("bodyKind=sse_like"));
     }
 
     #[test]
@@ -1754,6 +2212,25 @@ mod tests {
 
         assert!(retry.get("max_tokens").is_none());
         assert!(retry.get("max_completion_tokens").is_none());
+        assert_eq!(retry["temperature"], 0.7);
+    }
+
+    #[test]
+    fn openai_retry_body_removes_unsupported_service_tier() {
+        let body = json!({
+            "model": "gpt-test",
+            "messages": [],
+            "service_tier": "priority",
+            "temperature": 0.7
+        });
+
+        let retry = openai_unsupported_parameter_retry_body(
+            &body,
+            r#"{"error":{"message":"Unsupported parameter: service_tier","param":"service_tier","code":"unsupported_parameter"}}"#,
+        )
+        .unwrap();
+
+        assert!(retry.get("service_tier").is_none());
         assert_eq!(retry["temperature"], 0.7);
     }
 
@@ -2146,6 +2623,24 @@ mod tests {
     }
 
     #[test]
+    fn responses_unsupported_retry_removes_service_tier() {
+        let body = json!({
+            "model": "gpt-test",
+            "input": [],
+            "service_tier": "priority",
+            "temperature": 0.2
+        });
+        let retry = responses_unsupported_parameter_retry_body(
+            &body,
+            r#"{"error":{"message":"Unsupported parameter: service_tier","param":"service_tier","code":"unsupported_parameter"}}"#,
+        )
+        .unwrap();
+
+        assert!(retry.get("service_tier").is_none());
+        assert_eq!(retry["temperature"], 0.2);
+    }
+
+    #[test]
     fn openai_parser_converts_tool_calls_to_agent_tool_calls() {
         let reply = parse_openai_compatible(json!({
             "choices": [{
@@ -2338,6 +2833,69 @@ mod tests {
     }
 
     #[test]
+    fn provider_timeout_helpers_follow_hermes_provider_and_model_precedence() {
+        let mut provider = LlmProvider::default();
+        provider.timeout_seconds = 60;
+        provider.request_timeout_seconds = Some(45.0);
+        provider.stale_timeout_seconds = Some(30.0);
+        provider.models = json!({
+            "gpt-large": {
+                "timeout_seconds": "12.5",
+                "stale_timeout_seconds": 8
+            },
+            "gpt-fast": {
+                "timeoutSeconds": 9,
+                "staleTimeoutSeconds": "4.5"
+            },
+            "bad": {
+                "timeout_seconds": 0,
+                "stale_timeout_seconds": "nope"
+            }
+        });
+
+        assert_eq!(
+            provider_request_timeout_duration(&provider, "gpt-large").as_secs_f64(),
+            12.5
+        );
+        assert_eq!(
+            provider_request_timeout_duration(&provider, "gpt-fast").as_secs_f64(),
+            9.0
+        );
+        assert_eq!(
+            provider_request_timeout_seconds(&provider, "missing"),
+            Some(45.0)
+        );
+        assert_eq!(
+            provider_request_timeout_seconds(&provider, "bad"),
+            Some(45.0)
+        );
+        assert_eq!(
+            provider_stale_timeout_seconds(&provider, "gpt-large"),
+            Some(8.0)
+        );
+        assert_eq!(
+            provider_stale_timeout_seconds(&provider, "gpt-fast"),
+            Some(4.5)
+        );
+        assert_eq!(
+            provider_stale_timeout_seconds(&provider, "missing"),
+            Some(30.0)
+        );
+        assert_eq!(
+            provider_stream_stale_timeout_duration(&provider, "gpt-fast")
+                .unwrap()
+                .as_secs_f64(),
+            4.5
+        );
+
+        provider.request_timeout_seconds = None;
+        assert_eq!(
+            provider_request_timeout_duration(&provider, "missing").as_secs(),
+            60
+        );
+    }
+
+    #[test]
     fn bedrock_parser_converts_tool_use_blocks_to_agent_tool_calls() {
         let reply = parse_bedrock_converse(json!({
             "output": {
@@ -2412,6 +2970,9 @@ mod tests {
             model: "gpt-5-codex".into(),
             enabled: true,
             timeout_seconds: 60,
+            request_timeout_seconds: None,
+            stale_timeout_seconds: None,
+            models: json!({}),
             prompt_cache_mode: "off".into(),
             prompt_cache_ttl: "5m".into(),
             prompt_cache_layout: "native".into(),
@@ -2428,6 +2989,24 @@ mod tests {
             responses_url(&provider),
             "https://api.openai.com/v1/responses"
         );
+
+        provider.provider_type = "openai".into();
+        provider.preset = Some("openai-codex".into());
+        provider.base_url.clear();
+        assert!(is_responses_compatible(&provider));
+        assert_eq!(
+            responses_url(&provider),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+
+        provider.id = "xai".into();
+        provider.name = "xAI".into();
+        provider.provider_type = "openai".into();
+        provider.preset = Some("xai".into());
+        provider.base_url.clear();
+        provider.model = "grok-4".into();
+        assert!(is_responses_compatible(&provider));
+        assert_eq!(responses_url(&provider), "https://api.x.ai/v1/responses");
     }
 
     #[test]
@@ -2484,6 +3063,9 @@ mod tests {
             model: "claude-compatible".into(),
             enabled: true,
             timeout_seconds: 60,
+            request_timeout_seconds: None,
+            stale_timeout_seconds: None,
+            models: json!({}),
             prompt_cache_mode: "off".into(),
             prompt_cache_ttl: "5m".into(),
             prompt_cache_layout: "native".into(),
@@ -2521,6 +3103,17 @@ mod tests {
             "claude-code/0.1.0"
         );
         assert!(kimi.get("x-api-key").is_some());
+
+        provider.id = "minimax-oauth".into();
+        provider.provider_type = "openai".into();
+        provider.preset = Some("minimax-oauth".into());
+        provider.base_url.clear();
+        provider.model = "MiniMax-M2.7".into();
+        assert!(is_anthropic_compatible(&provider));
+        assert_eq!(
+            anthropic_messages_url(&provider, Some("mm-oauth-token")),
+            "https://api.minimax.io/anthropic/v1/messages"
+        );
     }
 
     #[test]
@@ -2537,6 +3130,9 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             enabled: true,
             timeout_seconds: 60,
+            request_timeout_seconds: None,
+            stale_timeout_seconds: None,
+            models: json!({}),
             prompt_cache_mode: "off".into(),
             prompt_cache_ttl: "5m".into(),
             prompt_cache_layout: "native".into(),
@@ -2595,6 +3191,9 @@ mod tests {
             model: "kimi-k2".into(),
             enabled: true,
             timeout_seconds: 60,
+            request_timeout_seconds: None,
+            stale_timeout_seconds: None,
+            models: json!({}),
             prompt_cache_mode: "off".into(),
             prompt_cache_ttl: "5m".into(),
             prompt_cache_layout: "native".into(),
@@ -2635,6 +3234,9 @@ mod tests {
             model: "test".into(),
             enabled: true,
             timeout_seconds: 60,
+            request_timeout_seconds: None,
+            stale_timeout_seconds: None,
+            models: json!({}),
             prompt_cache_mode: "off".into(),
             prompt_cache_ttl: "5m".into(),
             prompt_cache_layout: "native".into(),
@@ -2647,6 +3249,140 @@ mod tests {
 
         provider.api_key = Some("sk-real-key".into());
         assert_eq!(resolve_api_key(&provider).as_deref(), Some("sk-real-key"));
+    }
+
+    #[test]
+    fn api_key_resolution_reads_hermes_auth_store_tokens() {
+        let _guard = crate::hermes_auth::HERMES_AUTH_TEST_ENV_LOCK
+            .lock()
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "synthchat-llm-hermes-auth-{}",
+            crate::models::new_id("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            json!({
+                "providers": {
+                    "openai-codex": {
+                        "access_token": "codex-runtime-token",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                        "expires_at": "2999-01-01T00:00:00Z"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::env::set_var("HERMES_HOME", &dir);
+
+        let provider = LlmProvider {
+            id: "openai-codex".into(),
+            name: "OpenAI Codex".into(),
+            provider_type: "codex".into(),
+            preset: Some("openai-codex".into()),
+            base_url: String::new(),
+            append_chat_path: true,
+            api_key_env: String::new(),
+            api_key: None,
+            model: "gpt-5-codex".into(),
+            enabled: true,
+            timeout_seconds: 60,
+            request_timeout_seconds: None,
+            stale_timeout_seconds: None,
+            models: json!({}),
+            prompt_cache_mode: "off".into(),
+            prompt_cache_ttl: "5m".into(),
+            prompt_cache_layout: "native".into(),
+        };
+
+        assert_eq!(
+            resolve_api_key(&provider).as_deref(),
+            Some("codex-runtime-token")
+        );
+        assert_eq!(
+            provider_base_url(&provider),
+            "https://chatgpt.com/backend-api/codex"
+        );
+
+        std::env::remove_var("HERMES_HOME");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn runtime_credential_binding_freezes_hermes_pool_source() {
+        let _guard = crate::hermes_auth::HERMES_AUTH_TEST_ENV_LOCK
+            .lock()
+            .unwrap();
+        let old_hermes_home = std::env::var_os("HERMES_HOME");
+        let old_strategy = std::env::var_os("SYNTHCHAT_LLM_CREDENTIAL_POOL_STRATEGY");
+        let dir = std::env::temp_dir().join(format!(
+            "synthchat-llm-hermes-binding-{}",
+            crate::models::new_id("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            json!({
+                "credential_pool": {
+                    "openrouter": [{
+                        "label": "first",
+                        "access_token": "first-token",
+                        "base_url": "https://first.example/v1",
+                        "priority": 0
+                    }, {
+                        "label": "second",
+                        "access_token": "second-token",
+                        "base_url": "https://second.example/v1",
+                        "priority": 1
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::env::set_var("HERMES_HOME", &dir);
+        std::env::set_var("SYNTHCHAT_LLM_CREDENTIAL_POOL_STRATEGY", "round_robin");
+
+        let provider = LlmProvider {
+            id: "openrouter".into(),
+            name: "OpenRouter".into(),
+            provider_type: "openai".into(),
+            preset: Some("openrouter".into()),
+            base_url: String::new(),
+            append_chat_path: true,
+            api_key_env: String::new(),
+            api_key: None,
+            model: "openrouter/test".into(),
+            enabled: true,
+            timeout_seconds: 60,
+            request_timeout_seconds: None,
+            stale_timeout_seconds: None,
+            models: json!({}),
+            prompt_cache_mode: "off".into(),
+            prompt_cache_ttl: "5m".into(),
+            prompt_cache_layout: "native".into(),
+        };
+
+        let binding = bind_runtime_credential_for_attempt(&provider);
+        let bound_source = binding.source.as_deref().unwrap();
+        let (bound_key, bound_base_url) = match bound_source {
+            "hermes-pool:openrouter:first" => ("first-token", "https://first.example/v1"),
+            "hermes-pool:openrouter:second" => ("second-token", "https://second.example/v1"),
+            source => panic!("unexpected credential source: {source}"),
+        };
+        assert_eq!(binding.provider.api_key.as_deref(), Some(bound_key));
+        assert_eq!(binding.provider.base_url, bound_base_url);
+
+        assert_eq!(
+            resolve_api_key(&binding.provider).as_deref(),
+            Some(bound_key)
+        );
+
+        restore_env_var("SYNTHCHAT_LLM_CREDENTIAL_POOL_STRATEGY", old_strategy);
+        restore_env_var("HERMES_HOME", old_hermes_home);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2663,6 +3399,9 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             enabled: true,
             timeout_seconds: 60,
+            request_timeout_seconds: None,
+            stale_timeout_seconds: None,
+            models: json!({}),
             prompt_cache_mode: "off".into(),
             prompt_cache_ttl: "5m".into(),
             prompt_cache_layout: "native".into(),
@@ -2710,6 +3449,61 @@ mod tests {
             provider_api_key_env_candidates(&provider),
             vec!["OPENROUTER_API_KEY", "OPENAI_API_KEY"]
         );
+
+        provider.model = "anthropic/claude-sonnet-4.6".into();
+        assert_eq!(
+            provider_api_key_env_candidates(&provider),
+            vec!["OPENROUTER_API_KEY", "OPENAI_API_KEY"]
+        );
+
+        provider.id = "copilot-acp".into();
+        provider.provider_type = "codex".into();
+        provider.preset = Some("github".into());
+        provider.base_url = "acp://copilot".into();
+        provider.model = "gpt-5".into();
+        assert_eq!(
+            provider_api_key_env_candidates(&provider),
+            vec!["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
+        );
+
+        provider.id = "huggingface".into();
+        provider.provider_type = "openai".into();
+        provider.preset = Some("huggingface".into());
+        provider.base_url = "https://router.huggingface.co/v1".into();
+        provider.model = "qwen/qwen3-coder".into();
+        assert_eq!(
+            provider_api_key_env_candidates(&provider),
+            vec!["HF_TOKEN", "HF_API_KEY", "HUGGINGFACE_API_KEY"]
+        );
+
+        provider.id = "tencent-tokenhub".into();
+        provider.provider_type = "openai".into();
+        provider.preset = Some("tokenhub".into());
+        provider.base_url.clear();
+        provider.model = "hunyuan-code".into();
+        assert_eq!(
+            provider_api_key_env_candidates(&provider),
+            vec!["TOKENHUB_API_KEY"]
+        );
+
+        provider.id = "groq".into();
+        provider.provider_type = "openai".into();
+        provider.preset = Some("groq".into());
+        provider.base_url = "https://api.groq.com/openai/v1".into();
+        provider.model = "llama-3.3-70b-versatile".into();
+        assert_eq!(
+            provider_api_key_env_candidates(&provider),
+            vec!["GROQ_API_KEY"]
+        );
+
+        provider.id = "mistral".into();
+        provider.preset = Some("mistral".into());
+        provider.base_url = "https://api.mistral.ai/v1".into();
+        provider.model = "mistral-large-latest".into();
+        assert_eq!(
+            provider_api_key_env_candidates(&provider),
+            vec!["MISTRAL_API_KEY"]
+        );
     }
 
     #[test]
@@ -2726,6 +3520,9 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             enabled: true,
             timeout_seconds: 60,
+            request_timeout_seconds: None,
+            stale_timeout_seconds: None,
+            models: json!({}),
             prompt_cache_mode: "off".into(),
             prompt_cache_ttl: "5m".into(),
             prompt_cache_layout: "native".into(),
@@ -2757,6 +3554,193 @@ mod tests {
             provider_base_url_env_candidates(&provider),
             vec!["HERMES_XAI_BASE_URL", "XAI_BASE_URL"]
         );
+
+        provider.id = "openrouter".into();
+        provider.provider_type = "openai".into();
+        provider.preset = Some("openrouter".into());
+        provider.model = "anthropic/claude-sonnet-4.6".into();
+        assert_eq!(
+            provider_base_url_env_candidates(&provider),
+            vec!["OPENROUTER_BASE_URL"]
+        );
+
+        provider.id = "copilot-acp".into();
+        provider.provider_type = "codex".into();
+        provider.preset = Some("github".into());
+        provider.model = "gpt-5".into();
+        assert_eq!(
+            provider_base_url_env_candidates(&provider),
+            vec!["COPILOT_ACP_BASE_URL"]
+        );
+
+        provider.id = "opencode-go".into();
+        provider.provider_type = "openai".into();
+        provider.preset = Some("opencode-go".into());
+        assert_eq!(
+            provider_base_url_env_candidates(&provider),
+            vec!["OPENCODE_GO_BASE_URL"]
+        );
+
+        provider.id = "novita".into();
+        provider.provider_type = "openai".into();
+        provider.preset = Some("novita".into());
+        assert_eq!(
+            provider_base_url_env_candidates(&provider),
+            vec!["NOVITA_BASE_URL"]
+        );
+
+        provider.id = "azure-foundry".into();
+        provider.provider_type = "openai".into();
+        provider.preset = Some("azure-foundry".into());
+        assert_eq!(
+            provider_base_url_env_candidates(&provider),
+            vec!["AZURE_FOUNDRY_BASE_URL"]
+        );
+
+        provider.id = "lmstudio".into();
+        provider.provider_type = "openai".into();
+        provider.preset = Some("lmstudio".into());
+        assert_eq!(
+            provider_base_url_env_candidates(&provider),
+            vec!["LM_BASE_URL"]
+        );
+
+        provider.id = "qwen-oauth".into();
+        provider.provider_type = "openai".into();
+        provider.preset = Some("qwen-oauth".into());
+        provider.model = "qwen3-coder-plus".into();
+        assert_eq!(
+            provider_base_url_env_candidates(&provider),
+            vec![
+                "HERMES_QWEN_BASE_URL",
+                "DASHSCOPE_BASE_URL",
+                "ALIBABA_CODING_PLAN_BASE_URL"
+            ]
+        );
+
+        provider.id = "groq".into();
+        provider.provider_type = "openai".into();
+        provider.preset = Some("groq".into());
+        provider.model = "llama-3.3-70b-versatile".into();
+        assert_eq!(
+            provider_base_url_env_candidates(&provider),
+            vec!["GROQ_BASE_URL"]
+        );
+
+        provider.id = "mistral".into();
+        provider.preset = Some("mistral".into());
+        provider.model = "mistral-large-latest".into();
+        assert_eq!(
+            provider_base_url_env_candidates(&provider),
+            vec!["MISTRAL_BASE_URL"]
+        );
+    }
+
+    #[test]
+    fn provider_default_base_urls_follow_hermes_overlays() {
+        let mut provider = LlmProvider {
+            id: "nous".into(),
+            name: "Nous".into(),
+            provider_type: "openai".into(),
+            preset: Some("nous".into()),
+            base_url: String::new(),
+            append_chat_path: true,
+            api_key_env: String::new(),
+            api_key: None,
+            model: "hermes-4".into(),
+            enabled: true,
+            timeout_seconds: 60,
+            request_timeout_seconds: None,
+            stale_timeout_seconds: None,
+            models: json!({}),
+            prompt_cache_mode: "off".into(),
+            prompt_cache_ttl: "5m".into(),
+            prompt_cache_layout: "native".into(),
+        };
+
+        assert_eq!(
+            provider_default_base_url(&provider),
+            Some("https://inference-api.nousresearch.com/v1")
+        );
+
+        provider.id = "openrouter".into();
+        provider.preset = Some("openrouter".into());
+        provider.model = "anthropic/claude-sonnet-4.6".into();
+        assert_eq!(
+            provider_default_base_url(&provider),
+            Some("https://openrouter.ai/api/v1")
+        );
+
+        provider.id = "openai".into();
+        provider.preset = Some("openai".into());
+        provider.model = "gpt-5".into();
+        assert_eq!(
+            provider_default_base_url(&provider),
+            Some("https://api.openai.com/v1")
+        );
+
+        provider.id = "anthropic".into();
+        provider.provider_type = "anthropic".into();
+        provider.preset = Some("anthropic".into());
+        provider.model = "claude-sonnet-4.6".into();
+        assert_eq!(
+            provider_default_base_url(&provider),
+            Some("https://api.anthropic.com")
+        );
+
+        provider.id = "qwen-oauth".into();
+        provider.provider_type = "openai".into();
+        provider.preset = Some("qwen-oauth".into());
+        assert_eq!(
+            provider_default_base_url(&provider),
+            Some("https://portal.qwen.ai/v1")
+        );
+
+        provider.id = "minimax-oauth".into();
+        provider.preset = Some("minimax-oauth".into());
+        assert_eq!(
+            provider_default_base_url(&provider),
+            Some("https://api.minimax.io/anthropic")
+        );
+
+        provider.id = "stepfun".into();
+        provider.preset = Some("stepfun".into());
+        assert_eq!(
+            provider_default_base_url(&provider),
+            Some("https://api.stepfun.ai/step_plan/v1")
+        );
+
+        provider.id = "ollama-cloud".into();
+        provider.preset = Some("ollama-cloud".into());
+        assert_eq!(
+            provider_default_base_url(&provider),
+            Some("https://ollama.com/v1")
+        );
+
+        provider.id = "deepseek".into();
+        provider.preset = Some("deepseek".into());
+        assert_eq!(
+            provider_default_base_url(&provider),
+            Some("https://api.deepseek.com/v1")
+        );
+
+        provider.id = "groq".into();
+        provider.preset = Some("groq".into());
+        assert_eq!(
+            provider_default_base_url(&provider),
+            Some("https://api.groq.com/openai/v1")
+        );
+
+        provider.id = "mistral".into();
+        provider.preset = Some("mistral".into());
+        assert_eq!(
+            provider_default_base_url(&provider),
+            Some("https://api.mistral.ai/v1")
+        );
+
+        provider.id = "google-gemini-cli".into();
+        provider.preset = Some("google-gemini-cli".into());
+        assert_eq!(provider_default_base_url(&provider), None);
     }
 
     #[test]

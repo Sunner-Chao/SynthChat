@@ -164,8 +164,7 @@ if [ "$confirm" != "$branch" ]; then
 fi
 
 echo -e "\033[36m[clear-remote-branch] 删除远端分支...\033[0m"
-git push "$remote_name" --delete "$branch"
-if [ $? -ne 0 ]; then
+if ! git push "$remote_name" --delete "$branch"; then
     echo "删除远端分支失败。若该分支是默认分支，请先在 GitHub 上切换默认分支后再试。" >&2
     exit 1
 fi

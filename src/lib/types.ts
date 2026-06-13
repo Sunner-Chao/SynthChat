@@ -45,6 +45,7 @@ export interface ChatConfig {
   delegationInheritMcpToolsets?: boolean;
   delegationSubagentProviderId?: string;
   delegationSubagentModel?: string;
+  auxiliaryTaskAssignments?: Record<string, Record<string, unknown>>;
   agentRunTimeoutSeconds?: number;
   uiMessageLimit?: number;
   artifactScanLimit?: number;
@@ -83,6 +84,13 @@ export interface ChatConfig {
   llmRetryCount?: number;
   llmRetryBackoffMs?: number;
   responsesReasoningReplayEnabled?: boolean;
+  fastModeEnabled?: boolean;
+  runtimeFooterEnabled?: boolean;
+  statusbarEnabled?: boolean;
+  toolProgressDisplay?: "off" | "new" | "all" | "verbose" | string;
+  displaySkin?: string;
+  busyIndicatorStyle?: "kaomoji" | "emoji" | "unicode" | "ascii" | string;
+  codexRuntime?: "auto" | "codex_app_server" | string;
   toolCallRetryCount?: number;
   toolCallRetryBackoffMs?: number;
   toolResultPersistThresholdChars?: number;
@@ -184,6 +192,27 @@ export interface AppConfig {
   moments: MomentsConfig;
   videoSummary: VideoSummaryConfig;
   telemetryEnabled: boolean;
+}
+
+export interface HermesCredentialPoolEntryStatus {
+  providerId: string;
+  index: number;
+  id?: string;
+  label: string;
+  authType?: string;
+  source?: string;
+  state: string;
+  expiresAt?: string;
+  baseUrl?: string;
+}
+
+export interface AddHermesCredentialPoolEntryRequest {
+  provider: string;
+  label?: string;
+  apiKey: string;
+  baseUrl?: string;
+  authType?: string;
+  expiresAt?: string;
 }
 
 export interface StateSnapshotManifest {
@@ -301,6 +330,7 @@ export interface AgentRunRecord {
   subagentTask?: string | null;
   subagentToolsets?: string[];
   subagentMaxIterations?: number | null;
+  queueItemId?: string | null;
   userRequest?: string;
   state: string;
   startedAt: string;
@@ -348,6 +378,7 @@ export interface AgentRunEvent {
   subagentTask?: string | null;
   subagentToolsets?: string[];
   subagentMaxIterations?: number | null;
+  queueItemId?: string | null;
   state: string;
   message?: ChatMessage | null;
   toolEvent?: ToolEvent | null;
@@ -378,6 +409,41 @@ export interface ManagedProcessEvent {
   runId?: string | null;
   detail?: Record<string, unknown> | null;
   createdAt: string;
+}
+
+export interface ManagedProcessSnapshot {
+  id: string;
+  sessionId?: string;
+  session_id?: string;
+  label?: string | null;
+  command?: string | null;
+  cwd?: string | null;
+  pid?: number | null;
+  backend?: string | null;
+  envType?: string | null;
+  env_type?: string | null;
+  status?: "running" | "exited" | "stopped" | string;
+  conversationId?: string | null;
+  conversation_id?: string | null;
+  runId?: string | null;
+  run_id?: string | null;
+  startedAt?: string | null;
+  started_at?: string | null;
+  finishedAt?: string | null;
+  finished_at?: string | null;
+  exitCode?: number | null;
+  exit_code?: number | null;
+  notifyOnComplete?: boolean;
+  notify_on_complete?: boolean;
+  watchPatterns?: string[];
+  watch_patterns?: string[];
+  watchStats?: Record<string, unknown>;
+  watch_stats?: Record<string, unknown>;
+  stdoutTail?: string[];
+  stdout_tail?: string[];
+  stderrTail?: string[];
+  stderr_tail?: string[];
+  [key: string]: unknown;
 }
 
 export interface PlannerTraceRecord {
@@ -420,6 +486,56 @@ export interface AgentQueuedRequest {
   startedAt?: string | null;
   completedAt?: string | null;
   error?: string | null;
+}
+
+export interface AgentRuntimeEvent {
+  id: number;
+  kind: string;
+  source: string;
+  status?: string | null;
+  conversationId?: string | null;
+  conversation_id?: string | null;
+  runId?: string | null;
+  run_id?: string | null;
+  queueItemId?: string | null;
+  queue_item_id?: string | null;
+  taskId?: string | null;
+  task_id?: string | null;
+  processId?: string | null;
+  process_id?: string | null;
+  payload?: unknown;
+  createdAt?: string | null;
+  created_at?: string | null;
+}
+
+export interface AgentRuntimeEventStream {
+  schema: "hermes_kanban_runtime_events_desktop_v1" | string;
+  status: string;
+  action: string;
+  events: AgentRuntimeEvent[];
+  cursor: number;
+  count: number;
+  total: number;
+  since: number;
+  limit: number;
+  pollIntervalMs?: number;
+  websocketEmbedded?: boolean;
+  nativeRuntimeEventBridge?: boolean;
+  sources?: string[];
+}
+
+export interface KanbanDispatchDrainResult {
+  schema: "hermes_kanban_dispatch_drain_desktop_v1" | string;
+  status: string;
+  action: "kanban-dispatch-drain" | string;
+  dispatch: Record<string, unknown>;
+  drainRequested: boolean;
+  drain_requested?: boolean;
+  drained: AgentQueuedRequest[];
+  drainedCount: number;
+  drained_count?: number;
+  nativeDispatcherDrainBridge?: boolean;
+  boundary?: string;
 }
 
 export interface AgentControlCommand {
@@ -837,8 +953,11 @@ export interface PluginSummary {
   description: string;
   enabled: boolean;
   providedTools: string[];
+  providedCapabilities?: string[];
   providedHooks?: string[];
   requiresEnv?: string[];
+  missingEnv?: string[];
+  envConfigured?: boolean;
   version?: string;
   author?: string;
   source?: string;
@@ -846,6 +965,41 @@ export interface PluginSummary {
   kind?: string;
   path?: string;
   manifestPath?: string;
+  entryPoint?: string;
+}
+
+export interface PluginAuxiliaryTaskSummary {
+  pluginId: string;
+  pluginName: string;
+  key: string;
+  displayName: string;
+  description: string;
+  defaults?: Record<string, unknown>;
+}
+
+export interface AgentAuxiliaryTaskSummary {
+  key: string;
+  displayName: string;
+  description: string;
+  source: string;
+  pluginId?: string;
+  pluginName?: string;
+  defaults?: Record<string, unknown>;
+}
+
+export interface AgentAuxiliaryTaskAssignment {
+  key: string;
+  displayName: string;
+  description: string;
+  source: string;
+  pluginId?: string;
+  pluginName?: string;
+  provider: string;
+  model: string;
+  baseUrl: string;
+  apiKey: string;
+  timeout: number;
+  extraBody?: Record<string, unknown>;
 }
 
 export interface McpServer {
@@ -860,6 +1014,7 @@ export interface McpServer {
   enabled: boolean;
   timeoutSeconds: number;
   supportsParallelToolCalls?: boolean;
+  persistentSession?: boolean;
 }
 
 export interface CapabilityAdapter {

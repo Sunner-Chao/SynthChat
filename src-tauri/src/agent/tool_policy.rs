@@ -12,8 +12,9 @@ use crate::{
 
 use super::{
     append_parent_phase_event, complete_chat_with_provider_failover, computer_use_action,
-    dangerous_command_reason, discord_action, redact_sensitive_text, resolve_tool_call_payload,
-    shell_disabled_message, spotify_action, truncate_for_prompt,
+    dangerous_command_reason, discord_action, list_agent_auxiliary_task_assignments,
+    redact_sensitive_text, resolve_tool_call_payload, shell_disabled_message, spotify_action,
+    string_arg, truncate_for_prompt,
 };
 pub(super) fn summarize_tool_text(text: &str) -> String {
     let compact = text.lines().take(3).collect::<Vec<_>>().join(" ");
@@ -36,7 +37,20 @@ pub(super) fn append_tool_approval_request(
     tool_name: &str,
     payload: Value,
     reason: String,
+    tool_context: ToolExecutionContext,
 ) -> AppResult<ToolApprovalRequest> {
+    let context_snapshot = json!({
+        "conversationId": conversation_id,
+        "personaId": persona_id,
+        "agentId": agent_id,
+        "runId": run_id,
+        "serverId": server_id,
+        "toolName": tool_name,
+        "toolExecutionContext": format!("{tool_context:?}"),
+        "contextPropagated": true,
+        "propagation": "explicit-rust-context"
+    });
+    let _ = append_parent_phase_event(store, run_id, "tool_approval_context", context_snapshot);
     store.append_tool_approval(ToolApprovalRequest {
         id: new_id("approval"),
         created_at: now_iso(),
@@ -130,6 +144,7 @@ pub(super) async fn apply_smart_approval_mode(
     if providers.is_empty() {
         return Ok(Some(reason));
     }
+    let (approval_providers, approval_persona) = approval_provider_plan(store, providers, persona)?;
     let system_prompt = "You are a security reviewer for an AI coding agent. Decide whether a flagged tool command can be auto-approved. Respond with exactly one word: APPROVE, DENY, or ESCALATE.".to_string();
     let user_prompt = format!(
         "Command:\n{}\n\nFlagged reason:\n{}\n\nRules:\n- APPROVE only if the command is clearly safe, such as benign script execution, inspection, development tooling, or harmless file operations.\n- DENY if it could damage the system, overwrite secrets/config, wipe data, kill critical processes, drop databases, or bypass security.\n- ESCALATE if uncertain or context-dependent.\n\nRespond with exactly one word.",
@@ -139,8 +154,8 @@ pub(super) async fn apply_smart_approval_mode(
     let reply = match complete_chat_with_provider_failover(
         store,
         Some(run_id),
-        providers,
-        persona,
+        &approval_providers,
+        &approval_persona,
         system_prompt,
         Vec::new(),
         &user_prompt,
@@ -183,6 +198,117 @@ pub(super) async fn apply_smart_approval_mode(
             "BLOCKED by smart approval: {reason}. The command was assessed as genuinely dangerous. Do not retry."
         ))),
         _ => Ok(Some(reason)),
+    }
+}
+
+fn approval_provider_plan(
+    store: &AppStore,
+    main_providers: &[LlmProvider],
+    main_persona: &Persona,
+) -> AppResult<(Vec<LlmProvider>, Persona)> {
+    let Some(assignment) = list_agent_auxiliary_task_assignments(store)?
+        .into_iter()
+        .find(|assignment| assignment.key == "approval")
+    else {
+        return Ok((main_providers.to_vec(), main_persona.clone()));
+    };
+    let provider = assignment.provider.trim();
+    let provider_id = if provider.eq_ignore_ascii_case("auto") {
+        ""
+    } else {
+        provider
+    };
+    let model = assignment.model.trim();
+    let base_url = assignment.base_url.trim();
+    if provider_id.is_empty() && model.is_empty() && base_url.is_empty() {
+        return Ok((main_providers.to_vec(), main_persona.clone()));
+    }
+    let mut providers = if !base_url.is_empty() {
+        vec![LlmProvider {
+            id: "auxiliary-approval-custom".into(),
+            name: "Approval auxiliary".into(),
+            provider_type: "openai_compatible".into(),
+            base_url: base_url.into(),
+            append_chat_path: true,
+            api_key: (!assignment.api_key.trim().is_empty())
+                .then(|| assignment.api_key.trim().to_string()),
+            model: if model.is_empty() {
+                main_providers
+                    .first()
+                    .map(|provider| provider.model.clone())
+                    .unwrap_or_default()
+            } else {
+                model.to_string()
+            },
+            enabled: true,
+            timeout_seconds: assignment.timeout,
+            ..LlmProvider::default()
+        }]
+    } else if provider_id.is_empty() {
+        main_providers.to_vec()
+    } else {
+        let mut candidates = store.provider_candidates(Some(provider_id))?;
+        let credential_prefix = format!("{provider_id}:cred-");
+        candidates.retain(|provider| {
+            provider.id == provider_id || provider.id.starts_with(&credential_prefix)
+        });
+        if candidates.is_empty() {
+            return Err(AppError::NotFound(format!(
+                "approval llm provider {provider_id}"
+            )));
+        }
+        candidates
+    };
+    let mut persona = main_persona.clone();
+    if !provider_id.is_empty() {
+        persona.llm_provider = provider_id.to_string();
+    }
+    if !model.is_empty() {
+        persona.llm_model = model.to_string();
+        for provider in &mut providers {
+            provider.model = model.to_string();
+        }
+    }
+    Ok((providers, persona))
+}
+
+#[cfg(test)]
+mod approval_provider_plan_tests {
+    use super::approval_provider_plan;
+    use crate::{
+        agent::save_agent_auxiliary_task_assignment,
+        models::{new_id, LlmProvider},
+        store::AppStore,
+    };
+
+    #[test]
+    fn approval_provider_plan_uses_custom_auxiliary_assignment() {
+        let dir = std::env::temp_dir().join(format!("synthchat-approval-aux-{}", new_id("test")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AppStore::new(dir.join("state.json")).unwrap();
+        save_agent_auxiliary_task_assignment(
+            &store,
+            "approval",
+            "auto",
+            "approval-model",
+            "https://approval.example/v1",
+            "secret",
+            Some(12),
+            None,
+        )
+        .unwrap();
+        let persona = store.persona(None).unwrap();
+        let (providers, routed_persona) =
+            approval_provider_plan(&store, &[LlmProvider::default()], &persona).unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id, "auxiliary-approval-custom");
+        assert_eq!(providers[0].base_url, "https://approval.example/v1");
+        assert_eq!(providers[0].model, "approval-model");
+        assert_eq!(providers[0].timeout_seconds, 12);
+        assert_eq!(providers[0].api_key.as_deref(), Some("secret"));
+        assert_eq!(routed_persona.llm_model, "approval-model");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -248,19 +374,42 @@ pub(super) fn is_internal_tool(tool_name: &str) -> bool {
             | "workspace_diagnostics"
             | "env_probe"
             | "credential_pool"
+            | "dashboard_auth"
+            | "dashboard_plugins"
+            | "api_server_daemon"
+            | "context_engine"
+            | "plugin_runtime"
+            | "teams_pipeline"
+            | "teams_typing"
+            | "mattermost_typing"
+            | "google_chat_typing"
+            | "google_chat_update_message"
+            | "provider_plugins"
+            | "mcp_status"
+            | "mcp_oauth_clear"
+            | "mcp_oauth_refresh"
+            | "mcp_probe"
+            | "mcp_reset_session"
             | "osv_check"
+            | "security_scan"
             | "computer_use"
             | "delegate_task"
             | "mixture_of_agents"
             | "kanban_create"
+            | "kanban_decompose"
+            | "kanban_specify"
             | "kanban_list"
             | "kanban_show"
+            | "kanban_update"
+            | "kanban_delete"
             | "kanban_complete"
             | "kanban_block"
             | "kanban_unblock"
             | "kanban_heartbeat"
             | "kanban_comment"
             | "kanban_link"
+            | "kanban_unlink"
+            | "kanban_bulk_update"
             | "send_message"
             | "session_search"
             | "clarify"
@@ -269,6 +418,47 @@ pub(super) fn is_internal_tool(tool_name: &str) -> bool {
             | "remember_fact"
             | "manage_memory"
             | "memory"
+            | "memory_provider"
+            | "fact_store"
+            | "fact_feedback"
+            | "supermemory_store"
+            | "supermemory_search"
+            | "supermemory_forget"
+            | "supermemory_profile"
+            | "honcho_profile"
+            | "honcho_search"
+            | "honcho_reasoning"
+            | "honcho_context"
+            | "honcho_conclude"
+            | "mem0_profile"
+            | "mem0_search"
+            | "mem0_conclude"
+            | "viking_search"
+            | "viking_read"
+            | "viking_browse"
+            | "viking_remember"
+            | "viking_add_resource"
+            | "byterover_status"
+            | "brv_query"
+            | "brv_curate"
+            | "brv_status"
+            | "hindsight_reflect"
+            | "hindsight_search"
+            | "hindsight_remember"
+            | "retaindb_profile"
+            | "retaindb_search"
+            | "retaindb_context"
+            | "retaindb_store"
+            | "retaindb_remember"
+            | "retaindb_forget"
+            | "retaindb_upload_file"
+            | "retaindb_list_files"
+            | "retaindb_read_file"
+            | "retaindb_ingest_file"
+            | "retaindb_delete_file"
+            | "retaindb_ingest_session"
+            | "retaindb_agent_model"
+            | "retaindb_seed_agent"
             | "skills_list"
             | "skill_view"
             | "skill_manage"
@@ -276,6 +466,17 @@ pub(super) fn is_internal_tool(tool_name: &str) -> bool {
             | "video_generate"
             | "text_to_speech"
             | "transcribe_audio"
+            | "voice_status"
+            | "voice_playback"
+            | "voice_recording"
+            | "meet_join"
+            | "meet_status"
+            | "meet_transcript"
+            | "meet_leave"
+            | "meet_say"
+            | "meet_node"
+            | "disk_cleanup"
+            | "trace_flush"
             | "vision_analyze"
             | "video_analyze"
             | "weather"
@@ -286,6 +487,7 @@ pub(super) fn is_internal_tool(tool_name: &str) -> bool {
             | "feishu_doc_read"
             | "feishu_drive_list_comments"
             | "feishu_drive_list_comment_replies"
+            | "feishu_drive_update_comment_reaction"
             | "feishu_drive_reply_comment"
             | "feishu_drive_add_comment"
             | "yb_query_group_info"
@@ -300,6 +502,7 @@ pub(super) fn is_internal_tool(tool_name: &str) -> bool {
             | "spotify_playlists"
             | "spotify_albums"
             | "spotify_library"
+            | "spotify_status"
             | "discord"
             | "discord_admin"
             | "todo"
@@ -311,6 +514,7 @@ pub(super) fn is_internal_tool(tool_name: &str) -> bool {
             | "browser_snapshot"
             | "browser_back"
             | "browser_get_images"
+            | "browser_plugins"
             | "browser_provider"
             | "browser_create_session"
             | "browser_close_session"
@@ -374,10 +578,22 @@ pub(super) fn tool_allowed_by_agent_toolsets(
         return true;
     }
     let toolsets = tool_toolsets(tool);
+    if (enabled.contains("no_mcp") || disabled.contains("mcp")) && tool_is_mcp_scoped(tool) {
+        return false;
+    }
+    let enabled = enabled
+        .into_iter()
+        .filter(|name| name != "no_mcp")
+        .collect::<HashSet<_>>();
     let explicitly_enabled =
         enabled.is_empty() || toolsets.iter().any(|name| enabled.contains(name));
     let explicitly_disabled = toolsets.iter().any(|name| disabled.contains(name));
     explicitly_enabled && !explicitly_disabled
+}
+
+fn tool_is_mcp_scoped(tool: &ToolDefinition) -> bool {
+    matches!(tool.source.as_str(), "mcp" | "mcp_utility" | "plugin")
+        || tool.server_id != "__internal" && tool.server_id != "internal"
 }
 
 pub(super) fn tool_allowed_by_agent_capabilities(
@@ -409,13 +625,28 @@ pub(super) fn normalize_toolset_name(name: &str) -> String {
     name.trim().to_lowercase().replace('-', "_")
 }
 
+pub(super) fn normalize_mcp_server_toolset_component(name: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_sep = false;
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            out.push('_');
+            last_was_sep = true;
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
 pub(super) fn tool_toolsets(tool: &ToolDefinition) -> HashSet<String> {
     let mut names = HashSet::new();
     names.insert("all".into());
     names.insert(normalize_toolset_name(&tool.source));
     names.insert(format!(
         "server:{}",
-        normalize_toolset_name(&tool.server_id)
+        normalize_mcp_server_toolset_component(&tool.server_id)
     ));
     names.insert(format!("tool:{}", normalize_toolset_name(&tool.tool_name)));
     for name in semantic_toolsets_for_tool(tool) {
@@ -434,12 +665,20 @@ pub(super) fn semantic_toolsets_for_tool(tool: &ToolDefinition) -> Vec<&'static 
                 vec!["terminal", "code_execution"]
             }
             "env_probe" => vec!["terminal", "config"],
-            "credential_pool" => vec!["config"],
-            "osv_check" => vec!["security", "web"],
+            "credential_pool" | "dashboard_auth" | "dashboard_plugins" | "context_engine"
+            | "plugin_runtime" | "teams_pipeline" | "provider_plugins" | "api_server_daemon" => {
+                vec!["config", "tools"]
+            }
+            "teams_typing"
+            | "mattermost_typing"
+            | "google_chat_typing"
+            | "google_chat_update_message" => vec!["messaging"],
+            "osv_check" | "security_scan" => vec!["security", "web"],
             "browser_navigate"
             | "browser_snapshot"
             | "browser_back"
             | "browser_get_images"
+            | "browser_plugins"
             | "browser_provider"
             | "browser_create_session"
             | "browser_close_session"
@@ -463,6 +702,7 @@ pub(super) fn semantic_toolsets_for_tool(tool: &ToolDefinition) -> Vec<&'static 
             "video_generate" => vec!["video_gen"],
             "text_to_speech" => vec!["tts", "audio"],
             "transcribe_audio" => vec!["stt", "audio"],
+            "voice_status" | "voice_playback" | "voice_recording" => vec!["voice", "audio"],
             "delegate_task" => vec!["delegation"],
             "mixture_of_agents" => vec!["moa", "delegation"],
             "clarify" => vec!["clarify"],
@@ -470,15 +710,63 @@ pub(super) fn semantic_toolsets_for_tool(tool: &ToolDefinition) -> Vec<&'static 
             "session_search" => vec!["session_search", "search"],
             "todo" | "update_todo" | "checkpoint" | "kanban_create" | "kanban_list"
             | "kanban_show" | "kanban_complete" | "kanban_block" | "kanban_unblock"
-            | "kanban_heartbeat" | "kanban_comment" | "kanban_link" => vec!["todo", "planning"],
-            "recall_memory" | "remember_fact" | "manage_memory" | "memory" => vec!["memory"],
+            | "kanban_heartbeat" | "kanban_comment" | "kanban_link" | "kanban_decompose"
+            | "kanban_specify" | "kanban_update" | "kanban_delete" | "kanban_unlink"
+            | "kanban_bulk_update" => vec!["todo", "planning"],
+            "recall_memory"
+            | "remember_fact"
+            | "manage_memory"
+            | "memory"
+            | "memory_provider"
+            | "fact_store"
+            | "fact_feedback"
+            | "supermemory_store"
+            | "supermemory_search"
+            | "supermemory_forget"
+            | "supermemory_profile"
+            | "honcho_profile"
+            | "honcho_search"
+            | "honcho_reasoning"
+            | "honcho_context"
+            | "honcho_conclude"
+            | "mem0_profile"
+            | "mem0_search"
+            | "mem0_conclude"
+            | "viking_search"
+            | "viking_read"
+            | "viking_browse"
+            | "viking_remember"
+            | "viking_add_resource"
+            | "byterover_status"
+            | "brv_query"
+            | "brv_status"
+            | "hindsight_reflect"
+            | "hindsight_search"
+            | "hindsight_remember"
+            | "retaindb_search"
+            | "retaindb_store"
+            | "retaindb_profile"
+            | "retaindb_context"
+            | "retaindb_remember"
+            | "retaindb_forget"
+            | "retaindb_upload_file"
+            | "retaindb_list_files"
+            | "retaindb_read_file"
+            | "retaindb_ingest_file"
+            | "retaindb_delete_file"
+            | "retaindb_ingest_session"
+            | "retaindb_agent_model"
+            | "retaindb_seed_agent" => vec!["memory"],
             "skills_list" | "skill_view" | "skill_manage" => vec!["skills"],
             "computer_use" => vec!["computer_use"],
+            "disk_cleanup" => vec!["maintenance", "file"],
+            "trace_flush" => vec!["observability"],
             "homeassistant" | "ha_list_entities" | "ha_get_state" | "ha_list_services"
             | "ha_call_service" => vec!["homeassistant"],
             "feishu_doc_read"
             | "feishu_drive_list_comments"
             | "feishu_drive_list_comment_replies"
+            | "feishu_drive_update_comment_reaction"
             | "feishu_drive_reply_comment"
             | "feishu_drive_add_comment" => vec!["feishu"],
             "yb_query_group_info"
@@ -488,6 +776,7 @@ pub(super) fn semantic_toolsets_for_tool(tool: &ToolDefinition) -> Vec<&'static 
             | "yb_send_sticker" => vec!["yuanbao"],
             "spotify_playback" | "spotify_devices" | "spotify_queue" | "spotify_search"
             | "spotify_playlists" | "spotify_albums" | "spotify_library" => vec!["spotify"],
+            "spotify_status" => vec!["spotify", "config"],
             "discord" | "discord_admin" => vec!["discord"],
             "send_message" => vec!["messaging"],
             "artifact" | "list_artifacts" => vec!["artifact"],
@@ -558,6 +847,18 @@ pub(super) fn tool_allowed_in_context(
                         | "remember_fact"
                         | "recall_memory"
                         | "memory"
+                        | "fact_store"
+                        | "fact_feedback"
+                        | "supermemory_store"
+                        | "supermemory_forget"
+                        | "honcho_conclude"
+                        | "mem0_conclude"
+                        | "viking_remember"
+                        | "viking_add_resource"
+                        | "brv_curate"
+                        | "hindsight_reflect"
+                        | "hindsight_remember"
+                        | "retaindb_store"
                 ))
         }
         ToolExecutionContext::SubagentLeaf => {
@@ -570,13 +871,41 @@ pub(super) fn tool_allowed_in_context(
                         | "remember_fact"
                         | "recall_memory"
                         | "memory"
+                        | "fact_store"
+                        | "fact_feedback"
+                        | "supermemory_store"
+                        | "supermemory_forget"
+                        | "honcho_conclude"
+                        | "mem0_conclude"
+                        | "viking_remember"
+                        | "viking_add_resource"
+                        | "brv_curate"
+                        | "hindsight_reflect"
+                        | "hindsight_remember"
+                        | "retaindb_store"
                 ))
         }
         ToolExecutionContext::SubagentOrchestrator => {
             !(tool.source == "internal"
                 && matches!(
                     tool.tool_name.as_str(),
-                    "cronjob" | "clarify" | "remember_fact" | "recall_memory" | "memory"
+                    "cronjob"
+                        | "clarify"
+                        | "remember_fact"
+                        | "recall_memory"
+                        | "memory"
+                        | "fact_store"
+                        | "fact_feedback"
+                        | "supermemory_store"
+                        | "supermemory_forget"
+                        | "honcho_conclude"
+                        | "mem0_conclude"
+                        | "viking_remember"
+                        | "viking_add_resource"
+                        | "brv_curate"
+                        | "hindsight_reflect"
+                        | "hindsight_remember"
+                        | "retaindb_store"
                 ))
         }
     }
@@ -703,16 +1032,167 @@ pub(super) fn is_risky_tool_call(tool_name: &str, payload: &Value) -> bool {
         | "cronjob"
         | "ha_call_service"
         | "kanban_create"
+        | "kanban_decompose"
+        | "kanban_specify"
+        | "kanban_update"
+        | "kanban_delete"
         | "kanban_complete"
         | "kanban_block"
         | "kanban_unblock"
         | "kanban_heartbeat"
         | "kanban_comment"
         | "kanban_link"
+        | "kanban_unlink"
+        | "kanban_bulk_update"
+        | "feishu_drive_update_comment_reaction"
         | "feishu_drive_reply_comment"
         | "feishu_drive_add_comment"
         | "yb_send_dm"
-        | "yb_send_sticker" => true,
+        | "yb_send_sticker"
+        | "supermemory_store"
+        | "supermemory_forget"
+        | "honcho_conclude"
+        | "mem0_conclude"
+        | "viking_remember"
+        | "viking_add_resource"
+        | "brv_curate"
+        | "hindsight_reflect"
+        | "hindsight_remember"
+        | "retaindb_store"
+        | "retaindb_remember"
+        | "retaindb_forget"
+        | "retaindb_upload_file"
+        | "retaindb_ingest_file"
+        | "retaindb_delete_file"
+        | "retaindb_ingest_session"
+        | "retaindb_seed_agent"
+        | "fact_feedback" => true,
+        "fact_store" => string_arg(payload, &["action", "subcommand", "command"])
+            .map(|action| {
+                !matches!(
+                    action
+                        .trim()
+                        .to_ascii_lowercase()
+                        .replace('-', "_")
+                        .as_str(),
+                    "" | "list" | "search" | "probe" | "related" | "reason" | "contradict"
+                )
+            })
+            .unwrap_or(false),
+        "meet_node" => string_arg(payload, &["action", "subcommand", "command"])
+            .map(|action| {
+                let action = action.trim().to_ascii_lowercase().replace('-', "_");
+                if matches!(
+                    action.as_str(),
+                    "approve"
+                        | "add"
+                        | "register"
+                        | "remove"
+                        | "delete"
+                        | "forget"
+                        | "ensure_token"
+                        | "run"
+                        | "bootstrap"
+                        | "start_host"
+                ) {
+                    return true;
+                }
+                if matches!(action.as_str(), "token" | "token_status" | "host_plan")
+                    && payload
+                        .get("includeToken")
+                        .or_else(|| payload.get("include_token"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                {
+                    return true;
+                }
+                let execute = payload
+                    .get("execute")
+                    .or_else(|| payload.get("live"))
+                    .or_else(|| payload.get("apply"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let request_type = string_arg(payload, &["requestType", "request_type", "type"])
+                    .unwrap_or_else(|| action.clone())
+                    .trim()
+                    .to_ascii_lowercase()
+                    .replace('-', "_");
+                execute && matches!(request_type.as_str(), "start_bot" | "stop" | "say")
+            })
+            .unwrap_or(false),
+        "teams_pipeline" => {
+            let action = string_arg(payload, &["action", "subcommand", "command"])
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .replace('_', "-");
+            let live = payload
+                .get("execute")
+                .or_else(|| payload.get("live"))
+                .or_else(|| payload.get("apply"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let confirmed_sink_write = payload
+                .get("confirmSinkWrites")
+                .or_else(|| payload.get("confirm_sink_writes"))
+                .or_else(|| payload.get("confirmDelivery"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            (live
+                && matches!(
+                    action.as_str(),
+                    "subscribe"
+                        | "renew-subscription"
+                        | "delete-subscription"
+                        | "maintain-subscriptions"
+                        | "gateway-runtime"
+                        | "scheduler-runtime"
+                        | "runtime-plan"
+                        | "gateway-plan"
+                        | "gateway-stop"
+                        | "scheduler-stop"
+                        | "runtime-stop"
+                        | "gateway-restart"
+                        | "scheduler-restart"
+                        | "runtime-restart"
+                        | "run"
+                        | "replay"
+                ))
+                || (confirmed_sink_write
+                    && matches!(
+                        action.as_str(),
+                        "write-sinks" | "plan-sinks" | "replay-sinks" | "run" | "replay"
+                    ))
+        }
+        "api_server_daemon" => payload
+            .get("execute")
+            .or_else(|| payload.get("live"))
+            .or_else(|| payload.get("apply"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "dashboard_plugins" => {
+            let action = string_arg(payload, &["action", "subcommand", "command"])
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .replace('_', "-");
+            let live = payload
+                .get("execute")
+                .or_else(|| payload.get("live"))
+                .or_else(|| payload.get("apply"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            live && matches!(
+                action.as_str(),
+                "fastapi-host"
+                    | "dashboard-host"
+                    | "host-plan"
+                    | "host-run"
+                    | "host-start"
+                    | "host-stop"
+                    | "host-restart"
+            )
+        }
         "spotify_playback" => spotify_action(payload)
             .map(|action| {
                 !matches!(
@@ -733,6 +1213,18 @@ pub(super) fn is_risky_tool_call(tool_name: &str, payload: &Value) -> bool {
             .unwrap_or(false),
         "spotify_library" => spotify_action(payload)
             .map(|action| action != "list")
+            .unwrap_or(false),
+        "disk_cleanup" => string_arg(payload, &["action", "subcommand", "command"])
+            .map(|action| {
+                matches!(
+                    action
+                        .trim()
+                        .to_ascii_lowercase()
+                        .replace('-', "_")
+                        .as_str(),
+                    "quick" | "clean" | "cleanup" | "run" | "deep"
+                )
+            })
             .unwrap_or(false),
         "tool_call" => resolve_tool_call_payload(payload)
             .map(|(target_name, target_payload)| is_risky_tool_call(&target_name, &target_payload))
@@ -767,6 +1259,12 @@ pub(super) fn is_risky_tool_call(tool_name: &str, payload: &Value) -> bool {
             })
             .unwrap_or(true),
         "mixture_of_agents" => true,
+        "mcp_oauth_clear" => true,
+        "mcp_oauth_refresh" => true,
+        "teams_typing"
+        | "mattermost_typing"
+        | "google_chat_typing"
+        | "google_chat_update_message" => true,
         "send_message" => payload
             .get("action")
             .and_then(Value::as_str)

@@ -14,6 +14,7 @@ use crate::{
         AgentCheckpointRecord, AgentDefinition, AgentRunPhaseRecord, AgentRunRecord, ChatMessage,
         Conversation, Persona, SendChatRequest,
     },
+    skills as skill_library,
     store::AppStore,
 };
 
@@ -132,9 +133,14 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     {
         return Ok(messages);
     }
-    let effective_request_content =
+    let direct_skill_invocation =
+        build_direct_skill_slash_invocation_for_content(store, &conversation, &request.content)?;
+    let effective_request_content = if let Some(invocation) = direct_skill_invocation {
+        invocation.message
+    } else {
         clarification_response_context_for_turn(store, &conversation.id, &request.content)?
-            .unwrap_or_else(|| request.content.clone());
+            .unwrap_or_else(|| request.content.clone())
+    };
     let chat_config = store.config()?.chat;
     let enriched_user_content = expand_context_references(
         &agent,
@@ -152,11 +158,37 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     user_message.provider_data = request.provider_data.clone();
     let user = store.append_message(user_message)?;
 
+    let requested_api_run_id = request
+        .provider_data
+        .as_ref()
+        .and_then(|data| data.get("apiServer").or_else(|| data.get("api_server")))
+        .and_then(|api_server| {
+            api_server
+                .get("runId")
+                .or_else(|| api_server.get("run_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(existing) = requested_api_run_id
+        .as_deref()
+        .and_then(|run_id| store.agent_run(run_id).ok())
+        .filter(|run| matches!(run.state.as_str(), "completed" | "failed" | "aborted"))
+    {
+        return Err(AppError::BadRequest(format!(
+            "agent run {} is already terminal: {}",
+            existing.run_id, existing.state
+        )));
+    }
     let mut run = AgentRunRecord::new(
         conversation.id.clone(),
         persona.id.clone(),
         agent.id.clone(),
     );
+    if let Some(requested_run_id) = requested_api_run_id {
+        run.run_id = requested_run_id.to_string();
+    }
     run.user_request = effective_request_content.clone();
     run.queue_item_id = request.queue_item_id.clone();
     run.state = "running".into();
@@ -191,6 +223,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     let mut assistant_provider_data: Option<Value> = None;
     let mut assistant_model: Option<String> = None;
     let mut assistant_provider_id: Option<String> = None;
+    let mut assistant_prompt_tokens = 0usize;
     let skill_blocks =
         crate::skills::prompt_blocks_for_request(store, &agent, &effective_request_content)?;
     let memory_blocks =
@@ -842,6 +875,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                 &tool_name,
                                 payload,
                                 reason,
+                                tool_context,
                             )?;
                             run.state = "pendingApproval".into();
                             run.updated_at = now_iso();
@@ -1135,6 +1169,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                 &definition.tool_name,
                                 payload,
                                 reason,
+                                tool_context,
                             )?;
                             run.state = "pendingApproval".into();
                             run.updated_at = now_iso();
@@ -1174,6 +1209,14 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                 &saved_run.run_id,
                                 &definition,
                                 payload,
+                                Some(&PythonPluginBridgeContext {
+                                    agent: &agent,
+                                    conversation_id: &conversation.id,
+                                    run_id: &saved_run.run_id,
+                                    tool_context,
+                                    app,
+                                    allow_mutating_tools: true,
+                                }),
                             ),
                         )
                         .await?;
@@ -1356,6 +1399,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                 assistant_provider_data = reply.provider_data.clone();
                 assistant_model = reply.model.clone();
                 assistant_provider_id = reply.provider_id.clone();
+                assistant_prompt_tokens = reply.prompt_tokens;
                 break;
             }
         }
@@ -1423,7 +1467,6 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     run.updated_at = now_iso();
     run.completed_at = Some(run.updated_at.clone());
     let saved_completed_run = store.save_agent_run(run)?;
-    run_session_finished_hooks(store, &saved_completed_run, json!({"source": "chat_turn"})).await;
 
     let mut assistant_message = ChatMessage::new(
         conversation.id.clone(),
@@ -1433,6 +1476,65 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     );
     assistant_message.provider_data = assistant_provider_data;
     let assistant = store.append_message(assistant_message)?;
+    if assistant_prompt_tokens > 0 {
+        if let Some(note) = maybe_post_turn_compress_with_context_engine(
+            store,
+            &saved_completed_run.run_id,
+            &conversation.id,
+            assistant_prompt_tokens,
+            chat_config.short_context_token_budget,
+            (chat_config.max_context_rounds.max(1) * 2 + 1).clamp(3, 60),
+        )? {
+            append_parent_phase_event(
+                store,
+                &saved_completed_run.run_id,
+                "context_engine_post_turn_note",
+                json!({ "note": note }),
+            )?;
+        }
+    }
+    let saved_completed_run = store.agent_run(&saved_completed_run.run_id)?;
+    if let Some(request_id) =
+        line_postback_cache_set_ready_for_conversation(store, &conversation.id, &assistant_text)?
+    {
+        append_parent_phase_event(
+            store,
+            &saved_completed_run.run_id,
+            "line_postback_cache_ready",
+            json!({
+                "requestId": request_id,
+                "request_id": request_id,
+                "conversationId": conversation.id,
+                "conversation_id": conversation.id,
+            }),
+        )?;
+    }
+    run_session_finished_hooks(
+        store,
+        &saved_completed_run,
+        json!({
+            "source": "chat_turn",
+            "postDelivery": {
+                "schema": "hermes_post_delivery_callback_desktop_v1",
+                "delivered": true,
+                "transport": "local_conversation",
+                "conversationId": conversation.id,
+                "messageId": assistant.id,
+                "messageSource": assistant.source,
+            }
+        }),
+    )
+    .await;
+    let _ = maybe_generate_title_from_auxiliary_assignment(
+        store,
+        &conversation.id,
+        &chat_config,
+        &providers,
+        &effective_persona,
+        &effective_request_content,
+        &assistant_text,
+    )
+    .await;
     on_memory_turn_synced(
         store,
         &saved_completed_run.run_id,
@@ -1441,9 +1543,353 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         &effective_request_content,
         &assistant_text,
     )?;
+    maybe_enqueue_goal_continuation_after_turn(
+        store,
+        &conversation,
+        &persona,
+        &providers,
+        &effective_persona,
+        &assistant_text,
+        app,
+    )
+    .await?;
+    maybe_run_background_skill_curator(store, &chat_config)?;
     let saved_completed_run = store.agent_run(&saved_completed_run.run_id)?;
     emit_agent_run_record(app, &saved_completed_run, Some(&assistant));
     Ok(vec![user, assistant])
+}
+
+async fn maybe_enqueue_goal_continuation_after_turn(
+    store: &AppStore,
+    conversation: &Conversation,
+    persona: &Persona,
+    providers: &[LlmProvider],
+    effective_persona: &Persona,
+    assistant_text: &str,
+    app: Option<&AppHandle>,
+) -> AppResult<()> {
+    let Some(goal) = goal_state::agent_goal_status(store, &conversation.id)? else {
+        return Ok(());
+    };
+    if goal.status != "active" {
+        return Ok(());
+    }
+    let verdict = match goal_judge::judge_goal_completion(
+        store,
+        &goal.goal,
+        assistant_text,
+        &goal.subgoals,
+        providers,
+        effective_persona,
+    )
+    .await
+    {
+        Ok(verdict) => verdict,
+        Err(error) => goal_judge::GoalJudgeVerdict {
+            done: false,
+            reason: format!("judge error: {error}"),
+            parse_failed: false,
+            model: String::new(),
+        },
+    };
+    let Some(updated) = goal_state::record_agent_goal_verdict(
+        store,
+        &conversation.id,
+        verdict.done,
+        &verdict.reason,
+        verdict.parse_failed,
+    )?
+    else {
+        return Ok(());
+    };
+    if updated.status != "active" {
+        emit_agent_goal_event(
+            app,
+            &updated.status,
+            &conversation.id,
+            Some(&updated),
+            updated.last_reason.as_deref(),
+        );
+        return Ok(());
+    }
+    let has_pending_user_queue = pending_user_queue_exists(store, &conversation.id)?;
+    if has_pending_user_queue {
+        let paused = goal_state::pause_agent_goal_for_preempting_queue(store, &conversation.id)?;
+        emit_agent_goal_event(
+            app,
+            "paused",
+            &conversation.id,
+            paused.as_ref(),
+            paused
+                .as_ref()
+                .and_then(|state| state.paused_reason.as_deref()),
+        );
+        return Ok(());
+    }
+    let Some(prompt) = goal_state::agent_goal_continuation_prompt(&updated) else {
+        return Ok(());
+    };
+    let (_, queued) = enqueue_prompt_for_conversation(store, conversation, persona, &prompt)?;
+    emit_agent_queue_event(app, "queued", Some(&queued), Some(&conversation.id));
+    emit_agent_goal_event(
+        app,
+        "continuing",
+        &conversation.id,
+        Some(&updated),
+        updated.last_reason.as_deref(),
+    );
+    spawn_goal_continuation_drain(store, &conversation.id, app);
+    Ok(())
+}
+
+fn is_goal_continuation_prompt(content: &str) -> bool {
+    content.starts_with(GOAL_CONTINUATION_PREFIX)
+}
+
+const GOAL_CONTINUATION_PREFIX: &str = "[Continuing toward your standing goal]";
+
+fn pending_user_queue_exists(store: &AppStore, conversation_id: &str) -> AppResult<bool> {
+    Ok(store.agent_queue()?.into_iter().any(|item| {
+        item.conversation_id == conversation_id
+            && item.status == "pending"
+            && !is_goal_continuation_prompt(&item.content)
+    }))
+}
+
+fn pending_goal_continuation_exists(store: &AppStore, conversation_id: &str) -> AppResult<bool> {
+    Ok(store.agent_queue()?.into_iter().any(|item| {
+        item.conversation_id == conversation_id
+            && item.status == "pending"
+            && is_goal_continuation_prompt(&item.content)
+    }))
+}
+
+fn spawn_goal_continuation_drain(store: &AppStore, conversation_id: &str, app: Option<&AppHandle>) {
+    let Some(app) = app.cloned() else {
+        return;
+    };
+    let store = store.clone();
+    let conversation_id = conversation_id.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ =
+            drain_goal_continuations_for_conversation(&store, &conversation_id, Some(&app)).await;
+    });
+}
+
+async fn drain_goal_continuations_for_conversation(
+    store: &AppStore,
+    conversation_id: &str,
+    app: Option<&AppHandle>,
+) -> AppResult<usize> {
+    let mut count = 0usize;
+    loop {
+        if pending_user_queue_exists(store, conversation_id)? {
+            let paused = goal_state::pause_agent_goal_for_preempting_queue(store, conversation_id)?;
+            emit_agent_goal_event(
+                app,
+                "paused",
+                conversation_id,
+                paused.as_ref(),
+                paused
+                    .as_ref()
+                    .and_then(|state| state.paused_reason.as_deref()),
+            );
+            return Ok(count);
+        }
+        if !pending_goal_continuation_exists(store, conversation_id)? {
+            return Ok(count);
+        }
+        let Some(item) = store.claim_next_agent_request_with_content_prefix(
+            conversation_id,
+            GOAL_CONTINUATION_PREFIX,
+        )?
+        else {
+            return Ok(count);
+        };
+        emit_agent_queue_event(app, "claimed", Some(&item), Some(conversation_id));
+        let request = SendChatRequest {
+            conversation_id: Some(item.conversation_id.clone()),
+            persona_id: Some(item.persona_id.clone()),
+            agent_id: None,
+            content: item.content.clone(),
+            provider_data: None,
+            queue_item_id: Some(item.id.clone()),
+        };
+        let status = match Box::pin(run_chat_turn_with_app(
+            store,
+            request,
+            ToolExecutionContext::Interactive,
+            app,
+        ))
+        .await
+        {
+            Ok(_) => "completed",
+            Err(error) => {
+                let failed = store
+                    .complete_agent_queue_item(&item.id, "failed", Some(error.to_string()))?
+                    .unwrap_or_else(|| {
+                        let mut fallback = item.clone();
+                        fallback.status = "failed".into();
+                        fallback.error = Some(error.to_string());
+                        fallback.updated_at = now_iso();
+                        fallback.completed_at = Some(now_iso());
+                        fallback
+                    });
+                emit_agent_queue_event(app, &failed.status, Some(&failed), Some(conversation_id));
+                return Err(error);
+            }
+        };
+        let completed = store
+            .complete_agent_queue_item(&item.id, status, None)?
+            .unwrap_or_else(|| {
+                let mut fallback = item;
+                fallback.status = status.into();
+                fallback.updated_at = now_iso();
+                fallback.completed_at = Some(now_iso());
+                fallback
+            });
+        emit_agent_queue_event(
+            app,
+            &completed.status,
+            Some(&completed),
+            Some(conversation_id),
+        );
+        count += 1;
+    }
+}
+
+fn maybe_run_background_skill_curator(
+    store: &AppStore,
+    chat_config: &crate::models::ChatConfig,
+) -> AppResult<()> {
+    if !chat_config.background_skill_curator_enabled {
+        return Ok(());
+    }
+    let _ = skill_library::maybe_curate_skills_report(
+        store,
+        chat_config.background_skill_curator_interval_hours,
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod goal_loop_tests {
+    use super::*;
+    use crate::models::new_id;
+
+    #[tokio::test]
+    async fn active_goal_queues_continuation_after_continue_verdict() {
+        let dir = std::env::temp_dir().join(format!("synthchat-goal-loop-{}", new_id("test")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AppStore::new(dir.join("state.json")).unwrap();
+        let persona = store.persona(None).unwrap();
+        let conversation = store
+            .create_conversation(Some("Goal".into()), Some(persona.id.clone()))
+            .unwrap();
+        goal_state::set_agent_goal(&store, &conversation.id, "Finish the parity task", Some(3))
+            .unwrap();
+
+        maybe_enqueue_goal_continuation_after_turn(
+            &store,
+            &conversation,
+            &persona,
+            &[],
+            &persona,
+            "I inspected the current code and found more work remains.",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let state = goal_state::agent_goal_status(&store, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.status, "active");
+        assert_eq!(state.turns_used, 1);
+        let queue = store.agent_queue().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert!(queue[0]
+            .content
+            .starts_with("[Continuing toward your standing goal]"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn completed_goal_does_not_queue_continuation() {
+        let dir = std::env::temp_dir().join(format!("synthchat-goal-loop-{}", new_id("test")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AppStore::new(dir.join("state.json")).unwrap();
+        let persona = store.persona(None).unwrap();
+        let conversation = store
+            .create_conversation(Some("Goal".into()), Some(persona.id.clone()))
+            .unwrap();
+        goal_state::set_agent_goal(&store, &conversation.id, "Finish the parity task", Some(3))
+            .unwrap();
+
+        maybe_enqueue_goal_continuation_after_turn(
+            &store,
+            &conversation,
+            &persona,
+            &[],
+            &persona,
+            "The parity task is completed.",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let state = goal_state::agent_goal_status(&store, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.status, "done");
+        assert_eq!(state.turns_used, 1);
+        assert!(store.agent_queue().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn pending_user_queue_pauses_goal_continuation() {
+        let dir = std::env::temp_dir().join(format!("synthchat-goal-loop-{}", new_id("test")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AppStore::new(dir.join("state.json")).unwrap();
+        let persona = store.persona(None).unwrap();
+        let conversation = store
+            .create_conversation(Some("Goal".into()), Some(persona.id.clone()))
+            .unwrap();
+        goal_state::set_agent_goal(&store, &conversation.id, "Finish the parity task", Some(3))
+            .unwrap();
+        enqueue_prompt_for_conversation(&store, &conversation, &persona, "User changed priority")
+            .unwrap();
+
+        maybe_enqueue_goal_continuation_after_turn(
+            &store,
+            &conversation,
+            &persona,
+            &[],
+            &persona,
+            "I inspected the current code and found more work remains.",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let state = goal_state::agent_goal_status(&store, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.status, "paused");
+        assert_eq!(
+            state.paused_reason.as_deref(),
+            Some("pending user queue item preempted goal continuation")
+        );
+        let queue = store.agent_queue().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].content, "User changed priority");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 const EMPTY_RESPONSE_MAX_RECOVERY_ATTEMPTS: u32 = 3;
@@ -1490,6 +1936,187 @@ pub(super) fn next_empty_llm_response_recovery(
         max_attempts,
         after_tools,
     })
+}
+
+struct TitleGenerationProviderPlan {
+    providers: Vec<LlmProvider>,
+    persona: Persona,
+}
+
+async fn maybe_generate_title_from_auxiliary_assignment(
+    store: &AppStore,
+    conversation_id: &str,
+    chat_config: &ChatConfig,
+    main_providers: &[LlmProvider],
+    main_persona: &Persona,
+    user_message: &str,
+    assistant_response: &str,
+) -> AppResult<()> {
+    if !chat_config.auto_title_enabled {
+        return Ok(());
+    }
+    let messages = store.messages(conversation_id, None)?;
+    let visible_turns = messages
+        .iter()
+        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+        .count();
+    if visible_turns > 2 {
+        return Ok(());
+    }
+    let Some(plan) = build_title_generation_provider_plan(store, main_providers, main_persona)?
+    else {
+        return Ok(());
+    };
+    let title =
+        generate_conversation_title_with_plan(store, &plan, user_message, assistant_response)
+            .await?;
+    if let Some(title) = clean_generated_title(&title) {
+        store.rename_conversation(conversation_id, title)?;
+    }
+    Ok(())
+}
+
+fn build_title_generation_provider_plan(
+    store: &AppStore,
+    main_providers: &[LlmProvider],
+    main_persona: &Persona,
+) -> AppResult<Option<TitleGenerationProviderPlan>> {
+    let Some(assignment) = list_agent_auxiliary_task_assignments(store)?
+        .into_iter()
+        .find(|assignment| assignment.key == "title_generation")
+    else {
+        return Ok(None);
+    };
+    let provider = assignment.provider.trim();
+    let provider_id = if provider.eq_ignore_ascii_case("auto") {
+        ""
+    } else {
+        provider
+    };
+    let model = assignment.model.trim();
+    let base_url = assignment.base_url.trim();
+    if provider_id.is_empty() && model.is_empty() && base_url.is_empty() {
+        return Ok(None);
+    }
+    let mut providers = if !base_url.is_empty() {
+        vec![LlmProvider {
+            id: "auxiliary-title-generation-custom".into(),
+            name: "Title generation auxiliary".into(),
+            provider_type: "openai_compatible".into(),
+            base_url: base_url.into(),
+            append_chat_path: true,
+            api_key: (!assignment.api_key.trim().is_empty())
+                .then(|| assignment.api_key.trim().to_string()),
+            model: if model.is_empty() {
+                main_providers
+                    .first()
+                    .map(|provider| provider.model.clone())
+                    .unwrap_or_default()
+            } else {
+                model.to_string()
+            },
+            enabled: true,
+            timeout_seconds: assignment.timeout,
+            ..LlmProvider::default()
+        }]
+    } else if provider_id.is_empty() {
+        main_providers.to_vec()
+    } else {
+        let mut candidates = store.provider_candidates(Some(provider_id))?;
+        let credential_prefix = format!("{provider_id}:cred-");
+        candidates.retain(|provider| {
+            provider.id == provider_id || provider.id.starts_with(&credential_prefix)
+        });
+        if candidates.is_empty() {
+            return Err(AppError::NotFound(format!(
+                "title generation llm provider {provider_id}"
+            )));
+        }
+        candidates
+    };
+    let mut persona = main_persona.clone();
+    if !provider_id.is_empty() {
+        persona.llm_provider = provider_id.to_string();
+    }
+    if !model.is_empty() {
+        persona.llm_model = model.to_string();
+        for provider in &mut providers {
+            provider.model = model.to_string();
+        }
+    }
+    Ok(Some(TitleGenerationProviderPlan { providers, persona }))
+}
+
+async fn generate_conversation_title_with_plan(
+    store: &AppStore,
+    plan: &TitleGenerationProviderPlan,
+    user_message: &str,
+    assistant_response: &str,
+) -> AppResult<String> {
+    let user_snippet = user_message.chars().take(500).collect::<String>();
+    let assistant_snippet = assistant_response.chars().take(500).collect::<String>();
+    let system_prompt = "Generate a short, descriptive title (3-7 words) for a conversation. Return ONLY the title text. No quotes, no punctuation at the end, no prefixes.";
+    let prompt = format!("User: {user_snippet}\n\nAssistant: {assistant_snippet}");
+    let message = ChatMessage::new(
+        "__title_generation__".into(),
+        "user",
+        prompt.clone(),
+        "internal",
+    );
+    let reply = complete_chat_with_provider_failover(
+        store,
+        None,
+        &plan.providers,
+        &plan.persona,
+        system_prompt.to_string(),
+        vec![message],
+        &prompt,
+        None,
+        None,
+    )
+    .await?;
+    Ok(reply.content)
+}
+
+fn clean_generated_title(raw: &str) -> Option<String> {
+    let mut title = raw
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string();
+    if title.to_lowercase().starts_with("title:") {
+        title = title[6..].trim().to_string();
+    }
+    title = title
+        .trim_end_matches(['.', '!', '?', '。', '！', '？'])
+        .trim()
+        .to_string();
+    if title.is_empty() {
+        return None;
+    }
+    if title.chars().count() > 80 {
+        title = title.chars().take(77).collect::<String>();
+        title.push_str("...");
+    }
+    Some(title)
+}
+
+#[cfg(test)]
+mod title_generation_tests {
+    use super::clean_generated_title;
+
+    #[test]
+    fn clean_generated_title_strips_prefix_quotes_and_trailing_punctuation() {
+        assert_eq!(
+            clean_generated_title("\"Title: Build Hermes Plugins.\"").as_deref(),
+            Some("Build Hermes Plugins")
+        );
+        assert_eq!(clean_generated_title("   ").as_deref(), None);
+    }
 }
 
 pub(super) fn merge_disabled_toolset_overrides(
@@ -1769,6 +2396,11 @@ pub(super) fn check_agent_run_interrupted(
     {
         let reason = agent_run_timeout_reason(&latest, effective_timeout_seconds);
         let aborted = store.abort_agent_run(run_id, Some(reason.clone()))?;
+        store.mark_hermes_session_resume_pending(
+            &aborted.conversation_id,
+            "agent_run_timeout",
+            "agent-loop-timeout",
+        )?;
         spawn_session_finished_hooks(
             store,
             aborted.clone(),

@@ -13,9 +13,9 @@ use crate::{
 };
 
 use super::{
-    build_memory_context_block, builtin_memory_prefetch, internal_tool_availability,
-    render_internal_tool_prompt_block, render_mcp_tool_definitions, truncate_for_prompt,
-    InternalToolAvailability, ToolExecutionContext,
+    build_memory_context_block, builtin_memory_prefetch, holographic_memory_prefetch_facts,
+    internal_tool_availability, render_internal_tool_prompt_block, render_mcp_tool_definitions,
+    truncate_for_prompt, InternalToolAvailability, ToolExecutionContext,
 };
 
 #[allow(dead_code)]
@@ -387,7 +387,38 @@ pub(super) fn memory_prompt_blocks_for_query(
     persona: &Persona,
     query: &str,
 ) -> AppResult<Vec<MemoryEntry>> {
-    builtin_memory_prefetch(store, persona, query)
+    let mut memories = builtin_memory_prefetch(store, persona, query)?;
+    for fact in holographic_memory_prefetch_facts(store, query, 8)? {
+        let Some(content) = fact.get("content").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let id = fact
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("fact");
+        let trust = fact
+            .get("trust")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.5);
+        memories.push(MemoryEntry {
+            id: format!("holographic:{id}"),
+            persona_id: persona.id.clone(),
+            target: "memory".into(),
+            summary: format!("[Holographic fact trust {:.1}] {}", trust, content.trim()),
+            importance: ((trust * 5.0).round() as u8).clamp(1, 5),
+            created_at: fact
+                .get("createdAt")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            updated_at: fact
+                .get("updatedAt")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        });
+    }
+    Ok(memories)
 }
 
 fn render_memory_prompt_blocks(memory_blocks: &[MemoryEntry]) -> String {

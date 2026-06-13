@@ -101,7 +101,7 @@ pub(super) async fn delegate_task_tool(
             "delegate_task spawning is paused. Use /subagents resume before retrying.".into(),
         ));
     }
-    let parent = store.agent_run(parent_run_id)?;
+    let parent = ensure_parent_run_accepts_delegation(store, parent_run_id)?;
     let parent_depth = parent.subagent_depth.unwrap_or(0);
     if parent_depth >= agent.max_subagent_depth {
         return Err(AppError::BadRequest(format!(
@@ -207,6 +207,20 @@ pub(super) async fn delegate_task_tool(
         response["fileStateReminder"] = reminder;
     }
     Ok(serde_json::to_string_pretty(&response)?)
+}
+
+pub(super) fn ensure_parent_run_accepts_delegation(
+    store: &AppStore,
+    parent_run_id: &str,
+) -> AppResult<AgentRunRecord> {
+    let parent = store.agent_run(parent_run_id)?;
+    if matches!(parent.state.as_str(), "completed" | "failed" | "aborted") {
+        return Err(AppError::BadRequest(format!(
+            "parent agent run {parent_run_id} is already terminal: {}",
+            parent.state
+        )));
+    }
+    Ok(parent)
 }
 
 pub(super) fn delegation_spawn_paused() -> bool {

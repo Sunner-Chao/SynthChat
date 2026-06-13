@@ -69,15 +69,13 @@ if [ "$GLOBAL_MODE" = true ]; then
 fi
 
 echo -e "\033[36m[set-git-account] 设置 Git 用户名: $USER_NAME\033[0m"
-git config "${scope_args[@]}" user.name "$USER_NAME"
-if [ $? -ne 0 ]; then
+if ! git config "${scope_args[@]}" user.name "$USER_NAME"; then
     echo "设置 git user.name 失败" >&2
     exit 1
 fi
 
 echo -e "\033[36m[set-git-account] 设置 Git 邮箱: $EMAIL\033[0m"
-git config "${scope_args[@]}" user.email "$EMAIL"
-if [ $? -ne 0 ]; then
+if ! git config "${scope_args[@]}" user.email "$EMAIL"; then
     echo "设置 git user.email 失败" >&2
     exit 1
 fi

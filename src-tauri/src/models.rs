@@ -30,6 +30,13 @@ pub struct AppConfig {
     pub email: Value,
     pub sms: Value,
     pub dingtalk: Value,
+    pub teams: Value,
+    pub ntfy: Value,
+    pub simplex: Value,
+    pub irc: Value,
+    pub line: Value,
+    pub google_chat: Value,
+    pub google_meet: Value,
     pub whatsapp: Value,
     pub qqbot: Value,
     pub bluebubbles: Value,
@@ -68,6 +75,13 @@ impl Default for AppConfig {
             email: json!({"enabled": false, "address": "", "password": "", "smtpHost": "", "smtpPort": 587, "homeAddress": "", "subject": "Hermes Agent", "timeoutSeconds": 30}),
             sms: json!({"enabled": false, "accountSid": "", "authToken": "", "fromNumber": "", "apiBaseUrl": "https://api.twilio.com", "homeNumber": "", "timeoutSeconds": 30}),
             dingtalk: json!({"enabled": false, "webhookUrl": "", "homeTarget": "", "timeoutSeconds": 30}),
+            teams: json!({"enabled": false, "deliveryMode": "", "incomingWebhookUrl": "", "graphBaseUrl": "https://graph.microsoft.com/v1.0", "accessToken": "", "teamId": "", "channelId": "", "chatId": "", "homeChannel": "", "timeoutSeconds": 30}),
+            ntfy: json!({"enabled": false, "server": "https://ntfy.sh", "topic": "", "publishTopic": "", "token": "", "markdown": false, "homeChannel": "", "timeoutSeconds": 15}),
+            simplex: json!({"enabled": false, "wsUrl": "ws://127.0.0.1:5225", "homeChannel": "", "timeoutSeconds": 15}),
+            irc: json!({"enabled": false, "server": "", "port": 6697, "nickname": "hermes-bot", "channel": "", "useTls": true, "serverPassword": "", "nickservPassword": "", "homeChannel": "", "maxMessageLength": 450, "timeoutSeconds": 15}),
+            line: json!({"enabled": false, "apiBaseUrl": "https://api.line.me", "channelAccessToken": "", "channelSecret": "", "homeChannel": "", "timeoutSeconds": 15}),
+            google_chat: json!({"enabled": false, "apiBaseUrl": "https://chat.googleapis.com", "accessToken": "", "serviceAccountJson": "", "credentialsFile": "", "tokenUri": "https://oauth2.googleapis.com/token", "homeChannel": "", "timeoutSeconds": 30}),
+            google_meet: json!({"enabled": false, "mode": "desktop_state", "guestName": "Hermes Agent", "transcriptDir": "", "nodeRegistryPath": ""}),
             whatsapp: json!({"enabled": false, "bridgeUrl": "http://localhost:3000", "bridgePort": 3000, "homeChatId": "", "timeoutSeconds": 30}),
             qqbot: json!({"enabled": false, "appId": "", "clientSecret": "", "apiBaseUrl": "https://api.sgroup.qq.com", "tokenUrl": "https://bots.qq.com/app/getAppAccessToken", "homeTarget": "", "timeoutSeconds": 15}),
             bluebubbles: json!({"enabled": false, "serverUrl": "", "password": "", "homeChatId": "", "timeoutSeconds": 30}),
@@ -109,6 +123,7 @@ pub struct ChatConfig {
     pub delegation_inherit_mcp_toolsets: bool,
     pub delegation_subagent_provider_id: String,
     pub delegation_subagent_model: String,
+    pub auxiliary_task_assignments: Value,
     pub agent_run_timeout_seconds: u64,
     pub agent_post_tool_quiet_timeout_seconds: u64,
     pub ui_message_limit: usize,
@@ -137,6 +152,13 @@ pub struct ChatConfig {
     pub llm_retry_count: usize,
     pub llm_retry_backoff_ms: usize,
     pub responses_reasoning_replay_enabled: bool,
+    pub fast_mode_enabled: bool,
+    pub runtime_footer_enabled: bool,
+    pub statusbar_enabled: bool,
+    pub tool_progress_display: String,
+    pub display_skin: String,
+    pub busy_indicator_style: String,
+    pub codex_runtime: String,
     pub tool_call_retry_count: usize,
     pub tool_call_retry_backoff_ms: usize,
     pub tool_result_persist_threshold_chars: usize,
@@ -189,6 +211,7 @@ impl Default for ChatConfig {
             delegation_inherit_mcp_toolsets: true,
             delegation_subagent_provider_id: String::new(),
             delegation_subagent_model: String::new(),
+            auxiliary_task_assignments: json!({}),
             agent_run_timeout_seconds: 600,
             agent_post_tool_quiet_timeout_seconds: 90,
             ui_message_limit: 180,
@@ -217,6 +240,13 @@ impl Default for ChatConfig {
             llm_retry_count: 2,
             llm_retry_backoff_ms: 800,
             responses_reasoning_replay_enabled: true,
+            fast_mode_enabled: false,
+            runtime_footer_enabled: false,
+            statusbar_enabled: true,
+            tool_progress_display: "new".into(),
+            display_skin: "default".into(),
+            busy_indicator_style: "unicode".into(),
+            codex_runtime: "auto".into(),
             tool_call_retry_count: 1,
             tool_call_retry_backoff_ms: 300,
             tool_result_persist_threshold_chars: 24_000,
@@ -408,6 +438,20 @@ pub struct LlmProvider {
     pub model: String,
     pub enabled: bool,
     pub timeout_seconds: u64,
+    #[serde(
+        default,
+        alias = "request_timeout_seconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_timeout_seconds: Option<f64>,
+    #[serde(
+        default,
+        alias = "stale_timeout_seconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stale_timeout_seconds: Option<f64>,
+    #[serde(default)]
+    pub models: Value,
     #[serde(default = "default_prompt_cache_mode")]
     pub prompt_cache_mode: String,
     #[serde(default = "default_prompt_cache_ttl")]
@@ -430,6 +474,9 @@ impl Default for LlmProvider {
             model: "echo".into(),
             enabled: true,
             timeout_seconds: 60,
+            request_timeout_seconds: None,
+            stale_timeout_seconds: None,
+            models: json!({}),
             prompt_cache_mode: default_prompt_cache_mode(),
             prompt_cache_ttl: default_prompt_cache_ttl(),
             prompt_cache_layout: default_prompt_cache_layout(),
@@ -781,9 +828,15 @@ pub struct PluginSummary {
     #[serde(default)]
     pub provided_tools: Vec<String>,
     #[serde(default)]
+    pub provided_capabilities: Vec<String>,
+    #[serde(default)]
     pub provided_hooks: Vec<String>,
     #[serde(default)]
     pub requires_env: Vec<String>,
+    #[serde(default)]
+    pub missing_env: Vec<String>,
+    #[serde(default)]
+    pub env_configured: bool,
     #[serde(default)]
     pub version: String,
     #[serde(default)]
@@ -798,6 +851,72 @@ pub struct PluginSummary {
     pub path: String,
     #[serde(default)]
     pub manifest_path: String,
+    #[serde(default)]
+    pub entry_point: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginAuxiliaryTaskSummary {
+    pub plugin_id: String,
+    pub plugin_name: String,
+    pub key: String,
+    pub display_name: String,
+    pub description: String,
+    #[serde(default)]
+    pub defaults: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentAuxiliaryTaskSummary {
+    pub key: String,
+    pub display_name: String,
+    pub description: String,
+    pub source: String,
+    #[serde(default)]
+    pub plugin_id: String,
+    #[serde(default)]
+    pub plugin_name: String,
+    #[serde(default)]
+    pub defaults: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentAuxiliaryTaskAssignment {
+    pub key: String,
+    pub display_name: String,
+    pub description: String,
+    pub source: String,
+    #[serde(default)]
+    pub plugin_id: String,
+    #[serde(default)]
+    pub plugin_name: String,
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub timeout: u64,
+    #[serde(default)]
+    pub extra_body: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentGoalState {
+    pub goal: String,
+    pub status: String,
+    pub turns_used: u32,
+    pub max_turns: u32,
+    pub created_at: String,
+    pub last_turn_at: Option<String>,
+    pub last_verdict: Option<String>,
+    pub last_reason: Option<String>,
+    pub paused_reason: Option<String>,
+    pub consecutive_parse_failures: u32,
+    #[serde(default)]
+    pub subgoals: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1082,10 +1201,16 @@ pub struct AgentCheckpointRecord {
 pub struct MemoryEntry {
     pub id: String,
     pub persona_id: String,
+    #[serde(default = "default_memory_target")]
+    pub target: String,
     pub summary: String,
     pub importance: u8,
     pub created_at: String,
     pub updated_at: String,
+}
+
+pub fn default_memory_target() -> String {
+    "memory".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1243,7 +1368,9 @@ pub fn tool_event_kind(server_id: &str, tool_name: &str, description: Option<&st
         | "browser_snapshot"
         | "browser_vision"
         | "browser_get_images"
+        | "browser_plugins"
         | "transcribe_audio"
+        | "voice_status"
         | "vision_analyze"
         | "video_analyze"
         | "skill_view"
@@ -1252,6 +1379,27 @@ pub fn tool_event_kind(server_id: &str, tool_name: &str, description: Option<&st
         | "session_search"
         | "manage_memory"
         | "memory"
+        | "memory_provider"
+        | "dashboard_auth"
+        | "dashboard_plugins"
+        | "context_engine"
+        | "plugin_runtime"
+        | "teams_pipeline"
+        | "provider_plugins"
+        | "fact_store"
+        | "fact_feedback"
+        | "supermemory_profile"
+        | "honcho_profile"
+        | "honcho_context"
+        | "mem0_profile"
+        | "viking_read"
+        | "viking_browse"
+        | "byterover_status"
+        | "brv_status"
+        | "retaindb_profile"
+        | "retaindb_list_files"
+        | "retaindb_read_file"
+        | "retaindb_agent_model"
         | "kanban_show"
         | "kanban_list"
         | "ha_list_entities"
@@ -1263,33 +1411,66 @@ pub fn tool_event_kind(server_id: &str, tool_name: &str, description: Option<&st
         | "yb_query_group_info"
         | "yb_query_group_members"
         | "spotify_albums"
+        | "spotify_status"
         | "discord"
         | "browser_supervisor_state" => return "read".into(),
         "write_file"
         | "patch"
         | "skill_manage"
         | "remember_fact"
+        | "supermemory_store"
+        | "supermemory_forget"
+        | "honcho_conclude"
+        | "mem0_conclude"
+        | "viking_remember"
+        | "viking_add_resource"
+        | "brv_curate"
+        | "hindsight_reflect"
+        | "hindsight_remember"
+        | "retaindb_store"
+        | "retaindb_remember"
+        | "retaindb_forget"
+        | "retaindb_upload_file"
+        | "retaindb_ingest_file"
+        | "retaindb_delete_file"
+        | "retaindb_ingest_session"
+        | "retaindb_seed_agent"
         | "cronjob"
         | "send_message"
+        | "teams_typing"
+        | "mattermost_typing"
+        | "google_chat_typing"
+        | "google_chat_update_message"
         | "update_todo"
         | "ha_call_service"
         | "kanban_create"
+        | "kanban_specify"
+        | "kanban_update"
+        | "kanban_delete"
         | "kanban_complete"
         | "kanban_block"
         | "kanban_unblock"
         | "kanban_heartbeat"
         | "kanban_comment"
         | "kanban_link"
+        | "kanban_unlink"
+        | "kanban_bulk_update"
+        | "mcp_oauth_clear"
+        | "mcp_oauth_refresh"
+        | "feishu_drive_update_comment_reaction"
         | "feishu_drive_reply_comment"
         | "feishu_drive_add_comment"
         | "yb_send_dm"
         | "yb_send_sticker"
         | "discord_admin" => return "edit".into(),
-        "tool_search" | "search_files" | "yb_search_sticker" | "spotify_search" => {
+        "tool_search" | "search_files" | "yb_search_sticker" | "spotify_search"
+        | "supermemory_search" | "honcho_search" | "mem0_search" | "viking_search"
+        | "brv_query" | "hindsight_search" | "retaindb_search" => {
             return "search".into();
         }
         "web_extract" | "web_search" | "x_search" | "browser_navigate" | "browser_cdp"
-        | "weather" | "osv_check" => {
+        | "weather" | "osv_check" | "security_scan" | "mcp_status" | "trace_flush"
+        | "honcho_reasoning" | "retaindb_context" => {
             return "fetch".into();
         }
         "terminal"
@@ -1299,6 +1480,9 @@ pub fn tool_event_kind(server_id: &str, tool_name: &str, description: Option<&st
         | "execute_code"
         | "workspace_diagnostics"
         | "computer_use"
+        | "mcp_probe"
+        | "mcp_reset_session"
+        | "disk_cleanup"
         | "spotify_playback"
         | "spotify_devices"
         | "spotify_queue"
@@ -1315,6 +1499,8 @@ pub fn tool_event_kind(server_id: &str, tool_name: &str, description: Option<&st
         | "image_generate"
         | "video_generate"
         | "text_to_speech"
+        | "voice_playback"
+        | "voice_recording"
         | "clarify" => return "execute".into(),
         "_thinking" => return "think".into(),
         _ => {}

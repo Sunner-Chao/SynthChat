@@ -9,11 +9,14 @@ use serde_json::{json, Value};
 
 use crate::{
     error::{AppError, AppResult},
-    models::{AppConfig, SearchProvider},
+    models::{AppConfig, ChatMessage, LlmProvider, Persona, SearchProvider},
     store::AppStore,
 };
 
-use super::{string_arg, tool_registry::truncate_for_prompt, truncate_output};
+use super::{
+    complete_chat_with_provider_failover, list_agent_auxiliary_task_assignments, string_arg,
+    tool_registry::truncate_for_prompt, truncate_output,
+};
 
 const HERMES_WEB_LEGACY_PREFERENCE: [&str; 7] = [
     "firecrawl",
@@ -363,6 +366,14 @@ pub(super) async fn web_search_tool(store: &AppStore, payload: &Value) -> AppRes
 pub(super) async fn x_search_tool(store: &AppStore, payload: &Value) -> AppResult<String> {
     let original_query = string_arg(payload, &["query", "q"])
         .ok_or_else(|| AppError::BadRequest("x_search requires payload.query".into()))?;
+    let mode = string_arg(payload, &["mode", "backend"])
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    if !matches!(mode.as_str(), "web_search_bridge" | "bridge" | "web") {
+        return xai_responses_x_search(store, payload, &original_query).await;
+    }
     let search_query = build_x_search_query(payload)?;
     let mut bridged_payload = payload.clone();
     if let Some(map) = bridged_payload.as_object_mut() {
@@ -383,6 +394,394 @@ pub(super) async fn x_search_tool(store: &AppStore, payload: &Value) -> AppResul
         "searchQuery": bridged_payload.get("query").and_then(Value::as_str).unwrap_or_default(),
         "result": result_json
     }))?)
+}
+
+#[derive(Clone, Debug)]
+struct XaiSearchCredential {
+    api_key: String,
+    base_url: String,
+    source: String,
+}
+
+fn resolve_xai_search_credential(store: &AppStore) -> AppResult<XaiSearchCredential> {
+    let mut provider = LlmProvider::default();
+    provider.id = "xai-oauth".into();
+    provider.name = "xAI OAuth".into();
+    provider.provider_type = "xai-oauth".into();
+    provider.preset = Some("xai-oauth".into());
+    if let Some(credential) = crate::hermes_auth::resolve_hermes_runtime_credential(&provider) {
+        if !credential.api_key.trim().is_empty() {
+            return Ok(XaiSearchCredential {
+                api_key: credential.api_key,
+                base_url: credential
+                    .base_url
+                    .unwrap_or_else(|| "https://api.x.ai/v1".into())
+                    .trim_end_matches('/')
+                    .to_string(),
+                source: credential.source,
+            });
+        }
+    }
+    if let Some(api_key) = env::var("XAI_API_KEY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(XaiSearchCredential {
+            api_key,
+            base_url: env::var("XAI_BASE_URL")
+                .ok()
+                .map(|value| value.trim().trim_end_matches('/').to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "https://api.x.ai/v1".into()),
+            source: "env:XAI_API_KEY".into(),
+        });
+    }
+    let config = store.config()?;
+    if let Some(api_key) = config
+        .messaging_gateway
+        .get("dashboardEnv")
+        .and_then(Value::as_object)
+        .and_then(|env| env.get("XAI_API_KEY"))
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        let base_url = config
+            .messaging_gateway
+            .get("dashboardEnv")
+            .and_then(Value::as_object)
+            .and_then(|env| env.get("XAI_BASE_URL"))
+            .and_then(Value::as_str)
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "https://api.x.ai/v1".into());
+        return Ok(XaiSearchCredential {
+            api_key,
+            base_url,
+            source: "dashboardEnv:XAI_API_KEY".into(),
+        });
+    }
+    Err(AppError::BadRequest(
+        "No xAI credentials available. Configure xAI OAuth or set XAI_API_KEY.".into(),
+    ))
+}
+
+async fn xai_responses_x_search(
+    store: &AppStore,
+    payload: &Value,
+    query: &str,
+) -> AppResult<String> {
+    let credential = resolve_xai_search_credential(store)?;
+    let tool_def = xai_search_tool_definition(payload)?;
+    let model = xai_search_model(&store.config()?);
+    let body = json!({
+        "model": model,
+        "input": [{
+            "role": "user",
+            "content": query.trim()
+        }],
+        "tools": [tool_def],
+        "store": false
+    });
+    let timeout_seconds = xai_search_timeout_seconds(&store.config()?);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_seconds))
+        .user_agent("Hermes-Agent-SynthChat/1.0")
+        .build()
+        .map_err(|error| AppError::BadRequest(format!("failed to build xAI client: {error}")))?;
+    let url = format!("{}/responses", credential.base_url);
+    let response = client
+        .post(&url)
+        .bearer_auth(&credential.api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("x_search failed: {error}")))?;
+    let status = response.status();
+    let text = response.text().await.map_err(|error| {
+        AppError::BadRequest(format!("failed to read x_search response: {error}"))
+    })?;
+    if !status.is_success() {
+        return Ok(serde_json::to_string_pretty(&json!({
+            "success": false,
+            "provider": "xai",
+            "tool": "x_search",
+            "error": truncate_output(&text, 2000),
+            "httpStatus": status.as_u16(),
+            "credential_source": credential.source,
+        }))?);
+    }
+    let data = serde_json::from_str::<Value>(&text)
+        .map_err(|error| AppError::BadRequest(format!("invalid x_search JSON: {error}")))?;
+    let answer = extract_xai_response_text(&data);
+    let citations = data.get("citations").cloned().unwrap_or_else(|| json!([]));
+    let inline_citations = extract_xai_inline_citations(&data);
+    let active_filters = xai_search_active_filters(payload);
+    let degraded = !active_filters.is_empty()
+        && citations.as_array().is_none_or(Vec::is_empty)
+        && inline_citations.as_array().is_none_or(Vec::is_empty);
+    Ok(serde_json::to_string_pretty(&json!({
+        "success": true,
+        "provider": "xai",
+        "credential_source": credential.source,
+        "tool": "x_search",
+        "mode": "xai_responses",
+        "model": model,
+        "query": query.trim(),
+        "answer": answer,
+        "citations": citations,
+        "inline_citations": inline_citations,
+        "degraded": degraded,
+        "degraded_reason": if degraded {
+            Value::String(format!("no citations returned despite filters: {}", active_filters.join(", ")))
+        } else {
+            Value::Null
+        },
+        "raw": data,
+    }))?)
+}
+
+pub(super) fn xai_search_tool_definition(payload: &Value) -> AppResult<Value> {
+    let mut tool = json!({"type": "x_search"});
+    let allowed = xai_search_handles(
+        payload,
+        &["allowed_x_handles", "allowedXHandles", "allowed", "from"],
+    )?;
+    let excluded = xai_search_handles(
+        payload,
+        &["excluded_x_handles", "excludedXHandles", "excluded"],
+    )?;
+    if !allowed.is_empty() && !excluded.is_empty() {
+        return Err(AppError::BadRequest(
+            "allowed_x_handles and excluded_x_handles cannot be used together".into(),
+        ));
+    }
+    if !allowed.is_empty() {
+        tool["allowed_x_handles"] = json!(allowed);
+    }
+    if !excluded.is_empty() {
+        tool["excluded_x_handles"] = json!(excluded);
+    }
+    if let Some(from_date) = string_arg(
+        payload,
+        &["from_date", "fromDate", "since", "startDate", "start_date"],
+    ) {
+        xai_validate_date(&from_date, "from_date")?;
+        tool["from_date"] = json!(from_date.trim());
+    }
+    if let Some(to_date) = string_arg(
+        payload,
+        &["to_date", "toDate", "until", "endDate", "end_date"],
+    ) {
+        xai_validate_date(&to_date, "to_date")?;
+        tool["to_date"] = json!(to_date.trim());
+    }
+    if xai_bool_arg(
+        payload,
+        &["enable_image_understanding", "enableImageUnderstanding"],
+    ) {
+        tool["enable_image_understanding"] = json!(true);
+    }
+    if xai_bool_arg(
+        payload,
+        &["enable_video_understanding", "enableVideoUnderstanding"],
+    ) {
+        tool["enable_video_understanding"] = json!(true);
+    }
+    xai_validate_date_range(
+        tool.get("from_date").and_then(Value::as_str),
+        tool.get("to_date").and_then(Value::as_str),
+    )?;
+    Ok(tool)
+}
+
+fn xai_search_handles(payload: &Value, keys: &[&str]) -> AppResult<Vec<String>> {
+    let mut handles = Vec::new();
+    for key in keys {
+        if let Some(value) = payload.get(*key) {
+            if let Some(text) = value.as_str() {
+                handles.extend(text.split(',').map(str::to_string));
+            } else if let Some(items) = value.as_array() {
+                handles.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
+            }
+        }
+    }
+    let handles = handles
+        .into_iter()
+        .map(|value| value.trim().trim_start_matches('@').to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if handles.len() > 10 {
+        return Err(AppError::BadRequest(
+            "x_search supports at most 10 handles".into(),
+        ));
+    }
+    Ok(handles)
+}
+
+fn xai_validate_date(value: &str, field: &str) -> AppResult<()> {
+    let raw = value.trim();
+    if chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").is_err() {
+        Err(AppError::BadRequest(format!("{field} must be YYYY-MM-DD")))
+    } else {
+        Ok(())
+    }
+}
+
+fn xai_validate_date_range(from_date: Option<&str>, to_date: Option<&str>) -> AppResult<()> {
+    let parsed_from = from_date
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            chrono::NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d")
+                .map_err(|_| AppError::BadRequest("from_date must be YYYY-MM-DD".into()))
+        })
+        .transpose()?;
+    let parsed_to = to_date
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            chrono::NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d")
+                .map_err(|_| AppError::BadRequest("to_date must be YYYY-MM-DD".into()))
+        })
+        .transpose()?;
+    if let (Some(from), Some(to)) = (parsed_from, parsed_to) {
+        if from > to {
+            return Err(AppError::BadRequest(format!(
+                "from_date ({}) must be on or before to_date ({})",
+                from.format("%Y-%m-%d"),
+                to.format("%Y-%m-%d")
+            )));
+        }
+    }
+    if let Some(from) = parsed_from {
+        let today = chrono::Utc::now().date_naive();
+        if from > today {
+            return Err(AppError::BadRequest(format!(
+                "from_date ({}) is in the future; X Search only indexes past posts (today UTC is {})",
+                from.format("%Y-%m-%d"),
+                today.format("%Y-%m-%d")
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn xai_bool_arg(payload: &Value, keys: &[&str]) -> bool {
+    keys.iter()
+        .find_map(|key| payload.get(*key))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn xai_search_model(config: &AppConfig) -> String {
+    string_arg(&config.web, &["xSearchModel", "x_search_model"])
+        .or_else(|| {
+            string_arg(
+                &config.messaging_gateway,
+                &["xSearchModel", "x_search_model"],
+            )
+        })
+        .unwrap_or_else(|| "grok-4.20-reasoning".into())
+}
+
+fn xai_search_timeout_seconds(config: &AppConfig) -> u64 {
+    config
+        .web
+        .get("xSearchTimeoutSeconds")
+        .or_else(|| config.web.get("x_search_timeout_seconds"))
+        .or_else(|| config.messaging_gateway.get("xSearchTimeoutSeconds"))
+        .or_else(|| config.messaging_gateway.get("x_search_timeout_seconds"))
+        .and_then(Value::as_u64)
+        .unwrap_or(180)
+        .max(30)
+}
+
+fn xai_search_active_filters(payload: &Value) -> Vec<String> {
+    let mut filters = Vec::new();
+    if xai_search_handles(
+        payload,
+        &["allowed_x_handles", "allowedXHandles", "allowed", "from"],
+    )
+    .map(|items| !items.is_empty())
+    .unwrap_or(false)
+    {
+        filters.push("allowed_x_handles".into());
+    }
+    if xai_search_handles(
+        payload,
+        &["excluded_x_handles", "excludedXHandles", "excluded"],
+    )
+    .map(|items| !items.is_empty())
+    .unwrap_or(false)
+    {
+        filters.push("excluded_x_handles".into());
+    }
+    if string_arg(
+        payload,
+        &["from_date", "fromDate", "since", "startDate", "start_date"],
+    )
+    .is_some()
+    {
+        filters.push("from_date".into());
+    }
+    if string_arg(
+        payload,
+        &["to_date", "toDate", "until", "endDate", "end_date"],
+    )
+    .is_some()
+    {
+        filters.push("to_date".into());
+    }
+    filters
+}
+
+fn extract_xai_response_text(value: &Value) -> String {
+    if let Some(text) = value.get("output_text").and_then(Value::as_str) {
+        return text.to_string();
+    }
+    value
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|content| {
+            content
+                .get("text")
+                .or_else(|| content.get("output_text"))
+                .and_then(Value::as_str)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn extract_xai_inline_citations(value: &Value) -> Value {
+    fn walk(value: &Value, out: &mut Vec<Value>) {
+        match value {
+            Value::Object(map) => {
+                if map.get("type").and_then(Value::as_str) == Some("url_citation") {
+                    out.push(Value::Object(map.clone()));
+                }
+                for child in map.values() {
+                    walk(child, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut citations = Vec::new();
+    walk(value, &mut citations);
+    Value::Array(citations)
 }
 
 pub(super) fn build_x_search_query(payload: &Value) -> AppResult<String> {
@@ -823,6 +1222,7 @@ fn normalize_provider_search_results(
 }
 
 async fn provider_extract(
+    store: &AppStore,
     provider: &SearchProvider,
     urls: &[String],
     max_chars: usize,
@@ -840,6 +1240,7 @@ async fn provider_extract(
             )))
         }
     };
+    let rows = process_web_extract_rows_with_llm(store, rows, payload).await?;
     format_extract_rows(provider, &rows)
 }
 
@@ -1296,7 +1697,7 @@ pub(super) async fn web_extract_tool(store: &AppStore, payload: &Value) -> AppRe
     if let Some(provider) =
         provider.filter(|provider| web_extract_adapter_implemented(&provider.provider_type))
     {
-        return provider_extract(provider, &urls, max_chars, payload).await;
+        return provider_extract(store, provider, &urls, max_chars, payload).await;
     }
     let mut rows = Vec::new();
     for url in urls.iter().take(5) {
@@ -1319,6 +1720,7 @@ pub(super) async fn web_extract_tool(store: &AppStore, payload: &Value) -> AppRe
         };
         rows.push(row);
     }
+    rows = process_web_extract_rows_with_llm(store, rows, payload).await?;
     let mut sections = Vec::new();
     for row in &rows {
         let url = row.get("url").and_then(Value::as_str).unwrap_or("-");
@@ -1342,6 +1744,234 @@ pub(super) async fn web_extract_tool(store: &AppStore, payload: &Value) -> AppRe
         serde_json::to_string_pretty(&json!({"ok": ok, "results": rows}))?
     ));
     Ok(sections.join("\n\n---\n\n"))
+}
+
+struct WebExtractSummaryPlan {
+    providers: Vec<LlmProvider>,
+    persona: Persona,
+    model_label: String,
+}
+
+async fn process_web_extract_rows_with_llm(
+    store: &AppStore,
+    rows: Vec<Value>,
+    payload: &Value,
+) -> AppResult<Vec<Value>> {
+    let min_length = payload
+        .get("minLength")
+        .or_else(|| payload.get("min_length"))
+        .and_then(Value::as_u64)
+        .unwrap_or(5_000)
+        .clamp(500, 200_000) as usize;
+    let Some(plan) = build_web_extract_summary_plan(store, payload)? else {
+        return Ok(rows);
+    };
+    let mut processed = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        let ok = row.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        let content = row
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if ok && content.chars().count() >= min_length {
+            let url = row.get("url").and_then(Value::as_str).unwrap_or("");
+            let title = row.get("title").and_then(Value::as_str).unwrap_or("");
+            match summarize_web_extract_content(store, &plan, url, title, &content).await {
+                Ok(summary) if !summary.trim().is_empty() => {
+                    row["rawContent"] = Value::String(content.clone());
+                    row["content"] = Value::String(truncate_for_prompt(&summary, 5_000));
+                    row["llmProcessed"] = Value::Bool(true);
+                    row["llmModel"] = Value::String(plan.model_label.clone());
+                }
+                Ok(_) | Err(_) => {
+                    row["llmProcessed"] = Value::Bool(false);
+                    row["llmModel"] = Value::String(plan.model_label.clone());
+                }
+            }
+        }
+        processed.push(row);
+    }
+    Ok(processed)
+}
+
+fn build_web_extract_summary_plan(
+    store: &AppStore,
+    payload: &Value,
+) -> AppResult<Option<WebExtractSummaryPlan>> {
+    if payload
+        .get("useLlmProcessing")
+        .or_else(|| payload.get("use_llm_processing"))
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return Ok(None);
+    }
+    let explicit_processing = payload
+        .get("useLlmProcessing")
+        .or_else(|| payload.get("use_llm_processing"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let payload_model = string_arg(payload, &["model"]);
+    let payload_provider = string_arg(payload, &["llmProvider", "llm_provider", "summaryProvider"]);
+    let payload_base_url = string_arg(payload, &["baseUrl", "base_url"]);
+    let config = store.config()?;
+    let assignment_configured = config
+        .chat
+        .auxiliary_task_assignments
+        .as_object()
+        .map(|assignments| assignments.contains_key("web_extract"))
+        .unwrap_or(false);
+    if !explicit_processing
+        && payload_model.as_deref().unwrap_or("").trim().is_empty()
+        && payload_provider.as_deref().unwrap_or("").trim().is_empty()
+        && payload_base_url.as_deref().unwrap_or("").trim().is_empty()
+        && !assignment_configured
+    {
+        return Ok(None);
+    }
+
+    let assignment = list_agent_auxiliary_task_assignments(store)?
+        .into_iter()
+        .find(|assignment| assignment.key == "web_extract");
+    let assignment_provider = assignment
+        .as_ref()
+        .map(|assignment| assignment.provider.trim())
+        .unwrap_or("");
+    let provider_id = payload_provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            if assignment_provider.eq_ignore_ascii_case("auto") || assignment_provider.is_empty() {
+                None
+            } else {
+                Some(assignment_provider)
+            }
+        });
+    let model = payload_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            assignment
+                .as_ref()
+                .map(|assignment| assignment.model.trim())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("");
+    let base_url = payload_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            assignment
+                .as_ref()
+                .map(|assignment| assignment.base_url.trim())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("");
+    let api_key = assignment
+        .as_ref()
+        .map(|assignment| assignment.api_key.trim())
+        .unwrap_or("");
+    let timeout = assignment
+        .as_ref()
+        .map(|assignment| assignment.timeout)
+        .unwrap_or(60)
+        .max(1);
+
+    let custom_model = if model.is_empty() {
+        store
+            .provider(None)
+            .ok()
+            .map(|provider| provider.model)
+            .unwrap_or_default()
+    } else {
+        model.to_string()
+    };
+    let mut providers = if !base_url.is_empty() {
+        vec![LlmProvider {
+            id: "auxiliary-web-extract-custom".into(),
+            name: "Web extract auxiliary".into(),
+            provider_type: "openai_compatible".into(),
+            base_url: base_url.into(),
+            append_chat_path: true,
+            api_key: (!api_key.is_empty()).then(|| api_key.to_string()),
+            model: custom_model,
+            enabled: true,
+            timeout_seconds: timeout,
+            ..LlmProvider::default()
+        }]
+    } else {
+        store.provider_candidates(provider_id)?
+    };
+    if providers.is_empty() {
+        return Err(AppError::NotFound("web_extract auxiliary provider".into()));
+    }
+    if !model.is_empty() {
+        for provider in &mut providers {
+            provider.model = model.to_string();
+        }
+    }
+    for provider in &mut providers {
+        provider.timeout_seconds = timeout;
+    }
+    let mut persona = store.persona(None)?;
+    persona.temperature = 0.1;
+    persona.max_tokens = 4_000;
+    if let Some(provider_id) = provider_id {
+        persona.llm_provider = provider_id.to_string();
+    }
+    if !model.is_empty() {
+        persona.llm_model = model.to_string();
+    }
+    let model_label = model.to_string();
+    let model_label = if model_label.trim().is_empty() {
+        providers
+            .first()
+            .map(|provider| provider.model.clone())
+            .unwrap_or_else(|| "default".into())
+    } else {
+        model_label
+    };
+    Ok(Some(WebExtractSummaryPlan {
+        providers,
+        persona,
+        model_label,
+    }))
+}
+
+async fn summarize_web_extract_content(
+    store: &AppStore,
+    plan: &WebExtractSummaryPlan,
+    url: &str,
+    title: &str,
+    content: &str,
+) -> AppResult<String> {
+    let system_prompt = "You are an expert content analyst. Summarize extracted web content for an AI agent. Preserve concrete facts, code snippets, named entities, dates, numbers, caveats, and actionable details. Use concise markdown.".to_string();
+    let user_prompt = format!(
+        "Source URL: {url}\nTitle: {title}\n\nExtracted content:\n{content}\n\nCreate a concise but comprehensive markdown summary. Include important quotes or code exactly when needed."
+    );
+    let history = vec![ChatMessage::new(
+        "__web_extract__".into(),
+        "user",
+        user_prompt.clone(),
+        "web_extract",
+    )];
+    let reply = complete_chat_with_provider_failover(
+        store,
+        None,
+        &plan.providers,
+        &plan.persona,
+        system_prompt,
+        history,
+        &user_prompt,
+        None,
+        None,
+    )
+    .await?;
+    Ok(reply.content)
 }
 
 pub(super) fn web_extract_urls_from_payload(payload: &Value) -> Vec<String> {
@@ -1884,6 +2514,40 @@ mod tests {
             .unwrap()
             .iter()
             .any(|value| value.as_str() == Some("parallel")));
+    }
+
+    #[test]
+    fn web_extract_summary_plan_uses_auxiliary_assignment() {
+        let dir = std::env::temp_dir().join(format!(
+            "synthchat-web-extract-aux-{}",
+            crate::models::new_id("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AppStore::new(dir.join("state.json")).unwrap();
+        super::super::save_agent_auxiliary_task_assignment(
+            &store,
+            "web_extract",
+            "custom",
+            "web-summary-model",
+            "https://summary.example/v1",
+            "secret",
+            Some(37),
+            None,
+        )
+        .unwrap();
+
+        let plan = build_web_extract_summary_plan(&store, &json!({}))
+            .unwrap()
+            .expect("web_extract auxiliary assignment should enable summarization");
+
+        assert_eq!(plan.providers.len(), 1);
+        assert_eq!(plan.providers[0].id, "auxiliary-web-extract-custom");
+        assert_eq!(plan.providers[0].base_url, "https://summary.example/v1");
+        assert_eq!(plan.providers[0].model, "web-summary-model");
+        assert_eq!(plan.providers[0].timeout_seconds, 37);
+        assert_eq!(plan.persona.llm_model, "web-summary-model");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

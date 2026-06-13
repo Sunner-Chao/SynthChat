@@ -67,7 +67,7 @@ pub(super) async fn computer_use_tool(
         "reset_backend" => computer_use_reset_backend()?,
         "session_status" | "mcp_session_status" => computer_use_mcp_session_status()?,
         "mcp_probe" => computer_use_cua_mcp_probe(payload).await?,
-        "wait" => computer_use_wait(payload).await?,
+        "wait" => computer_use_wait(store, run_id, payload).await?,
         "capture" => computer_use_capture(store, run_id, payload).await?,
         "list_apps" => computer_use_list_apps(payload).await?,
         "click" | "double_click" | "right_click" | "middle_click" | "drag" | "scroll" | "type"
@@ -186,6 +186,7 @@ fn computer_use_status(_payload: &Value) -> AppResult<Value> {
             },
             "synthchatBackend": backend.get("name").cloned().unwrap_or(Value::Null),
             "backgroundInput": backend.get("backgroundInput").cloned().unwrap_or(Value::Bool(false)),
+            "backgroundInputContract": computer_use_background_input_contract(&backend),
             "gap": backend.get("gap").cloned().unwrap_or(Value::Null)
         },
         "lifecycle": computer_use_lifecycle_status(&backend)
@@ -221,6 +222,7 @@ fn computer_use_requirements() -> AppResult<Value> {
                 "available": backend.get("available").cloned().unwrap_or(Value::Bool(false)),
                 "transport": backend.get("transport").cloned().unwrap_or(Value::Null),
                 "installHint": backend.get("installHint").cloned().unwrap_or(Value::Null),
+                "backgroundInputContract": computer_use_background_input_contract(&backend),
                 "lifecycle": computer_use_lifecycle_status(&backend)
             }
         }
@@ -255,13 +257,15 @@ fn computer_use_setup_schema() -> AppResult<Value> {
                 "oneShotMcpClientImplemented": cfg!(target_os = "macos"),
                 "persistentSessionImplemented": cfg!(target_os = "macos"),
                 "backgroundInput": true,
+                "backgroundInputContract": computer_use_cua_reference_background_input_contract(),
                 "install": [
                     "/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh)\"",
                     "brew install trycua/tap/cua-driver"
                 ]
             }
         ],
-        "nextImplementationStep": "Validate persistent cua-driver MCP capture/action behavior on macOS and close remaining Hermes background-input parity gaps."
+        "backgroundInputContract": computer_use_cua_reference_background_input_contract(),
+        "nextImplementationStep": "Run a live macOS cua-driver smoke when that host/backend is available; desktop status now exposes the Hermes background-input contract and platform boundary explicitly."
     }))
 }
 
@@ -789,12 +793,89 @@ fn computer_use_lifecycle_status(backend: &Value) -> Value {
             "persistentSession": true,
             "lazyStart": true,
             "resetSupported": true,
-            "stdioMcpClientImplemented": true
+            "stdioMcpClientImplemented": true,
+            "backgroundInputContract": computer_use_cua_reference_background_input_contract()
         },
+        "backgroundInputContract": computer_use_background_input_contract(backend),
         "gap": if cfg!(target_os = "macos") {
-            "SynthChat now uses a lazy shared cua-driver MCP session for tool calls; remaining gap is full Hermes background input parity validation."
+            "SynthChat uses a lazy shared cua-driver MCP session for capture and actions; live end-to-end validation depends on a configured macOS cua-driver host."
         } else {
             "SynthChat CUA persistent cua-driver MCP session is compiled for macOS; this platform uses a compatibility or unsupported backend."
+        }
+    })
+}
+
+fn computer_use_cua_reference_background_input_contract() -> Value {
+    json!({
+        "schema": "hermes_computer_use_background_input_contract_v1",
+        "referenceBackend": "cua-driver",
+        "transport": "MCP stdio",
+        "doesNotStealCursor": true,
+        "doesNotStealKeyboardFocus": true,
+        "doesNotStealSpace": true,
+        "hiddenOrBehindWindows": true,
+        "elementTargeting": true,
+        "pixelCoordinates": true,
+        "nativeValueMutation": true,
+        "focusWithoutRaiseDefault": true,
+        "captureModes": ["som", "vision", "ax"],
+        "readOnlyActions": ["capture", "wait", "list_apps"],
+        "mutatingActions": [
+            "click",
+            "double_click",
+            "right_click",
+            "middle_click",
+            "drag",
+            "scroll",
+            "type",
+            "key",
+            "set_value",
+            "focus_app"
+        ],
+        "approvalRequiredForMutatingActions": true,
+        "hardBlockedSafetyRules": [
+            "destructive_system_shortcuts",
+            "dangerous_shell_text_patterns"
+        ],
+        "defaultRaiseWindow": false
+    })
+}
+
+fn computer_use_background_input_contract(backend: &Value) -> Value {
+    let reference = computer_use_cua_reference_background_input_contract();
+    let background_input = backend
+        .get("backgroundInput")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let backend_name = backend
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    json!({
+        "schema": "synthchat_computer_use_background_input_contract_v1",
+        "matchesHermesReference": cfg!(target_os = "macos") && backend_name == "cua-driver",
+        "reference": reference,
+        "backend": backend_name,
+        "transport": backend.get("transport").cloned().unwrap_or(Value::Null),
+        "backgroundInput": background_input,
+        "persistentMcpSession": cfg!(target_os = "macos") && backend_name == "cua-driver",
+        "lazyStart": backend_name == "cua-driver",
+        "captureModes": ["som", "vision", "ax"],
+        "supportedTargeting": {
+            "element": true,
+            "coordinate": true,
+            "app": true,
+            "window": cfg!(target_os = "macos")
+        },
+        "approvalRequiredForMutatingActions": true,
+        "hardBlockedSafetyRules": [
+            "destructive_system_shortcuts",
+            "dangerous_shell_text_patterns"
+        ],
+        "platformBoundary": if background_input {
+            "Uses Hermes cua-driver MCP background input semantics when the macOS backend is available."
+        } else {
+            "This platform uses a foreground/compatibility backend or no backend, so Hermes background-input behavior is reported but not claimed."
         }
     })
 }
@@ -1280,18 +1361,50 @@ fn computer_use_executable_extensions() -> Vec<String> {
     }
 }
 
-async fn computer_use_wait(payload: &Value) -> AppResult<Value> {
+async fn computer_use_wait(store: &AppStore, run_id: &str, payload: &Value) -> AppResult<Value> {
     let seconds = payload
         .get("seconds")
         .and_then(Value::as_f64)
         .unwrap_or(1.0)
         .clamp(0.0, 30.0);
-    tokio::time::sleep(Duration::from_millis((seconds * 1000.0) as u64)).await;
+    let total_ms = (seconds * 1000.0) as u64;
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_millis(total_ms);
+    loop {
+        if computer_use_run_interrupted(store, run_id)? {
+            return Ok(json!({
+                "action": "wait",
+                "ok": false,
+                "seconds": seconds,
+                "waitInterrupted": true,
+                "waitInterruptedReason": "agent_run_aborted",
+                "elapsedMs": started.elapsed().as_millis()
+            }));
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep((deadline - now).min(Duration::from_millis(100))).await;
+    }
     Ok(json!({
         "action": "wait",
         "ok": true,
-        "seconds": seconds
+        "seconds": seconds,
+        "waitInterrupted": false,
+        "elapsedMs": started.elapsed().as_millis()
     }))
+}
+
+fn computer_use_run_interrupted(store: &AppStore, run_id: &str) -> AppResult<bool> {
+    match store.agent_run(run_id) {
+        Ok(run) => Ok(matches!(
+            run.state.as_str(),
+            "completed" | "failed" | "aborted"
+        )),
+        Err(AppError::NotFound(_)) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(windows)]
@@ -2085,13 +2198,17 @@ fn blocked_computer_use_type_pattern(text: &str) -> Option<&'static str> {
     if pipe_to_shell("wget ", "bash") {
         return Some("wget ... | bash");
     }
-    if compact.contains("sudo rm -rf") {
-        return Some("sudo rm -rf");
+    if compact.contains("sudo rm -r") || compact.contains("sudo rm -f") {
+        return Some("sudo rm -[rf]");
     }
     if compact.trim_end() == "rm -rf /" || compact.contains(" rm -rf /") {
         return Some("rm -rf /");
     }
-    if compact.contains(":(){ :|:& }") || compact.contains(":(){:|:&}") {
+    let fork_compact = lower
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    if fork_compact.contains(":(){:|:&}") {
         return Some("fork bomb");
     }
     None
@@ -2105,9 +2222,9 @@ fn canonical_computer_use_key_combo(keys: &str) -> Vec<String> {
                 return None;
             }
             let canonical = match key.as_str() {
-                "command" | "cmd" | "win" | "windows" | "meta" => "cmd",
+                "command" | "cmd" | "win" | "windows" | "meta" | "⌘" => "cmd",
                 "control" | "ctrl" => "ctrl",
-                "alt" | "option" => "option",
+                "alt" | "option" | "⌥" => "option",
                 other => other,
             };
             Some(canonical.to_string())
@@ -2234,6 +2351,26 @@ mod tests {
             Some(cfg!(target_os = "macos"))
         );
         assert!(status["lifecycle"].get("activePersistentSession").is_some());
+        assert_eq!(
+            status["hermesParity"]["backgroundInputContract"]["schema"].as_str(),
+            Some("synthchat_computer_use_background_input_contract_v1")
+        );
+        assert_eq!(
+            status["hermesParity"]["backgroundInputContract"]["reference"]["schema"].as_str(),
+            Some("hermes_computer_use_background_input_contract_v1")
+        );
+        assert_eq!(
+            status["hermesParity"]["backgroundInputContract"]["approvalRequiredForMutatingActions"]
+                .as_bool(),
+            Some(true)
+        );
+        assert!(
+            status["hermesParity"]["backgroundInputContract"]["hardBlockedSafetyRules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("dangerous_shell_text_patterns"))
+        );
     }
 
     #[test]
@@ -2252,13 +2389,21 @@ mod tests {
             status["hermesReference"]["persistentSession"].as_bool(),
             Some(true)
         );
+        assert_eq!(
+            status["hermesReference"]["backgroundInputContract"]["defaultRaiseWindow"].as_bool(),
+            Some(false)
+        );
     }
 
     #[test]
-    fn computer_use_setup_schema_reports_cua_driver_mcp_lifecycle_gap() {
+    fn computer_use_setup_schema_reports_cua_driver_background_input_contract() {
         let schema = computer_use_setup_schema().unwrap();
 
         assert_eq!(schema["action"].as_str(), Some("setup_schema"));
+        assert_eq!(
+            schema["backgroundInputContract"]["schema"].as_str(),
+            Some("hermes_computer_use_background_input_contract_v1")
+        );
         let options = schema["backendOptions"].as_array().unwrap();
         let cua = options
             .iter()
@@ -2279,6 +2424,15 @@ mod tests {
             cua["oneShotMcpClientImplemented"].as_bool(),
             Some(cfg!(target_os = "macos"))
         );
+        assert_eq!(
+            cua["backgroundInputContract"]["focusWithoutRaiseDefault"].as_bool(),
+            Some(true)
+        );
+        assert!(cua["backgroundInputContract"]["mutatingActions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("set_value")));
     }
 
     #[test]
@@ -2312,6 +2466,10 @@ mod tests {
         assert_eq!(
             requirements["requirements"]["hermesReference"]["probeAction"]["action"].as_str(),
             Some("mcp_probe")
+        );
+        assert_eq!(
+            requirements["requirements"]["synthchat"]["backgroundInputContract"]["schema"].as_str(),
+            Some("synthchat_computer_use_background_input_contract_v1")
         );
     }
 }

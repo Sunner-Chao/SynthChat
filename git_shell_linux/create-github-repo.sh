@@ -25,6 +25,7 @@ ORG=""
 NO_SET_REMOTE=false
 NO_PUSH=false
 NO_CONFIG=false
+SHOW_HELP=false
 
 # 解析参数
 while [[ $# -gt 0 ]]; do
@@ -74,8 +75,8 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            show_help
-            exit 0
+            SHOW_HELP=true
+            shift
             ;;
         *)
             shift
@@ -136,11 +137,13 @@ read_choice() {
         read -r input
 
         if [[ -z "$input" ]]; then
-            return "$default"
+            CHOICE_RESULT="$default"
+            return 0
         fi
 
         if [[ "$input" =~ ^[0-9]+$ ]] && [[ "$input" -ge 1 ]] && [[ "$input" -le "$max" ]]; then
-            return "$input"
+            CHOICE_RESULT="$input"
+            return 0
         fi
 
         error "输入无效，请输入 1-$max"
@@ -282,10 +285,16 @@ ensure_remote() {
     step "配置 Git 远程"
     if [[ -n "$existing" ]]; then
         info "更新远程 $REMOTE_NAME -> $remote_url"
-        git remote set-url "$REMOTE_NAME" "$remote_url"
+        if ! git remote set-url "$REMOTE_NAME" "$remote_url"; then
+            error "更新远程 $REMOTE_NAME 失败"
+            exit 1
+        fi
     else
         info "新增远程 $REMOTE_NAME -> $remote_url"
-        git remote add "$REMOTE_NAME" "$remote_url"
+        if ! git remote add "$REMOTE_NAME" "$remote_url"; then
+            error "新增远程 $REMOTE_NAME 失败"
+            exit 1
+        fi
     fi
 }
 
@@ -316,7 +325,10 @@ ensure_initial_push() {
 
     step "初次推送"
     info "推送当前分支到远程..."
-    git push -u "$REMOTE_NAME" "$branch"
+    if ! git push -u "$REMOTE_NAME" "$branch"; then
+        error "初次推送失败，请检查远程仓库权限、SSH/HTTPS 认证或分支保护设置"
+        exit 1
+    fi
 }
 
 # ===== 权限管理函数 =====
@@ -344,7 +356,7 @@ set_visibility() {
         "$default_num"
 
     read_choice "请选择" 2 "$default_num"
-    local choice=$?
+    local choice="$CHOICE_RESULT"
 
     local new_visibility
     if [[ $choice -eq 1 ]]; then
@@ -456,7 +468,7 @@ manage_collaborators() {
         1
 
     read_choice "请选择操作" 3 1
-    local action=$?
+    local action="$CHOICE_RESULT"
 
     if [[ $action -eq 3 ]]; then return; fi
 
@@ -486,7 +498,7 @@ manage_collaborators() {
         echo -e "${GRAY}  $i. 返回上级${NC}"
 
         read_choice "请选择" "$i" "$i"
-        local select=$?
+        local select="$CHOICE_RESULT"
 
         if [[ $select -eq $i ]]; then return; fi
 
@@ -520,7 +532,7 @@ manage_collaborators() {
             3
 
         read_choice "请选择权限" 6 3
-        local perm_choice=$?
+        local perm_choice="$CHOICE_RESULT"
 
         if [[ $perm_choice -eq 6 ]]; then
             warn "已取消"
@@ -567,7 +579,7 @@ configure_permissions() {
         1
 
     read_choice "请选择" 2 1
-    local config_choice=$?
+    local config_choice="$CHOICE_RESULT"
 
     if [[ $config_choice -eq 2 ]]; then
         echo "$initial_visibility"
@@ -585,7 +597,7 @@ configure_permissions() {
             4
 
         read_choice "请选择操作" 4 4
-        local choice=$?
+        local choice="$CHOICE_RESULT"
 
         case $choice in
             1) show_repo_status "$repo" "$current_visibility" ;;
@@ -634,6 +646,11 @@ GitHub 仓库创建与权限管理工具
 EOF
 }
 
+if [[ "$SHOW_HELP" == "true" ]]; then
+    show_help
+    exit 0
+fi
+
 # ===== 交互式询问 =====
 
 ask_interactive() {
@@ -654,7 +671,7 @@ ask_interactive() {
             1
 
         read_choice "请选择" 2 1
-        local vis_choice=$?
+        local vis_choice="$CHOICE_RESULT"
         if [[ $vis_choice -eq 2 ]]; then
             PRIVATE=true
         fi

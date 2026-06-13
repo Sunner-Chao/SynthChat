@@ -50,6 +50,7 @@ import { EnvironmentCheck } from "./panels/EnvironmentCheck";
 import type {
   AccountConfig,
   AgentConfig,
+  AgentQueuedRequest,
   AgentRunEvent,
   AppSection,
   CapabilityAdapter,
@@ -305,7 +306,14 @@ export function App() {
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;
-    void listen("synthchat-agent-queue-event", () => {
+    void listen<{ type?: string; item?: AgentQueuedRequest | null }>("synthchat-agent-queue-event", (event) => {
+      const item = event.payload.item;
+      if (item) {
+        useAppStore.setState((state) => ({
+          agentQueue: [item, ...state.agentQueue.filter((entry) => entry.id !== item.id)]
+            .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+        }));
+      }
       void refreshAgentQueue();
     }).then((handler) => {
       unlisten = handler;
@@ -314,6 +322,20 @@ export function App() {
       if (unlisten) unlisten();
     };
   }, [refreshAgentQueue]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void listen<{ type: string; conversationId?: string | null }>("synthchat-agent-goal-event", (event) => {
+      void refreshAgentQueue();
+      void refreshAgentRuns();
+      void refreshChatData(event.payload.conversationId ?? null, null);
+    }).then((handler) => {
+      unlisten = handler;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [refreshAgentQueue, refreshAgentRuns, refreshChatData]);
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;

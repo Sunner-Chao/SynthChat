@@ -6,7 +6,10 @@ use crate::{
     store::AppStore,
 };
 
-use super::append_parent_phase_event;
+use super::{
+    append_parent_phase_event,
+    memory::{holographic_memory_prefetch_facts, mirror_memory_write_to_holographic},
+};
 
 const MEMORY_OPEN_TAG: &str = "<memory-context>";
 const MEMORY_CLOSE_TAG: &str = "</memory-context>";
@@ -110,6 +113,7 @@ pub(super) fn on_memory_write(
     target: &str,
     content: &str,
 ) -> AppResult<()> {
+    let mirrored = mirror_memory_write_to_holographic(store, action, target, content)?;
     if run_id.trim().is_empty() {
         return Ok(());
     }
@@ -122,7 +126,12 @@ pub(super) fn on_memory_write(
             "personaId": persona.id,
             "action": action,
             "target": target,
-            "contentChars": content.chars().count()
+            "contentChars": content.chars().count(),
+            "providerMirrors": [{
+                "provider": "holographic",
+                "mirrored": mirrored.is_some(),
+                "factId": mirrored.as_ref().and_then(|fact| fact.get("id")).and_then(serde_json::Value::as_str)
+            }]
         }),
     )
 }
@@ -133,25 +142,52 @@ pub(super) fn memory_pre_compress_context(
     query: &str,
 ) -> AppResult<String> {
     let memories = builtin_memory_prefetch(store, persona, query)?;
-    if memories.is_empty() {
+    let provider_context = memory_provider_prompt_context(store, &memories, query)?;
+    if provider_context.trim().is_empty() {
         return Ok(String::new());
     }
-    let lines = memories
-        .iter()
-        .take(8)
-        .map(|memory| {
-            format!(
-                "- memory {} importance {}: {}",
-                memory.id,
-                memory.importance,
-                sanitize_memory_context(&memory.summary)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
     Ok(format!(
-        "[assistant at memory-pre-compress] Memory provider pre-compress context to preserve if relevant: {lines}"
+        "[assistant at memory-pre-compress] Memory provider pre-compress context to preserve if relevant: {}",
+        provider_context.replace('\n', " ")
     ))
+}
+
+pub(super) fn memory_provider_prompt_context(
+    store: &AppStore,
+    memory_blocks: &[MemoryEntry],
+    query: &str,
+) -> AppResult<String> {
+    let builtin_lines = memory_blocks.iter().map(|memory| {
+        format!(
+            "- [builtin:{} importance {}] {}",
+            memory.id,
+            memory.importance,
+            sanitize_memory_context(&memory.summary)
+        )
+    });
+    let holographic_lines = holographic_memory_prefetch_facts(store, query, 8)?
+        .into_iter()
+        .filter_map(|fact| {
+            let content = fact.get("content").and_then(serde_json::Value::as_str)?;
+            let id = fact
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let trust = fact
+                .get("trust")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.5);
+            Some(format!(
+                "- [holographic:{id} trust {:.1}] {}",
+                trust,
+                sanitize_memory_context(content)
+            ))
+        });
+    let raw_context = builtin_lines
+        .chain(holographic_lines)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(build_memory_context_block(&raw_context))
 }
 
 pub(super) fn sanitize_memory_context(text: &str) -> String {

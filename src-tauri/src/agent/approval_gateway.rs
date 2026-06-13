@@ -37,9 +37,27 @@ pub async fn call_mcp_tool_with_retry(
         .await
         {
             Ok(result) if result.ok || attempt == retry_count => return Ok(result),
+            Ok(result)
+                if result
+                    .error
+                    .as_deref()
+                    .is_some_and(mcp::mcp_error_needs_reauth) =>
+            {
+                return Ok(result);
+            }
             Ok(result) => last = Some(result),
             Err(error) if attempt == retry_count => return Err(error),
             Err(error) => {
+                if mcp::mcp_error_needs_reauth(&error.to_string()) {
+                    return Ok(McpCallResult {
+                        ok: false,
+                        timed_out: false,
+                        elapsed_ms: 0,
+                        stdout: String::new(),
+                        stderr: error.to_string(),
+                        error: Some(error.to_string()),
+                    });
+                }
                 last = Some(McpCallResult {
                     ok: false,
                     timed_out: false,
@@ -430,6 +448,7 @@ async fn continue_agent_run_after_approval(
                                 &tool_name,
                                 payload,
                                 reason,
+                                ToolExecutionContext::Interactive,
                             )?;
                             mark_run_pending_approval(store, app, &run.run_id)?;
                             append_waiting_for_approval_message(
@@ -669,6 +688,7 @@ async fn continue_agent_run_after_approval(
                                 &definition.tool_name,
                                 payload,
                                 reason,
+                                ToolExecutionContext::Interactive,
                             )?;
                             mark_run_pending_approval(store, app, &run.run_id)?;
                             append_waiting_for_approval_message(
@@ -689,8 +709,14 @@ async fn continue_agent_run_after_approval(
                             iteration + 1,
                         )?;
                         run = store.agent_run(&run.run_id)?;
-                        match execute_recovery_mcp_tool(store, &run.run_id, &definition, payload)
-                            .await
+                        match execute_recovery_mcp_tool(
+                            store,
+                            &run.run_id,
+                            &definition,
+                            payload,
+                            None,
+                        )
+                        .await
                         {
                             Ok((text, mut event)) => {
                                 record_file_mutation_result(

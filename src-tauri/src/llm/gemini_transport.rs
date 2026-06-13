@@ -1,8 +1,9 @@
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
@@ -19,6 +20,17 @@ pub(super) async fn complete_gemini_compatible(
     native_tools: Option<&[ToolDefinition]>,
     options: &LlmCallOptions,
 ) -> AppResult<LlmReply> {
+    if provider_uses_cloudcode(provider) {
+        return complete_gemini_cloudcode(
+            provider,
+            persona,
+            system_prompt,
+            history,
+            native_tools,
+            options,
+        )
+        .await;
+    }
     let model = if !persona.llm_model.trim().is_empty() {
         persona.llm_model.trim()
     } else {
@@ -54,7 +66,7 @@ pub(super) async fn complete_gemini_compatible(
     }
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(provider.timeout_seconds.max(1)))
+        .timeout(provider_request_timeout_duration(provider, model))
         .default_headers(headers)
         .build()
         .map_err(|e| AppError::Llm(e.to_string()))?;
@@ -65,12 +77,13 @@ pub(super) async fn complete_gemini_compatible(
     } else {
         url.clone()
     };
-    let response = client
-        .post(request_url.clone())
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AppError::Llm(e.to_string()))?;
+    let response = send_llm_request_with_stale_timeout(
+        client.post(request_url.clone()).json(&body),
+        provider,
+        model,
+        "gemini generateContent request",
+    )
+    .await?;
 
     let status = response.status();
     let response_headers = response.headers().clone();
@@ -99,7 +112,12 @@ pub(super) async fn complete_gemini_compatible(
         retry_reason: None,
     };
     if let Some(callback) = options.stream_delta_callback.as_ref() {
-        let reply = read_gemini_stream(response, callback).await?;
+        let reply = read_gemini_stream(
+            response,
+            callback,
+            provider_stream_stale_timeout_duration(provider, model),
+        )
+        .await?;
         return Ok(with_reply_metadata_and_transport(
             reply,
             provider,
@@ -115,8 +133,8 @@ pub(super) async fn complete_gemini_compatible(
         .map_err(|e| AppError::Llm(format!("failed to read gemini response: {e}")))?;
     let payload: Value = serde_json::from_str(&text).map_err(|e| {
         AppError::Llm(format!(
-            "invalid gemini response ({status}): {e}; body: {}",
-            response_preview(&text)
+            "invalid gemini response ({status}): {e}; {}",
+            invalid_response_body_detail(&text, &response_headers)
         ))
     })?;
 
@@ -131,9 +149,159 @@ pub(super) async fn complete_gemini_compatible(
     })
 }
 
+async fn complete_gemini_cloudcode(
+    provider: &LlmProvider,
+    persona: &Persona,
+    system_prompt: String,
+    history: Vec<ChatMessage>,
+    native_tools: Option<&[ToolDefinition]>,
+    options: &LlmCallOptions,
+) -> AppResult<LlmReply> {
+    let model = if !persona.llm_model.trim().is_empty() {
+        persona.llm_model.trim()
+    } else {
+        provider.model.trim()
+    };
+    let Some(api_key) = resolve_api_key(provider) else {
+        return Err(AppError::Llm(
+            "google-gemini-cli requires Google OAuth credentials; run Hermes auth for google-gemini-cli first".into(),
+        ));
+    };
+
+    let mut inner = json!({
+        "systemInstruction": {
+            "role": "system",
+            "parts": [{"text": system_prompt}]
+        },
+        "contents": build_gemini_contents(history),
+        "generationConfig": {
+            "temperature": persona.temperature,
+            "maxOutputTokens": persona.max_tokens
+        }
+    });
+    if let Some(tools) = native_tools.filter(|tools| !tools.is_empty()) {
+        inner["tools"] = json!(gemini_tool_schemas(tools));
+    }
+    let wrapped = wrap_cloudcode_request(&cloudcode_project_id(), &gemini_model_id(model), inner);
+    let stream = options.stream_delta_callback.is_some();
+    let endpoint = if stream {
+        cloudcode_stream_generate_content_url()
+    } else {
+        cloudcode_generate_content_url()
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(
+        "Accept",
+        if stream {
+            HeaderValue::from_static("text/event-stream")
+        } else {
+            HeaderValue::from_static("application/json")
+        },
+    );
+    headers.insert(
+        "User-Agent",
+        HeaderValue::from_static("synthchat (gemini-cli-compat)"),
+    );
+    headers.insert(
+        "X-Goog-Api-Client",
+        HeaderValue::from_static("gl-rust/synthchat"),
+    );
+    headers.insert(
+        "x-activity-request-id",
+        HeaderValue::from_str(&Uuid::new_v4().to_string())
+            .map_err(|e| AppError::Llm(format!("invalid activity id: {e}")))?,
+    );
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {api_key}"))
+            .map_err(|e| AppError::Llm(format!("invalid authorization header: {e}")))?,
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(provider_request_timeout_duration(provider, model))
+        .default_headers(headers)
+        .build()
+        .map_err(|e| AppError::Llm(e.to_string()))?;
+    let started_at = Instant::now();
+    let response = send_llm_request_with_stale_timeout(
+        client.post(endpoint.clone()).json(&wrapped),
+        provider,
+        model,
+        "gemini cloudcode request",
+    )
+    .await?;
+    let status = response.status();
+    let response_headers = response.headers().clone();
+    if !status.is_success() {
+        let text = response
+            .text()
+            .await
+            .map_err(|e| AppError::Llm(format!("failed to read Cloud Code response: {e}")))?;
+        return Err(AppError::Llm(format!(
+            "Cloud Code Assist returned {status}: {}",
+            response_preview(&text)
+        )));
+    }
+    let transport = LlmTransportMetadata {
+        transport: if stream {
+            "gemini_cloudcode_stream_generate_content"
+        } else {
+            "gemini_cloudcode_generate_content"
+        },
+        method: "POST",
+        endpoint: endpoint.clone(),
+        status: Some(status.as_u16()),
+        elapsed_ms: Some(started_at.elapsed().as_millis().min(u64::MAX as u128) as u64),
+        retry_count: 0,
+        retry_reason: None,
+    };
+    if let Some(callback) = options.stream_delta_callback.as_ref() {
+        let reply = read_gemini_stream(
+            response,
+            callback,
+            provider_stream_stale_timeout_duration(provider, model),
+        )
+        .await?;
+        return Ok(with_reply_metadata_and_transport(
+            reply,
+            provider,
+            model,
+            &response_headers,
+            Some(transport),
+        ));
+    }
+    let text = response
+        .text()
+        .await
+        .map_err(|e| AppError::Llm(format!("failed to read Cloud Code response: {e}")))?;
+    let payload: Value = serde_json::from_str(&text).map_err(|e| {
+        AppError::Llm(format!(
+            "invalid Cloud Code response ({status}): {e}; {}",
+            invalid_response_body_detail(&text, &response_headers)
+        ))
+    })?;
+    let inner_payload = payload
+        .get("response")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or(payload);
+    parse_gemini_compatible(inner_payload).map(|reply| {
+        with_reply_metadata_and_transport(
+            reply,
+            provider,
+            model,
+            &response_headers,
+            Some(transport),
+        )
+    })
+}
+
 async fn read_gemini_stream(
     response: reqwest::Response,
     callback: &LlmDeltaCallback,
+    stale_timeout: Option<std::time::Duration>,
 ) -> AppResult<LlmReply> {
     let mut buffer = String::new();
     let mut content = String::new();
@@ -145,7 +313,22 @@ async fn read_gemini_stream(
     let mut tool_calls = Vec::<Value>::new();
     let mut stream = response.bytes_stream();
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next_chunk = if let Some(timeout) = stale_timeout {
+            tokio::time::timeout(timeout, stream.next())
+                .await
+                .map_err(|_| {
+                    AppError::Llm(format!(
+                        "gemini stream stale: no provider bytes for {}s",
+                        timeout.as_secs_f64()
+                    ))
+                })?
+        } else {
+            stream.next().await
+        };
+        let Some(chunk) = next_chunk else {
+            break;
+        };
         let chunk =
             chunk.map_err(|e| AppError::Llm(format!("failed to read gemini stream: {e}")))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -285,9 +468,17 @@ fn extend_unique_gemini_tool_calls(payload: &Value, tool_calls: &mut Vec<Value>)
 
 fn gemini_stream_payload_items(payload: Value) -> Vec<Value> {
     match payload {
-        Value::Array(items) => items,
-        item => vec![item],
+        Value::Array(items) => items.into_iter().map(unwrap_cloudcode_response).collect(),
+        item => vec![unwrap_cloudcode_response(item)],
     }
+}
+
+fn unwrap_cloudcode_response(payload: Value) -> Value {
+    payload
+        .get("response")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or(payload)
 }
 
 fn gemini_payload_text(payload: &Value) -> Option<String> {
@@ -351,10 +542,87 @@ pub(super) fn is_gemini_compatible(provider: &LlmProvider) -> bool {
         .to_lowercase();
     let base_url = provider_base_url(provider).to_lowercase();
     provider_type == "gemini"
+        || provider_uses_cloudcode(provider)
         || preset.contains("google")
         || preset.contains("gemini")
         || base_url.contains("generativelanguage.googleapis.com")
         || base_url.ends_with(":generatecontent")
+}
+
+fn provider_uses_cloudcode(provider: &LlmProvider) -> bool {
+    let id = provider.id.to_ascii_lowercase();
+    let preset = provider
+        .preset
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let base_url = provider_base_url(provider).to_ascii_lowercase();
+    id.contains("google-gemini-cli")
+        || preset.contains("google-gemini-cli")
+        || preset.contains("gemini-cli")
+        || preset.contains("gemini-oauth")
+        || base_url.starts_with("cloudcode-pa://")
+}
+
+fn wrap_cloudcode_request(project_id: &str, model: &str, inner_request: Value) -> Value {
+    json!({
+        "project": project_id,
+        "model": model,
+        "user_prompt_id": Uuid::new_v4().to_string(),
+        "request": inner_request
+    })
+}
+
+fn cloudcode_generate_content_url() -> String {
+    "https://cloudcode-pa.googleapis.com/v1internal:generateContent".into()
+}
+
+fn cloudcode_stream_generate_content_url() -> String {
+    "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse".into()
+}
+
+fn cloudcode_project_id() -> String {
+    for name in [
+        "HERMES_GEMINI_PROJECT_ID",
+        "GOOGLE_CLOUD_PROJECT",
+        "GCLOUD_PROJECT",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return value.to_string();
+            }
+        }
+    }
+    google_oauth_project_id_from_credentials().unwrap_or_default()
+}
+
+fn google_oauth_project_id_from_credentials() -> Option<String> {
+    let path = std::env::var_os("HERMES_HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("USERPROFILE")
+                        .filter(|value| !value.is_empty())
+                        .map(std::path::PathBuf::from)
+                })
+                .map(|home| home.join(".hermes"))
+        })?
+        .join("auth")
+        .join("google_oauth.json");
+    let payload = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&payload).ok()?;
+    value
+        .get("refresh")
+        .and_then(Value::as_str)
+        .and_then(|refresh| refresh.split('|').nth(1))
+        .map(str::trim)
+        .filter(|project| !project.is_empty())
+        .map(str::to_string)
 }
 
 pub(super) fn build_gemini_contents(history: Vec<ChatMessage>) -> Vec<Value> {
@@ -603,6 +871,143 @@ mod tests {
     use super::*;
 
     #[test]
+    fn google_gemini_cli_provider_uses_cloudcode_transport() {
+        let provider = LlmProvider {
+            id: "google-gemini-cli".into(),
+            name: "Google Gemini CLI".into(),
+            provider_type: "gemini".into(),
+            preset: Some("google-gemini-cli".into()),
+            model: "gemini-2.5-pro".into(),
+            ..LlmProvider::default()
+        };
+
+        assert!(provider_uses_cloudcode(&provider));
+        assert!(is_gemini_compatible(&provider));
+    }
+
+    #[test]
+    fn cloudcode_request_wraps_gemini_native_payload() {
+        let inner = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "generationConfig": {"temperature": 0.2}
+        });
+
+        let wrapped = wrap_cloudcode_request("project-1", "gemini-2.5-pro", inner.clone());
+
+        assert_eq!(wrapped["project"], "project-1");
+        assert_eq!(wrapped["model"], "gemini-2.5-pro");
+        assert_eq!(wrapped["request"], inner);
+        assert!(wrapped["user_prompt_id"]
+            .as_str()
+            .is_some_and(|id| Uuid::parse_str(id).is_ok()));
+    }
+
+    #[test]
+    fn cloudcode_stream_endpoint_uses_sse_internal_route() {
+        assert_eq!(
+            cloudcode_stream_generate_content_url(),
+            "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+        );
+    }
+
+    #[test]
+    fn cloudcode_stream_payload_unwraps_response_envelope() {
+        let deltas = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let callback_deltas = deltas.clone();
+        let callback: LlmDeltaCallback = std::sync::Arc::new(move |delta| {
+            callback_deltas.lock().unwrap().push(delta.to_string());
+            Ok(())
+        });
+        let line = format!(
+            "data: {}",
+            json!({
+                "response": {
+                    "candidates": [{
+                        "content": {
+                            "parts": [{"text": "hello cloudcode"}]
+                        }
+                    }],
+                    "usageMetadata": {
+                        "promptTokenCount": 3,
+                        "candidatesTokenCount": 2
+                    }
+                }
+            })
+        );
+        let mut content = String::new();
+        let mut last_payload = None::<Value>;
+        let mut prompt_tokens = 0usize;
+        let mut completion_tokens = 0usize;
+        let mut cache_read_tokens = 0usize;
+        let mut reasoning_tokens = 0usize;
+        let mut tool_calls = Vec::<Value>::new();
+
+        handle_gemini_stream_line(
+            &line,
+            &callback,
+            &mut content,
+            &mut last_payload,
+            &mut prompt_tokens,
+            &mut completion_tokens,
+            &mut cache_read_tokens,
+            &mut reasoning_tokens,
+            &mut tool_calls,
+        )
+        .unwrap();
+
+        assert_eq!(content, "hello cloudcode");
+        assert_eq!(*deltas.lock().unwrap(), vec!["hello cloudcode".to_string()]);
+        assert_eq!(prompt_tokens, 3);
+        assert_eq!(completion_tokens, 2);
+        assert!(last_payload
+            .as_ref()
+            .and_then(|payload| payload.get("response"))
+            .is_none());
+    }
+
+    #[test]
+    fn cloudcode_project_id_reads_env_before_google_oauth_credentials() {
+        let _guard = crate::hermes_auth::HERMES_AUTH_TEST_ENV_LOCK
+            .lock()
+            .unwrap();
+        let old_hermes_home = std::env::var_os("HERMES_HOME");
+        let old_project = std::env::var_os("HERMES_GEMINI_PROJECT_ID");
+        let old_google_project = std::env::var_os("GOOGLE_CLOUD_PROJECT");
+        let old_gcloud_project = std::env::var_os("GCLOUD_PROJECT");
+        let dir = std::env::temp_dir().join(format!(
+            "synthchat-cloudcode-project-{}",
+            crate::models::new_id("test")
+        ));
+        let auth_dir = dir.join("auth");
+        std::fs::create_dir_all(&auth_dir).unwrap();
+        std::fs::write(
+            auth_dir.join("google_oauth.json"),
+            json!({
+                "access": "google-access-token",
+                "refresh": "refresh-token|credential-project|managed-project",
+                "expires": 32503680000000u64
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        std::env::set_var("HERMES_HOME", &dir);
+        std::env::remove_var("GOOGLE_CLOUD_PROJECT");
+        std::env::remove_var("GCLOUD_PROJECT");
+        std::env::set_var("HERMES_GEMINI_PROJECT_ID", "env-project");
+        assert_eq!(cloudcode_project_id(), "env-project");
+
+        std::env::remove_var("HERMES_GEMINI_PROJECT_ID");
+        assert_eq!(cloudcode_project_id(), "credential-project");
+
+        restore_env("HERMES_HOME", old_hermes_home);
+        restore_env("HERMES_GEMINI_PROJECT_ID", old_project);
+        restore_env("GOOGLE_CLOUD_PROJECT", old_google_project);
+        restore_env("GCLOUD_PROJECT", old_gcloud_project);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn gemini_stream_tool_calls_collect_function_call_chunks() {
         let payload = json!({
             "candidates": [{
@@ -623,5 +1028,13 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"], "terminal");
         assert_eq!(calls[0]["function"]["arguments"], json!({"command": "pwd"}));
+    }
+
+    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
     }
 }

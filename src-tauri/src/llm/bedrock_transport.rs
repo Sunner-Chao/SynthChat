@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, time::Instant};
 
 use chrono::Utc;
 use futures::StreamExt;
@@ -73,17 +70,20 @@ pub(super) async fn complete_bedrock_compatible(
     let headers = bedrock_sigv4_headers(&request_url, &region, &credentials, &body_text)?;
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(provider.timeout_seconds.max(1)))
+        .timeout(provider_request_timeout_duration(provider, model))
         .build()
         .map_err(|error| AppError::Llm(error.to_string()))?;
     let started_at = Instant::now();
-    let response = client
-        .post(request_url.clone())
-        .headers(headers)
-        .body(body_text)
-        .send()
-        .await
-        .map_err(|error| AppError::Llm(error.to_string()))?;
+    let response = send_llm_request_with_stale_timeout(
+        client
+            .post(request_url.clone())
+            .headers(headers)
+            .body(body_text),
+        provider,
+        model,
+        "bedrock converse request",
+    )
+    .await?;
 
     let status = response.status();
     let response_headers = response.headers().clone();
@@ -112,7 +112,12 @@ pub(super) async fn complete_bedrock_compatible(
         retry_reason: None,
     };
     if let Some(callback) = options.stream_delta_callback.as_ref() {
-        let reply = read_bedrock_event_stream(response, callback).await?;
+        let reply = read_bedrock_event_stream(
+            response,
+            callback,
+            provider_stream_stale_timeout_duration(provider, model),
+        )
+        .await?;
         return Ok(with_reply_metadata_and_transport(
             reply,
             provider,
@@ -128,8 +133,8 @@ pub(super) async fn complete_bedrock_compatible(
         .map_err(|error| AppError::Llm(format!("failed to read bedrock response: {error}")))?;
     let payload = serde_json::from_str::<Value>(&text).map_err(|error| {
         AppError::Llm(format!(
-            "invalid bedrock response ({status}): {error}; body: {}",
-            response_preview(&text)
+            "invalid bedrock response ({status}): {error}; {}",
+            invalid_response_body_detail(&text, &response_headers)
         ))
     })?;
     parse_bedrock_converse(payload).map(|reply| {
@@ -146,6 +151,7 @@ pub(super) async fn complete_bedrock_compatible(
 async fn read_bedrock_event_stream(
     response: reqwest::Response,
     callback: &LlmDeltaCallback,
+    stale_timeout: Option<std::time::Duration>,
 ) -> AppResult<LlmReply> {
     let mut buffer = Vec::<u8>::new();
     let mut content = String::new();
@@ -155,7 +161,22 @@ async fn read_bedrock_event_stream(
     let mut tool_uses = BTreeMap::<usize, BedrockStreamToolUse>::new();
     let mut stream = response.bytes_stream();
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next_chunk = if let Some(timeout) = stale_timeout {
+            tokio::time::timeout(timeout, stream.next())
+                .await
+                .map_err(|_| {
+                    AppError::Llm(format!(
+                        "bedrock stream stale: no provider bytes for {}s",
+                        timeout.as_secs_f64()
+                    ))
+                })?
+        } else {
+            stream.next().await
+        };
+        let Some(chunk) = next_chunk else {
+            break;
+        };
         let chunk =
             chunk.map_err(|e| AppError::Llm(format!("failed to read bedrock stream: {e}")))?;
         buffer.extend_from_slice(&chunk);
@@ -665,15 +686,24 @@ fn bedrock_aws_credentials(provider: &LlmProvider) -> AppResult<AwsCredentials> 
         }
     }
 
-    let access_key = std::env::var("AWS_ACCESS_KEY_ID")
-        .map_err(|_| AppError::Llm("Bedrock requires AWS_ACCESS_KEY_ID".into()))?;
-    let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
-        .map_err(|_| AppError::Llm("Bedrock requires AWS_SECRET_ACCESS_KEY".into()))?;
-    Ok(AwsCredentials {
-        access_key,
-        secret_key,
-        session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
-    })
+    if let (Ok(access_key), Ok(secret_key)) = (
+        std::env::var("AWS_ACCESS_KEY_ID"),
+        std::env::var("AWS_SECRET_ACCESS_KEY"),
+    ) {
+        return Ok(AwsCredentials {
+            access_key,
+            secret_key,
+            session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
+        });
+    }
+
+    if let Some(credentials) = credentials_from_aws_shared_credentials(&bedrock_aws_profile()) {
+        return Ok(credentials);
+    }
+
+    Err(AppError::Llm(
+        "Bedrock requires AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or static credentials in AWS_PROFILE".into(),
+    ))
 }
 
 fn credentials_from_compound(value: &str, env_prefix: Option<&str>) -> Option<AwsCredentials> {
@@ -695,6 +725,82 @@ fn credentials_from_compound(value: &str, env_prefix: Option<&str>) -> Option<Aw
         access_key: access_key.to_string(),
         secret_key: secret_key.to_string(),
         session_token: token_from_value.or(token_from_env),
+    })
+}
+
+fn bedrock_aws_profile() -> String {
+    std::env::var("AWS_PROFILE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "default".into())
+}
+
+fn bedrock_shared_credentials_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("AWS_SHARED_CREDENTIALS_FILE")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| home_dir().map(|dir| dir.join(".aws").join("credentials")))
+}
+
+fn credentials_from_aws_shared_credentials(profile: &str) -> Option<AwsCredentials> {
+    let path = bedrock_shared_credentials_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    credentials_from_aws_shared_credentials_text(profile, &text)
+}
+
+fn credentials_from_aws_shared_credentials_text(
+    profile: &str,
+    text: &str,
+) -> Option<AwsCredentials> {
+    let target = profile.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let mut in_target = false;
+    let mut access_key: Option<String> = None;
+    let mut secret_key: Option<String> = None;
+    let mut session_token: Option<String> = None;
+
+    for raw_line in text.lines() {
+        let mut line = raw_line;
+        if let Some((before, _)) = line.split_once('#') {
+            line = before;
+        }
+        if let Some((before, _)) = line.split_once(';') {
+            line = before;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            let section = line.trim_start_matches('[').trim_end_matches(']').trim();
+            in_target = section == target;
+            continue;
+        }
+        if !in_target {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim().to_ascii_lowercase().as_str() {
+            "aws_access_key_id" => access_key = Some(value.to_string()),
+            "aws_secret_access_key" => secret_key = Some(value.to_string()),
+            "aws_session_token" => session_token = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    Some(AwsCredentials {
+        access_key: access_key?,
+        secret_key: secret_key?,
+        session_token,
     })
 }
 
@@ -807,5 +913,26 @@ mod tests {
         assert_eq!(calls[0]["id"], "tooluse_123");
         assert_eq!(calls[0]["function"]["name"], "terminal");
         assert_eq!(calls[0]["function"]["arguments"], json!({"command": "pwd"}));
+    }
+
+    #[test]
+    fn bedrock_shared_credentials_parser_reads_selected_profile() {
+        let text = r#"
+            [default]
+            aws_access_key_id = default-key
+            aws_secret_access_key = default-secret
+
+            [prod]
+            aws_access_key_id = prod-key # trailing comment
+            aws_secret_access_key = prod-secret ; another comment
+            aws_session_token = prod-token
+        "#;
+
+        let credentials = credentials_from_aws_shared_credentials_text("prod", text).unwrap();
+
+        assert_eq!(credentials.access_key, "prod-key");
+        assert_eq!(credentials.secret_key, "prod-secret");
+        assert_eq!(credentials.session_token.as_deref(), Some("prod-token"));
+        assert!(credentials_from_aws_shared_credentials_text("missing", text).is_none());
     }
 }

@@ -10,22 +10,49 @@ use std::{
 };
 
 use serde_json::{json, Value};
+use tauri::AppHandle;
 use tokio::{io::AsyncWriteExt, process::Command};
 
 use crate::{
     error::{AppError, AppResult},
-    models::AgentRunRecord,
+    models::{
+        new_id, now_iso, AgentDefinition, AgentRunRecord, ChatMessage, PluginAuxiliaryTaskSummary,
+    },
     store::AppStore,
 };
 
-use super::{delegation_request::DelegateTaskRequest, redact_sensitive_text, truncate_for_prompt};
+use super::{
+    append_parent_phase_event, append_tool_approval_request, available_mcp_tool_definitions,
+    decision_parser::PROVIDER_TOOL_CALL_META_KEY, delegation_request::DelegateTaskRequest,
+    disk_cleanup_post_tool_call_hook, disk_cleanup_session_end_hook, emit_agent_run_record,
+    execute_recovery_internal_tool, execute_recovery_mcp_tool, is_internal_tool, kanban_block_tool,
+    kanban_comment_tool, kanban_complete_tool, kanban_create_tool, kanban_decompose_tool,
+    kanban_heartbeat_tool, kanban_link_tool, kanban_list_tool, kanban_show_tool,
+    kanban_specify_tool, kanban_unblock_tool, langfuse_record_hook, record_tool_event_for_run,
+    record_tool_started_for_run, redact_sensitive_text, resolve_mcp_tool, tool_approval_reason,
+    truncate_for_prompt, ToolExecutionContext,
+};
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 const MAX_TIMEOUT_SECONDS: u64 = 300;
 const PYTHON_PLUGIN_HOOK_TIMEOUT_SECONDS: u64 = 60;
 const PYTHON_PLUGIN_TOOL_CACHE_TTL: Duration = Duration::from_secs(30);
+const PYTHON_PLUGIN_BRIDGE_TOOLS: &[&str] = &[
+    "kanban_create",
+    "kanban_decompose",
+    "kanban_specify",
+    "kanban_list",
+    "kanban_show",
+    "kanban_complete",
+    "kanban_block",
+    "kanban_unblock",
+    "kanban_heartbeat",
+    "kanban_comment",
+    "kanban_link",
+];
 const PYTHON_PLUGIN_HOOK_RUNNER: &str = r#"
 import asyncio
+import importlib.metadata
 import importlib.util
 import inspect
 import json
@@ -34,16 +61,25 @@ import sys
 import traceback
 
 class PluginContext:
-    def __init__(self, plugin_dir=""):
+    def __init__(self, plugin_dir="", bridge_tools=None):
         self.plugin_dir = plugin_dir
         self.hooks = {}
         self.commands = {}
         self.tools = {}
+        self.global_tools = None
+        self.bridge_tools = set(str(name) for name in (bridge_tools or []))
+        self.allow_external_dispatch = False
         self.skills = {}
+        self.auxiliary_tasks = {}
         self.injected_messages = []
+        self.context_engine = None
 
     def register_hook(self, hook_name, callback):
         self.hooks.setdefault(str(hook_name), []).append(callback)
+
+    def register_context_engine(self, engine):
+        self.context_engine = engine
+        return None
 
     def register_tool(
         self,
@@ -114,8 +150,78 @@ class PluginContext:
         }
         return None
 
-    def register_auxiliary_task(self, *args, **kwargs):
+    def register_auxiliary_task(self, key, *, display_name, description, defaults=None):
+        clean = str(key or "").strip()
+        if not clean:
+            raise ValueError("plugin auxiliary task key must be non-empty")
+        if not all(ch.isalnum() or ch == "_" for ch in clean):
+            raise ValueError("plugin auxiliary task key must contain only alphanumeric characters and underscores")
+        builtin = {
+            "vision",
+            "compression",
+            "web_extract",
+            "approval",
+            "goal_judge",
+            "mcp",
+            "title_generation",
+            "skills_hub",
+            "triage_specifier",
+            "kanban_decomposer",
+            "profile_describer",
+            "curator",
+        }
+        if clean in builtin:
+            raise ValueError("plugin auxiliary task key is reserved for a built-in task: " + clean)
+        merged_defaults = {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 60,
+            "extra_body": {},
+        }
+        if isinstance(defaults, dict):
+            merged_defaults.update(defaults)
+        self.auxiliary_tasks[clean] = {
+            "key": clean,
+            "display_name": str(display_name or clean),
+            "description": str(description or ""),
+            "defaults": merged_defaults,
+        }
         return None
+
+    def dispatch_tool(self, tool_name, args=None, **kwargs):
+        clean_tool = str(tool_name or "").strip()
+        registry = self.global_tools if isinstance(self.global_tools, dict) else self.tools
+        tool = registry.get(clean_tool)
+        if not tool:
+            if clean_tool in self.bridge_tools or self.allow_external_dispatch:
+                payload = args or {}
+                return json.dumps({
+                    "__synthchat_dispatch_tool__": {
+                        "tool_name": clean_tool,
+                        "args": _jsonable(payload),
+                        "kwargs": _jsonable(kwargs),
+                    }
+                })
+            raise ValueError("plugin tool not found: " + clean_tool)
+        for name in tool.get("requires_env") or []:
+            if isinstance(name, dict):
+                name = name.get("name") or name.get("key") or name.get("var") or name.get("env")
+            if name and not os.environ.get(str(name)):
+                raise RuntimeError("missing required env: " + str(name))
+        check_fn = tool.get("check_fn")
+        if callable(check_fn):
+            check = check_fn()
+            if inspect.isawaitable(check):
+                raise RuntimeError("async check_fn is not supported by dispatch_tool")
+            if check is False:
+                raise RuntimeError("plugin tool requirement check failed")
+        payload = args or {}
+        result = tool["handler"](payload, **kwargs)
+        if inspect.isawaitable(result):
+            raise RuntimeError("async tool handler is not supported by dispatch_tool")
+        return json.dumps(_jsonable(result))
 
     def inject_message(self, content, role="user"):
         text = str(content or "").strip()
@@ -142,42 +248,343 @@ async def _call(callback, kwargs):
 
 async def main():
     request = json.loads(sys.stdin.read() or "{}")
+    plugin_specs = request.get("plugins") or []
     plugin_dir = request.get("plugin_dir") or ""
     plugin_id = request.get("plugin_id") or "plugin"
+    plugin_source = request.get("plugin_source") or ""
+    entry_point = request.get("entry_point") or ""
     event = request.get("event") or ""
     command_name = request.get("command_name") or ""
     raw_args = request.get("raw_args") or ""
     tool_name = request.get("tool_name") or ""
     tool_args = request.get("tool_args") or {}
+    context_engine_action = request.get("context_engine_action") or ""
+    context_engine_messages = request.get("context_engine_messages") or []
+    context_engine_current_tokens = request.get("context_engine_current_tokens")
+    context_engine_focus_topic = request.get("context_engine_focus_topic")
+    context_engine_usage = request.get("context_engine_usage") or {}
+    context_engine_model = request.get("context_engine_model") or {}
+    context_engine_lifecycle_event = request.get("context_engine_lifecycle_event") or ""
+    context_engine_session_id = request.get("context_engine_session_id") or ""
+    context_engine_lifecycle_extra = request.get("context_engine_lifecycle_extra") or {}
     list_tools = bool(request.get("list_tools"))
     list_skills = bool(request.get("list_skills"))
+    list_commands = bool(request.get("list_commands"))
+    list_auxiliary_tasks = bool(request.get("list_auxiliary_tasks"))
     kwargs = request.get("kwargs") or {}
-    init_file = os.path.join(plugin_dir, "__init__.py")
-    if not os.path.isfile(init_file):
-        print(json.dumps({"results": []}))
+
+    def _safe_env_component(value):
+        clean = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(value or "").strip())
+        return clean or "context_engine"
+
+    def _prepare_context_engine_env(spec_info):
+        spec_plugin_id = spec_info.get("plugin_id") or plugin_id
+        spec_plugin_name = spec_info.get("plugin_name") or spec_plugin_id
+        spec_plugin_source = spec_info.get("plugin_source") or plugin_source
+        spec_plugin_dir = spec_info.get("plugin_dir") or plugin_dir
+        is_context_engine = (
+            spec_plugin_source == "context_engine"
+            or str(spec_plugin_id).startswith("context-engine/")
+        )
+        if not is_context_engine:
+            return
+        engine_name = _safe_env_component(spec_plugin_name)
+        explicit_root = (
+            os.environ.get("SYNTHCHAT_CONTEXT_ENGINE_STATE_ROOT")
+            or os.environ.get("HERMES_CONTEXT_ENGINE_STATE_ROOT")
+        )
+        hermes_home = os.environ.get("HERMES_HOME")
+        if explicit_root:
+            state_root = explicit_root
+        elif hermes_home:
+            state_root = os.path.join(hermes_home, "context-engine-state")
+        else:
+            state_root = os.path.join(spec_plugin_dir or ".", ".synthchat-state")
+            hermes_home = os.path.join(state_root, ".hermes")
+            os.environ.setdefault("HERMES_HOME", hermes_home)
+        state_dir = os.path.join(state_root, engine_name)
+        os.makedirs(state_dir, exist_ok=True)
+        os.environ["SYNTHCHAT_CONTEXT_ENGINE_NAME"] = engine_name
+        os.environ["HERMES_CONTEXT_ENGINE_NAME"] = engine_name
+        os.environ["SYNTHCHAT_CONTEXT_ENGINE_STATE_DIR"] = state_dir
+        os.environ["HERMES_CONTEXT_ENGINE_STATE_DIR"] = state_dir
+        os.environ.setdefault("SYNTHCHAT_HERMES_HOME", os.environ.get("HERMES_HOME", ""))
+
+    def _load_module(spec_info):
+        _prepare_context_engine_env(spec_info)
+        spec_plugin_dir = spec_info.get("plugin_dir") or ""
+        spec_plugin_id = spec_info.get("plugin_id") or "plugin"
+        spec_plugin_source = spec_info.get("plugin_source") or ""
+        spec_entry_point = spec_info.get("entry_point") or ""
+        if spec_plugin_source == "entrypoint":
+            module = None
+            eps = importlib.metadata.entry_points()
+            if hasattr(eps, "select"):
+                group_eps = eps.select(group="hermes_agent.plugins")
+            elif isinstance(eps, dict):
+                group_eps = eps.get("hermes_agent.plugins", [])
+            else:
+                group_eps = [ep for ep in eps if getattr(ep, "group", "") == "hermes_agent.plugins"]
+            for ep in group_eps:
+                if ep.name == spec_plugin_id or ep.value == spec_entry_point:
+                    module = ep.load()
+                    break
+            if module is None:
+                raise RuntimeError("entry point plugin not found: " + spec_plugin_id)
+            return module
+        init_file = os.path.join(spec_plugin_dir, "__init__.py")
+        if not os.path.isfile(init_file):
+            return None
+        parent_dir = os.path.dirname(spec_plugin_dir)
+        if parent_dir and parent_dir not in sys.path:
+            sys.path.insert(0, parent_dir)
+        module_name = "synthchat_hermes_plugin_" + "".join(
+            ch if ch.isalnum() else "_" for ch in spec_plugin_id
+        )
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            init_file,
+            submodule_search_locations=[spec_plugin_dir],
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("cannot load plugin module")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    bridge_tools = request.get("bridge_tools") or []
+    allow_external_dispatch = bool(request.get("allow_external_dispatch"))
+
+    def _load_context(spec_info):
+        module = _load_module(spec_info)
+        if module is None:
+            return None
+        ctx = PluginContext(spec_info.get("plugin_dir") or "", bridge_tools)
+        ctx.allow_external_dispatch = allow_external_dispatch
+        register = getattr(module, "register", None)
+        if callable(register):
+            register(ctx)
+        if ctx.context_engine is None:
+            for value in vars(module).values():
+                if not inspect.isclass(value):
+                    continue
+                if value.__module__ != getattr(module, "__name__", ""):
+                    continue
+                if hasattr(value, "get_tool_schemas") and hasattr(value, "handle_tool_call"):
+                    try:
+                        ctx.context_engine = value()
+                        break
+                    except Exception:
+                        pass
+        return ctx
+
+    if plugin_specs and command_name:
+        contexts = []
+        global_tools = {}
+        for spec_info in plugin_specs:
+            ctx = _load_context(spec_info)
+            if ctx is None:
+                continue
+            contexts.append(ctx)
+            for name, tool in ctx.tools.items():
+                global_tools.setdefault(name, tool)
+        for ctx in contexts:
+            ctx.global_tools = global_tools
+        clean = str(command_name).lower().strip().lstrip("/").replace(" ", "-")
+        for ctx in contexts:
+            command = ctx.commands.get(clean)
+            if not command:
+                continue
+            result = command["handler"](raw_args)
+            if inspect.isawaitable(result):
+                result = await result
+            injected = []
+            for item in contexts:
+                injected.extend(item.injected_messages)
+            print(json.dumps({
+                "handled": True,
+                "result": _jsonable(result),
+                "injected_messages": injected,
+            }))
+            return
+        print(json.dumps({"handled": False}))
         return
-    parent_dir = os.path.dirname(plugin_dir)
-    if parent_dir and parent_dir not in sys.path:
-        sys.path.insert(0, parent_dir)
-    module_name = "synthchat_hermes_plugin_" + "".join(
-        ch if ch.isalnum() else "_" for ch in plugin_id
-    )
-    spec = importlib.util.spec_from_file_location(
-        module_name,
-        init_file,
-        submodule_search_locations=[plugin_dir],
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError("cannot load plugin module")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    ctx = PluginContext(plugin_dir)
+
+    _prepare_context_engine_env({
+        "plugin_id": plugin_id,
+        "plugin_name": request.get("plugin_name") or plugin_id,
+        "plugin_source": plugin_source,
+        "plugin_dir": plugin_dir,
+    })
+
+    if plugin_source == "entrypoint":
+        module = None
+        eps = importlib.metadata.entry_points()
+        if hasattr(eps, "select"):
+            group_eps = eps.select(group="hermes_agent.plugins")
+        elif isinstance(eps, dict):
+            group_eps = eps.get("hermes_agent.plugins", [])
+        else:
+            group_eps = [ep for ep in eps if getattr(ep, "group", "") == "hermes_agent.plugins"]
+        for ep in group_eps:
+            if ep.name == plugin_id or ep.value == entry_point:
+                module = ep.load()
+                break
+        if module is None:
+            raise RuntimeError("entry point plugin not found: " + plugin_id)
+    else:
+        init_file = os.path.join(plugin_dir, "__init__.py")
+        if not os.path.isfile(init_file):
+            print(json.dumps({"results": []}))
+            return
+        parent_dir = os.path.dirname(plugin_dir)
+        if parent_dir and parent_dir not in sys.path:
+            sys.path.insert(0, parent_dir)
+        module_name = "synthchat_hermes_plugin_" + "".join(
+            ch if ch.isalnum() else "_" for ch in plugin_id
+        )
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            init_file,
+            submodule_search_locations=[plugin_dir],
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("cannot load plugin module")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    ctx = PluginContext(plugin_dir, bridge_tools)
+    ctx.allow_external_dispatch = allow_external_dispatch
     register = getattr(module, "register", None)
     if callable(register):
         register(ctx)
+    if ctx.context_engine is None:
+        for value in vars(module).values():
+            if not inspect.isclass(value):
+                continue
+            if value.__module__ != getattr(module, "__name__", ""):
+                continue
+            if hasattr(value, "compress") or (hasattr(value, "get_tool_schemas") and hasattr(value, "handle_tool_call")):
+                try:
+                    ctx.context_engine = value()
+                    break
+                except Exception:
+                    pass
+    if context_engine_action:
+        engine = getattr(ctx, "context_engine", None)
+        if engine is None:
+            print(json.dumps({"ok": False, "error": "context engine was not registered"}))
+            return
+        if context_engine_action == "compress":
+            if not hasattr(engine, "compress"):
+                print(json.dumps({"ok": False, "error": "context engine does not implement compress"}))
+                return
+            result = engine.compress(
+                context_engine_messages,
+                current_tokens=context_engine_current_tokens,
+                focus_topic=context_engine_focus_topic,
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            print(json.dumps({"ok": True, "messages": _jsonable(result)}))
+            return
+        if context_engine_action == "status":
+            status = engine.get_status() if hasattr(engine, "get_status") else {}
+            if inspect.isawaitable(status):
+                status = await status
+            print(json.dumps({"ok": True, "status": _jsonable(status)}))
+            return
+        if context_engine_action == "update_from_response":
+            method = getattr(engine, "update_from_response", None)
+            if method is None:
+                print(json.dumps({"ok": True, "implemented": False}))
+                return
+            result = method(context_engine_usage)
+            if inspect.isawaitable(result):
+                result = await result
+            print(json.dumps({"ok": True, "implemented": True, "result": _jsonable(result)}))
+            return
+        if context_engine_action == "update_model":
+            method = getattr(engine, "update_model", None)
+            if method is None:
+                print(json.dumps({"ok": True, "implemented": False}))
+                return
+            model_payload = context_engine_model or {}
+            result = method(
+                str(model_payload.get("model") or ""),
+                int(model_payload.get("context_length") or 0),
+                base_url=str(model_payload.get("base_url") or ""),
+                api_key=str(model_payload.get("api_key") or ""),
+                provider=str(model_payload.get("provider") or ""),
+                api_mode=str(model_payload.get("api_mode") or ""),
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            print(json.dumps({"ok": True, "implemented": True, "result": _jsonable(result)}))
+            return
+        if context_engine_action == "lifecycle":
+            event_name = str(context_engine_lifecycle_event or "").strip()
+            method = getattr(engine, event_name, None)
+            if method is None:
+                print(json.dumps({"ok": True, "implemented": False}))
+                return
+            if event_name == "on_session_start":
+                result = method(context_engine_session_id, **context_engine_lifecycle_extra)
+            elif event_name == "on_session_end":
+                result = method(context_engine_session_id, context_engine_messages)
+            elif event_name == "on_session_reset":
+                result = method()
+            else:
+                print(json.dumps({"ok": False, "error": "unsupported context engine lifecycle event: " + event_name}))
+                return
+            if inspect.isawaitable(result):
+                result = await result
+            print(json.dumps({"ok": True, "implemented": True, "result": _jsonable(result)}))
+            return
+        if context_engine_action == "should_compress_preflight":
+            method = getattr(engine, "should_compress_preflight", None)
+            if method is None:
+                print(json.dumps({"ok": True, "implemented": False}))
+                return
+            try:
+                result = method(context_engine_messages)
+            except TypeError:
+                result = method(messages=context_engine_messages, current_tokens=context_engine_current_tokens)
+            if inspect.isawaitable(result):
+                result = await result
+            print(json.dumps({"ok": True, "implemented": True, "decision": bool(result)}))
+            return
+        if context_engine_action == "should_compress":
+            method = getattr(engine, "should_compress", None)
+            if method is None:
+                print(json.dumps({"ok": True, "implemented": False}))
+                return
+            try:
+                result = method(context_engine_current_tokens)
+            except TypeError:
+                result = method(prompt_tokens=context_engine_current_tokens)
+            if inspect.isawaitable(result):
+                result = await result
+            print(json.dumps({"ok": True, "implemented": True, "decision": bool(result)}))
+            return
+        print(json.dumps({"ok": False, "error": "unsupported context engine action: " + str(context_engine_action)}))
+        return
     if list_skills:
         print(json.dumps({"skills": list(ctx.skills.values())}))
+        return
+    if list_commands:
+        commands = []
+        for name, command in ctx.commands.items():
+            commands.append({
+                "name": name,
+                "description": _jsonable(command.get("description") or "Plugin command"),
+                "args_hint": _jsonable(command.get("args_hint") or ""),
+            })
+        print(json.dumps({"commands": commands}))
+        return
+    if list_auxiliary_tasks:
+        print(json.dumps({"auxiliary_tasks": list(ctx.auxiliary_tasks.values())}))
         return
     if list_tools:
         tools = []
@@ -209,6 +616,25 @@ async def main():
                 "description": _jsonable(tool.get("description") or ""),
                 "emoji": _jsonable(tool.get("emoji") or ""),
             })
+        engine = getattr(ctx, "context_engine", None)
+        if engine is not None and hasattr(engine, "get_tool_schemas"):
+            schemas = engine.get_tool_schemas()
+            if inspect.isawaitable(schemas):
+                schemas = await schemas
+            for schema in schemas or []:
+                if not isinstance(schema, dict):
+                    continue
+                name = str(schema.get("name") or schema.get("function", {}).get("name") or "").strip()
+                if not name:
+                    continue
+                function_schema = schema.get("function") if isinstance(schema.get("function"), dict) else schema
+                tools.append({
+                    "name": name,
+                    "toolset": "context_engine",
+                    "schema": _jsonable(function_schema),
+                    "description": _jsonable(function_schema.get("description") or ""),
+                    "emoji": "",
+                })
         print(json.dumps({"tools": tools}))
         return
     if command_name:
@@ -229,27 +655,43 @@ async def main():
     if tool_name:
         clean_tool = str(tool_name).strip()
         tool = ctx.tools.get(clean_tool)
-        if not tool:
-            print(json.dumps({"ok": False, "error": "plugin did not register requested tool"}))
+        if tool:
+            for name in tool.get("requires_env") or []:
+                if isinstance(name, dict):
+                    name = name.get("name") or name.get("key") or name.get("var") or name.get("env")
+                if name and not os.environ.get(str(name)):
+                    print(json.dumps({"ok": False, "error": "missing required env: " + str(name)}))
+                    return
+            check_fn = tool.get("check_fn")
+            if callable(check_fn):
+                check = check_fn()
+                if inspect.isawaitable(check):
+                    check = await check
+                if check is False:
+                    print(json.dumps({"ok": False, "error": "plugin tool requirement check failed"}))
+                    return
+            result = tool["handler"](tool_args)
+            if inspect.isawaitable(result):
+                result = await result
+            print(json.dumps({"ok": True, "result": _jsonable(result)}))
             return
-        for name in tool.get("requires_env") or []:
-            if isinstance(name, dict):
-                name = name.get("name") or name.get("key") or name.get("var") or name.get("env")
-            if name and not os.environ.get(str(name)):
-                print(json.dumps({"ok": False, "error": "missing required env: " + str(name)}))
+        engine = getattr(ctx, "context_engine", None)
+        if engine is not None and hasattr(engine, "get_tool_schemas") and hasattr(engine, "handle_tool_call"):
+            schemas = engine.get_tool_schemas()
+            if inspect.isawaitable(schemas):
+                schemas = await schemas
+            engine_tool_names = {
+                str(schema.get("name") or schema.get("function", {}).get("name") or "").strip()
+                for schema in (schemas or [])
+                if isinstance(schema, dict)
+            }
+            if clean_tool in engine_tool_names:
+                result = engine.handle_tool_call(clean_tool, tool_args)
+                if inspect.isawaitable(result):
+                    result = await result
+                print(json.dumps({"ok": True, "result": _jsonable(result)}))
                 return
-        check_fn = tool.get("check_fn")
-        if callable(check_fn):
-            check = check_fn()
-            if inspect.isawaitable(check):
-                check = await check
-            if check is False:
-                print(json.dumps({"ok": False, "error": "plugin tool requirement check failed"}))
-                return
-        result = tool["handler"](tool_args)
-        if inspect.isawaitable(result):
-            result = await result
-        print(json.dumps({"ok": True, "result": _jsonable(result)}))
+        print(json.dumps({"ok": False, "error": "plugin did not register requested tool"}))
         return
     results = []
     for callback in ctx.hooks.get(event, []):
@@ -276,6 +718,8 @@ struct PythonPluginHookSpec {
     plugin_id: String,
     plugin_name: String,
     path: PathBuf,
+    source: String,
+    entry_point: String,
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +754,31 @@ pub(super) struct PythonPluginCommandResult {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct PythonPluginCommandDefinition {
+    pub(super) plugin_id: String,
+    pub(super) plugin_name: String,
+    pub(super) name: String,
+    pub(super) description: String,
+    pub(super) args_hint: String,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ContextEngineCompressedMessage {
+    pub(super) role: String,
+    pub(super) content: String,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PythonPluginBridgeContext<'a> {
+    pub(super) agent: &'a AgentDefinition,
+    pub(super) conversation_id: &'a str,
+    pub(super) run_id: &'a str,
+    pub(super) tool_context: ToolExecutionContext,
+    pub(super) app: Option<&'a AppHandle>,
+    pub(super) allow_mutating_tools: bool,
+}
+
+#[derive(Debug, Clone)]
 struct CachedPythonPluginTools {
     captured_at: Instant,
     tools: Vec<PythonPluginToolDefinition>,
@@ -326,6 +795,16 @@ struct CachedPythonPluginSkills {
 
 static PYTHON_PLUGIN_SKILL_CACHE: OnceLock<Mutex<HashMap<String, CachedPythonPluginSkills>>> =
     OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct CachedPythonPluginAuxiliaryTasks {
+    captured_at: Instant,
+    tasks: Vec<PluginAuxiliaryTaskSummary>,
+}
+
+static PYTHON_PLUGIN_AUXILIARY_TASK_CACHE: OnceLock<
+    Mutex<HashMap<String, CachedPythonPluginAuxiliaryTasks>>,
+> = OnceLock::new();
 
 #[derive(Debug)]
 struct ShellHookDiagnosticRun {
@@ -350,6 +829,23 @@ pub(super) async fn run_pre_tool_call_hooks(
     tool_name: &str,
     payload: &Value,
 ) -> AppResult<()> {
+    let plugin_payload = json!({
+        "tool_name": tool_name,
+        "args": payload,
+        "tool_input": payload,
+        "task_id": run_id,
+        "session_id": run_id,
+    });
+    let _ = langfuse_record_hook(store, "pre_tool_call", run_id, &plugin_payload, None);
+    if security_guidance_block_mode_enabled() {
+        let findings = security_guidance_scan_tool_args(tool_name, payload);
+        if !findings.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "security-guidance refused this write: {}\n\nTo override, unset SECURITY_GUIDANCE_BLOCK and retry.",
+                security_guidance_warning_block(&findings)
+            )));
+        }
+    }
     for spec in shell_hook_specs(store, "pre_tool_call")? {
         if !spec.matches_tool(tool_name) {
             continue;
@@ -362,13 +858,6 @@ pub(super) async fn run_pre_tool_call_hooks(
             }
         }
     }
-    let plugin_payload = json!({
-        "tool_name": tool_name,
-        "args": payload,
-        "tool_input": payload,
-        "task_id": run_id,
-        "session_id": run_id,
-    });
     for response in run_python_plugin_hooks(store, "pre_tool_call", &plugin_payload).await {
         if let Some(message) = shell_hook_block_message(&response) {
             return Err(AppError::BadRequest(format!(
@@ -386,6 +875,8 @@ pub(super) async fn run_post_tool_call_hooks(
     payload: &Value,
     result: &Value,
 ) -> AppResult<()> {
+    let _ = disk_cleanup_post_tool_call_hook(store, run_id, tool_name, payload, result);
+    let _ = langfuse_record_hook(store, "post_tool_call", run_id, payload, Some(result));
     for spec in shell_hook_specs(store, "post_tool_call")? {
         if !spec.matches_tool(tool_name) {
             continue;
@@ -444,8 +935,13 @@ pub(super) async fn run_transform_tool_result_hooks(
     ok: bool,
     error: Option<&str>,
 ) -> String {
+    let result_text = if ok && error.is_none() {
+        security_guidance_transform_tool_result(tool_name, payload, result_text)
+    } else {
+        result_text.to_string()
+    };
     let Ok(specs) = shell_hook_specs(store, "transform_tool_result") else {
-        return result_text.to_string();
+        return result_text;
     };
     let hook_payload = json!({
         "tool_name": tool_name,
@@ -487,7 +983,261 @@ pub(super) async fn run_transform_tool_result_hooks(
             return text;
         }
     }
-    result_text.to_string()
+    result_text
+}
+
+#[derive(Debug, Clone)]
+struct SecurityGuidanceFinding {
+    rule_name: &'static str,
+    reminder: &'static str,
+}
+
+const SECURITY_GUIDANCE_MAX_SCAN_BYTES: usize = 256 * 1024;
+
+fn security_guidance_disabled() -> bool {
+    env_bool("SECURITY_GUIDANCE_DISABLE")
+}
+
+fn security_guidance_block_mode_enabled() -> bool {
+    !security_guidance_disabled() && env_bool("SECURITY_GUIDANCE_BLOCK")
+}
+
+fn env_bool(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn security_guidance_transform_tool_result(
+    tool_name: &str,
+    payload: &Value,
+    result_text: &str,
+) -> String {
+    if security_guidance_disabled() || security_guidance_block_mode_enabled() {
+        return result_text.to_string();
+    }
+    let findings = security_guidance_scan_tool_args(tool_name, payload);
+    if findings.is_empty() || security_guidance_result_is_simple_error(result_text) {
+        return result_text.to_string();
+    }
+    format!(
+        "{result_text}\n\n{}",
+        security_guidance_warning_block(&findings)
+    )
+}
+
+fn security_guidance_result_is_simple_error(result_text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(result_text) else {
+        return false;
+    };
+    value
+        .as_object()
+        .map(|object| object.contains_key("error") && object.len() <= 2)
+        .unwrap_or(false)
+}
+
+fn security_guidance_scan_tool_args(
+    tool_name: &str,
+    payload: &Value,
+) -> Vec<SecurityGuidanceFinding> {
+    if security_guidance_disabled() {
+        return Vec::new();
+    }
+    let mut findings = Vec::new();
+    for (path, content) in security_guidance_extract_written_content(tool_name, payload) {
+        findings.extend(security_guidance_scan_content(&path, &content));
+    }
+    findings.sort_by_key(|finding| finding.rule_name);
+    findings.dedup_by_key(|finding| finding.rule_name);
+    findings
+}
+
+fn security_guidance_extract_written_content(
+    tool_name: &str,
+    payload: &Value,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    match tool_name {
+        "write_file" => {
+            if let Some(content) = string_arg_from_value(payload, &["content", "text"]) {
+                out.push((
+                    string_arg_from_value(payload, &["path", "filePath"]).unwrap_or_default(),
+                    content,
+                ));
+            }
+        }
+        "patch" => {
+            let path = string_arg_from_value(payload, &["path", "filePath"]).unwrap_or_default();
+            for key in [
+                "patch",
+                "new_string",
+                "newString",
+                "replacement",
+                "content",
+                "diff",
+            ] {
+                if let Some(content) = string_arg_from_value(payload, &[key]) {
+                    out.push((path.clone(), content));
+                }
+            }
+        }
+        "skill_manage" => {
+            let action = string_arg_from_value(payload, &["action"])
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if matches!(
+                action.as_str(),
+                "write_file" | "patch" | "edit" | "create" | "install_content"
+            ) {
+                let path = string_arg_from_value(payload, &["filePath", "file_path", "path"])
+                    .unwrap_or_default();
+                for key in [
+                    "fileContent",
+                    "file_content",
+                    "content",
+                    "newString",
+                    "new_string",
+                    "patch",
+                ] {
+                    if let Some(content) = string_arg_from_value(payload, &[key]) {
+                        out.push((path.clone(), content));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn string_arg_from_value(payload: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| payload.get(*key).and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+fn security_guidance_scan_content(path: &str, content: &str) -> Vec<SecurityGuidanceFinding> {
+    if content.is_empty()
+        || content
+            .as_bytes()
+            .len()
+            .saturating_sub(SECURITY_GUIDANCE_MAX_SCAN_BYTES)
+            > 0
+    {
+        return Vec::new();
+    }
+    let lower = content.to_ascii_lowercase();
+    let path_lower = path.to_ascii_lowercase();
+    let mut findings = Vec::new();
+    push_security_guidance_finding(
+        &mut findings,
+        "python_eval_injection",
+        "Avoid eval/exec on untrusted input. Prefer parsing, whitelisted dispatch, or ast.literal_eval for Python literals.",
+        lower.contains("eval(") || lower.contains("exec("),
+    );
+    push_security_guidance_finding(
+        &mut findings,
+        "python_pickle_load",
+        "pickle.load/pickle.loads can execute code during deserialization. Use a safer format for untrusted data.",
+        lower.contains("pickle.load(") || lower.contains("pickle.loads("),
+    );
+    push_security_guidance_finding(
+        &mut findings,
+        "python_yaml_load",
+        "yaml.load can construct arbitrary Python objects. Use yaml.safe_load or SafeLoader unless the input is fully trusted.",
+        lower.contains("yaml.load(") && !lower.contains("safe_load") && !lower.contains("safeloader"),
+    );
+    push_security_guidance_finding(
+        &mut findings,
+        "python_os_system",
+        "os.system and shell=True are command-injection prone. Prefer subprocess with an argument list and validated inputs.",
+        lower.contains("os.system(") || lower.contains("shell=true"),
+    );
+    push_security_guidance_finding(
+        &mut findings,
+        "requests_verify_false",
+        "verify=False disables TLS certificate validation. Keep verification enabled or pin a trusted CA bundle.",
+        lower.contains("verify=false"),
+    );
+    push_security_guidance_finding(
+        &mut findings,
+        "javascript_dangerously_set_inner_html",
+        "dangerouslySetInnerHTML can introduce XSS. Sanitize HTML with a trusted sanitizer or render structured content instead.",
+        content.contains("dangerouslySetInnerHTML"),
+    );
+    push_security_guidance_finding(
+        &mut findings,
+        "crypto_ecb_mode",
+        "ECB mode leaks plaintext structure. Use an authenticated mode such as AES-GCM or ChaCha20-Poly1305.",
+        lower.contains("ecb")
+            && (lower.contains("aes") || lower.contains("cipher") || lower.contains("crypto")),
+    );
+    push_security_guidance_finding(
+        &mut findings,
+        "xxe_xml_parser",
+        "XML parsers can be XXE-prone when external entities are enabled. Disable DTD/entity resolution or use a hardened parser.",
+        lower.contains("resolve_entities=true")
+            || lower.contains("noent")
+            || lower.contains("external_general_entities"),
+    );
+    push_security_guidance_finding(
+        &mut findings,
+        "github_actions_injection",
+        "GitHub Actions expressions sourced from github.event can be attacker-controlled. Pass them through env vars and quote safely.",
+        (path_lower.contains(".github/workflows") || path_lower.ends_with(".yml") || path_lower.ends_with(".yaml"))
+            && lower.contains("${{ github.event"),
+    );
+    push_security_guidance_finding(
+        &mut findings,
+        "torch_load_without_weights_only",
+        "torch.load can execute pickle payloads. Use weights_only=True for model weights when possible.",
+        lower.contains("torch.load(") && !lower.contains("weights_only=true"),
+    );
+    findings
+}
+
+fn push_security_guidance_finding(
+    findings: &mut Vec<SecurityGuidanceFinding>,
+    rule_name: &'static str,
+    reminder: &'static str,
+    matched: bool,
+) {
+    if matched {
+        findings.push(SecurityGuidanceFinding {
+            rule_name,
+            reminder,
+        });
+    }
+}
+
+fn security_guidance_warning_block(findings: &[SecurityGuidanceFinding]) -> String {
+    let names = findings
+        .iter()
+        .map(|finding| finding.rule_name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut lines = vec![
+        "---".to_string(),
+        format!(
+            "Security guidance - {} pattern{} matched ({names})",
+            findings.len(),
+            if findings.len() == 1 { "" } else { "s" }
+        ),
+        String::new(),
+    ];
+    for finding in findings {
+        lines.push(format!("- {}: {}", finding.rule_name, finding.reminder));
+    }
+    lines.push(String::new());
+    lines.push(
+        "Pattern matches can be false positives. If the construct is safe in this context, briefly document why; otherwise fix the code before moving on.".into(),
+    );
+    lines.join("\n")
 }
 
 pub(super) async fn run_pre_llm_call_hooks(
@@ -495,9 +1245,6 @@ pub(super) async fn run_pre_llm_call_hooks(
     run_id: &str,
     user_content: &str,
 ) -> Vec<String> {
-    let Ok(specs) = shell_hook_specs(store, "pre_llm_call") else {
-        return Vec::new();
-    };
     let payload = json!({
         "messages": [{
             "role": "user",
@@ -505,6 +1252,10 @@ pub(super) async fn run_pre_llm_call_hooks(
         }],
         "user_content": user_content,
     });
+    let _ = langfuse_record_hook(store, "pre_llm_call", run_id, &payload, None);
+    let Ok(specs) = shell_hook_specs(store, "pre_llm_call") else {
+        return Vec::new();
+    };
     let mut contexts = Vec::new();
     for spec in specs {
         let Ok(Some(response)) = run_shell_hook(&spec, run_id, "llm", &payload, None).await else {
@@ -610,9 +1361,6 @@ pub(super) async fn run_post_llm_call_hooks(
     model: Option<&str>,
     provider_id: Option<&str>,
 ) {
-    let Ok(specs) = shell_hook_specs(store, "post_llm_call") else {
-        return;
-    };
     let payload = json!({
         "user_message": user_content,
         "response_text": response_text,
@@ -620,6 +1368,10 @@ pub(super) async fn run_post_llm_call_hooks(
         "model": model.unwrap_or_default(),
         "provider": provider_id.unwrap_or_default(),
     });
+    let _ = langfuse_record_hook(store, "post_llm_call", run_id, &payload, None);
+    let Ok(specs) = shell_hook_specs(store, "post_llm_call") else {
+        return;
+    };
     for spec in specs {
         let _ = run_shell_hook(&spec, run_id, "llm", &payload, None).await;
     }
@@ -627,6 +1379,7 @@ pub(super) async fn run_post_llm_call_hooks(
 }
 
 pub(super) async fn run_pre_api_request_hooks(store: &AppStore, run_id: &str, payload: &Value) {
+    let _ = langfuse_record_hook(store, "pre_api_request", run_id, payload, None);
     let Ok(specs) = shell_hook_specs(store, "pre_api_request") else {
         return;
     };
@@ -636,6 +1389,7 @@ pub(super) async fn run_pre_api_request_hooks(store: &AppStore, run_id: &str, pa
 }
 
 pub(super) async fn run_post_api_request_hooks(store: &AppStore, run_id: &str, payload: &Value) {
+    let _ = langfuse_record_hook(store, "post_api_request", run_id, payload, None);
     let Ok(specs) = shell_hook_specs(store, "post_api_request") else {
         return;
     };
@@ -676,6 +1430,26 @@ pub(super) async fn run_pre_gateway_dispatch_hooks(
         else {
             continue;
         };
+        if let Some(callback) = response
+            .get("postDeliveryCallback")
+            .or_else(|| response.get("post_delivery_callback"))
+            .or_else(|| response.get("registerPostDeliveryCallback"))
+            .or_else(|| response.get("register_post_delivery_callback"))
+        {
+            if let Some(session_key) = hermes_post_delivery_session_key(platform, inbound) {
+                let generation = response
+                    .get("generation")
+                    .or_else(|| response.get("hermesRunGeneration"))
+                    .or_else(|| response.get("hermes_run_generation"))
+                    .and_then(Value::as_i64);
+                let _ = register_hermes_post_delivery_callback(
+                    store,
+                    &session_key,
+                    generation,
+                    callback.clone(),
+                );
+            }
+        }
         match response.get("action").and_then(Value::as_str) {
             Some("skip") => {
                 let reason = response
@@ -697,12 +1471,50 @@ pub(super) async fn run_pre_gateway_dispatch_hooks(
     PreGatewayDispatchDecision::Allow
 }
 
+fn hermes_post_delivery_session_key(platform: &str, inbound: &Value) -> Option<String> {
+    for key in ["sessionKey", "session_key", "sessionId", "session_id"] {
+        if let Some(value) = inbound.get(key).and_then(Value::as_str) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    let source = inbound.get("source").unwrap_or(&Value::Null);
+    for key in [
+        "sessionKey",
+        "session_key",
+        "chat_id",
+        "chatId",
+        "channel_id",
+        "room_id",
+    ] {
+        if let Some(value) = source.get(key).and_then(Value::as_str) {
+            let value = value.trim();
+            if !value.is_empty() {
+                let thread_id = source
+                    .get("thread_id")
+                    .or_else(|| source.get("threadId"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                return Some(match thread_id {
+                    Some(thread_id) => format!("{platform}:{value}:{thread_id}"),
+                    None => format!("{platform}:{value}"),
+                });
+            }
+        }
+    }
+    None
+}
+
 pub(super) async fn run_session_lifecycle_hooks(
     store: &AppStore,
     event: &str,
     run: &crate::models::AgentRunRecord,
     extra: Value,
 ) {
+    run_selected_context_engine_lifecycle_for_run(store, event, run, &extra);
     let Ok(specs) = shell_hook_specs(store, event) else {
         return;
     };
@@ -726,11 +1538,370 @@ pub(super) async fn run_session_lifecycle_hooks(
     }
 }
 
+fn selected_context_engine_name_for_hooks() -> Option<String> {
+    env::var("SYNTHCHAT_CONTEXT_ENGINE")
+        .or_else(|_| env::var("HERMES_CONTEXT_ENGINE"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("compressor"))
+}
+
+fn run_selected_context_engine_lifecycle_for_run(
+    store: &AppStore,
+    event: &str,
+    run: &crate::models::AgentRunRecord,
+    extra: &Value,
+) {
+    if !matches!(event, "on_session_start" | "on_session_end") {
+        return;
+    }
+    let Some(engine_name) = selected_context_engine_name_for_hooks() else {
+        return;
+    };
+    let messages = if event == "on_session_end" {
+        store
+            .messages(&run.conversation_id, None)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let lifecycle_extra = json!({
+        "run_id": run.run_id,
+        "conversation_id": run.conversation_id,
+        "persona_id": run.persona_id,
+        "agent_id": run.agent_id,
+        "status": run.state,
+        "state": run.state,
+        "source": extra.get("source").cloned().unwrap_or(Value::Null),
+        "extra": extra,
+    });
+    match run_context_engine_lifecycle(
+        &engine_name,
+        event,
+        &run.conversation_id,
+        &messages,
+        &lifecycle_extra,
+    ) {
+        Ok(true) => {
+            let _ = append_parent_phase_event(
+                store,
+                &run.run_id,
+                "context_engine_lifecycle",
+                json!({
+                    "contextEngine": engine_name,
+                    "event": event,
+                    "conversationId": run.conversation_id,
+                    "messageCount": messages.len(),
+                }),
+            );
+        }
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("SynthChat context engine '{engine_name}' lifecycle {event} failed: {error}");
+        }
+    }
+}
+
+fn hermes_post_delivery_callbacks_path(store: &AppStore) -> PathBuf {
+    store
+        .data_dir()
+        .join("platforms")
+        .join("post_delivery_callbacks.json")
+}
+
+fn load_hermes_post_delivery_registry(store: &AppStore) -> Value {
+    let path = hermes_post_delivery_callbacks_path(store);
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| {
+            json!({
+                "schema": "hermes_post_delivery_callback_registry_desktop_v1",
+                "desktopAdaptation": true,
+                "callbacks": {},
+                "history": []
+            })
+        })
+}
+
+fn save_hermes_post_delivery_registry(store: &AppStore, registry: &Value) -> AppResult<()> {
+    let path = hermes_post_delivery_callbacks_path(store);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(registry)?)?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+pub(super) fn register_hermes_post_delivery_callback(
+    store: &AppStore,
+    session_key: &str,
+    generation: Option<i64>,
+    callback: Value,
+) -> AppResult<Value> {
+    let session_key = session_key.trim();
+    if session_key.is_empty() {
+        return Err(AppError::BadRequest(
+            "post-delivery callback session_key is required".into(),
+        ));
+    }
+    let command = callback
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadRequest("post-delivery callback.command is required".into()))?
+        .to_string();
+    let callback_id = callback
+        .get("id")
+        .or_else(|| callback.get("callbackId"))
+        .or_else(|| callback.get("callback_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| new_id("post-delivery-callback"));
+    let timeout_seconds = callback
+        .get("timeout")
+        .or_else(|| callback.get("timeoutSeconds"))
+        .or_else(|| callback.get("timeout_seconds"))
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
+        .clamp(1, MAX_TIMEOUT_SECONDS);
+    let mut entry = json!({
+        "id": callback_id,
+        "callbackId": callback_id,
+        "command": command,
+        "timeoutSeconds": timeout_seconds,
+        "timeout_seconds": timeout_seconds,
+        "payload": callback.get("payload").cloned().unwrap_or(Value::Null),
+        "registeredAt": now_iso(),
+        "registered_at": now_iso(),
+        "schema": "hermes_post_delivery_callback_intent_desktop_v1",
+        "desktopAdaptation": true
+    });
+    if let Some(object) = entry.as_object_mut() {
+        if let Some(extra) = callback.get("extra") {
+            object.insert("extra".into(), extra.clone());
+        }
+    }
+
+    let mut registry = load_hermes_post_delivery_registry(store);
+    registry["schema"] = json!("hermes_post_delivery_callback_registry_desktop_v1");
+    registry["desktopAdaptation"] = json!(true);
+    registry["updatedAt"] = json!(now_iso());
+    if !registry
+        .get("callbacks")
+        .map(Value::is_object)
+        .unwrap_or(false)
+    {
+        registry["callbacks"] = json!({});
+    }
+    if !registry
+        .get("history")
+        .map(Value::is_array)
+        .unwrap_or(false)
+    {
+        registry["history"] = json!([]);
+    }
+    let callbacks = registry["callbacks"].as_object_mut().unwrap();
+    let existing = callbacks.get(session_key).cloned();
+    let mut stale = false;
+    let mut callback_entries = Vec::new();
+    if let Some(existing) = existing {
+        let existing_generation = existing.get("generation").and_then(Value::as_i64);
+        if let (Some(existing_generation), Some(generation)) = (existing_generation, generation) {
+            if generation < existing_generation {
+                stale = true;
+            }
+        }
+        if !stale
+            && (existing_generation.is_none()
+                || generation.is_none()
+                || existing_generation == generation)
+        {
+            callback_entries.extend(
+                existing
+                    .get("callbacks")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    if stale {
+        return Ok(json!({
+            "schema": "hermes_post_delivery_callback_registry_desktop_v1",
+            "registered": false,
+            "staleGeneration": true,
+            "sessionKey": session_key,
+            "generation": generation,
+            "note": "Stale-generation registrations do not overwrite a fresher Hermes post-delivery callback slot."
+        }));
+    }
+    callback_entries.push(entry.clone());
+    callbacks.insert(
+        session_key.to_string(),
+        json!({
+            "sessionKey": session_key,
+            "session_key": session_key,
+            "generation": generation,
+            "callbacks": callback_entries,
+            "updatedAt": now_iso(),
+            "updated_at": now_iso(),
+        }),
+    );
+    save_hermes_post_delivery_registry(store, &registry)?;
+    Ok(json!({
+        "schema": "hermes_post_delivery_callback_registry_desktop_v1",
+        "registered": true,
+        "staleGeneration": false,
+        "sessionKey": session_key,
+        "generation": generation,
+        "callback": entry
+    }))
+}
+
+fn pop_hermes_post_delivery_callbacks(
+    store: &AppStore,
+    session_key: &str,
+    generation: Option<i64>,
+) -> AppResult<Vec<Value>> {
+    let mut registry = load_hermes_post_delivery_registry(store);
+    let Some(callbacks) = registry.get_mut("callbacks").and_then(Value::as_object_mut) else {
+        return Ok(Vec::new());
+    };
+    let Some(entry) = callbacks.get(session_key).cloned() else {
+        return Ok(Vec::new());
+    };
+    let entry_generation = entry.get("generation").and_then(Value::as_i64);
+    if generation.is_some() && entry_generation != generation {
+        return Ok(Vec::new());
+    }
+    callbacks.remove(session_key);
+    registry["updatedAt"] = json!(now_iso());
+    save_hermes_post_delivery_registry(store, &registry)?;
+    Ok(entry
+        .get("callbacks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+fn append_hermes_post_delivery_history(store: &AppStore, records: Vec<Value>) -> AppResult<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let mut registry = load_hermes_post_delivery_registry(store);
+    if !registry
+        .get("history")
+        .map(Value::is_array)
+        .unwrap_or(false)
+    {
+        registry["history"] = json!([]);
+    }
+    if let Some(history) = registry["history"].as_array_mut() {
+        history.extend(records);
+        if history.len() > 100 {
+            let drop_count = history.len() - 100;
+            history.drain(0..drop_count);
+        }
+    }
+    registry["updatedAt"] = json!(now_iso());
+    save_hermes_post_delivery_registry(store, &registry)
+}
+
+fn hermes_post_delivery_generation_for_run(run: &crate::models::AgentRunRecord) -> Option<i64> {
+    run.phase_events.iter().rev().find_map(|event| {
+        event
+            .detail
+            .get("hermesRunGeneration")
+            .or_else(|| event.detail.get("hermes_run_generation"))
+            .and_then(Value::as_i64)
+    })
+}
+
+pub(super) async fn run_hermes_post_delivery_callbacks(
+    store: &AppStore,
+    run: &crate::models::AgentRunRecord,
+    extra: &Value,
+) -> AppResult<Value> {
+    let generation = hermes_post_delivery_generation_for_run(run);
+    let callbacks = pop_hermes_post_delivery_callbacks(store, &run.conversation_id, generation)?;
+    let mut records = Vec::new();
+    for callback in callbacks {
+        let command = callback
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let timeout_seconds = callback
+            .get("timeoutSeconds")
+            .or_else(|| callback.get("timeout_seconds"))
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
+            .clamp(1, MAX_TIMEOUT_SECONDS);
+        let spec = ShellHookSpec {
+            event: "post_delivery_callback".into(),
+            command,
+            matcher: None,
+            timeout_seconds,
+        };
+        let payload = json!({
+            "schema": "hermes_post_delivery_callback_fire_desktop_v1",
+            "sessionKey": run.conversation_id,
+            "session_key": run.conversation_id,
+            "runId": run.run_id,
+            "run_id": run.run_id,
+            "generation": generation,
+            "callback": callback,
+            "postDelivery": extra.get("postDelivery").cloned().unwrap_or(Value::Null),
+            "post_delivery": extra.get("post_delivery").cloned().unwrap_or_else(|| extra.get("postDelivery").cloned().unwrap_or(Value::Null)),
+            "extra": extra,
+            "desktopAdaptation": true
+        });
+        let mut record = json!({
+            "schema": "hermes_post_delivery_callback_fire_record_desktop_v1",
+            "sessionKey": run.conversation_id,
+            "runId": run.run_id,
+            "callbackId": callback.get("callbackId").or_else(|| callback.get("id")).cloned().unwrap_or(Value::Null),
+            "generation": generation,
+            "command": spec.command,
+            "firedAt": now_iso(),
+            "status": "started"
+        });
+        match run_shell_hook(&spec, &run.run_id, "post_delivery_callback", &payload, None).await {
+            Ok(result) => {
+                record["status"] = json!("completed");
+                record["result"] = result.unwrap_or(Value::Null);
+            }
+            Err(error) => {
+                record["status"] = json!("failed");
+                record["error"] = json!(error.to_string());
+            }
+        }
+        records.push(record);
+    }
+    let count = records.len();
+    append_hermes_post_delivery_history(store, records.clone())?;
+    Ok(json!({
+        "schema": "hermes_post_delivery_callback_registry_desktop_v1",
+        "fired": count,
+        "generation": generation,
+        "records": records
+    }))
+}
+
 pub(super) async fn run_session_finished_hooks(
     store: &AppStore,
     run: &crate::models::AgentRunRecord,
     extra: Value,
 ) {
+    let _ = run_hermes_post_delivery_callbacks(store, run, &extra).await;
+    let _ = disk_cleanup_session_end_hook(store, run);
     run_session_lifecycle_hooks(store, "on_session_end", run, extra.clone()).await;
     run_session_lifecycle_hooks(store, "on_session_finalize", run, extra).await;
 }
@@ -754,6 +1925,7 @@ pub(super) async fn run_session_reset_hooks(
     conversation: &crate::models::Conversation,
     extra: Value,
 ) {
+    run_selected_context_engine_reset(conversation, &extra);
     let Ok(specs) = shell_hook_specs(store, "on_session_reset") else {
         return;
     };
@@ -767,6 +1939,33 @@ pub(super) async fn run_session_reset_hooks(
     });
     for spec in specs {
         let _ = run_shell_hook(&spec, &conversation.id, "session", &payload, None).await;
+    }
+}
+
+fn run_selected_context_engine_reset(conversation: &crate::models::Conversation, extra: &Value) {
+    let Some(engine_name) = selected_context_engine_name_for_hooks() else {
+        return;
+    };
+    let lifecycle_extra = json!({
+        "conversation_id": conversation.id,
+        "persona_id": conversation.persona_id,
+        "agent_id": conversation.agent_id,
+        "title": conversation.title,
+        "source": extra.get("source").cloned().unwrap_or(Value::Null),
+        "extra": extra,
+    });
+    match run_context_engine_lifecycle(
+        &engine_name,
+        "on_session_reset",
+        &conversation.id,
+        &[],
+        &lifecycle_extra,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("SynthChat context engine '{engine_name}' lifecycle on_session_reset failed: {error}");
+        }
     }
 }
 
@@ -1209,18 +2408,7 @@ fn python_plugin_hook_specs(store: &AppStore, event: &str) -> AppResult<Vec<Pyth
     Ok(enabled_python_plugin_specs(store)?
         .into_iter()
         .filter(|plugin| plugin.provided_hooks.iter().any(|hook| hook == event))
-        .filter_map(|plugin| {
-            let path = PathBuf::from(&plugin.path);
-            if path.join("__init__.py").is_file() {
-                Some(PythonPluginHookSpec {
-                    plugin_id: plugin.id,
-                    plugin_name: plugin.name,
-                    path,
-                })
-            } else {
-                None
-            }
-        })
+        .filter_map(|plugin| python_plugin_spec_from_summary(plugin))
         .collect())
 }
 
@@ -1237,6 +2425,90 @@ fn enabled_python_plugin_specs(store: &AppStore) -> AppResult<Vec<crate::models:
                 .all(|name| name.trim().is_empty() || env::var_os(name).is_some())
         })
         .collect())
+}
+
+fn python_plugin_command_tool_specs(store: &AppStore) -> AppResult<Vec<PythonPluginHookSpec>> {
+    let mut specs = enabled_python_plugin_specs(store)?
+        .into_iter()
+        .filter_map(python_plugin_spec_from_summary)
+        .collect::<Vec<_>>();
+    specs.extend(context_engine_python_plugin_specs());
+    Ok(specs)
+}
+
+fn context_engine_python_plugin_specs() -> Vec<PythonPluginHookSpec> {
+    let root = hermes_context_engine_plugins_dir();
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut specs = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !path.is_dir() || name.starts_with('_') || name.starts_with('.') {
+                return None;
+            }
+            if !path.join("__init__.py").is_file() {
+                return None;
+            }
+            Some(PythonPluginHookSpec {
+                plugin_id: format!("context-engine/{name}"),
+                plugin_name: name,
+                path,
+                source: "context_engine".into(),
+                entry_point: String::new(),
+            })
+        })
+        .collect::<Vec<_>>();
+    specs.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    specs
+}
+
+fn hermes_context_engine_plugins_dir() -> PathBuf {
+    if let Some(root) = env::var_os("HERMES_AGENT_REPO")
+        .or_else(|| env::var_os("HERMES_REPO"))
+        .filter(|value| !value.is_empty())
+    {
+        return PathBuf::from(root).join("plugins").join("context_engine");
+    }
+    PathBuf::from(r"D:\pro_sunner\demo_vscode\hermes-agent")
+        .join("plugins")
+        .join("context_engine")
+}
+
+fn python_plugin_spec_from_summary(
+    plugin: crate::models::PluginSummary,
+) -> Option<PythonPluginHookSpec> {
+    let source = plugin.source.clone();
+    if source == "entrypoint" {
+        let entry_point = if plugin.entry_point.trim().is_empty() {
+            plugin.path.clone()
+        } else {
+            plugin.entry_point.clone()
+        };
+        if entry_point.trim().is_empty() {
+            return None;
+        }
+        return Some(PythonPluginHookSpec {
+            plugin_id: plugin.id,
+            plugin_name: plugin.name,
+            path: PathBuf::from(&entry_point),
+            source,
+            entry_point,
+        });
+    }
+    let path = PathBuf::from(&plugin.path);
+    if !path.join("__init__.py").is_file() {
+        return None;
+    }
+    Some(PythonPluginHookSpec {
+        plugin_id: plugin.id,
+        plugin_name: plugin.name,
+        path,
+        source,
+        entry_point: plugin.entry_point,
+    })
 }
 
 async fn run_python_plugin_hooks(store: &AppStore, event: &str, kwargs: &Value) -> Vec<Value> {
@@ -1270,87 +2542,271 @@ pub(super) async fn run_python_plugin_command(
     if command_name.is_empty() {
         return Ok(None);
     }
-    for plugin in enabled_python_plugin_specs(store)? {
-        let path = PathBuf::from(&plugin.path);
-        if !path.join("__init__.py").is_file() {
-            continue;
-        }
-        let spec = PythonPluginHookSpec {
-            plugin_id: plugin.id,
-            plugin_name: plugin.name,
-            path,
-        };
-        let output = run_python_plugin_command_runner(&spec, command_name, raw_args).await?;
-        if output
-            .get("handled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            let reply = output
-                .get("result")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| {
-                    output
-                        .get("result")
-                        .map(Value::to_string)
-                        .unwrap_or_default()
-                });
-            let injected_messages = output
-                .get("injected_messages")
-                .and_then(Value::as_array)
-                .map(|messages| {
-                    messages
-                        .iter()
-                        .filter_map(|message| {
-                            let content = message.get("content").and_then(Value::as_str)?.trim();
-                            if content.is_empty() {
-                                return None;
-                            }
-                            let role = message
-                                .get("role")
-                                .and_then(Value::as_str)
-                                .unwrap_or("user")
-                                .trim()
-                                .to_lowercase();
-                            Some(PythonPluginInjectedMessage {
-                                role: if matches!(
-                                    role.as_str(),
-                                    "user" | "assistant" | "system" | "tool"
-                                ) {
-                                    role
-                                } else {
-                                    "user".into()
-                                },
-                                content: content.to_string(),
-                            })
+    let specs = python_plugin_command_tool_specs(store)?;
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let output = run_python_plugin_command_runner(&specs, command_name, raw_args).await?;
+    if output
+        .get("handled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let result_value = resolve_python_plugin_bridge_result(
+            store,
+            output.get("result").cloned().unwrap_or(Value::Null),
+            None,
+        )
+        .await?;
+        let reply = result_value
+            .as_str()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| result_value.to_string());
+        let injected_messages = output
+            .get("injected_messages")
+            .and_then(Value::as_array)
+            .map(|messages| {
+                messages
+                    .iter()
+                    .filter_map(|message| {
+                        let content = message.get("content").and_then(Value::as_str)?.trim();
+                        if content.is_empty() {
+                            return None;
+                        }
+                        let role = message
+                            .get("role")
+                            .and_then(Value::as_str)
+                            .unwrap_or("user")
+                            .trim()
+                            .to_lowercase();
+                        Some(PythonPluginInjectedMessage {
+                            role: if matches!(
+                                role.as_str(),
+                                "user" | "assistant" | "system" | "tool"
+                            ) {
+                                role
+                            } else {
+                                "user".into()
+                            },
+                            content: content.to_string(),
                         })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            return Ok(Some(PythonPluginCommandResult {
-                reply,
-                injected_messages,
-            }));
-        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        return Ok(Some(PythonPluginCommandResult {
+            reply,
+            injected_messages,
+        }));
     }
     Ok(None)
+}
+
+async fn resolve_python_plugin_bridge_result(
+    store: &AppStore,
+    value: Value,
+    bridge_context: Option<&PythonPluginBridgeContext<'_>>,
+) -> AppResult<Value> {
+    let candidate = value
+        .as_str()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .unwrap_or_else(|| value.clone());
+    let Some(dispatch) = candidate.get("__synthchat_dispatch_tool__") else {
+        return Ok(value);
+    };
+    let tool_name = dispatch
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let payload = dispatch.get("args").cloned().unwrap_or_else(|| json!({}));
+    let allow_mutating_tools = bridge_context
+        .map(|context| context.allow_mutating_tools)
+        .unwrap_or(false);
+    if python_plugin_bridge_tool_mutates(tool_name, &payload) && !allow_mutating_tools {
+        return Err(AppError::BadRequest(format!(
+            "python plugin bridge tool requires agent run context: {tool_name}"
+        )));
+    }
+    if let Some(context) = bridge_context {
+        if is_internal_tool(tool_name) {
+            if let Some(reason) = tool_approval_reason(
+                store,
+                "__internal",
+                tool_name,
+                &payload,
+                python_plugin_bridge_tool_mutates(tool_name, &payload),
+            )? {
+                return request_python_plugin_bridge_approval(
+                    store,
+                    context,
+                    "__internal",
+                    tool_name,
+                    payload.clone(),
+                    reason,
+                );
+            }
+            let (text, event) = Box::pin(execute_recovery_internal_tool(
+                store,
+                context.agent,
+                context.conversation_id,
+                context.run_id,
+                tool_name,
+                payload.clone(),
+                context.tool_context,
+                context.app,
+            ))
+            .await?;
+            record_tool_event_for_run(
+                store,
+                context.app,
+                context.conversation_id,
+                context.run_id,
+                event,
+            )?;
+            return Ok(Value::String(text));
+        }
+        let tools = available_mcp_tool_definitions(store, context.agent)?;
+        if let Some(definition) = resolve_mcp_tool(&tools, tool_name) {
+            if definition.source == "python-plugin" {
+                return Err(AppError::BadRequest(format!(
+                    "python plugin bridge cannot recursively dispatch python plugin tool: {tool_name}"
+                )));
+            }
+            if let Some(reason) = tool_approval_reason(
+                store,
+                &definition.server_id,
+                &definition.tool_name,
+                &payload,
+                definition.requires_approval,
+            )? {
+                return request_python_plugin_bridge_approval(
+                    store,
+                    context,
+                    &definition.server_id,
+                    &definition.tool_name,
+                    payload.clone(),
+                    reason,
+                );
+            }
+            let (text, event) = Box::pin(execute_recovery_mcp_tool(
+                store,
+                context.run_id,
+                &definition,
+                payload.clone(),
+                Some(context),
+            ))
+            .await?;
+            record_tool_event_for_run(
+                store,
+                context.app,
+                context.conversation_id,
+                context.run_id,
+                event,
+            )?;
+            return Ok(Value::String(text));
+        }
+    }
+    let result = match tool_name {
+        "kanban_create" => kanban_create_tool(store, &payload)?,
+        "kanban_list" => kanban_list_tool(store, &payload)?,
+        "kanban_show" => kanban_show_tool(store, &payload)?,
+        "kanban_decompose" => kanban_decompose_tool(store, &payload).await?,
+        "kanban_specify" => kanban_specify_tool(store, &payload).await?,
+        "kanban_complete" => kanban_complete_tool(store, &payload)?,
+        "kanban_block" => kanban_block_tool(store, &payload)?,
+        "kanban_unblock" => kanban_unblock_tool(store, &payload)?,
+        "kanban_heartbeat" => kanban_heartbeat_tool(store, &payload)?,
+        "kanban_comment" => kanban_comment_tool(store, &payload)?,
+        "kanban_link" => kanban_link_tool(store, &payload)?,
+        _ => {
+            return Err(AppError::BadRequest(format!(
+                "python plugin bridge tool is not available: {tool_name}"
+            )));
+        }
+    };
+    Ok(Value::String(result))
+}
+
+fn request_python_plugin_bridge_approval(
+    store: &AppStore,
+    context: &PythonPluginBridgeContext<'_>,
+    server_id: &str,
+    tool_name: &str,
+    payload: Value,
+    reason: String,
+) -> AppResult<Value> {
+    let run = store.agent_run(context.run_id)?;
+    let approval_payload = python_plugin_bridge_approval_payload(payload);
+    record_tool_started_for_run(
+        store,
+        context.app,
+        context.run_id,
+        server_id,
+        tool_name,
+        &approval_payload,
+        0,
+    )?;
+    let approval = append_tool_approval_request(
+        store,
+        context.conversation_id,
+        &run.persona_id,
+        &run.agent_id,
+        context.run_id,
+        server_id,
+        tool_name,
+        approval_payload,
+        reason,
+        context.tool_context,
+    )?;
+    let mut updated_run = store.agent_run(context.run_id)?;
+    updated_run.state = "pendingApproval".into();
+    updated_run.updated_at = crate::models::now_iso();
+    let saved_run = store.save_agent_run(updated_run)?;
+    let assistant = store.append_message(ChatMessage::new(
+        context.conversation_id.to_string(),
+        "assistant",
+        format!(
+            "插件工具调用正在等待审批：{} · {}",
+            approval.server_id, approval.tool_name
+        ),
+        "desktop-agent",
+    ))?;
+    emit_agent_run_record(context.app, &saved_run, Some(&assistant));
+    Err(AppError::BadRequest(format!(
+        "python plugin bridge tool requires approval: {} · {}",
+        approval.server_id, approval.tool_name
+    )))
+}
+
+fn python_plugin_bridge_approval_payload(mut payload: Value) -> Value {
+    if let Some(object) = payload.as_object_mut() {
+        object
+            .entry(PROVIDER_TOOL_CALL_META_KEY.to_string())
+            .or_insert_with(|| json!({"id": new_id("call")}));
+    }
+    payload
+}
+
+fn python_plugin_bridge_tool_mutates(tool_name: &str, payload: &Value) -> bool {
+    match tool_name {
+        "kanban_create" | "kanban_complete" | "kanban_block" | "kanban_unblock"
+        | "kanban_heartbeat" | "kanban_comment" | "kanban_link" | "kanban_specify" => true,
+        "kanban_decompose" => payload
+            .get("create")
+            .or_else(|| payload.get("createTasks"))
+            .or_else(|| payload.get("create_tasks"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 pub(super) fn list_python_plugin_tools(
     store: &AppStore,
 ) -> AppResult<Vec<PythonPluginToolDefinition>> {
     let mut definitions = Vec::new();
-    for plugin in enabled_python_plugin_specs(store)? {
-        let path = PathBuf::from(&plugin.path);
-        if !path.join("__init__.py").is_file() {
-            continue;
-        }
-        let spec = PythonPluginHookSpec {
-            plugin_id: plugin.id,
-            plugin_name: plugin.name,
-            path,
-        };
+    for spec in python_plugin_command_tool_specs(store)? {
         match cached_python_plugin_tool_definitions(&spec) {
             Ok(tools) => definitions.extend(tools),
             Err(error) => {
@@ -1369,20 +2825,58 @@ pub(super) fn list_python_plugin_skills(
 ) -> AppResult<Vec<PythonPluginSkillDefinition>> {
     let mut definitions = Vec::new();
     for plugin in enabled_python_plugin_specs(store)? {
-        let path = PathBuf::from(&plugin.path);
-        if !path.join("__init__.py").is_file() {
+        let Some(spec) = python_plugin_spec_from_summary(plugin) else {
             continue;
-        }
-        let spec = PythonPluginHookSpec {
-            plugin_id: plugin.id,
-            plugin_name: plugin.name,
-            path,
         };
         match cached_python_plugin_skill_definitions(&spec) {
             Ok(skills) => definitions.extend(skills),
             Err(error) => {
                 eprintln!(
                     "SynthChat plugin skill discovery failed for {}: {}",
+                    spec.plugin_id, error
+                );
+            }
+        }
+    }
+    Ok(definitions)
+}
+
+pub(super) fn list_python_plugin_commands(
+    store: &AppStore,
+) -> AppResult<Vec<PythonPluginCommandDefinition>> {
+    let mut definitions = Vec::new();
+    for spec in python_plugin_command_tool_specs(store)? {
+        match run_python_plugin_command_list_runner(&spec) {
+            Ok(commands) => definitions.extend(commands),
+            Err(error) => {
+                eprintln!(
+                    "SynthChat plugin command discovery failed for {}: {}",
+                    spec.plugin_id, error
+                );
+            }
+        }
+    }
+    definitions.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+    });
+    Ok(definitions)
+}
+
+pub(crate) fn list_python_plugin_auxiliary_tasks(
+    store: &AppStore,
+) -> AppResult<Vec<PluginAuxiliaryTaskSummary>> {
+    let mut definitions = Vec::new();
+    for plugin in enabled_python_plugin_specs(store)? {
+        let Some(spec) = python_plugin_spec_from_summary(plugin) else {
+            continue;
+        };
+        match cached_python_plugin_auxiliary_task_definitions(&spec) {
+            Ok(tasks) => definitions.extend(tasks),
+            Err(error) => {
+                eprintln!(
+                    "SynthChat plugin auxiliary task discovery failed for {}: {}",
                     spec.plugin_id, error
                 );
             }
@@ -1449,7 +2943,39 @@ fn cached_python_plugin_skill_definitions(
     Ok(skills)
 }
 
+fn cached_python_plugin_auxiliary_task_definitions(
+    spec: &PythonPluginHookSpec,
+) -> AppResult<Vec<PluginAuxiliaryTaskSummary>> {
+    let cache_key = python_plugin_tool_cache_key(spec);
+    let cache = PYTHON_PLUGIN_AUXILIARY_TASK_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = cache.lock().map_err(|_| {
+            AppError::BadRequest("python plugin auxiliary task cache lock poisoned".into())
+        })?;
+        if let Some(cached) = guard.get(&cache_key) {
+            if cached.captured_at.elapsed() < PYTHON_PLUGIN_TOOL_CACHE_TTL {
+                return Ok(cached.tasks.clone());
+            }
+        }
+    }
+    let tasks = run_python_plugin_auxiliary_task_list_runner(spec)?;
+    let mut guard = cache.lock().map_err(|_| {
+        AppError::BadRequest("python plugin auxiliary task cache lock poisoned".into())
+    })?;
+    guard.insert(
+        cache_key,
+        CachedPythonPluginAuxiliaryTasks {
+            captured_at: Instant::now(),
+            tasks: tasks.clone(),
+        },
+    );
+    Ok(tasks)
+}
+
 fn python_plugin_tool_cache_key(spec: &PythonPluginHookSpec) -> String {
+    if spec.source == "entrypoint" {
+        return format!("{}|entrypoint|{}", spec.plugin_id, spec.entry_point.trim());
+    }
     let init_path = spec.path.join("__init__.py");
     let modified = init_path
         .metadata()
@@ -1465,30 +2991,24 @@ pub(super) async fn run_python_plugin_tool(
     store: &AppStore,
     tool_name: &str,
     payload: &Value,
+    bridge_context: Option<&PythonPluginBridgeContext<'_>>,
 ) -> AppResult<String> {
     let mut last_error = None;
-    for plugin in enabled_python_plugin_specs(store)? {
-        let path = PathBuf::from(&plugin.path);
-        if !path.join("__init__.py").is_file() {
-            continue;
-        }
-        let spec = PythonPluginHookSpec {
-            plugin_id: plugin.id,
-            plugin_name: plugin.name,
-            path,
-        };
-        let output = run_python_plugin_tool_runner(&spec, tool_name, payload).await?;
+    for spec in python_plugin_command_tool_specs(store)? {
+        let output =
+            run_python_plugin_tool_runner(&spec, tool_name, payload, bridge_context.is_some())
+                .await?;
         if output.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            return Ok(output
-                .get("result")
-                .and_then(Value::as_str)
+            let result_value = resolve_python_plugin_bridge_result(
+                store,
+                output.get("result").cloned().unwrap_or(Value::Null),
+                bridge_context,
+            )
+            .await?;
+            return Ok(result_value
+                .as_str()
                 .map(ToOwned::to_owned)
-                .unwrap_or_else(|| {
-                    output
-                        .get("result")
-                        .map(Value::to_string)
-                        .unwrap_or_default()
-                }));
+                .unwrap_or_else(|| result_value.to_string()));
         }
         let error = output
             .get("error")
@@ -1506,6 +3026,312 @@ pub(super) async fn run_python_plugin_tool(
     })))
 }
 
+pub(super) fn run_context_engine_compress(
+    engine_name: &str,
+    messages: &[ChatMessage],
+    current_tokens: usize,
+    focus_topic: Option<&str>,
+) -> AppResult<Vec<ContextEngineCompressedMessage>> {
+    let clean = engine_name.trim();
+    if clean.is_empty() || clean.eq_ignore_ascii_case("compressor") {
+        return Err(AppError::BadRequest(
+            "context engine name must be a non-default plugin".into(),
+        ));
+    }
+    let spec = context_engine_python_plugin_specs()
+        .into_iter()
+        .find(|spec| spec.plugin_name.eq_ignore_ascii_case(clean))
+        .ok_or_else(|| AppError::NotFound(format!("context engine {clean}")))?;
+    let request_messages = messages
+        .iter()
+        .filter(|message| {
+            matches!(
+                message.role.as_str(),
+                "system" | "user" | "assistant" | "tool"
+            )
+        })
+        .map(|message| {
+            json!({
+                "role": message.role,
+                "content": message.content,
+            })
+        })
+        .collect::<Vec<_>>();
+    let request = json!({
+        "plugin_id": spec.plugin_id,
+        "plugin_name": spec.plugin_name,
+        "plugin_source": spec.source,
+        "entry_point": spec.entry_point,
+        "plugin_dir": spec.path,
+        "context_engine_action": "compress",
+        "context_engine_messages": request_messages,
+        "context_engine_current_tokens": current_tokens,
+        "context_engine_focus_topic": focus_topic.unwrap_or_default(),
+    });
+    let output = run_python_plugin_hook_runner_blocking(&request)?;
+    if !output.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let error = output
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("context engine compress failed");
+        return Err(AppError::BadRequest(format!(
+            "context engine compress failed for {clean}: {error}"
+        )));
+    }
+    let raw_messages = output
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            AppError::BadRequest("context engine compress returned no messages".into())
+        })?;
+    let compressed = raw_messages
+        .iter()
+        .filter_map(|message| {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("assistant")
+                .trim()
+                .to_ascii_lowercase();
+            let content = message.get("content").and_then(Value::as_str)?.trim();
+            if content.is_empty() {
+                return None;
+            }
+            Some(ContextEngineCompressedMessage {
+                role: if matches!(role.as_str(), "system" | "user" | "assistant" | "tool") {
+                    role
+                } else {
+                    "assistant".into()
+                },
+                content: content.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if compressed.is_empty() {
+        return Err(AppError::BadRequest(
+            "context engine compress returned empty content".into(),
+        ));
+    }
+    Ok(compressed)
+}
+
+pub(super) fn run_context_engine_should_compress(
+    engine_name: &str,
+    messages: &[ChatMessage],
+    current_tokens: usize,
+    preflight: bool,
+) -> AppResult<Option<bool>> {
+    let clean = engine_name.trim();
+    if clean.is_empty() || clean.eq_ignore_ascii_case("compressor") {
+        return Err(AppError::BadRequest(
+            "context engine name must be a non-default plugin".into(),
+        ));
+    }
+    let spec = context_engine_python_plugin_specs()
+        .into_iter()
+        .find(|spec| spec.plugin_name.eq_ignore_ascii_case(clean))
+        .ok_or_else(|| AppError::NotFound(format!("context engine {clean}")))?;
+    let request_messages = messages
+        .iter()
+        .filter(|message| {
+            matches!(
+                message.role.as_str(),
+                "system" | "user" | "assistant" | "tool"
+            )
+        })
+        .map(|message| {
+            json!({
+                "role": message.role,
+                "content": message.content,
+            })
+        })
+        .collect::<Vec<_>>();
+    let request = json!({
+        "plugin_id": spec.plugin_id,
+        "plugin_name": spec.plugin_name,
+        "plugin_source": spec.source,
+        "entry_point": spec.entry_point,
+        "plugin_dir": spec.path,
+        "context_engine_action": if preflight {
+            "should_compress_preflight"
+        } else {
+            "should_compress"
+        },
+        "context_engine_messages": request_messages,
+        "context_engine_current_tokens": current_tokens,
+    });
+    let output = run_python_plugin_hook_runner_blocking(&request)?;
+    if !output.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let error = output
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("context engine compression decision failed");
+        return Err(AppError::BadRequest(format!(
+            "context engine compression decision failed for {clean}: {error}"
+        )));
+    }
+    if !output
+        .get("implemented")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    Ok(Some(
+        output
+            .get("decision")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    ))
+}
+
+pub(super) fn run_context_engine_update_from_response(
+    engine_name: &str,
+    usage: &Value,
+) -> AppResult<bool> {
+    let clean = engine_name.trim();
+    if clean.is_empty() || clean.eq_ignore_ascii_case("compressor") {
+        return Err(AppError::BadRequest(
+            "context engine name must be a non-default plugin".into(),
+        ));
+    }
+    let spec = context_engine_python_plugin_specs()
+        .into_iter()
+        .find(|spec| spec.plugin_name.eq_ignore_ascii_case(clean))
+        .ok_or_else(|| AppError::NotFound(format!("context engine {clean}")))?;
+    let request = json!({
+        "plugin_id": spec.plugin_id,
+        "plugin_name": spec.plugin_name,
+        "plugin_source": spec.source,
+        "entry_point": spec.entry_point,
+        "plugin_dir": spec.path,
+        "context_engine_action": "update_from_response",
+        "context_engine_usage": usage,
+    });
+    let output = run_python_plugin_hook_runner_blocking(&request)?;
+    if !output.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let error = output
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("context engine update_from_response failed");
+        return Err(AppError::BadRequest(format!(
+            "context engine update_from_response failed for {clean}: {error}"
+        )));
+    }
+    Ok(output
+        .get("implemented")
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
+}
+
+pub(super) fn run_context_engine_update_model(
+    engine_name: &str,
+    model_context: &Value,
+) -> AppResult<bool> {
+    let clean = engine_name.trim();
+    if clean.is_empty() || clean.eq_ignore_ascii_case("compressor") {
+        return Err(AppError::BadRequest(
+            "context engine name must be a non-default plugin".into(),
+        ));
+    }
+    let spec = context_engine_python_plugin_specs()
+        .into_iter()
+        .find(|spec| spec.plugin_name.eq_ignore_ascii_case(clean))
+        .ok_or_else(|| AppError::NotFound(format!("context engine {clean}")))?;
+    let request = json!({
+        "plugin_id": spec.plugin_id,
+        "plugin_name": spec.plugin_name,
+        "plugin_source": spec.source,
+        "entry_point": spec.entry_point,
+        "plugin_dir": spec.path,
+        "context_engine_action": "update_model",
+        "context_engine_model": model_context,
+    });
+    let output = run_python_plugin_hook_runner_blocking(&request)?;
+    if !output.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let error = output
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("context engine update_model failed");
+        return Err(AppError::BadRequest(format!(
+            "context engine update_model failed for {clean}: {error}"
+        )));
+    }
+    Ok(output
+        .get("implemented")
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
+}
+
+pub(super) fn run_context_engine_lifecycle(
+    engine_name: &str,
+    event: &str,
+    session_id: &str,
+    messages: &[ChatMessage],
+    extra: &Value,
+) -> AppResult<bool> {
+    let clean = engine_name.trim();
+    if clean.is_empty() || clean.eq_ignore_ascii_case("compressor") {
+        return Err(AppError::BadRequest(
+            "context engine name must be a non-default plugin".into(),
+        ));
+    }
+    let clean_event = event.trim();
+    if !matches!(
+        clean_event,
+        "on_session_start" | "on_session_end" | "on_session_reset"
+    ) {
+        return Err(AppError::BadRequest(format!(
+            "unsupported context engine lifecycle event: {clean_event}"
+        )));
+    }
+    let spec = context_engine_python_plugin_specs()
+        .into_iter()
+        .find(|spec| spec.plugin_name.eq_ignore_ascii_case(clean))
+        .ok_or_else(|| AppError::NotFound(format!("context engine {clean}")))?;
+    let request_messages = messages
+        .iter()
+        .filter(|message| {
+            matches!(
+                message.role.as_str(),
+                "system" | "user" | "assistant" | "tool"
+            )
+        })
+        .map(|message| {
+            json!({
+                "role": message.role,
+                "content": message.content,
+            })
+        })
+        .collect::<Vec<_>>();
+    let request = json!({
+        "plugin_id": spec.plugin_id,
+        "plugin_name": spec.plugin_name,
+        "plugin_source": spec.source,
+        "entry_point": spec.entry_point,
+        "plugin_dir": spec.path,
+        "context_engine_action": "lifecycle",
+        "context_engine_lifecycle_event": clean_event,
+        "context_engine_session_id": session_id,
+        "context_engine_messages": request_messages,
+        "context_engine_lifecycle_extra": extra,
+    });
+    let output = run_python_plugin_hook_runner_blocking(&request)?;
+    if !output.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let error = output
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("context engine lifecycle failed");
+        return Err(AppError::BadRequest(format!(
+            "context engine lifecycle {clean_event} failed for {clean}: {error}"
+        )));
+    }
+    Ok(output
+        .get("implemented")
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
+}
+
 async fn run_python_plugin_hook(
     spec: &PythonPluginHookSpec,
     event: &str,
@@ -1514,6 +3340,8 @@ async fn run_python_plugin_hook(
     let request = json!({
         "plugin_id": spec.plugin_id,
         "plugin_name": spec.plugin_name,
+        "plugin_source": spec.source,
+        "entry_point": spec.entry_point,
         "plugin_dir": spec.path,
         "event": event,
         "kwargs": kwargs,
@@ -1532,16 +3360,19 @@ async fn run_python_plugin_hook(
 }
 
 async fn run_python_plugin_command_runner(
-    spec: &PythonPluginHookSpec,
+    specs: &[PythonPluginHookSpec],
     command_name: &str,
     raw_args: &str,
 ) -> AppResult<Value> {
+    let plugins = specs
+        .iter()
+        .map(python_plugin_spec_request_value)
+        .collect::<Vec<_>>();
     let request = json!({
-        "plugin_id": spec.plugin_id,
-        "plugin_name": spec.plugin_name,
-        "plugin_dir": spec.path,
+        "plugins": plugins,
         "command_name": command_name,
         "raw_args": raw_args,
+        "bridge_tools": PYTHON_PLUGIN_BRIDGE_TOOLS,
     });
     let output = run_python_plugin_hook_runner(&request).await?;
     if let Some(error) = output.get("error").and_then(Value::as_str) {
@@ -1552,12 +3383,24 @@ async fn run_python_plugin_command_runner(
     Ok(output)
 }
 
+fn python_plugin_spec_request_value(spec: &PythonPluginHookSpec) -> Value {
+    json!({
+        "plugin_id": spec.plugin_id,
+        "plugin_name": spec.plugin_name,
+        "plugin_source": spec.source,
+        "entry_point": spec.entry_point,
+        "plugin_dir": spec.path,
+    })
+}
+
 fn run_python_plugin_tool_list_runner(
     spec: &PythonPluginHookSpec,
 ) -> AppResult<Vec<PythonPluginToolDefinition>> {
     let request = json!({
         "plugin_id": spec.plugin_id,
         "plugin_name": spec.plugin_name,
+        "plugin_source": spec.source,
+        "entry_point": spec.entry_point,
         "plugin_dir": spec.path,
         "list_tools": true,
     });
@@ -1606,6 +3449,8 @@ fn run_python_plugin_skill_list_runner(
     let request = json!({
         "plugin_id": spec.plugin_id,
         "plugin_name": spec.plugin_name,
+        "plugin_source": spec.source,
+        "entry_point": spec.entry_point,
         "plugin_dir": spec.path,
         "list_skills": true,
     });
@@ -1644,17 +3489,121 @@ fn run_python_plugin_skill_list_runner(
         .unwrap_or_default())
 }
 
+fn run_python_plugin_command_list_runner(
+    spec: &PythonPluginHookSpec,
+) -> AppResult<Vec<PythonPluginCommandDefinition>> {
+    let request = json!({
+        "plugin_id": spec.plugin_id,
+        "plugin_name": spec.plugin_name,
+        "plugin_source": spec.source,
+        "entry_point": spec.entry_point,
+        "plugin_dir": spec.path,
+        "list_commands": true,
+    });
+    let output = run_python_plugin_hook_runner_blocking(&request)?;
+    if let Some(error) = output.get("error").and_then(Value::as_str) {
+        return Err(AppError::BadRequest(format!(
+            "python plugin command discovery runner error: {error}"
+        )));
+    }
+    Ok(output
+        .get("commands")
+        .and_then(Value::as_array)
+        .map(|commands| {
+            commands
+                .iter()
+                .filter_map(|command| {
+                    let name = command.get("name").and_then(Value::as_str)?.trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    Some(PythonPluginCommandDefinition {
+                        plugin_id: spec.plugin_id.clone(),
+                        plugin_name: spec.plugin_name.clone(),
+                        name: name.to_string(),
+                        description: command
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Plugin command")
+                            .to_string(),
+                        args_hint: command
+                            .get("args_hint")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn run_python_plugin_auxiliary_task_list_runner(
+    spec: &PythonPluginHookSpec,
+) -> AppResult<Vec<PluginAuxiliaryTaskSummary>> {
+    let request = json!({
+        "plugin_id": spec.plugin_id,
+        "plugin_name": spec.plugin_name,
+        "plugin_source": spec.source,
+        "entry_point": spec.entry_point,
+        "plugin_dir": spec.path,
+        "list_auxiliary_tasks": true,
+    });
+    let output = run_python_plugin_hook_runner_blocking(&request)?;
+    if let Some(error) = output.get("error").and_then(Value::as_str) {
+        return Err(AppError::BadRequest(format!(
+            "python plugin auxiliary task discovery runner error: {error}"
+        )));
+    }
+    Ok(output
+        .get("auxiliary_tasks")
+        .and_then(Value::as_array)
+        .map(|tasks| {
+            tasks
+                .iter()
+                .filter_map(|task| {
+                    let key = task.get("key").and_then(Value::as_str)?.trim();
+                    if key.is_empty() {
+                        return None;
+                    }
+                    Some(PluginAuxiliaryTaskSummary {
+                        plugin_id: spec.plugin_id.clone(),
+                        plugin_name: spec.plugin_name.clone(),
+                        key: key.to_string(),
+                        display_name: task
+                            .get("display_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or(key)
+                            .to_string(),
+                        description: task
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        defaults: task.get("defaults").cloned().unwrap_or_else(|| json!({})),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 async fn run_python_plugin_tool_runner(
     spec: &PythonPluginHookSpec,
     tool_name: &str,
     payload: &Value,
+    allow_external_dispatch: bool,
 ) -> AppResult<Value> {
     let request = json!({
         "plugin_id": spec.plugin_id,
         "plugin_name": spec.plugin_name,
+        "plugin_source": spec.source,
+        "entry_point": spec.entry_point,
         "plugin_dir": spec.path,
         "tool_name": tool_name,
         "tool_args": payload,
+        "bridge_tools": PYTHON_PLUGIN_BRIDGE_TOOLS,
+        "allow_external_dispatch": allow_external_dispatch,
     });
     let output = run_python_plugin_hook_runner(&request).await?;
     if let Some(error) = output.get("error").and_then(Value::as_str) {

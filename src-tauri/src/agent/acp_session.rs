@@ -19,7 +19,7 @@ use super::{
     acp_history::acp_session_history_updates_for_store,
     acp_queue::acp_queue_update_notification,
     acp_server::{AcpListSessionsResponse, AcpSessionInfo},
-    shell_hooks::spawn_session_finished_hooks,
+    shell_hooks::{list_python_plugin_commands, spawn_session_finished_hooks},
 };
 
 static ACP_SESSION_RUNTIME_CONFIG: OnceLock<Mutex<HashMap<String, AcpSessionRuntimeConfig>>> =
@@ -264,7 +264,7 @@ pub(super) fn acp_session_status_notifications(
 ) -> AppResult<Vec<Value>> {
     let mut notifications = Vec::new();
     notifications.extend(acp_session_info_notification(store, session_id)?);
-    notifications.extend(acp_available_commands_notification(session_id));
+    notifications.extend(acp_available_commands_notification(store, session_id));
     notifications.extend(acp_usage_notification(store, session_id)?);
     Ok(notifications)
 }
@@ -279,15 +279,94 @@ pub(super) fn acp_session_info_notification(
     Ok(vec![acp_session_update_notification(session_id, update)])
 }
 
-fn acp_available_commands_notification(session_id: &str) -> Vec<Value> {
+fn acp_available_commands_notification(store: &AppStore, session_id: &str) -> Vec<Value> {
     vec![acp_session_update_notification(
         session_id,
-        acp_available_commands_update(),
+        acp_available_commands_update_for_store(store),
     )]
 }
 
 pub(super) fn acp_available_commands_update() -> Value {
-    let available_commands = acp_advertised_command_specs()
+    acp_available_commands_update_from_specs(acp_advertised_command_specs_owned())
+}
+
+pub(super) fn acp_available_commands_update_for_store(store: &AppStore) -> Value {
+    let mut specs = acp_advertised_command_specs_owned();
+    let mut used = specs
+        .iter()
+        .map(|(name, _, _)| (*name).to_string())
+        .collect::<HashSet<_>>();
+
+    if let Ok(mut plugin_commands) = list_python_plugin_commands(store) {
+        plugin_commands.sort_by(|left, right| left.name.cmp(&right.name));
+        for command in plugin_commands {
+            let name = sanitize_acp_dynamic_command_name(&command.name);
+            if name.is_empty() || !used.insert(name.clone()) {
+                continue;
+            }
+            let description = if command.description.trim().is_empty() {
+                format!("Plugin command from {}", command.plugin_name)
+            } else {
+                command.description
+            };
+            let hint = (!command.args_hint.trim().is_empty()).then(|| command.args_hint);
+            specs.push((
+                name,
+                truncate_acp_command_description(&description),
+                hint.map(|hint| hint.trim().to_string()),
+            ));
+        }
+    }
+
+    if let Ok(mut skills) = crate::skills::list_skills(store) {
+        skills.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        for skill in skills {
+            let name = sanitize_acp_dynamic_command_name(&skill.name);
+            if name.is_empty() || !used.insert(name.clone()) {
+                continue;
+            }
+            let description = if skill.description.trim().is_empty() {
+                format!("Invoke skill {}", skill.name)
+            } else {
+                skill.description
+            };
+            specs.push((
+                name,
+                truncate_acp_command_description(&description),
+                Some("instruction for the skill".into()),
+            ));
+        }
+    }
+
+    if let Ok(mut bundles) = crate::skills::list_skill_bundles(store) {
+        bundles.sort_by(|left, right| left.id.cmp(&right.id));
+        for bundle in bundles {
+            let name = sanitize_acp_dynamic_command_name(&bundle.id);
+            if name.is_empty() || !used.insert(name.clone()) {
+                continue;
+            }
+            let description = if bundle.description.trim().is_empty() {
+                format!("Invoke skill bundle {}", bundle.name)
+            } else {
+                bundle.description
+            };
+            specs.push((
+                name,
+                truncate_acp_command_description(&description),
+                Some("instruction for the skill bundle".into()),
+            ));
+        }
+    }
+
+    acp_available_commands_update_from_specs(specs)
+}
+
+fn acp_available_commands_update_from_specs(specs: Vec<(String, String, Option<String>)>) -> Value {
+    let available_commands = specs
         .into_iter()
         .map(|(name, description, hint)| {
             let mut value = json!({
@@ -308,6 +387,62 @@ pub(super) fn acp_available_commands_update() -> Value {
         "sessionUpdate": "available_commands_update",
         "availableCommands": available_commands
     })
+}
+
+fn acp_advertised_command_specs_owned() -> Vec<(String, String, Option<String>)> {
+    acp_advertised_command_specs()
+        .into_iter()
+        .map(|(name, description, hint)| {
+            (
+                name.to_string(),
+                description.to_string(),
+                hint.map(str::to_string),
+            )
+        })
+        .collect()
+}
+
+fn sanitize_acp_dynamic_command_name(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut previous_hyphen = false;
+    for ch in value
+        .trim()
+        .trim_start_matches('/')
+        .trim_start_matches('／')
+        .to_lowercase()
+        .chars()
+    {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            Some(ch)
+        } else if ch == ' ' || ch == '_' || ch == '-' || ch == '/' {
+            Some('-')
+        } else {
+            None
+        };
+        let Some(ch) = mapped else {
+            continue;
+        };
+        if ch == '-' {
+            if normalized.is_empty() || previous_hyphen {
+                continue;
+            }
+            previous_hyphen = true;
+        } else {
+            previous_hyphen = false;
+        }
+        normalized.push(ch);
+    }
+    normalized.trim_matches('-').to_string()
+}
+
+fn truncate_acp_command_description(value: &str) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= 100 {
+        return normalized;
+    }
+    let mut truncated = normalized.chars().take(97).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 pub(super) fn acp_advertised_command_specs(

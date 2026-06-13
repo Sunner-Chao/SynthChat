@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { BookOpen, Bot, ChevronRight, Download, Edit3, ExternalLink, PlugZap, Plus, Puzzle, RefreshCw, Search, Sparkles, Terminal, Trash2, XCircle } from "lucide-react";
+import { BookOpen, Bot, ChevronRight, Download, Edit3, ExternalLink, Globe, PlugZap, Plus, Puzzle, RefreshCw, Search, Sparkles, Terminal, Trash2, XCircle } from "lucide-react";
 
 // Mock listen function for standalone frontend
 function listen<T>(event: string, handler: (event: { payload: T }) => void): Promise<() => void> {
@@ -10,7 +10,7 @@ function listen<T>(event: string, handler: (event: { payload: T }) => void): Pro
 }
 import { api } from "../lib/api";
 import { useAppStore } from "../lib/store";
-import type { AgentControlCommand, AgentDefinition, AgentQueuedRequest, AgentRunRecord, AgentTodoItem, CapabilityAdapter, EnhancedSkillSummary, MarketplaceSkill, MemoryStatus, PlannerTraceRecord, PluginSummary, ScheduledAgentJob, ScheduledJobOutputRecord, SkillAuditLogEntry, SkillBundle, SkillInstallRecord, SkillTap, SkillTapStatus, SkillUpdateCheck, StateSnapshotManifest, ToolApprovalRequest, ToolArtifactRecord, ToolDefinition, ToolRouterTraceRecord, ToolTraceEntry, WorkspaceSnapshotManifest, Worldbook } from "../lib/types";
+import type { AgentControlCommand, AgentDefinition, AgentQueuedRequest, AgentRunRecord, AgentTodoItem, CapabilityAdapter, EnhancedSkillSummary, ManagedProcessSnapshot, MarketplaceSkill, MemoryStatus, PlannerTraceRecord, PluginAuxiliaryTaskSummary, PluginSummary, ScheduledAgentJob, ScheduledJobOutputRecord, SkillAuditLogEntry, SkillBundle, SkillInstallRecord, SkillTap, SkillTapStatus, SkillUpdateCheck, StateSnapshotManifest, ToolApprovalRequest, ToolArtifactRecord, ToolDefinition, ToolRouterTraceRecord, ToolTraceEntry, WorkspaceSnapshotManifest, Worldbook } from "../lib/types";
 export function MemoryPanel() {
   const { memories, personas, saveMemory, deleteMemory, goBack } = useAppStore();
   const [personaId, setPersonaId] = useState("default");
@@ -215,6 +215,26 @@ export function WorldbooksPanel() {
 
 export function PluginsPanel() {
   const { plugins, togglePlugin, goBack } = useAppStore();
+  const [auxiliaryTasks, setAuxiliaryTasks] = useState<PluginAuxiliaryTaskSummary[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    api.listPluginAuxiliaryTasks()
+      .then((tasks) => {
+        if (!cancelled) setAuxiliaryTasks(tasks);
+      })
+      .catch(() => {
+        if (!cancelled) setAuxiliaryTasks([]);
+      });
+    return () => { cancelled = true; };
+  }, [plugins]);
+  const auxiliaryTasksByPlugin = useMemo(() => {
+    return auxiliaryTasks.reduce<Record<string, PluginAuxiliaryTaskSummary[]>>((acc, task) => {
+      const key = task.pluginId || task.pluginName;
+      if (!key) return acc;
+      acc[key] = [...(acc[key] ?? []), task];
+      return acc;
+    }, {});
+  }, [auxiliaryTasks]);
   return (
     <section className="primary-panel embedded-panel">
       <div className="panel-title action-title">
@@ -230,6 +250,10 @@ export function PluginsPanel() {
         <div className="plugin-list">
           {plugins.map((plugin) => (
             <div className="card plugin-card" key={plugin.id}>
+              {(() => {
+                const pluginAuxiliaryTasks = auxiliaryTasksByPlugin[plugin.id] ?? auxiliaryTasksByPlugin[plugin.name] ?? [];
+                return (
+                  <>
               <div className="plugin-header">
                 <strong>{plugin.name}</strong>
                 <button
@@ -276,6 +300,19 @@ export function PluginsPanel() {
                   ))}
                 </div>
               ) : null}
+              {pluginAuxiliaryTasks.length ? (
+                <div className="plugin-tools">
+                  <span>Aux：</span>
+                  {pluginAuxiliaryTasks.map((task) => (
+                    <span className="tool-tag" key={`${task.pluginId}:${task.key}`} title={task.description || task.displayName}>
+                      {task.key}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+                  </>
+                );
+              })()}
             </div>
           ))}
         </div>
@@ -384,6 +421,7 @@ const AGENT_TOOLSETS = [
 type PlatformAdapterState = {
   platform?: string;
   status?: string;
+  mode?: string;
   updatedAt?: string;
   startedAt?: string | null;
   stoppedAt?: string | null;
@@ -395,7 +433,97 @@ type PlatformAdapterState = {
   runtime?: boolean;
   transport?: string;
   capabilities?: string[];
+  runtimeAdapter?: boolean;
+  runtime_adapter?: boolean;
+  messagingGateway?: boolean;
+  messaging_gateway?: boolean;
+  externalDaemon?: boolean;
+  external_daemon?: boolean;
+  gatewayPlatform?: string;
+  gateway_platform?: string;
+  capabilityMatrix?: Record<string, boolean>;
+  capability_matrix?: Record<string, boolean>;
 };
+
+function platformAdapterMode(adapter?: PlatformAdapterState | null) {
+  if (!adapter) return "unknown";
+  if (adapter.mode) return adapter.mode;
+  if (adapter.messagingGateway || adapter.messaging_gateway) return "messaging_gateway";
+  return adapter.runtime ? "runtime" : "send_only";
+}
+
+function platformAdapterCapabilityText(adapter?: PlatformAdapterState | null) {
+  const matrix = adapter?.capabilityMatrix ?? adapter?.capability_matrix;
+  if (!matrix) return "capabilities=n/a";
+  const caps = ["send", "receive", "lifecycle", "attachments"]
+    .map((key) => `${key}:${matrix[key] ? "yes" : "no"}`);
+  const boundary = [
+    adapter?.messagingGateway || adapter?.messaging_gateway ? "gateway" : "",
+    adapter?.externalDaemon || adapter?.external_daemon ? "external-daemon" : "",
+  ].filter(Boolean);
+  return [...caps, ...boundary].join(" · ");
+}
+
+function managedProcessId(process: ManagedProcessSnapshot) {
+  return process.id || process.sessionId || process.session_id || "unknown";
+}
+
+function managedProcessConversationId(process: ManagedProcessSnapshot) {
+  return process.conversationId ?? process.conversation_id ?? "";
+}
+
+function managedProcessRunId(process: ManagedProcessSnapshot) {
+  return process.runId ?? process.run_id ?? "";
+}
+
+function managedProcessTime(process: ManagedProcessSnapshot) {
+  return process.finishedAt ?? process.finished_at ?? process.startedAt ?? process.started_at ?? "";
+}
+
+function managedProcessWatchText(process: ManagedProcessSnapshot) {
+  const patterns = process.watchPatterns ?? process.watch_patterns ?? [];
+  const stats = process.watchStats ?? process.watch_stats ?? {};
+  const matchCount = typeof stats.matchCount === "number" ? stats.matchCount : 0;
+  const emitCount = typeof stats.emitCount === "number" ? stats.emitCount : 0;
+  const notify = process.notifyOnComplete ?? process.notify_on_complete ?? false;
+  return [
+    notify ? "notify" : "",
+    patterns.length ? `watch:${patterns.join(",")}` : "",
+    patterns.length ? `match:${matchCount}/emit:${emitCount}` : "",
+  ].filter(Boolean).join(" · ") || "watch:off";
+}
+
+function asRecord(value: unknown): Record<string, any> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : {};
+}
+
+function compactJson(value: unknown, limit = 180) {
+  const text = JSON.stringify(value ?? {});
+  return text.length > limit ? `${text.slice(0, limit)}...` : text;
+}
+
+function browserRuntimeLines(status: Record<string, unknown> | null) {
+  const provider = asRecord(status?.provider);
+  const supervisor = asRecord(status?.supervisor);
+  const activeProvider = asRecord(provider.activeProvider ?? provider.hermesResolvedProvider);
+  const providers = Array.isArray(provider.providers) ? provider.providers : [];
+  const summary = asRecord(supervisor.summary);
+  return {
+    title: activeProvider.name || activeProvider.id || provider.hermesResolutionReason || "local",
+    detail: `providers:${providers.length} · reason:${provider.hermesResolutionReason ?? "n/a"} · supervisor:${summary.status ?? summary.active ?? "n/a"}`,
+    raw: compactJson(status)
+  };
+}
+
+function computerUseRuntimeLines(status: Record<string, unknown> | null) {
+  const backend = asRecord(status?.backend);
+  const lifecycle = asRecord(status?.lifecycle);
+  return {
+    title: backend.name || status?.platform || "computer_use",
+    detail: `platform:${status?.platform ?? "n/a"} · available:${String(backend.available ?? backend.ok ?? "n/a")} · lifecycle:${lifecycle.status ?? lifecycle.lastStatus ?? "n/a"}`,
+    raw: compactJson(status)
+  };
+}
 
 export function McpPanel() {
   const { mcpServers, capabilityAdapters, agentRuns, conversations, activeConversationId, personas, lastMcpResult, lastMcpToolsResult, callMcpTool, listMcpTools, saveMcpServers, saveCapabilityAdapters, refreshAgentRuns, bootstrap, goBack } = useAppStore();
@@ -403,12 +531,18 @@ export function McpPanel() {
   const [toolName, setToolName] = useState("echo");
   const [selectedServerId, setSelectedServerId] = useState("");
   const [busy, setBusy] = useState(false);
+  const [mcpNotice, setMcpNotice] = useState("");
+  const [mcpOauthCallback, setMcpOauthCallback] = useState("");
+  const [mcpStatus, setMcpStatus] = useState<Record<string, any> | null>(null);
   const [traces, setTraces] = useState<ToolTraceEntry[]>([]);
   const [toolDefinitions, setToolDefinitions] = useState<ToolDefinition[]>([]);
   const [approvals, setApprovals] = useState<ToolApprovalRequest[]>([]);
   const [controlCommands, setControlCommands] = useState<AgentControlCommand[]>([]);
   const [agentQueue, setAgentQueue] = useState<AgentQueuedRequest[]>([]);
   const [agentTodos, setAgentTodos] = useState<AgentTodoItem[]>([]);
+  const [managedProcesses, setManagedProcesses] = useState<ManagedProcessSnapshot[]>([]);
+  const [browserRuntimeStatus, setBrowserRuntimeStatus] = useState<Record<string, unknown> | null>(null);
+  const [computerUseRuntimeStatus, setComputerUseRuntimeStatus] = useState<Record<string, unknown> | null>(null);
   const [scheduledJobs, setScheduledJobs] = useState<ScheduledAgentJob[]>([]);
   const [scheduledPrompt, setScheduledPrompt] = useState("");
   const [scheduledName, setScheduledName] = useState("");
@@ -440,6 +574,10 @@ export function McpPanel() {
   const [mattermostAdapterState, setMattermostAdapterState] = useState<PlatformAdapterState | null>(null);
   const [platformAdapterStates, setPlatformAdapterStates] = useState<PlatformAdapterState[]>([]);
   const server = mcpServers.find((item) => item.id === selectedServerId) ?? mcpServers[0];
+  const selectedMcpStatus = useMemo(() => {
+    const servers = Array.isArray(mcpStatus?.servers) ? mcpStatus?.servers : [];
+    return servers.find((item: Record<string, any>) => item.id === server?.id || item.name === server?.name) ?? null;
+  }, [mcpStatus, server?.id, server?.name]);
   const pendingApprovalRunIds = new Set(
     approvals
       .filter((approval) => approval.status === "pending" && approval.runId)
@@ -522,6 +660,15 @@ export function McpPanel() {
   const visibleTodos = agentTodos
     .filter((item) => agentRuns.some((run) => run.runId === item.runId && !["completed", "failed", "aborted"].includes(run.state)))
     .slice(0, 12);
+  const visibleManagedProcesses = useMemo(
+    () => managedProcesses
+      .slice()
+      .sort((a, b) => String(managedProcessTime(b)).localeCompare(String(managedProcessTime(a))))
+      .slice(0, 8),
+    [managedProcesses]
+  );
+  const browserRuntime = useMemo(() => browserRuntimeLines(browserRuntimeStatus), [browserRuntimeStatus]);
+  const computerUseRuntime = useMemo(() => computerUseRuntimeLines(computerUseRuntimeStatus), [computerUseRuntimeStatus]);
 
   useEffect(() => {
     if (!selectedServerId && mcpServers[0]) setSelectedServerId(mcpServers[0].id);
@@ -534,6 +681,10 @@ export function McpPanel() {
 
   const refreshToolDefinitions = async () => {
     setToolDefinitions(await api.listToolDefinitions());
+  };
+
+  const refreshMcpStatus = async () => {
+    setMcpStatus(await api.getMcpStatus());
   };
 
   const refreshApprovals = async () => {
@@ -550,6 +701,19 @@ export function McpPanel() {
 
   const refreshAgentTodos = async () => {
     setAgentTodos(await api.listAgentTodos());
+  };
+
+  const refreshManagedProcesses = async () => {
+    setManagedProcesses(await api.listManagedProcesses());
+  };
+
+  const refreshBrowserComputerRuntime = async () => {
+    const [browserStatus, computerStatus] = await Promise.all([
+      api.browserRuntimeStatus(),
+      api.computerUseRuntimeStatus()
+    ]);
+    setBrowserRuntimeStatus(browserStatus);
+    setComputerUseRuntimeStatus(computerStatus);
   };
 
   const refreshMattermostAdapter = async () => {
@@ -581,7 +745,7 @@ export function McpPanel() {
   };
 
   const refreshAgentRuntime = async () => {
-    await Promise.all([refreshTraces(), refreshApprovals(), refreshControlCommands(), refreshAgentQueue(), refreshAgentTodos(), refreshMattermostAdapter(), refreshScheduledJobs(), refreshStateSnapshots(), refreshWorkspaceSnapshots(), refreshTrustedTools(), refreshAgentRuns()]);
+    await Promise.all([refreshTraces(), refreshApprovals(), refreshControlCommands(), refreshAgentQueue(), refreshAgentTodos(), refreshManagedProcesses(), refreshBrowserComputerRuntime(), refreshMattermostAdapter(), refreshScheduledJobs(), refreshStateSnapshots(), refreshWorkspaceSnapshots(), refreshTrustedTools(), refreshAgentRuns()]);
   };
 
   const refreshRegistryFromServers = async () => {
@@ -597,10 +761,13 @@ export function McpPanel() {
 
   useEffect(() => {
     void refreshTraces();
+    void refreshMcpStatus();
     void refreshToolDefinitions();
     void refreshApprovals();
     void refreshAgentQueue();
     void refreshAgentTodos();
+    void refreshManagedProcesses();
+    void refreshBrowserComputerRuntime();
     void refreshMattermostAdapter();
     void refreshScheduledJobs();
     void refreshStateSnapshots();
@@ -629,6 +796,18 @@ export function McpPanel() {
         void refreshToolDefinitions();
       }
     ).then((handler) => {
+      unlisten = handler;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void listen("synthchat-managed-process-event", () => {
+      void refreshManagedProcesses();
+    }).then((handler) => {
       unlisten = handler;
     });
     return () => {
@@ -707,6 +886,16 @@ export function McpPanel() {
       const state = await api.stopPlatformAdapter(platform);
       if (platform === "mattermost") setMattermostAdapterState(state);
       await refreshMattermostAdapter();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const stopManagedProcess = async (processId: string) => {
+    setBusy(true);
+    try {
+      await api.stopManagedProcess(processId);
+      await refreshManagedProcesses();
     } finally {
       setBusy(false);
     }
@@ -1081,6 +1270,32 @@ export function McpPanel() {
     );
   };
 
+  const togglePersistentSession = async () => {
+    if (!server) return;
+    await saveMcpServers(
+      mcpServers.map((item) =>
+        item.id === server.id
+          ? { ...item, persistentSession: !item.persistentSession }
+          : item
+      )
+    );
+    await refreshMcpStatus();
+  };
+
+  const resetPersistentSession = async () => {
+    if (!server) return;
+    setBusy(true);
+    try {
+      const result = await api.resetMcpPersistentSession(server.id);
+      const closed = Array.isArray(result.closed) ? result.closed.length : 0;
+      const missing = Array.isArray(result.missing) ? result.missing.length : 0;
+      setMcpNotice(`已重置 MCP persistent session：closed=${closed} · missing=${missing}`);
+      await refreshMcpStatus();
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const toggleAdapter = async (adapter: CapabilityAdapter) => {
     await saveCapabilityAdapters(
       capabilityAdapters.map((item) =>
@@ -1094,6 +1309,72 @@ export function McpPanel() {
     setBusy(true);
     try {
       await listMcpTools(server.id, server.timeoutSeconds);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const clearMcpOauthCache = async () => {
+    if (!server) return;
+    if (!window.confirm(`清理 ${server.name || server.id} 的 MCP OAuth 缓存？清理后需要重新认证。`)) return;
+    setBusy(true);
+    try {
+      const result = await api.removeMcpOauthTokens(server.id);
+      const removed = Array.isArray(result.removed) ? result.removed.length : 0;
+      const missing = Array.isArray(result.missing) ? result.missing.length : 0;
+      setMcpNotice(`已清理 OAuth 缓存：removed=${removed} · missing=${missing}`);
+      await refreshToolDefinitions();
+      await refreshMcpStatus();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const refreshMcpOauthCache = async () => {
+    if (!server) return;
+    setBusy(true);
+    try {
+      const result = await api.refreshMcpOauthTokens(server.id);
+      setMcpNotice(result?.success ? "已刷新 OAuth token。" : "OAuth token 刷新完成。");
+      await refreshToolDefinitions();
+      await refreshMcpStatus();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const startMcpOauthLogin = async () => {
+    if (!server) return;
+    setBusy(true);
+    try {
+      const result = await api.startMcpOauthLogin(server.id);
+      const authorizationUrl = String(result?.authorizationUrl ?? "");
+      if (authorizationUrl) {
+        window.open(authorizationUrl, "_blank", "noopener,noreferrer");
+      }
+      const listener = result?.callbackListener;
+      const listenerText = listener?.listening ? "本地回调监听已启动，浏览器授权完成后会自动兑换 token。" : "本地回调监听未启动，请将回调 URL 或 code 粘贴到下方。";
+      setMcpNotice(`已生成 OAuth 授权链接。${listenerText} redirect=${result?.redirectUri ?? "n/a"}`);
+      await refreshMcpStatus();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const finishMcpOauthLogin = async () => {
+    if (!server) return;
+    const value = mcpOauthCallback.trim();
+    if (!value) {
+      setMcpNotice("请先粘贴 OAuth callback URL 或 code。");
+      return;
+    }
+    setBusy(true);
+    try {
+      const result = await api.finishMcpOauthLogin(server.id, value);
+      setMcpNotice(result?.success ? "OAuth 登录完成，token 已写入缓存。" : "OAuth 登录流程已完成。");
+      setMcpOauthCallback("");
+      await refreshToolDefinitions();
+      await refreshMcpStatus();
     } finally {
       setBusy(false);
     }
@@ -1116,6 +1397,34 @@ export function McpPanel() {
         <div className="mcp-console">
           <div className="card" style={{ margin: "0 16px 12px" }}>
             <div className="card-header">服务器信息</div>
+            {mcpNotice ? <p className="form-hint">{mcpNotice}</p> : null}
+            {selectedMcpStatus ? (
+              <div className="adapter-row trace-row" style={{ margin: "0 16px 12px" }}>
+                <span className="row-icon indigo"><PlugZap size={17} /></span>
+                <div className="adapter-info">
+                  <strong>{selectedMcpStatus.name ?? selectedMcpStatus.id}</strong>
+                  <small>
+                    auth={selectedMcpStatus.auth ?? "none"} · oauth={selectedMcpStatus.oauthStatus?.state ?? "n/a"} · cache={selectedMcpStatus.oauthStatus?.tokenStatus?.cacheState ?? "n/a"}
+                  </small>
+                  <code>
+                    refreshReady={String(selectedMcpStatus.oauthStatus?.tokenStatus?.refreshReady ?? false)} · risk={selectedMcpStatus.oauthStatus?.tokenStatus?.refreshRisk ?? "n/a"}
+                  </code>
+                  <code>
+                    persistent={String(selectedMcpStatus.persistentSession?.active ?? false)} · calls={selectedMcpStatus.persistentSession?.calls ?? 0}
+                  </code>
+                  <code>
+                    httpSession={String(selectedMcpStatus.httpSession?.active ?? false)} · tail={selectedMcpStatus.httpSession?.idTail ?? "n/a"}
+                  </code>
+                </div>
+                <span className={`status-badge ${selectedMcpStatus.connected ? "enabled" : selectedMcpStatus.needsRefresh ? "warning" : "disabled"}`}>
+                  {selectedMcpStatus.status ?? "unknown"}
+                </span>
+                <button className="btn-secondary" disabled={busy} onClick={() => void refreshMcpStatus()} type="button">
+                  <RefreshCw size={15} />
+                  刷新状态
+                </button>
+              </div>
+            ) : null}
             <div className="form-group">
               <div className="form-row">
                 <label>Server</label>
@@ -1167,6 +1476,120 @@ export function McpPanel() {
               </label>
               <p className="form-hint">仅在该 MCP server 的工具彼此独立且线程安全时开启。</p>
             </div>
+            <div className="form-group">
+              <label className="check-row">
+                <input
+                  checked={Boolean(server.persistentSession)}
+                  onChange={() => void togglePersistentSession()}
+                  type="checkbox"
+                />
+                <span>复用 stdio JSON-RPC session</span>
+              </label>
+              <p className="form-hint">仅对 stdio MCP JSON-RPC 工具调用生效；配置变化或调用失败会自动重建 session。</p>
+              <div className="inline-actions" style={{ paddingTop: 8 }}>
+                <button
+                  className="btn-secondary"
+                  disabled={busy || (!server.persistentSession && !selectedMcpStatus?.persistentSession?.active)}
+                  onClick={() => void resetPersistentSession()}
+                  type="button"
+                >
+                  <RefreshCw size={15} />
+                  重置 persistent session
+                </button>
+              </div>
+            </div>
+            <div className="inline-actions" style={{ padding: "0 16px 12px" }}>
+              <button className="btn-secondary" disabled={busy} onClick={() => void startMcpOauthLogin()} type="button">
+                <ExternalLink size={15} />
+                OAuth 登录
+              </button>
+              <button className="btn-secondary" disabled={busy} onClick={() => void refreshMcpOauthCache()} type="button">
+                <RefreshCw size={15} />
+                刷新 OAuth
+              </button>
+              <button className="btn-secondary" disabled={busy} onClick={() => void clearMcpOauthCache()} type="button">
+                <Trash2 size={15} />
+                清理 OAuth 缓存
+              </button>
+            </div>
+            <div className="form-group">
+              <div className="form-row">
+                <label>OAuth 回调</label>
+                <input
+                  placeholder="粘贴 callback URL 或 authorization code"
+                  value={mcpOauthCallback}
+                  onChange={(event) => setMcpOauthCallback(event.target.value)}
+                />
+                <button className="btn-secondary" disabled={busy || !mcpOauthCallback.trim()} onClick={() => void finishMcpOauthLogin()} type="button">
+                  完成授权
+                </button>
+              </div>
+            </div>
+          </div>
+          <div className="card" style={{ margin: "0 16px 12px" }}>
+            <div className="card-header">Browser / Computer Use Runtime</div>
+            <div className="adapter-list">
+              <div className="adapter-row trace-row">
+                <span className="row-icon indigo"><Globe size={17} /></span>
+                <div className="adapter-info">
+                  <strong>{browserRuntime.title}</strong>
+                  <small>{browserRuntime.detail}</small>
+                  <code>{browserRuntime.raw}</code>
+                </div>
+                <button className="btn-secondary" disabled={busy} onClick={() => void refreshBrowserComputerRuntime()} type="button">
+                  <RefreshCw size={15} />
+                  刷新
+                </button>
+              </div>
+              <div className="adapter-row trace-row">
+                <span className="row-icon neutral"><Bot size={17} /></span>
+                <div className="adapter-info">
+                  <strong>{computerUseRuntime.title}</strong>
+                  <small>{computerUseRuntime.detail}</small>
+                  <code>{computerUseRuntime.raw}</code>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div className="card" style={{ margin: "0 16px 12px" }}>
+            <div className="card-header">Managed Processes</div>
+            <div className="adapter-list">
+              {visibleManagedProcesses.length === 0 ? (
+                <p className="form-hint">暂无后台进程；terminal background/process start 会显示在这里。</p>
+              ) : (
+                visibleManagedProcesses.map((process) => {
+                  const id = managedProcessId(process);
+                  const status = process.status ?? "unknown";
+                  const running = status === "running";
+                  const stdoutTail = process.stdoutTail ?? process.stdout_tail ?? [];
+                  const stderrTail = process.stderrTail ?? process.stderr_tail ?? [];
+                  const latestLine = [...stderrTail.slice(-1), ...stdoutTail.slice(-1)].filter(Boolean).at(0);
+                  return (
+                    <div className="adapter-row trace-row" key={id}>
+                      <span className="row-icon neutral"><Terminal size={17} /></span>
+                      <div className="adapter-info">
+                        <strong>{process.label || id}</strong>
+                        <small>
+                          {process.backend ?? "local"} · {process.envType ?? process.env_type ?? "local"} · {managedProcessWatchText(process)}
+                        </small>
+                        <code>
+                          id={id} · run={managedProcessRunId(process) || "none"} · conversation={managedProcessConversationId(process) || "none"}
+                        </code>
+                        {latestLine ? <small>{String(latestLine)}</small> : null}
+                      </div>
+                      <span className={`status-badge ${running ? "enabled" : status === "exited" ? "disabled" : "warning"}`}>
+                        {status}
+                      </span>
+                      {running ? (
+                        <button className="btn-secondary" disabled={busy} onClick={() => void stopManagedProcess(id)} type="button">
+                          停止
+                        </button>
+                      ) : null}
+                    </div>
+                  );
+                })
+              )}
+            </div>
           </div>
           <div className="card" style={{ margin: "0 16px 12px" }}>
             <div className="card-header">平台 Adapter</div>
@@ -1176,8 +1599,9 @@ export function McpPanel() {
                 <div className="adapter-info">
                   <strong>Mattermost</strong>
                   <small>
-                    received {mattermostAdapterState?.receivedCount ?? 0} · triggered {mattermostAdapterState?.triggeredCount ?? 0}
+                    {platformAdapterMode(mattermostAdapterState)} · {mattermostAdapterState?.transport ?? "websocket"} · received {mattermostAdapterState?.receivedCount ?? 0} · triggered {mattermostAdapterState?.triggeredCount ?? 0}
                   </small>
+                  <small>{platformAdapterCapabilityText(mattermostAdapterState)}</small>
                   <code>
                     updatedAt={mattermostAdapterState?.updatedAt ?? "n/a"}
                   </code>
@@ -1205,8 +1629,9 @@ export function McpPanel() {
                   <div className="adapter-info">
                     <strong>{adapter.platform}</strong>
                     <small>
-                      {adapter.runtime ? "runtime" : "send-only"} · {adapter.transport ?? "unknown"}
+                      {platformAdapterMode(adapter)} · {adapter.transport ?? "unknown"}
                     </small>
+                    <small>{platformAdapterCapabilityText(adapter)}</small>
                     <code>
                       configured={adapter.configured ? "true" : "false"} · enabled={adapter.enabled ? "true" : "false"}
                     </code>

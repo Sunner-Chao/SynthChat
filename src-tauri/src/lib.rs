@@ -1,5 +1,6 @@
 mod agent;
 mod error;
+mod hermes_auth;
 mod llm;
 mod mcp;
 mod model_catalog;
@@ -7,6 +8,7 @@ mod models;
 mod plugins;
 mod skills;
 mod store;
+mod threat_patterns;
 
 use std::{
     collections::HashMap,
@@ -37,6 +39,7 @@ const MAX_CHAT_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcpCliAction {
     Stdio,
+    McpStdio,
     Version,
     Check,
     Setup,
@@ -50,6 +53,19 @@ fn state_path() -> PathBuf {
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("synthchat-data").join("state.json")
+}
+
+fn sync_runtime_env_from_config(config: &AppConfig) {
+    std::env::set_var(
+        "SYNTHCHAT_LLM_CREDENTIAL_POOL_STRATEGY",
+        config.chat.llm_credential_pool_strategy.trim(),
+    );
+}
+
+fn sync_runtime_env_from_store(store: &AppStore) {
+    if let Ok(config) = store.config() {
+        sync_runtime_env_from_config(&config);
+    }
 }
 
 pub fn acp_stdio_requested_from_args<I, S>(args: I) -> bool
@@ -67,6 +83,7 @@ where
 {
     args.into_iter().skip(1).find_map(|arg| match arg.as_ref() {
         "--acp-stdio" | "acp-stdio" | "serve-acp" | "--serve-acp" => Some(AcpCliAction::Stdio),
+        "--mcp-stdio" | "mcp-stdio" | "serve-mcp" | "--serve-mcp" => Some(AcpCliAction::McpStdio),
         "--version" => Some(AcpCliAction::Version),
         "--check" => Some(AcpCliAction::Check),
         "--setup" => Some(AcpCliAction::Setup),
@@ -81,6 +98,7 @@ pub fn print_acp_version() {
 
 pub fn run_acp_check() -> AppResult<()> {
     let store = AppStore::new(state_path())?;
+    sync_runtime_env_from_store(&store);
     let request = json!({
         "jsonrpc": "2.0",
         "id": "check",
@@ -99,6 +117,7 @@ pub fn run_acp_check() -> AppResult<()> {
 
 pub fn run_acp_setup() -> AppResult<()> {
     let store = AppStore::new(state_path())?;
+    sync_runtime_env_from_store(&store);
     let provider_type = std::env::var("SYNTHCHAT_ACP_PROVIDER_TYPE")
         .ok()
         .map(|value| value.trim().to_string())
@@ -167,6 +186,7 @@ pub fn run_acp_setup_browser() -> AppResult<()> {
 
 pub fn run_acp_stdio() -> AppResult<()> {
     let store = AppStore::new(state_path())?;
+    sync_runtime_env_from_store(&store);
     let runtime = tokio::runtime::Runtime::new()?;
     let stdin = io::stdin();
     let stdout = Arc::new(Mutex::new(io::stdout()));
@@ -230,6 +250,155 @@ pub fn run_acp_stdio() -> AppResult<()> {
     Ok(())
 }
 
+pub fn run_mcp_stdio() -> AppResult<()> {
+    let store = AppStore::new(state_path())?;
+    sync_runtime_env_from_store(&store);
+    let runtime = tokio::runtime::Runtime::new()?;
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let request = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(error) => {
+                writeln!(
+                    stdout,
+                    "{}",
+                    mcp_stdio_error_response(Value::Null, -32700, &error.to_string())
+                )?;
+                stdout.flush()?;
+                continue;
+            }
+        };
+        if let Some(response) = runtime.block_on(handle_mcp_stdio_json_rpc(&store, &request)) {
+            writeln!(stdout, "{response}")?;
+            stdout.flush()?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_mcp_stdio_json_rpc(store: &AppStore, request: &Value) -> Option<Value> {
+    let id = request.get("id").cloned();
+    let Some(id) = id else {
+        return None;
+    };
+    let Some(method) = request.get("method").and_then(Value::as_str) else {
+        return Some(mcp_stdio_error_response(
+            id,
+            -32600,
+            "MCP request missing method",
+        ));
+    };
+    let result = match method {
+        "initialize" => json!({
+            "protocolVersion": mcp_stdio_protocol_version(request),
+            "serverInfo": {
+                "name": "synthchat-tools",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "tools": {},
+                "resources": {},
+                "prompts": {}
+            }
+        }),
+        "ping" => json!({}),
+        "tools/list" => json!({
+            "tools": agent::synthchat_tools_mcp_definitions()
+        }),
+        "resources/list" => json!({
+            "resources": []
+        }),
+        "resources/templates/list" => json!({
+            "resourceTemplates": []
+        }),
+        "prompts/list" => json!({
+            "prompts": []
+        }),
+        "tools/call" => {
+            let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+            let Some(name) = params.get("name").and_then(Value::as_str) else {
+                return Some(mcp_stdio_error_response(
+                    id,
+                    -32602,
+                    "tools/call requires params.name",
+                ));
+            };
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            match agent::synthchat_tools_mcp_call(store, name, arguments).await {
+                Ok(text) => {
+                    return Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": text
+                            }],
+                            "isError": false
+                        }
+                    }));
+                }
+                Err(error) => {
+                    return Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": error.to_string()
+                            }],
+                            "isError": true
+                        }
+                    }));
+                }
+            }
+        }
+        _ => {
+            return Some(mcp_stdio_error_response(
+                id,
+                -32601,
+                &format!("MCP server method '{method}' is not supported by SynthChat yet."),
+            ));
+        }
+    };
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    }))
+}
+
+fn mcp_stdio_protocol_version(request: &Value) -> String {
+    request
+        .get("params")
+        .and_then(|params| params.get("protocolVersion"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("2024-11-05")
+        .to_string()
+}
+
+fn mcp_stdio_error_response(id: Value, code: i64, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message
+        }
+    })
+}
+
 fn write_acp_stdio_result(
     stdout: Arc<Mutex<io::Stdout>>,
     request: Value,
@@ -276,7 +445,11 @@ fn get_config(store: State<'_, AppStore>) -> AppResult<AppConfig> {
 
 #[tauri::command(rename_all = "camelCase")]
 fn save_config(store: State<'_, AppStore>, config: AppConfig) -> AppResult<()> {
-    store.set_config(config)
+    let result = store.set_config(config.clone());
+    if result.is_ok() {
+        sync_runtime_env_from_config(&config);
+    }
+    result
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -290,6 +463,25 @@ fn remove_trusted_tool_pattern(
     pattern: String,
 ) -> AppResult<AppConfig> {
     store.untrust_tool_pattern(&pattern)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn add_hermes_credential_pool_entry(
+    provider: String,
+    label: Option<String>,
+    api_key: String,
+    base_url: Option<String>,
+    auth_type: Option<String>,
+    expires_at: Option<String>,
+) -> AppResult<hermes_auth::HermesCredentialPoolEntryStatus> {
+    hermes_auth::add_hermes_credential_pool_entry(
+        &provider,
+        label.as_deref(),
+        &api_key,
+        base_url.as_deref(),
+        auth_type.as_deref(),
+        expires_at.as_deref(),
+    )
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -589,6 +781,46 @@ async fn list_mcp_tools(
 }
 
 #[tauri::command(rename_all = "camelCase")]
+fn get_mcp_status(store: State<'_, AppStore>) -> AppResult<Value> {
+    mcp::mcp_status(&store)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn reset_mcp_persistent_session(
+    store: State<'_, AppStore>,
+    server_id: Option<String>,
+) -> AppResult<Value> {
+    mcp::reset_mcp_persistent_session(&store, server_id.as_deref()).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn remove_mcp_oauth_tokens(store: State<'_, AppStore>, server_id: String) -> AppResult<Value> {
+    mcp::remove_mcp_oauth_tokens(&store, &server_id)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn refresh_mcp_oauth_tokens(
+    store: State<'_, AppStore>,
+    server_id: String,
+) -> AppResult<Value> {
+    mcp::refresh_mcp_oauth_tokens(&store, &server_id).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn start_mcp_oauth_login(store: State<'_, AppStore>, server_id: String) -> AppResult<Value> {
+    mcp::start_mcp_oauth_login(&store, &server_id).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn finish_mcp_oauth_login(
+    store: State<'_, AppStore>,
+    server_id: String,
+    code_or_callback_url: String,
+) -> AppResult<Value> {
+    mcp::finish_mcp_oauth_login(&store, &server_id, &code_or_callback_url).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
 async fn call_mcp_tool(
     store: State<'_, AppStore>,
     server_id: String,
@@ -692,8 +924,182 @@ fn list_agent_runs(store: State<'_, AppStore>) -> AppResult<Vec<models::AgentRun
 }
 
 #[tauri::command(rename_all = "camelCase")]
+fn list_agent_runtime_events(
+    store: State<'_, AppStore>,
+    conversation_id: Option<String>,
+    run_id: Option<String>,
+    queue_item_id: Option<String>,
+    task_id: Option<String>,
+    board: Option<String>,
+    since: Option<u64>,
+    limit: Option<u64>,
+) -> AppResult<Value> {
+    store.reload_from_disk()?;
+    agent::agent_runtime_events(
+        &store,
+        &serde_json::json!({
+            "action": "kanban-runtime-events",
+            "conversationId": conversation_id,
+            "runId": run_id,
+            "queueItemId": queue_item_id,
+            "taskId": task_id,
+            "board": board,
+            "since": since.unwrap_or(0),
+            "limit": limit.unwrap_or(80),
+        }),
+    )
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn list_managed_processes(store: State<'_, AppStore>) -> AppResult<Vec<Value>> {
+    store.managed_processes()
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn stop_managed_process(
+    store: State<'_, AppStore>,
+    process_id: String,
+    forget: Option<bool>,
+) -> AppResult<Value> {
+    store.stop_managed_process(&process_id, forget.unwrap_or(false))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn browser_runtime_status(store: State<'_, AppStore>) -> AppResult<Value> {
+    agent::browser_runtime_status(&store).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn computer_use_runtime_status(store: State<'_, AppStore>) -> AppResult<Value> {
+    agent::computer_use_runtime_status(&store).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
 fn list_agent_control_commands() -> Vec<agent::AgentControlCommandView> {
     agent::list_agent_control_commands()
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn list_plugin_auxiliary_tasks(
+    store: State<'_, AppStore>,
+) -> AppResult<Vec<models::PluginAuxiliaryTaskSummary>> {
+    agent::list_python_plugin_auxiliary_tasks(&store)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn list_agent_auxiliary_tasks(
+    store: State<'_, AppStore>,
+) -> AppResult<Vec<models::AgentAuxiliaryTaskSummary>> {
+    agent::list_agent_auxiliary_tasks(&store)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn agent_auxiliary_task_defaults(
+    store: State<'_, AppStore>,
+    key: String,
+) -> AppResult<serde_json::Value> {
+    agent::agent_auxiliary_task_defaults(&store, &key)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn list_agent_auxiliary_task_assignments(
+    store: State<'_, AppStore>,
+) -> AppResult<Vec<models::AgentAuxiliaryTaskAssignment>> {
+    agent::list_agent_auxiliary_task_assignments(&store)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn save_agent_auxiliary_task_assignment(
+    store: State<'_, AppStore>,
+    key: String,
+    provider: String,
+    model: String,
+    base_url: String,
+    api_key: String,
+    timeout: Option<u64>,
+    extra_body: Option<serde_json::Value>,
+) -> AppResult<Vec<models::AgentAuxiliaryTaskAssignment>> {
+    agent::save_agent_auxiliary_task_assignment(
+        &store, &key, &provider, &model, &base_url, &api_key, timeout, extra_body,
+    )
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn reset_agent_auxiliary_task_assignments(
+    store: State<'_, AppStore>,
+) -> AppResult<Vec<models::AgentAuxiliaryTaskAssignment>> {
+    agent::reset_agent_auxiliary_task_assignments(&store)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn judge_agent_goal(
+    store: State<'_, AppStore>,
+    goal: String,
+    response: String,
+    subgoals: Option<Vec<String>>,
+) -> AppResult<Value> {
+    agent::judge_agent_goal(&store, &goal, &response, subgoals.unwrap_or_default()).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn agent_goal_status(store: State<'_, AppStore>, conversation_id: String) -> AppResult<Value> {
+    agent::agent_goal_status(&store, &conversation_id)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn set_agent_goal(
+    store: State<'_, AppStore>,
+    conversation_id: String,
+    goal: String,
+    max_turns: Option<u32>,
+) -> AppResult<Value> {
+    agent::set_agent_goal(&store, &conversation_id, &goal, max_turns)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn pause_agent_goal(
+    store: State<'_, AppStore>,
+    conversation_id: String,
+    reason: Option<String>,
+) -> AppResult<Value> {
+    agent::pause_agent_goal(&store, &conversation_id, reason.as_deref())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn resume_agent_goal(
+    store: State<'_, AppStore>,
+    conversation_id: String,
+    reset_budget: Option<bool>,
+) -> AppResult<Value> {
+    agent::resume_agent_goal(&store, &conversation_id, reset_budget.unwrap_or(true))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn clear_agent_goal(store: State<'_, AppStore>, conversation_id: String) -> AppResult<Value> {
+    agent::clear_agent_goal(&store, &conversation_id)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn add_agent_subgoal(
+    store: State<'_, AppStore>,
+    conversation_id: String,
+    text: String,
+) -> AppResult<Value> {
+    agent::add_agent_subgoal(&store, &conversation_id, &text)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn remove_agent_subgoal(
+    store: State<'_, AppStore>,
+    conversation_id: String,
+    index: usize,
+) -> AppResult<Value> {
+    agent::remove_agent_subgoal(&store, &conversation_id, index)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn clear_agent_subgoals(store: State<'_, AppStore>, conversation_id: String) -> AppResult<Value> {
+    agent::clear_agent_subgoals(&store, &conversation_id)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -821,6 +1227,15 @@ async fn drain_agent_queue(
 }
 
 #[tauri::command(rename_all = "camelCase")]
+async fn dispatch_kanban_and_drain_agent_queue(
+    app: AppHandle,
+    store: State<'_, AppStore>,
+    payload: serde_json::Value,
+) -> AppResult<Value> {
+    agent::dispatch_kanban_and_drain_agent_queue(&store, Some(&app), payload).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
 async fn start_mattermost_adapter(app: AppHandle, store: State<'_, AppStore>) -> AppResult<Value> {
     agent::start_mattermost_adapter(&store, app).await
 }
@@ -903,6 +1318,15 @@ fn list_agents(store: State<'_, AppStore>) -> AppResult<Vec<AgentDefinition>> {
 #[tauri::command(rename_all = "camelCase")]
 fn save_agent(store: State<'_, AppStore>, agent: AgentDefinition) -> AppResult<AgentDefinition> {
     store.save_agent(agent)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn auto_describe_agent(
+    store: State<'_, AppStore>,
+    agent_id: Option<String>,
+    overwrite: Option<bool>,
+) -> AppResult<AgentDefinition> {
+    agent::auto_describe_agent(&store, agent_id, overwrite.unwrap_or(false)).await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1623,6 +2047,11 @@ fn save_memory(store: State<'_, AppStore>, memory: Value) -> AppResult<models::M
             .and_then(Value::as_str)
             .unwrap_or("default")
             .to_string(),
+        target: memory
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("memory")
+            .to_string(),
         summary: memory
             .get("summary")
             .and_then(Value::as_str)
@@ -1838,10 +2267,12 @@ fn reveal_local_file(path: String) -> AppResult<()> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let store = AppStore::new(state_path()).expect("failed to initialize SynthChat state");
+    sync_runtime_env_from_store(&store);
     tauri::Builder::default()
         .manage(store)
         .setup(|app| {
             let store = app.state::<AppStore>();
+            mcp::start_mcp_keepalive_loop(store.inner().clone());
             let reattached = agent::reattach_managed_process_watchers(&store, Some(&app.handle()));
             if reattached > 0 {
                 let _ = app.emit(
@@ -1878,6 +2309,7 @@ pub fn run() {
             save_config,
             add_trusted_tool_pattern,
             remove_trusted_tool_pattern,
+            add_hermes_credential_pool_entry,
             list_state_snapshots,
             create_state_snapshot,
             prune_state_snapshots,
@@ -1923,6 +2355,12 @@ pub fn run() {
             list_plugins,
             toggle_plugin,
             list_mcp_tools,
+            get_mcp_status,
+            reset_mcp_persistent_session,
+            remove_mcp_oauth_tokens,
+            refresh_mcp_oauth_tokens,
+            start_mcp_oauth_login,
+            finish_mcp_oauth_login,
             call_mcp_tool,
             list_tool_traces,
             list_tool_definitions,
@@ -1935,7 +2373,27 @@ pub fn run() {
             list_planner_traces,
             list_tool_router_traces,
             list_agent_runs,
+            list_agent_runtime_events,
+            list_managed_processes,
+            stop_managed_process,
+            browser_runtime_status,
+            computer_use_runtime_status,
             list_agent_control_commands,
+            list_plugin_auxiliary_tasks,
+            list_agent_auxiliary_tasks,
+            agent_auxiliary_task_defaults,
+            list_agent_auxiliary_task_assignments,
+            save_agent_auxiliary_task_assignment,
+            reset_agent_auxiliary_task_assignments,
+            judge_agent_goal,
+            agent_goal_status,
+            set_agent_goal,
+            pause_agent_goal,
+            resume_agent_goal,
+            clear_agent_goal,
+            add_agent_subgoal,
+            remove_agent_subgoal,
+            clear_agent_subgoals,
             list_agent_queue,
             cancel_agent_queue_item,
             clear_finished_agent_queue_items,
@@ -1949,6 +2407,7 @@ pub fn run() {
             export_agent_run_bundle,
             list_tool_artifacts_for_run,
             drain_agent_queue,
+            dispatch_kanban_and_drain_agent_queue,
             start_mattermost_adapter,
             stop_mattermost_adapter,
             mattermost_adapter_status,
@@ -1961,6 +2420,7 @@ pub fn run() {
             abort_agent_run,
             list_agents,
             save_agent,
+            auto_describe_agent,
             delete_agent,
             get_agent_config,
             save_agent_config,
@@ -2039,6 +2499,233 @@ mod tests {
         assert!(acp_stdio_requested_from_args(["synthchat", "--acp-stdio"]));
         assert!(acp_stdio_requested_from_args(["synthchat", "serve-acp"]));
         assert!(!acp_stdio_requested_from_args(["synthchat", "--dev"]));
+    }
+
+    #[test]
+    fn mcp_stdio_action_is_detected_from_args() {
+        assert_eq!(
+            acp_cli_action_from_args(["synthchat", "--mcp-stdio"]),
+            Some(AcpCliAction::McpStdio)
+        );
+        assert_eq!(
+            acp_cli_action_from_args(["synthchat", "serve-mcp"]),
+            Some(AcpCliAction::McpStdio)
+        );
+    }
+
+    #[test]
+    fn mcp_stdio_initialize_ping_and_empty_lists_are_protocol_compatible() {
+        let dir = std::env::temp_dir().join(format!("synthchat-mcp-protocol-{}", new_id("test")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AppStore::new(dir.join("state.json")).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let initialize = runtime
+            .block_on(handle_mcp_stdio_json_rpc(
+                &store,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26"
+                    }
+                }),
+            ))
+            .unwrap();
+        assert_eq!(initialize["result"]["protocolVersion"], "2025-03-26");
+        assert!(initialize["result"]["capabilities"]["tools"].is_object());
+        assert!(initialize["result"]["capabilities"]["resources"].is_object());
+        assert!(initialize["result"]["capabilities"]["prompts"].is_object());
+
+        let initialized_notification = runtime.block_on(handle_mcp_stdio_json_rpc(
+            &store,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }),
+        ));
+        assert!(initialized_notification.is_none());
+
+        for (id, method, result_key) in [
+            ("ping", "ping", ""),
+            ("resources", "resources/list", "resources"),
+            ("templates", "resources/templates/list", "resourceTemplates"),
+            ("prompts", "prompts/list", "prompts"),
+        ] {
+            let response = runtime
+                .block_on(handle_mcp_stdio_json_rpc(
+                    &store,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": method
+                    }),
+                ))
+                .unwrap();
+            assert!(response.get("error").is_none());
+            if result_key.is_empty() {
+                assert!(response["result"].as_object().unwrap().is_empty());
+            } else {
+                assert!(response["result"][result_key]
+                    .as_array()
+                    .unwrap()
+                    .is_empty());
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mcp_stdio_tools_list_exposes_hermes_style_tool_surface() {
+        let dir = std::env::temp_dir().join(format!("synthchat-mcp-stdio-{}", new_id("test")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AppStore::new(dir.join("state.json")).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let response = runtime
+            .block_on(handle_mcp_stdio_json_rpc(
+                &store,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list"
+                }),
+            ))
+            .unwrap();
+        let tools = response["result"]["tools"].as_array().unwrap();
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"web_search"));
+        assert!(names.contains(&"browser_snapshot"));
+        assert!(names.contains(&"vision_analyze"));
+        assert!(names.contains(&"text_to_speech"));
+        assert!(names.contains(&"kanban_complete"));
+        assert!(tools
+            .iter()
+            .all(|tool| tool["inputSchema"]["type"] == "object"));
+        let web_search = tools
+            .iter()
+            .find(|tool| tool["name"] == "web_search")
+            .expect("web_search should be exposed");
+        assert_eq!(
+            web_search["annotations"]["source"],
+            json!("synthchat-tools")
+        );
+        assert_eq!(web_search["annotations"]["serverId"], json!("__internal"));
+        assert_eq!(
+            web_search["inputSchema"]["properties"]["query"]["type"],
+            "string"
+        );
+        assert_eq!(
+            web_search["inputSchema"]["properties"]["limit"]["type"],
+            "integer"
+        );
+        let browser_navigate = tools
+            .iter()
+            .find(|tool| tool["name"] == "browser_navigate")
+            .expect("browser_navigate should be exposed");
+        assert_eq!(
+            browser_navigate["inputSchema"]["properties"]["url"]["type"],
+            "string"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mcp_stdio_tools_call_invokes_exposed_internal_tool() {
+        let dir = std::env::temp_dir().join(format!("synthchat-mcp-call-{}", new_id("test")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AppStore::new(dir.join("state.json")).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let response = runtime
+            .block_on(handle_mcp_stdio_json_rpc(
+                &store,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "voice_status",
+                        "arguments": {}
+                    }
+                }),
+            ))
+            .unwrap();
+        assert_eq!(response["result"]["isError"], false);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"action\":\"voice_status\""));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mcp_stdio_tools_call_accepts_json_string_arguments_and_rejects_unsafe_tools() {
+        let dir = std::env::temp_dir().join(format!("synthchat-mcp-call-args-{}", new_id("test")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AppStore::new(dir.join("state.json")).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let string_args = runtime
+            .block_on(handle_mcp_stdio_json_rpc(
+                &store,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "string-args",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "voice_status",
+                        "arguments": "{}"
+                    }
+                }),
+            ))
+            .unwrap();
+        assert_eq!(string_args["result"]["isError"], false);
+
+        let unsafe_tool = runtime
+            .block_on(handle_mcp_stdio_json_rpc(
+                &store,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "unsafe-tool",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "terminal",
+                        "arguments": {
+                            "command": "echo should-not-run"
+                        }
+                    }
+                }),
+            ))
+            .unwrap();
+        assert_eq!(unsafe_tool["result"]["isError"], true);
+        assert!(unsafe_tool["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not exposed"));
+
+        let bad_args = runtime
+            .block_on(handle_mcp_stdio_json_rpc(
+                &store,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "bad-args",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "voice_status",
+                        "arguments": []
+                    }
+                }),
+            ))
+            .unwrap();
+        assert_eq!(bad_args["result"]["isError"], true);
+        assert!(bad_args["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("must be a JSON object"));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

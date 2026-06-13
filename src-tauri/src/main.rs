@@ -5,6 +5,7 @@ fn main() {
     if let Some(action) = synthchat_v1_lib::acp_cli_action_from_args(std::env::args()) {
         let result = match action {
             synthchat_v1_lib::AcpCliAction::Stdio => synthchat_v1_lib::run_acp_stdio(),
+            synthchat_v1_lib::AcpCliAction::McpStdio => synthchat_v1_lib::run_mcp_stdio(),
             synthchat_v1_lib::AcpCliAction::Version => {
                 synthchat_v1_lib::print_acp_version();
                 Ok(())

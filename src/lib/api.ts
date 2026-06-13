@@ -1,10 +1,14 @@
 import { convertFileSrc as tauriConvertFileSrc, invoke } from "@tauri-apps/api/core";
 import type {
   ActionResult,
+  AddHermesCredentialPoolEntryRequest,
+  AgentAuxiliaryTaskAssignment,
+  AgentAuxiliaryTaskSummary,
   AgentConfig,
   AgentControlCommand,
   AgentDefinition,
   AgentQueuedRequest,
+  AgentRuntimeEventStream,
   AgentRunRecord,
   AgentTodoItem,
   AppConfig,
@@ -13,11 +17,15 @@ import type {
   ChatMessage,
   Conversation,
   EnvCheckResult,
+  HermesCredentialPoolEntryStatus,
   ImageProvider,
+  KanbanDispatchDrainResult,
   LlmProvider,
+  ManagedProcessSnapshot,
   MemoryEntry,
   MemoryStatus,
   Persona,
+  PluginAuxiliaryTaskSummary,
   ProfileConfig,
   SearchProvider,
   ScheduledAgentJob,
@@ -53,6 +61,7 @@ const fallbackConfig: AppConfig = {
     delegationInheritMcpToolsets: true,
     delegationSubagentProviderId: "",
     delegationSubagentModel: "",
+    auxiliaryTaskAssignments: {},
     agentRunTimeoutSeconds: 600,
     uiMessageLimit: 180,
     artifactScanLimit: 80,
@@ -79,6 +88,13 @@ const fallbackConfig: AppConfig = {
     llmRetryCount: 2,
     llmRetryBackoffMs: 800,
     responsesReasoningReplayEnabled: true,
+    fastModeEnabled: false,
+    runtimeFooterEnabled: false,
+    statusbarEnabled: true,
+    toolProgressDisplay: "new",
+    displaySkin: "default",
+    busyIndicatorStyle: "unicode",
+    codexRuntime: "auto",
     toolCallRetryCount: 1,
     toolCallRetryBackoffMs: 300,
     toolGuardrailWarningsEnabled: true,
@@ -249,6 +265,21 @@ export async function removeTrustedToolPattern(pattern: string): Promise<AppConf
       ...fallbackConfig.chat,
       trustedToolPatterns: (fallbackConfig.chat.trustedToolPatterns ?? []).filter((item) => item !== pattern)
     }
+  }));
+}
+
+export async function addHermesCredentialPoolEntry(
+  request: AddHermesCredentialPoolEntryRequest
+): Promise<HermesCredentialPoolEntryStatus> {
+  return call("add_hermes_credential_pool_entry", { ...request }, () => ({
+    providerId: request.provider,
+    index: 1,
+    label: request.label?.trim() || "api-key-1",
+    authType: request.authType || "api_key",
+    source: "manual",
+    state: "mock",
+    expiresAt: request.expiresAt,
+    baseUrl: request.baseUrl
   }));
 }
 
@@ -430,6 +461,38 @@ export const api: Record<string, any> = {
   listMcpServers: () => call("list_mcp_servers", {}, () => []),
   saveMcpServers: (servers: unknown[]) => call("save_mcp_servers", { servers }, () => undefined),
   listAgentRuns: () => call<AgentRunRecord[]>("list_agent_runs", {}, () => []),
+  listAgentRuntimeEvents: (options: {
+    conversationId?: string | null;
+    runId?: string | null;
+    queueItemId?: string | null;
+    taskId?: string | null;
+    board?: string | null;
+    since?: number;
+    limit?: number;
+  } = {}) => call<AgentRuntimeEventStream>("list_agent_runtime_events", options, () => ({
+    schema: "hermes_kanban_runtime_events_desktop_v1",
+    status: "ok",
+    action: "kanban-runtime-events",
+    events: [],
+    cursor: options.since ?? 0,
+    count: 0,
+    total: 0,
+    since: options.since ?? 0,
+    limit: options.limit ?? 80,
+    pollIntervalMs: 300,
+    websocketEmbedded: false,
+    nativeRuntimeEventBridge: false,
+    sources: []
+  })),
+  listManagedProcesses: () => call<ManagedProcessSnapshot[]>("list_managed_processes", {}, () => []),
+  stopManagedProcess: (processId: string, forget = false) =>
+    call<ManagedProcessSnapshot>("stop_managed_process", { processId, forget }, () => ({
+      id: processId,
+      status: "stopped",
+      finishedAt: new Date().toISOString()
+    })),
+  browserRuntimeStatus: () => call<Record<string, unknown>>("browser_runtime_status", {}, () => ({})),
+  computerUseRuntimeStatus: () => call<Record<string, unknown>>("computer_use_runtime_status", {}, () => ({})),
   listAgentControlCommands: () => call<AgentControlCommand[]>("list_agent_control_commands", {}, () => []),
   listAgentQueue: () => call<AgentQueuedRequest[]>("list_agent_queue", {}, () => []),
   cancelAgentQueueItem: (id: string) => call<AgentQueuedRequest>("cancel_agent_queue_item", { id }, () => ({
@@ -473,6 +536,17 @@ export const api: Record<string, any> = {
   exportAgentRunBundle: (runId: string) => call<string>("export_agent_run_bundle", { runId }, () => ""),
   listToolArtifactsForRun: (runId: string) => call<ToolArtifactRecord[]>("list_tool_artifacts_for_run", { runId }, () => []),
   drainAgentQueue: () => call<AgentQueuedRequest[]>("drain_agent_queue", {}, () => []),
+  dispatchKanbanAndDrainAgentQueue: (payload: Record<string, unknown> = {}) =>
+    call<KanbanDispatchDrainResult>("dispatch_kanban_and_drain_agent_queue", { payload }, () => ({
+      schema: "hermes_kanban_dispatch_drain_desktop_v1",
+      status: "unavailable",
+      action: "kanban-dispatch-drain",
+      dispatch: {},
+      drainRequested: false,
+      drained: [],
+      drainedCount: 0,
+      nativeDispatcherDrainBridge: false
+    })),
   startMattermostAdapter: () => call<Record<string, unknown>>("start_mattermost_adapter", {}, () => ({ platform: "mattermost", status: "unavailable" })),
   stopMattermostAdapter: () => call<Record<string, unknown>>("stop_mattermost_adapter", {}, () => ({ platform: "mattermost", status: "stopped" })),
   mattermostAdapterStatus: () => call<Record<string, unknown>>("mattermost_adapter_status", {}, () => ({ platform: "mattermost", status: "stopped" })),
@@ -538,6 +612,8 @@ export const api: Record<string, any> = {
   })),
   listAgents: () => call<AgentDefinition[]>("list_agents", {}, () => [defaultAgent()]),
   saveAgent: (agent: AgentDefinition) => call("save_agent", { agent }, () => agent),
+  autoDescribeAgent: (agentId?: string, overwrite = false) =>
+    call<AgentDefinition>("auto_describe_agent", { agentId, overwrite }, () => defaultAgent()),
   deleteAgent: (id: string) => call("delete_agent", { id }, () => undefined),
   getAgentConfig: () => call<AgentConfig>("get_agent_config", {}, () => ({
     enabled: true,
@@ -660,6 +736,21 @@ export const api: Record<string, any> = {
     removedWorkspaceSnapshots: 0
   })),
   listPlugins: () => call("list_plugins", {}, () => []),
+  listPluginAuxiliaryTasks: () => call<PluginAuxiliaryTaskSummary[]>("list_plugin_auxiliary_tasks", {}, () => []),
+  listAgentAuxiliaryTasks: () => call<AgentAuxiliaryTaskSummary[]>("list_agent_auxiliary_tasks", {}, () => []),
+  agentAuxiliaryTaskDefaults: (key: string) => call<Record<string, unknown>>("agent_auxiliary_task_defaults", { key }, () => ({})),
+  listAgentAuxiliaryTaskAssignments: () => call<AgentAuxiliaryTaskAssignment[]>("list_agent_auxiliary_task_assignments", {}, () => []),
+  saveAgentAuxiliaryTaskAssignment: (assignment: Pick<AgentAuxiliaryTaskAssignment, "key" | "provider" | "model" | "baseUrl" | "apiKey" | "timeout" | "extraBody">) => call<AgentAuxiliaryTaskAssignment[]>("save_agent_auxiliary_task_assignment", assignment, () => []),
+  resetAgentAuxiliaryTaskAssignments: () => call<AgentAuxiliaryTaskAssignment[]>("reset_agent_auxiliary_task_assignments", {}, () => []),
+  judgeAgentGoal: (goal: string, response: string, subgoals?: string[]) => call<{ done: boolean; reason: string; parseFailed: boolean; model: string }>("judge_agent_goal", { goal, response, subgoals }, () => ({ done: false, reason: "unavailable", parseFailed: false, model: "" })),
+  agentGoalStatus: (conversationId: string) => call("agent_goal_status", { conversationId }, () => ({ ok: true, goal: null, continuationPrompt: null })),
+  setAgentGoal: (conversationId: string, goal: string, maxTurns?: number) => call("set_agent_goal", { conversationId, goal, maxTurns }, () => ({ ok: false, goal: null, continuationPrompt: null })),
+  pauseAgentGoal: (conversationId: string, reason?: string) => call("pause_agent_goal", { conversationId, reason }, () => ({ ok: false, goal: null, continuationPrompt: null })),
+  resumeAgentGoal: (conversationId: string, resetBudget = true) => call("resume_agent_goal", { conversationId, resetBudget }, () => ({ ok: false, goal: null, continuationPrompt: null })),
+  clearAgentGoal: (conversationId: string) => call("clear_agent_goal", { conversationId }, () => ({ ok: false, goal: null, continuationPrompt: null })),
+  addAgentSubgoal: (conversationId: string, text: string) => call("add_agent_subgoal", { conversationId, text }, () => ({ ok: false, goal: null, continuationPrompt: null })),
+  removeAgentSubgoal: (conversationId: string, index: number) => call("remove_agent_subgoal", { conversationId, index }, () => ({ ok: false, goal: null, continuationPrompt: null })),
+  clearAgentSubgoals: (conversationId: string) => call("clear_agent_subgoals", { conversationId }, () => ({ ok: false, goal: null, continuationPrompt: null })),
   togglePlugin: (pluginId: string, enabled: boolean) => call("toggle_plugin", { pluginId, enabled }, () => []),
   listSkillBundles: () => call("list_skill_bundles", {}, () => []),
   installSkillBundle: (bundleId: string, agentId?: string) => call("install_skill_bundle", { bundleId, agentId }, () => []),
@@ -697,6 +788,12 @@ export const api: Record<string, any> = {
   importSkillSnapshot: (path: string) => call("import_skill_snapshot", { path }, () => 0),
   saveSkillConfig: (agentId: string, skillId: string, config: Record<string, string>) => call("save_skill_config", { agentId, skillId, config }, () => undefined),
   listMcpTools: (serverId: string, timeoutSeconds?: number) => call("list_mcp_tools", { serverId, timeoutSeconds }, () => ({ ok: true, timedOut: false, elapsedMs: 0, tools: [] })),
+  getMcpStatus: () => call("get_mcp_status", {}, () => ({ ok: true, success: true, servers: [] })),
+  resetMcpPersistentSession: (serverId?: string) => call("reset_mcp_persistent_session", { serverId }, () => ({ ok: true, success: true, serverId: serverId ?? "", closed: [], missing: [] })),
+  removeMcpOauthTokens: (serverId: string) => call("remove_mcp_oauth_tokens", { serverId }, () => ({ ok: true, success: true, serverId, removed: [], missing: [] })),
+  refreshMcpOauthTokens: (serverId: string) => call("refresh_mcp_oauth_tokens", { serverId }, () => ({ ok: true, success: true, serverId })),
+  startMcpOauthLogin: (serverId: string) => call("start_mcp_oauth_login", { serverId }, () => ({ ok: true, success: true, serverId, authorizationUrl: "", redirectUri: "" })),
+  finishMcpOauthLogin: (serverId: string, codeOrCallbackUrl: string) => call("finish_mcp_oauth_login", { serverId, codeOrCallbackUrl }, () => ({ ok: true, success: true, serverId })),
   callMcpTool: (serverId: string, toolName: string, payload: unknown, timeoutSeconds?: number) => call("call_mcp_tool", { serverId, toolName, payload, timeoutSeconds }, () => ({ ok: true, timedOut: false, elapsedMs: 0, stdout: "", stderr: "" })),
   listPlannerTraces: () => call("list_planner_traces", {}, () => []),
   listToolRouterTraces: () => call("list_tool_router_traces", {}, () => []),

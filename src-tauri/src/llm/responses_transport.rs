@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::{collections::BTreeMap, time::Instant};
 
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
@@ -48,6 +48,9 @@ pub(super) async fn complete_responses_compatible(
         "max_output_tokens": persona.max_tokens,
         "store": false
     });
+    if options.fast_mode_enabled {
+        body["service_tier"] = json!("priority");
+    }
     if options.responses_reasoning_replay_enabled {
         body["include"] = json!(["reasoning.encrypted_content"]);
     }
@@ -64,18 +67,19 @@ pub(super) async fn complete_responses_compatible(
     }
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(provider.timeout_seconds.max(1)))
+        .timeout(provider_request_timeout_duration(provider, model))
         .default_headers(headers)
         .build()
         .map_err(|e| AppError::Llm(e.to_string()))?;
 
     let started_at = Instant::now();
-    let response = client
-        .post(url.clone())
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AppError::Llm(e.to_string()))?;
+    let response = send_llm_request_with_stale_timeout(
+        client.post(url.clone()).json(&body),
+        provider,
+        model,
+        "responses request",
+    )
+    .await?;
 
     let mut status = response.status();
     let mut response_headers = response.headers().clone();
@@ -90,12 +94,13 @@ pub(super) async fn complete_responses_compatible(
         if let Some(retry_body) = responses_unsupported_parameter_retry_body(&body, &text) {
             retry_count = 1;
             retry_reason = Some("unsupported_parameter_recovery".to_string());
-            let retry_response = client
-                .post(responses_url(provider))
-                .json(&retry_body)
-                .send()
-                .await
-                .map_err(|e| AppError::Llm(e.to_string()))?;
+            let retry_response = send_llm_request_with_stale_timeout(
+                client.post(responses_url(provider)).json(&retry_body),
+                provider,
+                model,
+                "responses retry request",
+            )
+            .await?;
             status = retry_response.status();
             response_headers = retry_response.headers().clone();
             let text = retry_response.text().await.map_err(|e| {
@@ -111,8 +116,8 @@ pub(super) async fn complete_responses_compatible(
             }
             let payload = serde_json::from_str::<Value>(&text).map_err(|error| {
                 AppError::Llm(format!(
-                    "invalid recovered responses llm response ({status}): {error}; body: {}",
-                    response_preview(&text)
+                    "invalid recovered responses llm response ({status}): {error}; {}",
+                    invalid_response_body_detail(&text, &response_headers)
                 ))
             })?;
             let transport = LlmTransportMetadata {
@@ -152,7 +157,12 @@ pub(super) async fn complete_responses_compatible(
         retry_reason,
     };
     if let Some(callback) = options.stream_delta_callback.as_ref() {
-        let reply = read_responses_sse_stream(response, callback).await?;
+        let reply = read_responses_sse_stream(
+            response,
+            callback,
+            provider_stream_stale_timeout_duration(provider, model),
+        )
+        .await?;
         return Ok(with_reply_metadata_and_transport(
             stamp_responses_provider_data_issuer(reply, &issuer_kind),
             provider,
@@ -168,8 +178,8 @@ pub(super) async fn complete_responses_compatible(
         .map_err(|e| AppError::Llm(format!("failed to read responses llm response: {e}")))?;
     let payload = serde_json::from_str::<Value>(&text).map_err(|error| {
         AppError::Llm(format!(
-            "invalid responses llm response ({status}): {error}; body: {}",
-            response_preview(&text)
+            "invalid responses llm response ({status}): {error}; {}",
+            invalid_response_body_detail(&text, &response_headers)
         ))
     })?;
     parse_responses_compatible(payload)
@@ -188,6 +198,7 @@ pub(super) async fn complete_responses_compatible(
 async fn read_responses_sse_stream(
     response: reqwest::Response,
     callback: &LlmDeltaCallback,
+    stale_timeout: Option<std::time::Duration>,
 ) -> AppResult<LlmReply> {
     let mut buffer = String::new();
     let mut content = String::new();
@@ -196,9 +207,25 @@ async fn read_responses_sse_stream(
     let mut completion_tokens = 0usize;
     let mut reasoning_tokens = 0usize;
     let mut output_items = Vec::<Value>::new();
+    let mut tool_state = ResponsesStreamToolCallState::default();
     let mut stream = response.bytes_stream();
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next_chunk = if let Some(timeout) = stale_timeout {
+            tokio::time::timeout(timeout, stream.next())
+                .await
+                .map_err(|_| {
+                    AppError::Llm(format!(
+                        "responses stream stale: no provider bytes for {}s",
+                        timeout.as_secs_f64()
+                    ))
+                })?
+        } else {
+            stream.next().await
+        };
+        let Some(chunk) = next_chunk else {
+            break;
+        };
         let chunk =
             chunk.map_err(|e| AppError::Llm(format!("failed to read responses stream: {e}")))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -217,6 +244,7 @@ async fn read_responses_sse_stream(
                 &mut completion_tokens,
                 &mut reasoning_tokens,
                 &mut output_items,
+                &mut tool_state,
             )?;
         }
     }
@@ -231,21 +259,22 @@ async fn read_responses_sse_stream(
             &mut completion_tokens,
             &mut reasoning_tokens,
             &mut output_items,
+            &mut tool_state,
         )?;
     }
 
-    if let Some(payload) = final_response {
-        if let Ok(mut reply) = parse_responses_compatible(payload) {
-            if !content.trim().is_empty() {
-                reply.content = scrub_reasoning_blocks(&content);
-                reply.completion_tokens = if completion_tokens == 0 {
-                    estimate_tokens(&reply.content)
-                } else {
-                    completion_tokens
-                };
-            }
-            return Ok(reply);
+    if let Some(mut payload) = final_response {
+        merge_responses_stream_fallback_output(&mut payload, &output_items, &content);
+        let mut reply = parse_responses_compatible(payload)?;
+        if !content.trim().is_empty() {
+            reply.content = scrub_reasoning_blocks(&content);
+            reply.completion_tokens = if completion_tokens == 0 {
+                estimate_tokens(&reply.content)
+            } else {
+                completion_tokens
+            };
         }
+        return Ok(reply);
     }
     if !output_items.is_empty() {
         let payload = json!({
@@ -303,6 +332,7 @@ fn handle_responses_sse_line(
     completion_tokens: &mut usize,
     reasoning_tokens: &mut usize,
     output_items: &mut Vec<Value>,
+    tool_state: &mut ResponsesStreamToolCallState,
 ) -> AppResult<()> {
     let Some(data) = line.trim().strip_prefix("data:") else {
         return Ok(());
@@ -314,6 +344,13 @@ fn handle_responses_sse_line(
     let Ok(payload) = serde_json::from_str::<Value>(data) else {
         return Ok(());
     };
+    let event_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if event_type == "error" {
+        return Err(AppError::Llm(format_responses_stream_error(&payload)));
+    }
     if let Some(delta) = payload
         .get("delta")
         .and_then(Value::as_str)
@@ -327,16 +364,21 @@ fn handle_responses_sse_line(
         content.push_str(delta);
         callback(delta)?;
     }
-    if payload.get("type").and_then(Value::as_str) == Some("response.completed") {
+    if matches!(
+        event_type,
+        "response.completed" | "response.failed" | "response.incomplete"
+    ) {
         if let Some(response) = payload.get("response") {
             *final_response = Some(response.clone());
         }
     }
-    if payload.get("type").and_then(Value::as_str) == Some("response.output_item.done") {
+    if event_type == "response.output_item.done" {
         if let Some(item) = payload.get("item") {
             output_items.push(item.clone());
+            tool_state.remove_item(item);
         }
     }
+    tool_state.handle_event(event_type, &payload, output_items);
     let usage = payload
         .get("usage")
         .or_else(|| payload.pointer("/response/usage"));
@@ -359,6 +401,160 @@ fn handle_responses_sse_line(
             .unwrap_or(0) as usize;
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct ResponsesStreamToolCallState {
+    items: BTreeMap<String, Value>,
+    argument_deltas: BTreeMap<String, String>,
+}
+
+impl ResponsesStreamToolCallState {
+    fn handle_event(&mut self, event_type: &str, payload: &Value, output_items: &mut Vec<Value>) {
+        match event_type {
+            "response.output_item.added" => self.remember_added_item(payload),
+            "response.function_call_arguments.delta" => self.append_arguments_delta(payload),
+            "response.function_call_arguments.done" => self.finish_arguments(payload, output_items),
+            _ => {}
+        }
+    }
+
+    fn remember_added_item(&mut self, payload: &Value) {
+        let Some(item) = payload.get("item").filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call" | "custom_tool_call")
+            )
+        }) else {
+            return;
+        };
+        let Some(key) =
+            responses_stream_item_key(item).or_else(|| responses_stream_event_key(payload))
+        else {
+            return;
+        };
+        self.items.insert(key, item.clone());
+    }
+
+    fn append_arguments_delta(&mut self, payload: &Value) {
+        let Some(key) = responses_stream_event_key(payload) else {
+            return;
+        };
+        let Some(delta) = payload.get("delta").and_then(Value::as_str) else {
+            return;
+        };
+        self.argument_deltas.entry(key).or_default().push_str(delta);
+    }
+
+    fn finish_arguments(&mut self, payload: &Value, output_items: &mut Vec<Value>) {
+        let Some(key) = responses_stream_event_key(payload) else {
+            return;
+        };
+        let arguments = payload
+            .get("arguments")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| self.argument_deltas.remove(&key))
+            .unwrap_or_default();
+        let mut item = self.items.remove(&key).unwrap_or_else(|| {
+            json!({
+                "type": "function_call",
+                "id": key,
+                "call_id": payload.get("call_id").cloned().unwrap_or_else(|| json!(key)),
+                "name": payload.get("name").cloned().unwrap_or(Value::Null),
+            })
+        });
+        if item.get("call_id").is_none() {
+            item["call_id"] = payload
+                .get("call_id")
+                .cloned()
+                .unwrap_or_else(|| json!(key));
+        }
+        if item
+            .get("arguments")
+            .is_none_or(|value| value.is_null() || value.as_str() == Some(""))
+        {
+            item["arguments"] = json!(arguments);
+        }
+        item["status"] = json!("completed");
+        let duplicate = responses_stream_item_key(&item).is_some_and(|item_key| {
+            output_items
+                .iter()
+                .filter_map(responses_stream_item_key)
+                .any(|existing| existing == item_key)
+        });
+        if !duplicate {
+            output_items.push(item);
+        }
+    }
+
+    fn remove_item(&mut self, item: &Value) {
+        if let Some(key) = responses_stream_item_key(item) {
+            self.items.remove(&key);
+            self.argument_deltas.remove(&key);
+        }
+    }
+}
+
+fn responses_stream_event_key(payload: &Value) -> Option<String> {
+    first_response_stream_string(payload, &["item_id", "output_item_id", "call_id", "id"])
+}
+
+fn responses_stream_item_key(item: &Value) -> Option<String> {
+    first_response_stream_string(item, &["id", "call_id"])
+}
+
+fn first_response_stream_string(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn merge_responses_stream_fallback_output(
+    payload: &mut Value,
+    output_items: &[Value],
+    content: &str,
+) {
+    let output_missing_or_empty = payload
+        .get("output")
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.is_empty());
+    if output_missing_or_empty && !output_items.is_empty() {
+        payload["output"] = json!(output_items);
+    }
+    if payload
+        .get("output_text")
+        .and_then(Value::as_str)
+        .is_none_or(|text| text.trim().is_empty())
+        && !content.trim().is_empty()
+    {
+        payload["output_text"] = json!(content);
+    }
+}
+
+fn format_responses_stream_error(payload: &Value) -> String {
+    if let Some(error) = payload.get("error") {
+        return format_responses_error(Some(error), "error");
+    }
+    let code = payload
+        .get("code")
+        .map(value_to_compact_error_part)
+        .filter(|value| !value.trim().is_empty());
+    let message = payload
+        .get("message")
+        .map(value_to_compact_error_part)
+        .filter(|value| !value.trim().is_empty());
+    match (code, message) {
+        (Some(code), Some(message)) if code != message => format!("{code}: {message}"),
+        (Some(code), _) => code,
+        (_, Some(message)) => message,
+        _ => "Responses stream emitted an error event".into(),
+    }
 }
 
 pub(super) fn responses_unsupported_parameter_retry_body(
@@ -385,6 +581,9 @@ pub(super) fn responses_unsupported_parameter_retry_body(
         Some("include") => {
             object.remove("include")?;
         }
+        Some("service_tier") => {
+            object.remove("service_tier")?;
+        }
         _ => {
             if unsupported_parameter_error_mentions(&lower, "temperature") {
                 object.remove("temperature")?;
@@ -398,6 +597,8 @@ pub(super) fn responses_unsupported_parameter_retry_body(
                 || lower.contains("reasoning.encrypted_content")
             {
                 object.remove("include")?;
+            } else if unsupported_parameter_error_mentions(&lower, "service_tier") {
+                object.remove("service_tier")?;
             } else {
                 return None;
             }
@@ -407,6 +608,7 @@ pub(super) fn responses_unsupported_parameter_retry_body(
 }
 
 pub(super) fn is_responses_compatible(provider: &LlmProvider) -> bool {
+    let provider_id = provider.id.to_lowercase();
     let provider_type = provider.provider_type.to_lowercase();
     let preset = provider
         .preset
@@ -414,10 +616,18 @@ pub(super) fn is_responses_compatible(provider: &LlmProvider) -> bool {
         .unwrap_or_default()
         .to_lowercase();
     let base_url = provider_base_url(provider).to_lowercase();
-    provider_type.contains("responses")
+    provider_id.contains("openai-codex")
+        || provider_id.contains("xai")
+        || provider_id.contains("grok")
+        || provider_id.contains("copilot-acp")
+        || provider_type.contains("responses")
         || provider_type.contains("codex")
+        || preset.contains("xai")
+        || preset.contains("grok")
+        || preset.contains("copilot-acp")
         || preset.contains("responses")
         || preset.contains("codex")
+        || host_matches(&base_url, "api.x.ai")
         || base_url.ends_with("/responses")
         || base_url.contains("/backend-api/codex")
 }
@@ -539,6 +749,7 @@ fn push_responses_text_item(input: &mut Vec<Value>, role: &str, part_type: &str,
 }
 
 fn responses_issuer_kind(provider: &LlmProvider) -> String {
+    let provider_id = provider.id.to_ascii_lowercase();
     let provider_type = provider.provider_type.to_ascii_lowercase();
     let preset = provider
         .preset
@@ -546,18 +757,24 @@ fn responses_issuer_kind(provider: &LlmProvider) -> String {
         .unwrap_or_default()
         .to_ascii_lowercase();
     let base_url = provider_base_url(provider).trim().to_ascii_lowercase();
-    if provider_type.contains("xai")
+    if provider_id.contains("xai")
+        || provider_id.contains("grok")
+        || provider_type.contains("xai")
         || preset.contains("xai")
         || base_url.contains("api.x.ai")
         || base_url.contains("grok")
     {
         "xai_responses".into()
-    } else if provider_type.contains("github")
+    } else if provider_id.contains("copilot")
+        || provider_id.contains("github")
+        || provider_type.contains("github")
         || preset.contains("github")
+        || preset.contains("copilot")
         || base_url.contains("models.github.ai")
     {
         "github_responses".into()
-    } else if provider_type.contains("codex")
+    } else if provider_id.contains("openai-codex")
+        || provider_type.contains("codex")
         || preset.contains("codex")
         || base_url.contains("/backend-api/codex")
         || base_url.contains("chatgpt.com")
@@ -1109,6 +1326,7 @@ mod tests {
         let mut completion_tokens = 0;
         let mut reasoning_tokens = 0;
         let mut output_items = Vec::new();
+        let mut tool_state = ResponsesStreamToolCallState::default();
 
         handle_responses_sse_line(
             r#"data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc_123","call_id":"call_123","name":"terminal","arguments":{"command":"pwd"},"status":"completed"}}"#,
@@ -1119,6 +1337,7 @@ mod tests {
             &mut completion_tokens,
             &mut reasoning_tokens,
             &mut output_items,
+            &mut tool_state,
         )
         .unwrap();
 
@@ -1131,5 +1350,107 @@ mod tests {
             value["tool_calls"][0]["function"]["arguments"],
             json!({"command": "pwd"})
         );
+    }
+
+    #[test]
+    fn responses_stream_error_event_surfaces_code_and_message() {
+        let callback: LlmDeltaCallback = Arc::new(|_| Ok(()));
+        let mut content = String::new();
+        let mut final_response = None;
+        let mut prompt_tokens = 0;
+        let mut completion_tokens = 0;
+        let mut reasoning_tokens = 0;
+        let mut output_items = Vec::new();
+        let mut tool_state = ResponsesStreamToolCallState::default();
+
+        let error = handle_responses_sse_line(
+            r#"data: {"type":"error","code":"rate_limit_exceeded","message":"quota exhausted"}"#,
+            &callback,
+            &mut content,
+            &mut final_response,
+            &mut prompt_tokens,
+            &mut completion_tokens,
+            &mut reasoning_tokens,
+            &mut output_items,
+            &mut tool_state,
+        )
+        .unwrap_err();
+
+        let text = error.to_string();
+        assert!(text.contains("rate_limit_exceeded"));
+        assert!(text.contains("quota exhausted"));
+    }
+
+    #[test]
+    fn responses_stream_failed_terminal_frame_is_not_downgraded_to_empty_text() {
+        let callback: LlmDeltaCallback = Arc::new(|_| Ok(()));
+        let mut content = String::new();
+        let mut final_response = None;
+        let mut prompt_tokens = 0;
+        let mut completion_tokens = 0;
+        let mut reasoning_tokens = 0;
+        let mut output_items = Vec::new();
+        let mut tool_state = ResponsesStreamToolCallState::default();
+
+        handle_responses_sse_line(
+            r#"data: {"type":"response.failed","response":{"status":"failed","error":{"code":"invalid_request_error","message":"bad reasoning replay"}}}"#,
+            &callback,
+            &mut content,
+            &mut final_response,
+            &mut prompt_tokens,
+            &mut completion_tokens,
+            &mut reasoning_tokens,
+            &mut output_items,
+            &mut tool_state,
+        )
+        .unwrap();
+
+        let error = parse_responses_compatible(final_response.unwrap()).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("invalid_request_error"));
+        assert!(text.contains("bad reasoning replay"));
+    }
+
+    #[test]
+    fn responses_stream_reconstructs_function_call_from_argument_deltas() {
+        let callback: LlmDeltaCallback = Arc::new(|_| Ok(()));
+        let mut content = String::new();
+        let mut final_response = None;
+        let mut prompt_tokens = 0;
+        let mut completion_tokens = 0;
+        let mut reasoning_tokens = 0;
+        let mut output_items = Vec::new();
+        let mut tool_state = ResponsesStreamToolCallState::default();
+
+        for line in [
+            r#"data: {"type":"response.output_item.added","item_id":"fc_delta","item":{"type":"function_call","id":"fc_delta","call_id":"call_delta","name":"terminal","arguments":"","status":"in_progress"}}"#,
+            r#"data: {"type":"response.function_call_arguments.delta","item_id":"fc_delta","delta":"{\"command\":"}"#,
+            r#"data: {"type":"response.function_call_arguments.delta","item_id":"fc_delta","delta":"\"pwd\"}"}"#,
+            r#"data: {"type":"response.function_call_arguments.done","item_id":"fc_delta"}"#,
+        ] {
+            handle_responses_sse_line(
+                line,
+                &callback,
+                &mut content,
+                &mut final_response,
+                &mut prompt_tokens,
+                &mut completion_tokens,
+                &mut reasoning_tokens,
+                &mut output_items,
+                &mut tool_state,
+            )
+            .unwrap();
+        }
+
+        let reply = parse_responses_compatible(json!({"output": output_items})).unwrap();
+        let value = serde_json::from_str::<Value>(&reply.content).unwrap();
+        assert_eq!(value["tool_calls"][0]["id"], "fc_delta");
+        assert_eq!(value["tool_calls"][0]["call_id"], "call_delta");
+        assert_eq!(value["tool_calls"][0]["function"]["name"], "terminal");
+        let arguments = value["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .unwrap();
+        assert_eq!(arguments, json!({"command": "pwd"}));
     }
 }

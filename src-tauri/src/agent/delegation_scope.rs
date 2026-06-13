@@ -8,7 +8,10 @@ use crate::{
     store::AppStore,
 };
 
-use super::{delegation_request::DelegateTaskRequest, normalize_toolset_name};
+use super::{
+    delegation_request::DelegateTaskRequest, normalize_mcp_server_toolset_component,
+    normalize_toolset_name,
+};
 
 pub(super) fn delegation_child_toolsets(
     agent: &AgentDefinition,
@@ -23,7 +26,10 @@ pub(super) fn delegation_child_toolsets(
         push_unique_toolset(&mut toolsets, "mcp");
         push_unique_toolset(&mut toolsets, "mcp_utility");
         for server_id in &agent.enabled_mcp_servers {
-            let server_toolset = format!("server:{}", normalize_toolset_name(server_id));
+            let server_toolset = format!(
+                "server:{}",
+                normalize_mcp_server_toolset_component(server_id)
+            );
             push_unique_toolset(&mut toolsets, &server_toolset);
         }
         for parent_toolset in &agent.enabled_toolsets {
@@ -32,7 +38,13 @@ pub(super) fn delegation_child_toolsets(
                 || normalized == "mcp_utility"
                 || normalized.starts_with("server:")
             {
-                push_unique_toolset(&mut toolsets, parent_toolset);
+                if let Some(server) = normalized.strip_prefix("server:") {
+                    let server_toolset =
+                        format!("server:{}", normalize_mcp_server_toolset_component(server));
+                    push_unique_toolset(&mut toolsets, &server_toolset);
+                } else {
+                    push_unique_toolset(&mut toolsets, parent_toolset);
+                }
             }
         }
     }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::DefaultHasher, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     env,
     hash::{Hash, Hasher},
     sync::{Mutex, OnceLock},
@@ -27,10 +27,12 @@ use super::{
     redact_sensitive_text, run_post_tool_call_hooks, run_pre_tool_call_hooks,
     run_python_plugin_tool, run_transform_tool_result_hooks, spotify_settings, summarize_tool_text,
     tool_allowed_by_agent_capabilities, tool_allowed_by_agent_toolsets, tool_allowed_in_context,
-    yuanbao_bridge_available, yuanbao_stickers_available, ToolExecutionContext,
+    tool_toolsets, yuanbao_bridge_available, yuanbao_stickers_available, PythonPluginBridgeContext,
+    ToolExecutionContext,
 };
 
 const PYTHON_PLUGIN_SERVER_PREFIX: &str = "__python_plugin:";
+const TOOL_SEARCH_CHARS_PER_TOKEN: f64 = 4.0;
 
 pub(super) fn render_internal_tool_prompt_block(
     agent: &AgentDefinition,
@@ -65,6 +67,7 @@ pub(super) fn render_internal_tool_prompt_block(
 pub(super) struct InternalToolAvailability {
     browser_session_provider: bool,
     search_provider: bool,
+    x_search_provider: bool,
     image_provider: bool,
     video_provider: bool,
     vision_provider: bool,
@@ -94,6 +97,7 @@ impl InternalToolAvailability {
         Self {
             browser_session_provider: true,
             search_provider: true,
+            x_search_provider: true,
             image_provider: true,
             video_provider: true,
             vision_provider: true,
@@ -114,6 +118,7 @@ impl Clone for InternalToolAvailability {
         Self {
             browser_session_provider: self.browser_session_provider,
             search_provider: self.search_provider,
+            x_search_provider: self.x_search_provider,
             image_provider: self.image_provider,
             video_provider: self.video_provider,
             vision_provider: self.vision_provider,
@@ -163,6 +168,7 @@ fn compute_internal_tool_availability(store: &AppStore) -> InternalToolAvailabil
             .search_providers()
             .ok()
             .is_some_and(|providers| providers.iter().any(search_provider_configured)),
+        x_search_provider: config.as_ref().is_some_and(x_search_credentials_configured),
         image_provider: store.enabled_image_provider().ok().flatten().is_some(),
         video_provider: store.enabled_video_provider().ok().flatten().is_some(),
         vision_provider: store.enabled_vision_provider().ok().flatten().is_some(),
@@ -257,6 +263,30 @@ fn search_provider_configured(provider: &crate::models::SearchProvider) -> bool 
             .is_some_and(|value| !value.trim().is_empty())
 }
 
+fn x_search_credentials_configured(config: &crate::models::AppConfig) -> bool {
+    env::var("XAI_API_KEY")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+        || config
+            .messaging_gateway
+            .get("dashboardEnv")
+            .and_then(Value::as_object)
+            .and_then(|env| env.get("XAI_API_KEY"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        || x_search_oauth_credential_configured()
+}
+
+fn x_search_oauth_credential_configured() -> bool {
+    let mut provider = crate::models::LlmProvider::default();
+    provider.id = "xai-oauth".into();
+    provider.name = "xAI OAuth".into();
+    provider.provider_type = "xai-oauth".into();
+    provider.preset = Some("xai-oauth".into());
+    crate::hermes_auth::resolve_hermes_runtime_credential(&provider)
+        .is_some_and(|credential| !credential.api_key.trim().is_empty())
+}
+
 fn default_search_provider_env_key(provider_type: &str) -> Option<&'static str> {
     match provider_type
         .trim()
@@ -316,11 +346,13 @@ pub(super) fn internal_tool_available(
     match tool_name {
         "browser_create_session" | "browser_close_session" => availability.browser_session_provider,
         "web_provider" => true,
-        "web_search" | "x_search" => availability.search_provider,
+        "web_search" => availability.search_provider,
+        "x_search" => availability.x_search_provider,
         "image_generate" => availability.image_provider,
         "video_generate" => availability.video_provider,
         "vision_analyze" | "video_analyze" | "browser_vision" => availability.vision_provider,
         "text_to_speech" | "transcribe_audio" => availability.audio_provider,
+        "voice_status" | "voice_playback" | "voice_recording" => true,
         "weather" => availability.weather,
         "ha_list_entities" | "ha_get_state" | "ha_list_services" | "ha_call_service" => {
             availability.homeassistant
@@ -328,6 +360,7 @@ pub(super) fn internal_tool_available(
         "feishu_doc_read"
         | "feishu_drive_list_comments"
         | "feishu_drive_list_comment_replies"
+        | "feishu_drive_update_comment_reaction"
         | "feishu_drive_reply_comment"
         | "feishu_drive_add_comment" => availability.feishu,
         "yb_query_group_info" | "yb_query_group_members" | "yb_send_dm" | "yb_send_sticker" => {
@@ -385,7 +418,7 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
         ),
         (
             "terminal",
-            r#"- terminal: payload {"command":"shell command","cwd":".","stdin":"optional stdin text","taskId":"optional session","sessionId":"optional session","timeoutSeconds":60,"background":false,"notify_on_complete":false,"watch_patterns":["ready"]}. With taskId/sessionId and no explicit cwd, SynthChat persists the shell CWD between terminal calls using a Hermes-style cwd marker. With background=true/backgroundProcess=true/bg=true, terminal is routed to process(action="start") so it returns a managed process session_id and supports notify_on_complete/watch_patterns, logs, wait, stdin, stop/kill, and notifications. Set TERMINAL_ENV=docker to run through the Docker backend with workspace and configured credential/skill/cache mounts, resource/security args, configured volumes/env, persistent labeled containers, cross-process reuse, and orphan cleanup. Set TERMINAL_ENV=singularity to execute through apptainer/singularity exec with workspace and configured credential/skill/cache bind mounts. Set TERMINAL_ENV=ssh with TERMINAL_SSH_HOST/USER/PORT/KEY to execute over SSH with stdin, timeout, ControlMaster reuse, remote cwd markers, credential/skill/cache upload sync unless TERMINAL_SSH_SYNC_FILES=false, and execution-time sync-back unless TERMINAL_SSH_SYNC_BACK=false; multi-file upload and sync-back use tar-over-SSH by default with scp fallback when disabled/unavailable, and stale synced remote files are removed unless TERMINAL_SSH_SYNC_DELETE=false. Set TERMINAL_ENV=modal with TERMINAL_MODAL_MODE=direct plus Modal credentials and the Python modal SDK for direct Modal sandbox execution with session cwd, app-data persisted snapshot restore/save, stale snapshot fallback to the base image, credential/skill/cache upload sync unless TERMINAL_MODAL_SYNC_FILES=false, and execution-time sync-back unless TERMINAL_MODAL_SYNC_BACK=false; set TERMINAL_MODAL_MODE=managed with a configured managed tool gateway/token for gateway-owned Modal terminal execution with remote cwd and environment snapshots. Set TERMINAL_ENV=daytona with DAYTONA_API_KEY and the Python daytona SDK for a basic persistent Daytona sandbox execution backend with credential/skill/cache upload sync unless TERMINAL_DAYTONA_SYNC_FILES=false and execution-time sync-back unless TERMINAL_DAYTONA_SYNC_BACK=false."#,
+            r#"- terminal: payload {"command":"shell command","cwd":".","stdin":"optional stdin text","taskId":"optional session","sessionId":"optional session","timeoutSeconds":180,"background":false,"notify_on_complete":false,"watch_patterns":["ready"]}. Timeout defaults to TERMINAL_TIMEOUT or 180s; explicit foreground timeout above TERMINAL_MAX_FOREGROUND_TIMEOUT (default 600s) is rejected, so use background=true with notify_on_complete=true for longer bounded jobs. With taskId/sessionId and no explicit cwd, SynthChat persists the shell CWD between terminal calls using a Hermes-style cwd marker. With background=true/backgroundProcess=true/bg=true, terminal is routed to process(action="start") so it returns a managed process session_id and supports notify_on_complete/watch_patterns, logs, wait, stdin, stop/kill, and notifications. Set TERMINAL_ENV=docker to run through the Docker backend with workspace and configured credential/skill/cache mounts, resource/security args, configured volumes/env, persistent labeled containers, cross-process reuse, and orphan cleanup. Set TERMINAL_ENV=singularity to execute through apptainer/singularity exec with workspace and configured credential/skill/cache bind mounts. Set TERMINAL_ENV=ssh with TERMINAL_SSH_HOST/USER/PORT/KEY to execute over SSH with stdin, timeout, ControlMaster reuse, remote cwd markers, credential/skill/cache upload sync unless TERMINAL_SSH_SYNC_FILES=false, and execution-time sync-back unless TERMINAL_SSH_SYNC_BACK=false; multi-file upload and sync-back use tar-over-SSH by default with scp fallback when disabled/unavailable, and stale synced remote files are removed unless TERMINAL_SSH_SYNC_DELETE=false. Set TERMINAL_ENV=modal with TERMINAL_MODAL_MODE=direct plus Modal credentials and the Python modal SDK for direct Modal sandbox execution with session cwd, app-data persisted snapshot restore/save, stale snapshot fallback to the base image, credential/skill/cache upload sync unless TERMINAL_MODAL_SYNC_FILES=false, and execution-time sync-back unless TERMINAL_MODAL_SYNC_BACK=false; set TERMINAL_MODAL_MODE=managed with a configured managed tool gateway/token for gateway-owned Modal terminal execution with remote cwd and environment snapshots. Set TERMINAL_ENV=daytona with DAYTONA_API_KEY and the Python daytona SDK for a basic persistent Daytona sandbox execution backend with credential/skill/cache upload sync unless TERMINAL_DAYTONA_SYNC_FILES=false and execution-time sync-back unless TERMINAL_DAYTONA_SYNC_BACK=false."#,
         ),
         (
             "process",
@@ -408,8 +441,76 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
             r#"- credential_pool: payload {"action":"status"} shows redacted LLM credential cooldown status; {"action":"reset","providerId":"optional provider id"} clears credential cooldowns; {"action":"files","containerBase":"/root/.synthchat"} lists configured credential-file mounts; {"action":"skills","containerBase":"/root/.synthchat","limit":100} lists skill directory mounts/files; {"action":"cache","containerBase":"/root/.synthchat","limit":100} lists artifact cache mounts/files; {"action":"sync_files","containerBase":"/root/.synthchat","limit":100} lists credential+skill+cache files for future remote sandbox sync; {"action":"translate_cache_path","hostPath":"path"} maps a host artifact cache path to the agent-visible sandbox path."#,
         ),
         (
+            "dashboard_auth",
+            r#"- dashboard_auth: payload {"provider":"nous","action":"status|contract|diagnostics"} returns a read-only Hermes dashboard_auth/nous OAuth contract snapshot: client_id source/shape, Portal URL, authorize/token/JWKS endpoints, RS256 JWT claim expectations, no-refresh-token V1 behavior, redirect URI rules, and SynthChat desktop boundary notes. Use this when diagnosing dashboard OAuth readiness; it is separate from LLM `/auth login nous` device-code auth."#,
+        ),
+        (
+            "dashboard_plugins",
+            r#"- dashboard_plugins: payload {"action":"status|list|manifest|routes|achievements|state|diagnostics|rescan|reset-state|recent-unlocks|session-badges|fastapi-host|dashboard-host|host-plan|host-run|host-start|host-stop|host-restart|kanban-board|kanban-config|kanban-stats|kanban-assignees|kanban-task|kanban-events|kanban-events-checkpoint|kanban-runtime-events|kanban-runtime-checkpoint|kanban-create|kanban-update|kanban-delete|kanban-comment|kanban-link|kanban-unlink|kanban-bulk|kanban-diagnostics|kanban-workers-active|kanban-run|kanban-run-inspect|kanban-run-terminate|kanban-task-log|kanban-attachments|kanban-attachment-add|kanban-attachment-read|kanban-attachment-delete|kanban-dispatch|kanban-reclaim|kanban-reassign|kanban-boards|kanban-board-create|kanban-board-update|kanban-board-delete|kanban-board-switch|kanban-profiles|kanban-profile-update|kanban-profile-describe-auto|kanban-orchestration|kanban-orchestration-set","plugin":"all|hermes-achievements|example|kanban","sessionId":"optional","taskId":"optional","runId":"optional","queueItemId":"optional","tenant":"optional","includeArchived":false,"limit":20,"since":0,"board":"optional","dryRun":true,"enqueueAgent":false,"execute":false,"dashboardCommand":"optional","attachmentId":"optional","sourcePath":"optional","filename":"optional","profile":"optional","reclaimFirst":false} returns a Hermes dashboard plugin catalog/status snapshot for dashboard-only plugins such as hermes-achievements, example-dashboard, and kanban. fastapi-host/dashboard-host/host-plan expose the Hermes dashboard FastAPI host managed-process start/stop contract; host-start/host-run starts the external host, host-stop stops the tracked SynthChat managed-process task, and host-restart performs stop plus start through the async managed-process path when execute/live/apply is true. rescan performs a desktop-native Hermes achievements scan over SynthChat conversations/messages/runs/tool traces and writes Hermes-layout state.json, scan_snapshot.json, and scan_checkpoint.json; reset-state clears unlock/snapshot/checkpoint state; recent-unlocks and session-badges read the local snapshot. kanban-board, kanban-config, kanban-stats, kanban-assignees, and kanban-task adapt Hermes Kanban dashboard read routes from SynthChat AppStore/config, including columns, cards, dashboard preferences, comments, dependency links, and assignee/status counts. kanban-events and kanban-events-checkpoint adapt Hermes WebSocket /api/plugins/kanban/events?since= cursor payloads through desktop polling over task events; kanban-runtime-events and kanban-runtime-checkpoint merge queue items, AgentRun phase/tool transitions, ManagedProcess snapshots, and task events into one Hermes-style runtime cursor stream for dashboard/frontend consumption. kanban-create, kanban-update, kanban-delete, kanban-comment, kanban-link, kanban-unlink, and kanban-bulk adapt Hermes Kanban dashboard write routes to native AppStore task mutations. kanban-diagnostics, kanban-workers-active, kanban-run, kanban-run-inspect, kanban-run-terminate, and kanban-task-log adapt Hermes worker/diagnostic/readiness routes with SynthChat ManagedProcess and task metadata; kanban-attachments plus kanban-attachment-add/read/delete adapt Hermes attachment list/upload/download/delete routes as desktop file-backed actions; kanban-dispatch dry-runs by default and, with dryRun:false, claims ready assigned tasks into running AgentRunRecord/ManagedProcess entries for desktop worker visibility; with enqueueAgent:true it also appends a Kanban worker prompt into the normal agent queue for execution by the existing queue drain/runtime. kanban-reclaim and kanban-reassign adapt Hermes dashboard recovery routes by releasing active claims, stopping desktop managed worker records, aborting the matching AgentRunRecord when present, returning tasks to ready, and optionally assigning a new profile. kanban-boards, kanban-board-create/update/delete/switch, kanban-profiles, kanban-profile-update/describe-auto, and kanban-orchestration/set adapt Hermes board and orchestration settings through SynthChat config/personas/task metadata. These plugins are dashboard/API-host surfaces, not model tools, and SynthChat still does not embed Hermes' FastAPI dashboard host."#,
+        ),
+        (
+            "api_server_daemon",
+            r#"- api_server_daemon: payload {"action":"status|plan|start|run|stop|restart|daemon|managed-process","execute":false,"apiServerCommand":"optional"} exposes the Hermes API server daemon lifecycle as a desktop control surface. Read-only calls return the managed-process start/stop plan for running the external Hermes gateway with API_SERVER_ENABLED=true, the corresponding gateway service-manager/operator plan, and the native SynthChat HTTP/SSE boundary. With execute/live/apply:true the async dispatcher starts, stops, or restarts the external daemon through SynthChat's managed-process path so process logs, task ids, and stop controls are visible; OS service-manager install/start remains an operator-applied boundary."#,
+        ),
+        (
+            "context_engine",
+            r#"- context_engine: payload {"action":"status|discover|commands|diagnostics"} returns a Hermes context-engine plugin compatibility snapshot: default compressor engine, context.engine one-active-engine semantics, plugins/context_engine/<name> discovery status, register(ctx)/ContextEngine subclass loader patterns, context-engine slash-command forwarding rules, SynthChat native /context and /compact adaptation, compression auxiliary assignment status, dynamic context-engine command/tool discovery, bounded helper-subprocess command/tool dispatch, manual /compact and pre/post-turn lifecycle forwarding, and the remaining boundary that SynthChat does not embed Hermes' long-lived in-process Python ContextEngine object model."#,
+        ),
+        (
+            "plugin_runtime",
+            r#"- plugin_runtime: payload {"action":"status|sources|registries|commands|tools|hooks|auxiliary|diagnostics"} returns a Hermes PluginManager compatibility snapshot: bundled/user/project/entry-point discovery sources, PluginContext registration surface, Hermes load rules, current SynthChat plugin manifests, enabled plugin counts, Python plugin tool/command/skill/auxiliary discovery counts, manifest hook status, dynamic planner/dispatch bridge support, bounded helper-subprocess execution for plugin tools, slash commands, skills, auxiliary tasks, hooks, and context-engine bridges, plus the remaining boundary that SynthChat does not embed Hermes' byte-for-byte PluginManager or a long-lived Hermes Python daemon."#,
+        ),
+        (
+            "teams_pipeline",
+            r#"- teams_pipeline: payload {"action":"status|validate|list|show|subscriptions|token-health|upsert-subscription|delete-local-subscription|upsert-job|upsert-sink-record|get-sink-record|receipt-key|has-notification-receipt|record-notification-receipt|record-event-timestamp|get-event-timestamp|webhook-validation|webhook-notification|schedule-received|gateway-runtime|scheduler-runtime|runtime-plan|gateway-plan|gateway-stop|scheduler-stop|runtime-stop|gateway-restart|scheduler-restart|runtime-restart|fetch|run|summarize|generate-summary|summary-prompt|write-sinks|plan-sinks|subscribe|renew-subscription|delete-subscription|maintain-subscriptions","jobId":"optional","storePath":"optional","conversationId":"optional","personaId":"optional","execute":false,"dryRun":false,"enqueueAgent":false,"confirmPipelineRun":false,"confirmLiveGraphRead":false,"confirmLiveGraphMutation":false,"confirmSinkWrites":false,"summarizeWithLlm":false}. Hermes teams_pipeline desktop adaptation: reads and writes the durable TeamsPipelineStore-compatible local JSON state, validates/deduplicates MSGraph webhook notification batches into received pipeline jobs, locally schedule-received marks received jobs queued with deterministic agent prompts for the normal queue/cron/manual run surfaces, and with enqueueAgent:true appends those prompts to a SynthChat conversation and native agent queue without starting the run from this tool, exposes gateway-runtime/scheduler-runtime managed-process start/stop plans for the external Hermes MSGRAPH_WEBHOOK scheduler and can start, stop, or restart that scheduler through the async managed-process path when execute/live/apply is true, lists/compacts stored meeting jobs, shows subscriptions, validates MSGRAPH_* and Teams delivery readiness, reports token-health readiness, returns Graph artifact/replay/subscription plans by default, can perform live Microsoft Graph meeting artifact fetch only when execute/live/apply plus confirmLiveGraphRead are explicitly true, can run a confirmed native replay that fetches transcript artifacts, builds a Hermes-shaped TeamsMeetingSummaryPayload, and persists the job while planning Notion/Linear/Teams sink writes unless confirmSinkWrites is explicitly true; when run/replay also has summarizeWithLlm/useConfiguredLlmSummary:true the async dispatcher follows the live replay with current-agent LLM summary regeneration, persistence, and sink replay. It exposes Hermes JSON summary prompt/parser/fallback through summarize/generate-summary and can call the current agent LLM when summarize has execute/live/apply:true, can replay sink planning/writes for an existing completed job through write-sinks/plan-sinks, and can perform live Microsoft Graph subscription create/renew/delete/maintenance only when execute/live/apply plus confirmLiveGraphMutation are explicitly true and approvals allow the risky call. Hermes registered this plugin as operator CLI only; use terminal/process for full external sink replay when needed."#,
+        ),
+        (
+            "teams_typing",
+            r#"- teams_typing: payload {"action":"send|start|typing|stop","chat_id":"Bot Framework conversation id","conversation_id":"alias","serviceUrl":"optional Bot Framework service URL","timeoutMs":1500}. Sends a Hermes-style Microsoft Teams typing activity through Bot Framework POST /v3/conversations/{id}/activities using configured botToken/mediaAccessToken/accessToken or TEAMS_BOT_TOKEN/TEAMS_MEDIA_ACCESS_TOKEN/TEAMS_GRAPH_ACCESS_TOKEN. serviceUrl hosts are restricted to known Bot Framework hosts unless explicitly allowlisted; stop is a no-op because Bot Framework typing stops by ceasing refresh sends."#,
+        ),
+        (
+            "mattermost_typing",
+            r#"- mattermost_typing: payload {"action":"send|start|typing|stop","channel_id":"Mattermost channel id","chat_id":"alias"}. Sends a Hermes-style Mattermost typing indicator through POST /api/v4/users/{bot_user_id}/typing with {"channel_id":...}, using settings.mattermost.url/token and botUserId or MATTERMOST_BOT_USER_ID; if bot user id is absent it resolves /users/me first. stop is a no-op because Mattermost typing expires naturally."#,
+        ),
+        (
+            "google_chat_typing",
+            r#"- google_chat_typing: payload {"action":"send|start|typing|stop","chat_id":"spaces/<id>|users/<id>","target":"google_chat:spaces/<id>","thread_id":"optional spaces/<id>/threads/<id>","text":"optional marker text"}. Creates Hermes' visible Google Chat typing marker message (default "Hermes is thinking...") through POST /v1/{space_or_user}/messages using the same Google Chat REST credentials as send_message. stop is a no-op because the marker is a real message; live gateway runtimes may patch it in-place later."#,
+        ),
+        (
+            "google_chat_update_message",
+            r#"- google_chat_update_message: payload {"message_id":"spaces/<id>/messages/<id>","text":"replacement text"}. Adapts Hermes Google Chat edit_message/_patch_message by PATCHing /v1/{message_id}?updateMask=text with the same REST credentials as send_message, allowing a visible typing marker or progress message to be updated in-place without delete tombstones."#,
+        ),
+        (
+            "provider_plugins",
+            r#"- provider_plugins: payload {"family":"all|model|web|image|video","provider":"optional provider id"} returns a read-only Hermes provider-plugin catalog for model-providers, web providers, image_gen providers, and video_gen providers. It maps each Hermes manifest to SynthChat provider configuration/readiness, required env vars, missing env vars, and explicit runtime boundaries without making network calls or mutating provider settings."#,
+        ),
+        (
+            "mcp_status",
+            r#"- mcp_status: payload {} returns Hermes-style MCP configuration status: configured/enabled servers, registered MCP/utility tools, transport/protocol, auth hints, tool filters, parallel-safety flags, and needsRefresh markers. It is read-only and does not start MCP servers."#,
+        ),
+        (
+            "mcp_oauth_clear",
+            r#"- mcp_oauth_clear: payload {"serverId":"id/name prefix"} deletes the selected server's Hermes-layout MCP OAuth token triplet (<server>.json, <server>.client.json, <server>.meta.json) so the next use requires re-authentication. Use only after mcp_status shows needs_reauth or the user asks to reset MCP OAuth."#,
+        ),
+        (
+            "mcp_oauth_refresh",
+            r#"- mcp_oauth_refresh: payload {"serverId":"id/name prefix"} refreshes the selected server's Hermes-layout MCP OAuth token using cached refresh_token, client info, and OAuth metadata, then writes the refreshed token file. Use after mcp_status shows refresh_available, or when the user asks to refresh MCP OAuth. Do not use when tokenStatus.refreshReady=false; use mcp_oauth_clear only for reset/reauth."#,
+        ),
+        (
+            "mcp_probe",
+            r#"- mcp_probe: payload {"serverId":"optional id/name prefix","timeoutSeconds":10} explicitly starts enabled MCP server(s) long enough to list tools, applies include/exclude filters, updates the tool registry on success, and returns per-server ok/timedOut/error/toolCount diagnostics. Use mcp_status first."#,
+        ),
+        (
+            "mcp_reset_session",
+            r#"- mcp_reset_session: payload {"serverId":"optional id/name prefix"} closes the selected server's active MCP persistent stdio session, or all active persistent sessions when omitted. Use after mcp_status shows persistentSession.active=true and a persistent MCP call appears stale, wedged, or out of sync; the next tool call will start a fresh session."#,
+        ),
+        (
             "osv_check",
             r#"- osv_check: payload {"package":"@scope/pkg","ecosystem":"npm|PyPI","version":"optional"} or {"command":"npx|uvx|pipx","args":["pkg@1.0.0"]}. Queries OSV and reports MAL-* malware advisories only."#,
+        ),
+        (
+            "security_scan",
+            r#"- security_scan: payload {"content":"text or command","scope":"all|context|strict"} scans text with Hermes-style threat patterns and reports built-in command risk plus Tirith availability diagnostics."#,
         ),
         (
             "computer_use",
@@ -428,12 +529,28 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
             r#"- kanban_create: payload {"title":"task title","body":"details","assignee":"optional","priority":0,"parents":["task-id"]} creates a local agent kanban task."#,
         ),
         (
+            "kanban_decompose",
+            r#"- kanban_decompose: payload {"objective":"larger task or goal","maxTasks":6,"create":false,"parents":["optional parent task ids"],"assignee":"optional"} decomposes work into actionable kanban draft cards using the kanban_decomposer auxiliary model when configured, otherwise deterministic fallback. Set create=true to create the cards."#,
+        ),
+        (
+            "kanban_specify",
+            r#"- kanban_specify: payload {"taskId":"triage task id","author":"optional"} expands a rough triage card into a concrete spec using the triage_specifier auxiliary model when configured, otherwise deterministic fallback, then promotes it to todo."#,
+        ),
+        (
             "kanban_list",
             r#"- kanban_list: payload {"status":"optional","assignee":"optional","limit":50,"includeArchived":false} lists local agent kanban tasks."#,
         ),
         (
             "kanban_show",
             r#"- kanban_show: payload {"taskId":"task id"} shows a kanban task with comments/events/links."#,
+        ),
+        (
+            "kanban_update",
+            r#"- kanban_update: payload {"taskId":"task id","title":"optional","body":"optional","status":"triage|todo|scheduled|ready|running|blocked|review|done|archived","assignee":"optional/null","priority":0,"tenant":"optional/null","metadata":{}} updates a local agent kanban task and records an update event. done is stored as completed for compatibility with existing task tools."#,
+        ),
+        (
+            "kanban_delete",
+            r#"- kanban_delete: payload {"taskId":"task id","hardDelete":false} archives a kanban task by default; hardDelete=true removes it and clears dependency references."#,
         ),
         (
             "kanban_complete",
@@ -460,12 +577,20 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
             r#"- kanban_link: payload {"parentId":"parent task id","childId":"child task id"} links kanban task dependencies."#,
         ),
         (
+            "kanban_unlink",
+            r#"- kanban_unlink: payload {"parentId":"parent task id","childId":"child task id"} removes a kanban dependency link and records unlink events on both tasks."#,
+        ),
+        (
+            "kanban_bulk_update",
+            r#"- kanban_bulk_update: payload {"taskIds":["task ids"],"status":"optional","assignee":"optional/null","priority":0,"metadata":{},"author":"optional"} updates multiple kanban tasks with a dashboard-style bulk patch."#,
+        ),
+        (
             "send_message",
             r#"- send_message: payload {"action":"list"} returns local targets plus configured externalTargets and Hermes-style directoryTargets; payload {"action":"import_directory","directory":{"updated_at":"...","platforms":{"slack":[{"id":"C...","name":"engineering","type":"channel"}]}}} writes channel_directory.json; payload {"action":"refresh_directory","url":"https://...","token":"optional bearer","timeoutSeconds":15} fetches and writes channel_directory.json; payload {"action":"refresh_directory","platform":"mattermost"} builds channel_directory.json from the configured Mattermost teams/channels; payload {"target":"current|conversationId|title|discord|discord:<channel_id>|feishu:<receive_id>|feishu:<receive_id>:<reply_message_id>|telegram|telegram:<chat_id>|telegram:<chat_id>:<message_thread_id>|slack|slack:<channel_id>|slack:<channel_id>:<thread_ts>|slack:<user_id>|mattermost|mattermost:<channel_id>|mattermost:<channel_id>:<root_id>|matrix|matrix:<room_id>|signal|signal:<recipient>|signal:group:<group_id>|email|email:<address>|sms|sms:<phone>|dingtalk|dingtalk:<target>|whatsapp|whatsapp:<chat_id>|qqbot|qqbot:<id>|homeassistant|homeassistant:<notify_target>|bluebubbles|bluebubbles:<chat_id>|wecom:<chat_id>|weixin:<chat_id>|yuanbao:direct:<account_id>|yuanbao:group:<group_code>","message":"text to send","role":"assistant|user","platform":"optional discord|feishu|telegram|slack|mattermost|matrix|signal|email|sms|dingtalk|whatsapp|qqbot|homeassistant|bluebubbles|wecom|weixin|yuanbao","channel_id":"optional Discord/Telegram/Slack/Mattermost/QQBot channel id","chat_id":"optional Telegram/WhatsApp/QQBot/Home Assistant/BlueBubbles/WeCom/Weixin target","room_id":"optional Matrix room id","recipient":"optional Signal recipient","to":"optional Email/SMS target","subject":"optional Email subject","receive_id":"optional Feishu receive id","receive_id_type":"chat_id|open_id|union_id|email","user_id":"optional Yuanbao account id"} sends to local SynthChat conversations, Discord through configured bot/bridge, Feishu/Lark OpenAPI with MEDIA:<path> image/file uploads, Telegram Bot API with MEDIA:<path> photo/video/voice/audio/document uploads plus [[as_document]] force-document routing, Slack chat.postMessage text routing, Slack user IDs U... via conversations.open DM routing, Mattermost REST text posts and MEDIA:<path> local file uploads, Matrix Client-Server API routing with MEDIA:<path> uploads for unencrypted rooms, Signal signal-cli JSON-RPC with MEDIA:<path> attachments, Email SMTP text routing, SMS/Twilio text routing, DingTalk robot webhook text routing, WhatsApp bridge text routing, QQBot REST text routing, Home Assistant notify text routing, BlueBubbles iMessage text and MEDIA:<path> attachment routing, Yuanbao direct DM through the configured bridge, or WeCom/Weixin/Yuanbao group through settings.messagingGateway when configured. Bare platform targets require corresponding settings.* home target; named targets can resolve through Hermes channel_directory.json. In cron runs, duplicate sends to the configured HERMES_CRON_AUTO_DELIVER_* target are skipped because the final response will be auto-delivered there."#,
         ),
         (
             "session_search",
-            r#"- session_search: payload {"query":"topic","limit":5,"kind":"all|message|run|tool|artifact"} or {"conversationId":"...","messageId":"...","window":5}"#,
+            r#"- session_search: payload {"query":"topic","limit":3,"kind":"all|message|run|tool|artifact","sort":"newest|oldest"} discovers matching past sessions; payload {} browses recent sessions; payload {"session_id":"...","around_message_id":"...","window":5} scrolls around an anchor. Results include Hermes-style success/count/session_id/match_message_id/around_message_id aliases plus SynthChat conversationId/messageId fields."#,
         ),
         (
             "clarify",
@@ -492,8 +617,120 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
             r#"- memory: payload {"action":"search|read|add|replace|remove","query":"optional","summary":"stable memory","id":"memory id","importance":1-5,"limit":8}. Hermes-compatible alias for memory operations."#,
         ),
         (
+            "memory_provider",
+            r#"- memory_provider: payload {"action":"status|discover|tools"}. Hermes memory-provider adaptation: reports the active provider, bundled provider discovery, provider tool names, required env/config, local holographic state path, and external provider runtime boundaries."#,
+        ),
+        (
+            "fact_store",
+            r#"- fact_store: payload {"action":"add|search|probe|related|reason|contradict|update|remove|list","content":"fact text","query":"search text","entity":"entity","entities":["A","B"],"fact_id":"id","category":"user_pref|project|tool|general","tags":"comma,separated","trust_delta":0.1,"min_trust":0.3,"limit":10}. Hermes holographic memory adaptation with local structured facts, entity recall, trust scoring, and feedback."#,
+        ),
+        (
+            "fact_feedback",
+            r#"- fact_feedback: payload {"action":"helpful|unhelpful","fact_id":"id"}. Rates a fact_store fact after use and adjusts its trust score."#,
+        ),
+        (
+            "supermemory_search",
+            r#"- supermemory_search: payload {"query":"memory search","limit":5,"container_tag":"optional","execute":false,"confirmSupermemoryLive":false}. Hermes Supermemory provider semantic search. By default this reports readiness/route planning without network; with execute/live/apply:true plus confirmSupermemoryLive:true it performs the Supermemory v4 REST bridge matching Hermes SDK calls. supermemory_store/profile/forget share the same confirmed-live mode."#,
+        ),
+        (
+            "honcho_reasoning",
+            r#"- honcho_reasoning: payload {"query":"question about user/context","reasoning_level":"minimal|low|medium|high|max","peer":"user","execute":false,"confirmHonchoLive":false}. Hermes Honcho dialectic Q&A. By default this reports readiness/route planning without network; with execute/live/apply:true plus confirmHonchoLive:true it performs the Honcho v3 REST bridge using HONCHO_* / honcho.json config. honcho_profile/search/context/conclude share the same confirmed-live mode."#,
+        ),
+        (
+            "mem0_search",
+            r#"- mem0_search: payload {"query":"memory search","top_k":10,"rerank":false,"execute":false,"confirmMem0Live":false}. Hermes Mem0 semantic memory search. By default this reports readiness/route planning without network; with execute/live/apply:true plus confirmMem0Live:true it performs the Mem0 Platform v3 REST bridge matching Hermes MemoryClient calls. mem0_profile and mem0_conclude share the same confirmed-live mode."#,
+        ),
+        (
+            "viking_search",
+            r#"- viking_search: payload {"query":"knowledge search","mode":"auto|fast|deep","scope":"viking://optional","limit":10,"execute":false,"confirmOpenVikingLive":false}. Hermes OpenViking semantic search. By default this reports readiness/route planning without network; with execute/live/apply:true plus confirmOpenVikingLive:true it performs the OpenViking REST call using OPENVIKING_ENDPOINT/API key/account/user/agent. viking_read/browse/remember/add_resource share the same confirmed-live mode; viking_add_resource supports remote URLs/paths and local file multipart temp_upload before resource creation."#,
+        ),
+        (
+            "byterover_status",
+            r#"- byterover_status: payload {"action":"status|probe|run","execute":false,"confirmByteRoverLive":false}. Hermes ByteRover provider readiness/status for the brv CLI knowledge tree: reports brv CLI candidates, $HERMES_HOME/byterover working-directory stats, optional BRV_API_KEY cloud-sync readiness, and Hermes brv_query/brv_curate/brv_status contract. By default it does not execute brv; action=run or execute/live/apply:true plus confirmByteRoverLive:true runs brv status in the ByteRover working directory."#,
+        ),
+        (
+            "brv_query",
+            r#"- brv_query: payload {"query":"knowledge search","execute":false,"confirmByteRoverLive":false}. Hermes ByteRover persistent knowledge-tree search. By default this reports the planned brv query command without running external processes; with execute/live/apply:true plus confirmByteRoverLive:true it runs `brv query -- <query>` in $HERMES_HOME/byterover with Hermes' 10s query timeout and returns bounded stdout/stderr."#,
+        ),
+        (
+            "brv_curate",
+            r#"- brv_curate: payload {"content":"memory content","execute":false,"confirmByteRoverLive":false}. Hermes ByteRover persistent knowledge-tree write. By default this reports the planned brv curate command without running external processes; with execute/live/apply:true plus confirmByteRoverLive:true it runs `brv curate -- <content>` in $HERMES_HOME/byterover with Hermes' 120s curate timeout."#,
+        ),
+        (
+            "brv_status",
+            r#"- brv_status: payload {"execute":false,"confirmByteRoverLive":false}. Hermes ByteRover CLI status check. By default this reports the planned command and local readiness; with execute/live/apply:true plus confirmByteRoverLive:true it runs `brv status` in $HERMES_HOME/byterover with a 15s timeout."#,
+        ),
+        (
+            "hindsight_search",
+            r#"- hindsight_search: payload {"query":"memory search","max_tokens":4096,"tags":["optional"],"types":["observation"],"execute":false,"confirmHindsightLive":false}. Hermes Hindsight provider recall over knowledge-graph long-term memory. By default this reports readiness/route planning without network; with execute/live/apply:true plus confirmHindsightLive:true it performs a Hindsight REST bridge matching Hermes client.arecall bank/query/budget/max_tokens/tags/types semantics."#,
+        ),
+        (
+            "hindsight_reflect",
+            r#"- hindsight_reflect: payload {"query":"question to synthesize","budget":"low|mid|high","execute":false,"confirmHindsightLive":false}. Hermes Hindsight provider cross-memory reflection. By default this reports readiness/route planning without network; with execute/live/apply:true plus confirmHindsightLive:true it performs the Hindsight reflect REST bridge using HINDSIGHT_* / profile config."#,
+        ),
+        (
+            "hindsight_remember",
+            r#"- hindsight_remember: payload {"content":"memory content","context":"optional","tags":["optional"],"metadata":{},"execute":false,"confirmHindsightLive":false}. Hermes Hindsight provider memory write. By default this reports readiness/route planning without network; with execute/live/apply:true plus confirmHindsightLive:true it performs a Hindsight retain REST bridge matching Hermes client.aretain metadata/tag/context semantics."#,
+        ),
+        (
+            "retaindb_search",
+            r#"- retaindb_search: payload {"query":"memory search","limit":10,"memory_type":"optional","execute":false,"confirmRetainDbLive":false}. Hermes RetainDB provider cloud-memory search. By default this reports readiness/route planning without network; with execute/live/apply:true plus confirmRetainDbLive:true it performs the Hermes POST /v1/memory/search request using RETAINDB_* config."#,
+        ),
+        (
+            "retaindb_context",
+            r#"- retaindb_context: payload {"query":"current task","max_tokens":1200,"execute":false,"confirmRetainDbLive":false}. Hermes RetainDB synthesized context query. By default this reports readiness/route planning without network; with execute/live/apply:true plus confirmRetainDbLive:true it performs POST /v1/context/query with include_memories=true."#,
+        ),
+        (
+            "retaindb_store",
+            r#"- retaindb_store: payload {"content":"memory content","memory_type":"fact|preference|task|project|context|relationship|custom","metadata":{},"execute":false,"confirmRetainDbLive":false}. Hermes RetainDB provider cloud-memory write. By default this reports readiness/route planning without network; with execute/live/apply:true plus confirmRetainDbLive:true it performs POST /v1/memory with Hermes fallback to POST /v1/memories."#,
+        ),
+        (
+            "retaindb_remember",
+            r#"- retaindb_remember: payload {"content":"memory content","memory_type":"factual|preference|goal|instruction|event|opinion","importance":0.7,"execute":false,"confirmRetainDbLive":false}. Hermes RetainDB explicit memory write alias; same confirmed live execution path as retaindb_store."#,
+        ),
+        (
+            "retaindb_forget",
+            r#"- retaindb_forget: payload {"memory_id":"memory id","execute":false,"confirmRetainDbLive":false}. Hermes RetainDB delete-memory tool. By default this reports readiness/route planning without network; with execute/live/apply:true plus confirmRetainDbLive:true it performs DELETE /v1/memory/{memory_id} with fallback to DELETE /v1/memories/{memory_id}."#,
+        ),
+        (
+            "retaindb_upload_file",
+            r#"- retaindb_upload_file: payload {"local_path":"path","remote_path":"/optional/name","scope":"USER|PROJECT|ORG","ingest":false,"execute":false,"confirmRetainDbLive":false}. Hermes RetainDB shared file upload. By default this reports readiness/route planning without network; with execute/live/apply:true plus confirmRetainDbLive:true it uploads multipart POST /v1/files and can optionally ingest the returned file id."#,
+        ),
+        (
+            "retaindb_list_files",
+            r#"- retaindb_list_files: payload {"prefix":"optional","limit":50,"execute":false,"confirmRetainDbLive":false}. Hermes RetainDB shared file listing. By default this reports readiness/route planning without network; with execute/live/apply:true plus confirmRetainDbLive:true it performs GET /v1/files."#,
+        ),
+        (
+            "retaindb_read_file",
+            r#"- retaindb_read_file: payload {"file_id":"file id","execute":false,"confirmRetainDbLive":false}. Hermes RetainDB shared file read. With confirmed live execution it reads metadata plus GET /v1/files/{file_id}/content and returns text up to 32000 chars or a binary-file note."#,
+        ),
+        (
+            "retaindb_ingest_file",
+            r#"- retaindb_ingest_file: payload {"file_id":"file id","user_id":"optional","agent_id":"optional","execute":false,"confirmRetainDbLive":false}. Hermes RetainDB file ingestion. With confirmed live execution it performs POST /v1/files/{file_id}/ingest."#,
+        ),
+        (
+            "retaindb_delete_file",
+            r#"- retaindb_delete_file: payload {"file_id":"file id","execute":false,"confirmRetainDbLive":false}. Hermes RetainDB shared file delete. With confirmed live execution it performs DELETE /v1/files/{file_id}."#,
+        ),
+        (
+            "retaindb_ingest_session",
+            r#"- retaindb_ingest_session: payload {"messages":[{"role":"user|assistant","content":"text"}],"user_id":"optional","session_id":"optional","execute":false,"confirmRetainDbLive":false}. Hermes RetainDB durable session ingest. With confirmed live execution it performs POST /v1/memory/ingest/session with write_mode=sync."#,
+        ),
+        (
+            "retaindb_agent_model",
+            r#"- retaindb_agent_model: payload {"agent_id":"optional","execute":false,"confirmRetainDbLive":false}. Hermes RetainDB agent self-model read. With confirmed live execution it performs GET /v1/memory/agent/{agent_id}/model."#,
+        ),
+        (
+            "retaindb_seed_agent",
+            r#"- retaindb_seed_agent: payload {"agent_id":"optional","content":"SOUL.md or persistent instructions","source":"soul_md","execute":false,"confirmRetainDbLive":false}. Hermes RetainDB agent identity seed. With confirmed live execution it performs POST /v1/memory/agent/{agent_id}/seed."#,
+        ),
+        (
+            "retaindb_profile",
+            r#"- retaindb_profile: payload {"action":"status|profile","user_id":"optional","execute":false,"confirmRetainDbLive":false}. Hermes RetainDB provider profile/status. By default this reports readiness/route planning without network; with execute/live/apply:true plus confirmRetainDbLive:true it performs GET /v1/memory/profile/{user_id} with Hermes fallback to GET /v1/memories."#,
+        ),
+        (
             "skills_list",
-            r#"- skills_list: payload {"query":"optional","enabledOnly":false}"#,
+            r#"- skills_list: payload {"query":"optional","category":"optional","enabledOnly":false}. Returns Hermes-style success, categories, and category fields."#,
         ),
         (
             "skill_view",
@@ -501,7 +738,7 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
         ),
         (
             "skill_manage",
-            r#"- skill_manage: payload {"action":"create|edit|patch|delete|write_file|remove_file","name":"skill-name","content":"full SKILL.md","category":"optional","filePath":"references/file.md","fileContent":"...","oldString":"...","newString":"...","replaceAll":false}"#,
+            r#"- skill_manage: payload {"action":"status|list_installs|usage|audit|audit_log|check_updates|update|uninstall|list_taps|add_tap|remove_tap|curator_report|curator_status|curator_pause|curator_resume|export_snapshot|import_snapshot|install_file|install_content|create|edit|patch|pin|unpin|archive|restore|delete|write_file|remove_file","name":"skill-name or selector when needed","content":"full SKILL.md","category":"optional","path":"snapshot or install file path","repo":"tap repo","filePath":"references/file.md","fileContent":"...","oldString":"...","newString":"...","replaceAll":false,"force":false,"reason":"archive reason"}. Use status/list_installs/usage/audit/check_updates before mutating skills; delete/uninstall/archive refuse unsafe targets. usage returns Hermes-style skill usage/provenance sidecar records used by curator protection."#,
         ),
         (
             "image_generate",
@@ -518,6 +755,50 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
         (
             "transcribe_audio",
             r#"- transcribe_audio: payload {"path":"relative audio path"} or {"url":"https://example.com/voice.mp3","model":"whisper-1","language":"zh"}"#,
+        ),
+        (
+            "voice_status",
+            r#"- voice_status: payload {"cleanup":false,"maxAgeSeconds":3600} reports Hermes-style voice mode readiness: local audio capture/playback command availability, STT/TTS provider readiness, and optional old temp recording cleanup. It does not start recording."#,
+        ),
+        (
+            "voice_playback",
+            r#"- voice_playback: payload {"action":"play|stop|status","path":"relative audio path"} plays or interrupts a local audio file with the configured/default system player, matching Hermes-style voice playback controls."#,
+        ),
+        (
+            "voice_recording",
+            r#"- voice_recording: payload {"action":"start|stop|cancel|status","durationSeconds":0} starts, stops, cancels, or inspects a Hermes-style local voice recording. It writes a temporary recording_*.wav and requires HERMES_LOCAL_MIC_COMMAND/SYNTHCHAT_LOCAL_MIC_COMMAND or a platform recorder."#,
+        ),
+        (
+            "meet_join",
+            r#"- meet_join: payload {"url":"https://meet.google.com/abc-defg-hij","mode":"transcribe|realtime","guest_name":"Hermes Agent","duration":"30m","headed":false,"node":"optional","execute":false} validates an explicit Google Meet URL and records a Hermes-style desktop Meet session with transcript path and runtime boundary metadata, including the Hermes local Playwright bot subprocess command/env/log/status/transcript/say-queue plan plus SynthChat process-tool start/stop payloads keyed by google-meet:<meeting-id>. With execute/live/apply:true and no node, starts the planned local bot command through the managed process tool path so logs/status/stop controls appear in the normal process UI; google_meet.localBotCommand can override the command while preserving HERMES_MEET_* env setup. With node plus execute/live/apply:true, routes start_bot through the registered Hermes remote-node JSON-over-WebSocket RPC. It does not scan calendars or auto-dial; Playwright join/audio execution still happens inside the local google_meet runtime or an external meet node."#,
+        ),
+        (
+            "meet_status",
+            r#"- meet_status: payload {"node":"optional","execute":false} reports Hermes-style Google Meet session state, active flag, mode, transcript line count, transcript path, node hint, and desktop runtime boundary metadata. With node plus execute/live/apply:true, routes status through the registered Hermes remote-node RPC."#,
+        ),
+        (
+            "meet_transcript",
+            r#"- meet_transcript: payload {"last":10,"node":"optional","execute":false} reads the active Google Meet transcript file and returns all lines or the last N lines. With node plus execute/live/apply:true, routes transcript through the registered Hermes remote-node RPC."#,
+        ),
+        (
+            "meet_leave",
+            r#"- meet_leave: payload {"node":"optional","execute":false} marks the active Google Meet desktop session stopped and records a Hermes-style stop reason. With node plus execute/live/apply:true, routes stop through the registered Hermes remote-node RPC. Safe when no session is active."#,
+        ),
+        (
+            "meet_say",
+            r#"- meet_say: payload {"text":"what to say","node":"optional","execute":false} queues speech text for a realtime Google Meet session. With node plus execute/live/apply:true, routes say through the registered Hermes remote-node RPC. It refuses locally unless the active session was joined with mode='realtime'; actual audio playback requires the external google_meet OpenAI Realtime bridge."#,
+        ),
+        (
+            "meet_node",
+            r#"- meet_node: payload {"action":"list|status|approve|remove|resolve|request-envelope|token|ensure-token|requirements|setup|host-plan|run|audio-plan|realtime-plan","name":"node-name","url":"ws://host:18789","token":"secret","requestType":"ping|status|start_bot|stop|transcript|say","payload":{},"execute":false} manages the Hermes Google Meet remote-node registry at $HERMES_HOME/workspace/meetings/nodes.json, redacts tokens in read responses, can build Hermes JSON-over-WebSocket request envelopes, exposes Hermes meet-node host token/bootstrap commands, local Playwright/realtime setup requirements, and realtime audio bridge diagnostics. action=run with execute/live/apply:true starts the Hermes meet-node host through the normal managed process path; nodeHostCommand can override the launched command. Other execute/live/apply:true requests send one JSON-over-WebSocket request to the resolved remote node."#,
+        ),
+        (
+            "disk_cleanup",
+            r#"- disk_cleanup: payload {"action":"status|track|forget|dry_run|quick|deep|guess","path":"optional path","category":"temp|test|research|download|chrome-profile|cron-output|other"}. Hermes-style disk-cleanup adaptation for ephemeral session files: tracks scoped files under SynthChat data/HERMES_HOME, previews quick/deep cleanup, deletes deterministic test/temp/cron-output candidates with approval, and reports deep-clean prompt candidates instead of deleting them automatically."#,
+        ),
+        (
+            "trace_flush",
+            r#"- trace_flush: payload {"action":"status|flush|clear","dryRun":false}. Hermes Langfuse observability adaptation: reports buffered native trace events, flushes opt-in Langfuse events to /api/public/ingestion when HERMES_LANGFUSE_PUBLIC_KEY and HERMES_LANGFUSE_SECRET_KEY are configured, or clears the local buffer."#,
         ),
         (
             "vision_analyze",
@@ -558,6 +839,10 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
         (
             "feishu_drive_list_comment_replies",
             r#"- feishu_drive_list_comment_replies: payload {"file_token":"doc file token","comment_id":"comment id","file_type":"docx","page_size":100,"page_token":"optional"} lists Feishu/Lark comment replies."#,
+        ),
+        (
+            "feishu_drive_update_comment_reaction",
+            r#"- feishu_drive_update_comment_reaction: payload {"file_token":"doc file token","reply_id":"reply id","file_type":"docx","action":"add|delete","reaction_type":"OK"} adds or removes a Feishu/Lark Drive v2 comment reply reaction, matching Hermes feishu_comment reaction handling."#,
         ),
         (
             "feishu_drive_reply_comment",
@@ -616,6 +901,10 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
             r#"- spotify_library: payload {"kind":"tracks|albums","action":"list|save|remove","limit":20,"offset":0,"market":"US","uris":["spotify:track|album:..."],"ids":["id"],"items":["id/uri/url"]}. Reads or edits saved Spotify tracks/albums."#,
         ),
         (
+            "spotify_status",
+            r#"- spotify_status: payload {"action":"status|manifest|tools|auth|diagnostics"} returns a read-only Hermes Spotify plugin status snapshot: plugin.yaml metadata, backend auto-load semantics, seven registered Spotify tools, Hermes `hermes auth spotify` / providers.spotify gate, SynthChat credential-source readiness from settings/env, risk-policy summary, and explicit no-network/no-token-refresh boundaries."#,
+        ),
+        (
             "discord",
             r#"- discord: payload {"action":"fetch_messages|search_members|create_thread|send_message","channel_id":"channel id","guild_id":"server id","query":"member prefix","name":"thread name","content":"message text","message_id":"optional anchor/reply","limit":50,"before":"snowflake","after":"snowflake","auto_archive_duration":1440}. Reads and participates in Discord via bot token or configured bridge."#,
         ),
@@ -652,6 +941,10 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
         (
             "browser_get_images",
             r#"- browser_get_images: payload {"url":"https://example.com"}"#,
+        ),
+        (
+            "browser_plugins",
+            r#"- browser_plugins: payload {"action":"status|manifest|providers|readiness|diagnostics"} returns a read-only Hermes browser provider plugin snapshot for plugins/browser/browserbase, browser_use, and firecrawl: backend manifests, register_browser_provider semantics, required env readiness, Hermes legacy browser-use/browserbase selection behavior, Firecrawl explicit-selection boundary, SynthChat BrowserProvider registry mapping, and no-session/no-network diagnostic boundaries."#,
         ),
         (
             "browser_provider",
@@ -723,7 +1016,7 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
         ),
         (
             "x_search",
-            r#"- x_search: payload {"query":"topic on X/Twitter","limit":5,"from":"optional username","since":"YYYY-MM-DD","until":"YYYY-MM-DD"}. Uses configured web_search provider as a compatibility bridge."#,
+            r#"- x_search: payload {"query":"topic on X/Twitter","allowed_x_handles":["optional_handle"],"excluded_x_handles":["optional_handle"],"from_date":"YYYY-MM-DD","to_date":"YYYY-MM-DD","enable_image_understanding":false,"enable_video_understanding":false}. Uses xAI's built-in Responses x_search tool when xAI credentials are configured; set mode=web_search_bridge only for the legacy search-query bridge."#,
         ),
         (
             "web_extract",
@@ -743,6 +1036,8 @@ pub(super) fn available_mcp_tool_definitions(
     if !agent.mcp_enabled {
         return Ok(vec![]);
     }
+    let mcp_filters = registered_mcp_tool_filters(store)?;
+    let platform_toolsets = cli_platform_toolsets(store)?;
     let mut tools = store
         .tool_definitions()?
         .into_iter()
@@ -750,13 +1045,16 @@ pub(super) fn available_mcp_tool_definitions(
             agent.enabled_mcp_servers.is_empty()
                 || agent.enabled_mcp_servers.contains(&tool.server_id)
         })
+        .filter(|tool| registered_mcp_tool_allowed(tool, &mcp_filters))
+        .filter(|tool| cli_platform_tool_allowed(tool, platform_toolsets.as_ref()))
         .collect::<Vec<_>>();
     tools.extend(
         python_plugin_tool_definitions(store)?
             .into_iter()
             .filter(|tool| {
-                agent.enabled_mcp_servers.is_empty()
-                    || agent.enabled_mcp_servers.contains(&tool.server_id)
+                (agent.enabled_mcp_servers.is_empty()
+                    || agent.enabled_mcp_servers.contains(&tool.server_id))
+                    && cli_platform_tool_allowed(tool, platform_toolsets.as_ref())
             }),
     );
     tools.retain(|tool| tool_allowed_by_agent_capabilities(tool, agent));
@@ -789,19 +1087,26 @@ pub(super) fn visible_tool_definitions_for_agent(
         })
         .collect::<Vec<_>>();
     if agent.mcp_enabled {
+        let mcp_filters = registered_mcp_tool_filters(store)?;
+        let platform_toolsets = cli_platform_toolsets(store)?;
         tools.extend(store.tool_definitions()?.into_iter().filter(|tool| {
-            agent.enabled_mcp_servers.is_empty()
-                || agent.enabled_mcp_servers.contains(&tool.server_id)
+            (agent.enabled_mcp_servers.is_empty()
+                || agent.enabled_mcp_servers.contains(&tool.server_id))
+                && registered_mcp_tool_allowed(tool, &mcp_filters)
+                && cli_platform_tool_allowed(tool, platform_toolsets.as_ref())
         }));
         tools.extend(
             python_plugin_tool_definitions(store)?
                 .into_iter()
                 .filter(|tool| {
-                    agent.enabled_mcp_servers.is_empty()
-                        || agent.enabled_mcp_servers.contains(&tool.server_id)
+                    (agent.enabled_mcp_servers.is_empty()
+                        || agent.enabled_mcp_servers.contains(&tool.server_id))
+                        && cli_platform_tool_allowed(tool, platform_toolsets.as_ref())
                 }),
         );
     }
+    let platform_toolsets = cli_platform_toolsets(store)?;
+    tools.retain(|tool| cli_platform_tool_allowed(tool, platform_toolsets.as_ref()));
     tools = apply_agent_toolset_policy(tools, agent);
     tools = apply_tool_context_policy(tools, context);
     tools.sort_by(|left, right| {
@@ -811,6 +1116,134 @@ pub(super) fn visible_tool_definitions_for_agent(
             .then_with(|| left.tool_name.cmp(&right.tool_name))
     });
     Ok(tools)
+}
+
+#[derive(Debug, Clone, Default)]
+struct RegisteredMcpToolFilters {
+    include: HashSet<String>,
+    exclude: HashSet<String>,
+}
+
+fn registered_mcp_tool_filters(
+    store: &AppStore,
+) -> AppResult<HashMap<String, RegisteredMcpToolFilters>> {
+    let mut filters = HashMap::new();
+    for server in store.static_list("mcpServers")? {
+        let Some(server_id) = server.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        filters.insert(
+            server_id.to_string(),
+            RegisteredMcpToolFilters {
+                include: registered_mcp_tool_filter_set(
+                    server
+                        .get("tools")
+                        .and_then(|tools| tools.get("include"))
+                        .or_else(|| server.get("toolInclude"))
+                        .or_else(|| server.get("tool_include")),
+                ),
+                exclude: registered_mcp_tool_filter_set(
+                    server
+                        .get("tools")
+                        .and_then(|tools| tools.get("exclude"))
+                        .or_else(|| server.get("toolExclude"))
+                        .or_else(|| server.get("tool_exclude")),
+                ),
+            },
+        );
+    }
+    Ok(filters)
+}
+
+fn registered_mcp_tool_allowed(
+    tool: &ToolDefinition,
+    filters: &HashMap<String, RegisteredMcpToolFilters>,
+) -> bool {
+    if tool.source != "mcp" {
+        return true;
+    }
+    let Some(filters) = filters.get(&tool.server_id) else {
+        return true;
+    };
+    let name = normalize_registered_mcp_tool_filter_name(&tool.tool_name);
+    (filters.include.is_empty() || filters.include.contains(&name))
+        && !filters.exclude.contains(&name)
+}
+
+fn registered_mcp_tool_filter_set(value: Option<&Value>) -> HashSet<String> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(normalize_registered_mcp_tool_filter_name)
+            .filter(|value| !value.is_empty())
+            .collect(),
+        Some(Value::String(raw)) => raw
+            .split(',')
+            .map(normalize_registered_mcp_tool_filter_name)
+            .filter(|value| !value.is_empty())
+            .collect(),
+        _ => HashSet::new(),
+    }
+}
+
+fn normalize_registered_mcp_tool_filter_name(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn cli_platform_toolsets(store: &AppStore) -> AppResult<Option<HashSet<String>>> {
+    let config = store.config()?;
+    let Some(value) = config
+        .chat
+        .auxiliary_task_assignments
+        .get("hermesPlatformToolsets")
+        .or_else(|| {
+            config
+                .chat
+                .auxiliary_task_assignments
+                .get("hermes_platform_toolsets")
+        })
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("cli").or_else(|| object.get("desktop")))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(super::normalize_toolset_name)
+            .filter(|name| !name.is_empty())
+            .collect(),
+    ))
+}
+
+fn cli_platform_tool_allowed(
+    tool: &ToolDefinition,
+    platform_toolsets: Option<&HashSet<String>>,
+) -> bool {
+    let Some(platform_toolsets) = platform_toolsets else {
+        return true;
+    };
+    if platform_toolsets.is_empty() {
+        return false;
+    }
+    let toolsets = cli_platform_toolsets_for_tool(tool);
+    toolsets.iter().any(|name| platform_toolsets.contains(name))
+}
+
+fn cli_platform_toolsets_for_tool(tool: &ToolDefinition) -> HashSet<String> {
+    if tool.source == "internal" {
+        let names = match tool.tool_name.as_str() {
+            "terminal" | "process" | "env_probe" => vec!["terminal"],
+            "execute_code" | "workspace_diagnostics" => vec!["code_execution"],
+            _ => return tool_toolsets(tool),
+        };
+        return names.into_iter().map(str::to_string).collect();
+    }
+    tool_toolsets(tool)
 }
 
 fn python_plugin_tool_definitions(store: &AppStore) -> AppResult<Vec<ToolDefinition>> {
@@ -976,6 +1409,7 @@ pub(super) async fn execute_recovery_mcp_tool(
     run_id: &str,
     definition: &ToolDefinition,
     payload: Value,
+    plugin_bridge_context: Option<&PythonPluginBridgeContext<'_>>,
 ) -> AppResult<(String, ToolEvent)> {
     let replay_payload = payload.clone();
     let payload = strip_provider_tool_call_metadata(payload);
@@ -985,7 +1419,13 @@ pub(super) async fn execute_recovery_mcp_tool(
         .starts_with(PYTHON_PLUGIN_SERVER_PREFIX)
     {
         let started = Instant::now();
-        let result = run_python_plugin_tool(store, &definition.tool_name, &payload).await;
+        let result = run_python_plugin_tool(
+            store,
+            &definition.tool_name,
+            &payload,
+            plugin_bridge_context,
+        )
+        .await;
         let elapsed_ms = started.elapsed().as_millis();
         let (ok, mut text, error) = match result {
             Ok(text) => (true, redact_sensitive_text(&text), None),
@@ -1177,36 +1617,394 @@ pub(super) fn tool_search_tool(
         .unwrap_or(8)
         .clamp(1, 30) as usize;
     let include_unavailable = payload_bool(payload, &["includeUnavailable", "include_unavailable"]);
-    let mut matches = tool_catalog(store, agent, context, include_unavailable)?
+    let catalog = tool_catalog(store, agent, context, include_unavailable)?;
+    let total_available = catalog.len();
+    let retrieval = tool_catalog_retrieval_stats(&catalog, query);
+    let mut matches = catalog
         .into_iter()
         .map(|entry| {
-            let score = tool_catalog_relevance(&entry, query);
+            let score = retrieval.score_entry(&entry);
             (score, entry)
         })
-        .filter(|(score, _)| query.is_empty() || *score > 0)
+        .filter(|(score, _)| query.is_empty() || score.score > 0.0)
         .collect::<Vec<_>>();
     matches.sort_by(|left, right| {
-        right.0.cmp(&left.0).then_with(|| {
-            left.1["name"]
-                .as_str()
-                .unwrap_or("")
-                .cmp(right.1["name"].as_str().unwrap_or(""))
-        })
+        right
+            .0
+            .score
+            .partial_cmp(&left.0.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                left.1["name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(right.1["name"].as_str().unwrap_or(""))
+            })
     });
+    if !query.is_empty() && matches.is_empty() {
+        matches =
+            retrieval.substring_matches(&tool_catalog(store, agent, context, include_unavailable)?);
+        matches.sort_by(|left, right| {
+            right
+                .0
+                .score
+                .partial_cmp(&left.0.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    left.1["name"]
+                        .as_str()
+                        .unwrap_or("")
+                        .cmp(right.1["name"].as_str().unwrap_or(""))
+                })
+        });
+    }
+    let result_count = matches.len().min(limit);
     let matches = matches
         .into_iter()
         .take(limit)
         .map(|(score, mut entry)| {
-            entry["score"] = json!(score);
+            entry["score"] = json!(score.score);
+            entry["searchMode"] = json!(score.mode);
+            entry["search_mode"] = entry["searchMode"].clone();
+            entry["matchedTerms"] = json!(score.matched_terms);
+            entry["matched_terms"] = entry["matchedTerms"].clone();
+            if entry.get("source_name").is_none() {
+                entry["source_name"] = json!(tool_catalog_source_name(&entry));
+            }
+            if entry.get("sourceName").is_none() {
+                entry["sourceName"] = entry.get("source_name").cloned().unwrap_or(Value::Null);
+            }
             entry
         })
         .collect::<Vec<_>>();
+    let retrieval_summary = json!({
+        "mode": retrieval.mode(),
+        "queryTokens": retrieval.query_tokens.clone(),
+        "query_tokens": retrieval.query_tokens.clone(),
+        "catalogSize": total_available,
+        "catalog_size": total_available,
+        "deferredCount": retrieval.deferred_count,
+        "deferred_count": retrieval.deferred_count,
+        "deferredTokens": retrieval.deferred_tokens,
+        "deferred_tokens": retrieval.deferred_tokens,
+        "thresholdTokens": retrieval.threshold_tokens,
+        "threshold_tokens": retrieval.threshold_tokens,
+        "thresholdPct": retrieval.threshold_pct,
+        "threshold_pct": retrieval.threshold_pct,
+        "returned": result_count,
+        "limit": limit
+    });
     Ok(serde_json::to_string_pretty(&json!({
+        "success": true,
         "query": query,
         "includeUnavailable": include_unavailable,
+        "total_available": total_available,
+        "totalAvailable": total_available,
         "count": matches.len(),
+        "searchMode": retrieval.mode(),
+        "search_mode": retrieval.mode(),
+        "deferredCount": retrieval.deferred_count,
+        "deferred_count": retrieval.deferred_count,
+        "deferredTokens": retrieval.deferred_tokens,
+        "deferred_tokens": retrieval.deferred_tokens,
+        "thresholdTokens": retrieval.threshold_tokens,
+        "threshold_tokens": retrieval.threshold_tokens,
+        "retrieval": retrieval_summary,
         "matches": matches
     }))?)
+}
+
+#[derive(Clone, Debug)]
+struct ToolCatalogSearchScore {
+    score: f64,
+    mode: &'static str,
+    matched_terms: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ToolCatalogRetrievalStats {
+    query: String,
+    query_tokens: Vec<String>,
+    doc_tokens: Vec<Vec<String>>,
+    doc_frequency: HashMap<String, usize>,
+    avg_doc_len: f64,
+    deferred_count: usize,
+    deferred_tokens: usize,
+    threshold_pct: f64,
+    threshold_tokens: usize,
+}
+
+impl ToolCatalogRetrievalStats {
+    fn mode(&self) -> &'static str {
+        if self.query_tokens.is_empty() {
+            "all"
+        } else {
+            "bm25"
+        }
+    }
+
+    fn score_entry(&self, entry: &Value) -> ToolCatalogSearchScore {
+        if self.query_tokens.is_empty() {
+            return ToolCatalogSearchScore {
+                score: 1.0,
+                mode: "all",
+                matched_terms: Vec::new(),
+            };
+        }
+        let tokens = tool_catalog_search_tokens(entry);
+        let score = bm25_score(
+            &self.query_tokens,
+            &tokens,
+            self.avg_doc_len,
+            &self.doc_frequency,
+            self.doc_tokens.len(),
+        ) + tool_catalog_name_boost(entry, &self.query_tokens);
+        let matched_terms = matched_query_terms(&self.query_tokens, &tokens, entry);
+        ToolCatalogSearchScore {
+            score,
+            mode: "bm25",
+            matched_terms,
+        }
+    }
+
+    fn substring_matches(&self, catalog: &[Value]) -> Vec<(ToolCatalogSearchScore, Value)> {
+        let needle = self.query.trim().to_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        catalog
+            .iter()
+            .filter_map(|entry| {
+                let haystack = tool_catalog_exact_fields(entry)
+                    .into_iter()
+                    .map(|value| value.to_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if haystack.contains(&needle) {
+                    Some((
+                        ToolCatalogSearchScore {
+                            score: 0.1,
+                            mode: "substring",
+                            matched_terms: vec![needle.clone()],
+                        },
+                        entry.clone(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+fn tool_catalog_retrieval_stats(catalog: &[Value], query: &str) -> ToolCatalogRetrievalStats {
+    let doc_tokens = catalog
+        .iter()
+        .map(tool_catalog_search_tokens)
+        .collect::<Vec<_>>();
+    let mut doc_frequency = HashMap::new();
+    for tokens in &doc_tokens {
+        let mut seen = HashSet::new();
+        for token in tokens {
+            if seen.insert(token) {
+                *doc_frequency.entry(token.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    let avg_doc_len = if doc_tokens.is_empty() {
+        0.0
+    } else {
+        doc_tokens.iter().map(Vec::len).sum::<usize>() as f64 / doc_tokens.len() as f64
+    };
+    let deferred_tokens = estimate_tool_catalog_tokens(catalog);
+    let threshold_pct = 10.0;
+    let threshold_tokens = 20_000;
+    ToolCatalogRetrievalStats {
+        query: query.trim().to_string(),
+        query_tokens: tokenize_tool_search_text(query),
+        doc_tokens,
+        doc_frequency,
+        avg_doc_len,
+        deferred_count: catalog.len(),
+        deferred_tokens,
+        threshold_pct,
+        threshold_tokens,
+    }
+}
+
+fn estimate_tool_catalog_tokens(catalog: &[Value]) -> usize {
+    let total_chars = catalog
+        .iter()
+        .map(|entry| {
+            serde_json::to_string(entry)
+                .map(|text| text.len())
+                .unwrap_or_else(|_| entry.to_string().len())
+        })
+        .sum::<usize>();
+    (total_chars as f64 / TOOL_SEARCH_CHARS_PER_TOKEN).ceil() as usize
+}
+
+fn bm25_score(
+    query_tokens: &[String],
+    doc_tokens: &[String],
+    avg_doc_len: f64,
+    doc_frequency: &HashMap<String, usize>,
+    doc_count: usize,
+) -> f64 {
+    if doc_tokens.is_empty() || query_tokens.is_empty() || doc_count == 0 {
+        return 0.0;
+    }
+    let mut term_frequency = HashMap::<&str, usize>::new();
+    for token in doc_tokens {
+        *term_frequency.entry(token.as_str()).or_insert(0) += 1;
+    }
+    let k1 = 1.5;
+    let b = 0.75;
+    let doc_len = doc_tokens.len() as f64;
+    let mut score = 0.0;
+    for query_token in query_tokens {
+        let Some(df) = doc_frequency.get(query_token).copied() else {
+            continue;
+        };
+        let tf = term_frequency
+            .get(query_token.as_str())
+            .copied()
+            .unwrap_or(0) as f64;
+        if tf == 0.0 {
+            continue;
+        }
+        let idf = (1.0 + (doc_count as f64 - df as f64 + 0.5) / (df as f64 + 0.5)).ln();
+        let denominator = tf + k1 * (1.0 - b + b * doc_len / avg_doc_len.max(1.0));
+        score += idf * (tf * (k1 + 1.0) / denominator);
+    }
+    score
+}
+
+fn tool_catalog_name_boost(entry: &Value, query_tokens: &[String]) -> f64 {
+    let exact_fields = tool_catalog_exact_fields(entry)
+        .into_iter()
+        .map(|value| value.to_lowercase())
+        .collect::<Vec<_>>();
+    query_tokens
+        .iter()
+        .map(|term| {
+            exact_fields
+                .iter()
+                .map(|field| {
+                    if field == term {
+                        3.0
+                    } else if field.contains(term) {
+                        0.75
+                    } else {
+                        0.0
+                    }
+                })
+                .fold(0.0, f64::max)
+        })
+        .sum()
+}
+
+fn matched_query_terms(
+    query_tokens: &[String],
+    doc_tokens: &[String],
+    entry: &Value,
+) -> Vec<String> {
+    let doc_set = doc_tokens.iter().collect::<HashSet<_>>();
+    let exact_text = tool_catalog_exact_fields(entry)
+        .into_iter()
+        .map(|value| value.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut matched = Vec::new();
+    for term in query_tokens {
+        if (doc_set.contains(term) || exact_text.contains(term)) && !matched.contains(term) {
+            matched.push(term.clone());
+        }
+    }
+    matched
+}
+
+fn tool_catalog_search_tokens(entry: &Value) -> Vec<String> {
+    tokenize_tool_search_text(&tool_catalog_search_text(entry))
+}
+
+fn tool_catalog_search_text(entry: &Value) -> String {
+    let mut parts = tool_catalog_exact_fields(entry);
+    for key in ["description", "payloadShape"] {
+        if let Some(value) = entry.get(key).and_then(Value::as_str) {
+            parts.push(value.to_string());
+        }
+    }
+    for key in ["payloadSchema", "inputSchema", "schema", "parameters"] {
+        if let Some(value) = entry.get(key) {
+            parts.extend(tool_schema_search_terms(value));
+        }
+    }
+    parts.join(" ")
+}
+
+fn tool_catalog_exact_fields(entry: &Value) -> Vec<String> {
+    let mut fields = [
+        "name",
+        "displayName",
+        "source",
+        "serverId",
+        "toolName",
+        "source_name",
+        "sourceName",
+    ]
+    .into_iter()
+    .filter_map(|key| entry.get(key).and_then(Value::as_str))
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    if let Some(aliases) = entry.get("aliases").and_then(Value::as_array) {
+        fields.extend(aliases.iter().filter_map(Value::as_str).map(str::to_string));
+    }
+    fields
+}
+
+fn tool_schema_search_terms(schema: &Value) -> Vec<String> {
+    let mut terms = Vec::new();
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        terms.extend(properties.keys().cloned());
+        for value in properties.values() {
+            if let Some(description) = value.get("description").and_then(Value::as_str) {
+                terms.push(description.to_string());
+            }
+        }
+    }
+    if let Ok(text) = serde_json::to_string(schema) {
+        terms.push(text);
+    }
+    terms
+}
+
+fn tokenize_tool_search_text(text: &str) -> Vec<String> {
+    text.replace(['_', '.', '-', '/', ':'], " ")
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(str::to_lowercase)
+        .flat_map(expand_tool_search_token)
+        .collect()
+}
+
+fn expand_tool_search_token(token: String) -> Vec<String> {
+    let mut tokens = vec![token.clone()];
+    match token.as_str() {
+        "visual" | "visually" => tokens.push("vision".into()),
+        "vision" => tokens.push("visual".into()),
+        "screenshot" | "screenshots" => {
+            tokens.push("capture".into());
+            tokens.push("image".into());
+            tokens.push("vision".into());
+            tokens.push("visual".into());
+        }
+        "capture" | "captures" => tokens.push("screenshot".into()),
+        "image" | "images" => tokens.push("vision".into()),
+        _ => {}
+    }
+    tokens
 }
 
 pub(super) fn tool_describe_tool(
@@ -1229,7 +2027,44 @@ pub(super) fn tool_describe_tool(
         .find(|entry| tool_catalog_name_matches(entry, requested))
         .cloned()
         .ok_or_else(|| AppError::BadRequest(format!("tool not found: {requested}")))?;
+    let mut entry = entry;
+    let parameters = entry
+        .get("payloadSchema")
+        .or_else(|| entry.get("inputSchema"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let description = entry
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    entry["success"] = json!(true);
+    entry["parameters"] = parameters.clone();
+    entry["schema"] = parameters;
+    entry["description"] = json!(description);
+    if entry.get("source_name").is_none() {
+        entry["source_name"] = json!(tool_catalog_source_name(&entry));
+    }
+    if entry.get("sourceName").is_none() {
+        entry["sourceName"] = entry.get("source_name").cloned().unwrap_or(Value::Null);
+    }
     Ok(serde_json::to_string_pretty(&entry)?)
+}
+
+fn tool_catalog_source_name(entry: &Value) -> String {
+    let source = entry
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let server_id = entry
+        .get("serverId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if server_id.is_empty() || server_id == "__internal" {
+        source.to_string()
+    } else {
+        server_id.to_string()
+    }
 }
 
 pub(super) fn resolve_tool_call_payload(payload: &Value) -> AppResult<(String, Value)> {
@@ -1380,6 +2215,7 @@ fn internal_tool_unavailable_reason(tool_name: &str) -> &'static str {
         "feishu_doc_read"
         | "feishu_drive_list_comments"
         | "feishu_drive_list_comment_replies"
+        | "feishu_drive_update_comment_reaction"
         | "feishu_drive_reply_comment"
         | "feishu_drive_add_comment" => "Feishu/Lark settings are incomplete",
         "yb_query_group_info" | "yb_query_group_members" | "yb_send_dm" | "yb_send_sticker" => {
@@ -1400,85 +2236,6 @@ fn payload_bool(payload: &Value, keys: &[&str]) -> bool {
         .find_map(|key| payload.get(*key))
         .and_then(Value::as_bool)
         .unwrap_or(false)
-}
-
-fn tool_catalog_relevance(entry: &Value, query: &str) -> usize {
-    if query.trim().is_empty() {
-        return 1;
-    }
-    let haystack = vec![
-        entry
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        entry
-            .get("displayName")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        entry
-            .get("source")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        entry
-            .get("serverId")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        entry
-            .get("toolName")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        entry
-            .get("aliases")
-            .and_then(Value::as_array)
-            .map(|aliases| {
-                aliases
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default(),
-        entry
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        entry
-            .get("payloadShape")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-    ]
-    .join(" ")
-    .to_lowercase();
-    query
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-        .map(str::trim)
-        .filter(|term| !term.is_empty())
-        .map(|term| {
-            let term = term.to_lowercase();
-            if haystack.contains(&term) {
-                if entry
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_lowercase()
-                    .contains(&term)
-                {
-                    4
-                } else {
-                    1
-                }
-            } else {
-                0
-            }
-        })
-        .sum()
 }
 
 pub(super) fn credential_pool_tool(store: &AppStore, payload: &Value) -> AppResult<String> {

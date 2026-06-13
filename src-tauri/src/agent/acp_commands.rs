@@ -5,7 +5,8 @@ use serde_json::json;
 use crate::{error::AppResult, store::AppStore};
 
 use super::acp_session::{
-    acp_advertised_command_specs, acp_estimate_session_context_tokens, acp_model_selection_from_id,
+    acp_advertised_command_specs, acp_available_commands_update_for_store,
+    acp_estimate_session_context_tokens, acp_model_selection_from_id,
     acp_session_runtime_config_for_store, acp_update_session_runtime_config,
 };
 use super::shell_hooks::spawn_session_reset_hooks;
@@ -47,7 +48,7 @@ pub(super) async fn acp_local_command_reply_for_prompt(
     session_id: &str,
     text: &str,
 ) -> AppResult<Option<AcpLocalCommandReply>> {
-    if let Some(help_text) = acp_help_text_for_prompt(text) {
+    if let Some(help_text) = acp_help_text_for_prompt_with_store(store, text) {
         return Ok(Some(AcpLocalCommandReply::usage(help_text)));
     }
     if let Some(model_text) = acp_model_text_for_prompt(store, session_id, text)? {
@@ -80,6 +81,27 @@ pub(super) fn acp_help_text_for_prompt(text: &str) -> Option<String> {
     }
     let mut lines = vec!["Available commands:".to_string(), String::new()];
     for (name, description, _) in acp_advertised_command_specs() {
+        lines.push(format!("  /{name:10}  {description}"));
+    }
+    lines.push(String::new());
+    lines.push("Unrecognized /commands are sent to the model as normal messages.".into());
+    Some(lines.join("\n"))
+}
+
+pub(super) fn acp_help_text_for_prompt_with_store(store: &AppStore, text: &str) -> Option<String> {
+    let (command, _args) = acp_slash_command_parts(text)?;
+    if command != "help" {
+        return None;
+    }
+    let update = acp_available_commands_update_for_store(store);
+    let commands = update["availableCommands"].as_array()?;
+    let mut lines = vec!["Available commands:".to_string(), String::new()];
+    for command in commands {
+        let name = command["name"].as_str().unwrap_or_default();
+        if name.trim().is_empty() {
+            continue;
+        }
+        let description = command["description"].as_str().unwrap_or_default();
         lines.push(format!("  /{name:10}  {description}"));
     }
     lines.push(String::new());

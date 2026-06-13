@@ -267,8 +267,7 @@ if [ "$is_repo" = true ]; then
         if [[ "$reset_remote" =~ ^(y|yes)$ ]]; then
             remote_info=$(resolve_repository_url_interactive)
             IFS='|' read -r repo_info_repo repo_info_url repo_info_proto repo_info_ssh repo_info_rname <<< "$remote_info"
-            git remote set-url origin "$repo_info_url"
-            if [ $? -ne 0 ]; then
+            if ! git remote set-url origin "$repo_info_url"; then
                 echo "更新 origin 远程失败。" >&2
                 exit 1
             fi
@@ -280,8 +279,7 @@ if [ "$is_repo" = true ]; then
         if [ -z "$set_remote" ] || [[ "$set_remote" =~ ^(y|yes)$ ]]; then
             remote_info=$(resolve_repository_url_interactive)
             IFS='|' read -r repo_info_repo repo_info_url repo_info_proto repo_info_ssh repo_info_rname <<< "$remote_info"
-            git remote add origin "$repo_info_url"
-            if [ $? -ne 0 ]; then
+            if ! git remote add origin "$repo_info_url"; then
                 echo "新增 origin 远程失败。" >&2
                 exit 1
             fi

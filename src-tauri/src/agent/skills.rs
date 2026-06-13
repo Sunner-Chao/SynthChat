@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use crate::{
     error::{AppError, AppResult},
     models::EnhancedSkillSummary,
+    skills as skill_library,
     store::AppStore,
 };
 
@@ -25,15 +26,26 @@ pub(super) fn skills_list_tool(store: &AppStore, payload: &Value) -> AppResult<S
         .or_else(|| payload.get("enabled_only"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let category = payload
+        .get("category")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
     let mut skills = skills_with_python_plugins(store)?;
     skills.sort_by(|left, right| {
-        left.source
-            .cmp(&right.source)
+        skill_category(left)
+            .cmp(&skill_category(right))
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
     });
     let rows = skills
         .into_iter()
         .filter(|skill| !enabled_only || skill.enabled)
+        .filter(|skill| {
+            category
+                .as_deref()
+                .is_none_or(|category| skill_category(skill).eq_ignore_ascii_case(category))
+        })
         .filter(|skill| {
             query.is_empty()
                 || skill.name.to_lowercase().contains(&query)
@@ -42,10 +54,12 @@ pub(super) fn skills_list_tool(store: &AppStore, payload: &Value) -> AppResult<S
                 || skill.source.to_lowercase().contains(&query)
         })
         .map(|skill| {
+            let category = skill_category(&skill);
             json!({
                 "id": skill.id,
                 "name": skill.name,
                 "description": truncate_for_prompt(&skill.description, 800),
+                "category": category,
                 "enabled": skill.enabled,
                 "source": skill.source,
                 "version": skill.version,
@@ -55,13 +69,43 @@ pub(super) fn skills_list_tool(store: &AppStore, payload: &Value) -> AppResult<S
             })
         })
         .collect::<Vec<_>>();
+    let mut categories = rows
+        .iter()
+        .filter_map(|row| row.get("category").and_then(Value::as_str))
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    categories.sort();
+    categories.dedup();
     Ok(serde_json::to_string_pretty(&json!({
         "ok": true,
+        "success": true,
         "count": rows.len(),
         "query": query,
+        "category": category.unwrap_or_default(),
+        "categories": categories,
         "enabledOnly": enabled_only,
         "skills": rows
     }))?)
+}
+
+fn skill_category(skill: &EnhancedSkillSummary) -> String {
+    if let Some((category, _)) = skill.id.split_once('/') {
+        let category = category.trim();
+        if !category.is_empty() {
+            return category.to_string();
+        }
+    }
+    let path = skill.path.replace('\\', "/");
+    path.split('/')
+        .find(|part| {
+            !part.trim().is_empty()
+                && *part != "."
+                && !part.eq_ignore_ascii_case("skill.md")
+                && !part.eq_ignore_ascii_case("skills")
+        })
+        .unwrap_or("")
+        .to_string()
 }
 
 pub(super) fn skill_view_tool(store: &AppStore, payload: &Value) -> AppResult<String> {
@@ -110,8 +154,10 @@ pub(super) fn skill_view_tool(store: &AppStore, payload: &Value) -> AppResult<St
         .unwrap_or(&target)
         .display()
         .to_string();
+    let _ = skill_library::record_skill_usage(store, skill, "view", Some("foreground"));
     Ok(serde_json::to_string_pretty(&json!({
         "ok": true,
+        "success": true,
         "id": skill.id,
         "name": skill.name,
         "description": skill.description,
@@ -192,26 +238,330 @@ pub(super) fn skill_manage_tool(store: &AppStore, payload: &Value) -> AppResult<
         .ok_or_else(|| AppError::BadRequest("skill_manage requires payload.action".into()))?
         .trim()
         .to_lowercase();
-    let name = string_arg(payload, &["name", "id", "skill", "skillId", "skill_id"])
-        .ok_or_else(|| AppError::BadRequest("skill_manage requires payload.name".into()))?;
-    let result = match action.as_str() {
-        "create" => skill_manage_create(store, &name, payload)?,
-        "edit" => skill_manage_edit(store, &name, payload)?,
-        "patch" => skill_manage_patch(store, &name, payload)?,
-        "delete" => skill_manage_delete(store, &name)?,
+    let name = string_arg(payload, &["name", "id", "skill", "skillId", "skill_id"]);
+    let mut result = match action.as_str() {
+        "status" | "hub_status" | "hub-status" => skill_manage_status(store)?,
+        "list_installs" | "list-installs" | "provenance" => skill_manage_list_installs(store)?,
+        "usage" | "usage_log" | "usage-log" => skill_manage_usage(store, payload)?,
+        "audit" | "guard_scan" | "guard-scan" => {
+            skill_manage_audit(store, name.as_deref(), payload)?
+        }
+        "audit_log" | "audit-log" => skill_manage_audit_log(store, payload)?,
+        "check_updates" | "check-updates" | "updates" => {
+            skill_manage_check_updates(store, name.as_deref())?
+        }
+        "update" | "sync" => skill_manage_update(store, name.as_deref(), payload)?,
+        "uninstall" => skill_manage_uninstall(store, name.as_deref(), payload)?,
+        "list_taps" | "list-taps" => skill_manage_list_taps(store)?,
+        "add_tap" | "add-tap" => skill_manage_add_tap(store, payload)?,
+        "remove_tap" | "remove-tap" => skill_manage_remove_tap(store, payload)?,
+        "curator_report" | "curator-report" => skill_manage_curator_report(store)?,
+        "curator_status" | "curator-status" => skill_manage_curator_status(store)?,
+        "curator_pause" | "curator-pause" => skill_manage_curator_pause(store, true)?,
+        "curator_resume" | "curator-resume" => skill_manage_curator_pause(store, false)?,
+        "export_snapshot" | "export-snapshot" => skill_manage_export_snapshot(store, payload)?,
+        "import_snapshot" | "import-snapshot" => skill_manage_import_snapshot(store, payload)?,
+        "install_file" | "install-file" => skill_manage_install_file(store, payload)?,
+        "install_content" | "install-content" => skill_manage_install_content(store, payload)?,
+        "create" => skill_manage_create(store, required_skill_name(name.as_deref())?, payload)?,
+        "edit" => skill_manage_edit(store, required_skill_name(name.as_deref())?, payload)?,
+        "patch" => skill_manage_patch(store, required_skill_name(name.as_deref())?, payload)?,
+        "pin" => skill_manage_pin(store, required_skill_name(name.as_deref())?)?,
+        "unpin" | "un-pin" => skill_manage_unpin(store, required_skill_name(name.as_deref())?)?,
+        "archive" => skill_manage_archive(store, required_skill_name(name.as_deref())?, payload)?,
+        "restore" => skill_manage_restore(store, required_skill_name(name.as_deref())?)?,
+        "delete" => skill_manage_delete(store, required_skill_name(name.as_deref())?)?,
         "write_file" | "write-file" | "writefile" => {
-            skill_manage_write_file(store, &name, payload)?
+            skill_manage_write_file(store, required_skill_name(name.as_deref())?, payload)?
         }
         "remove_file" | "remove-file" | "removefile" => {
-            skill_manage_remove_file(store, &name, payload)?
+            skill_manage_remove_file(store, required_skill_name(name.as_deref())?, payload)?
         }
         other => {
             return Err(AppError::BadRequest(format!(
-                "unsupported skill_manage action '{other}'. Use create, edit, patch, delete, write_file, or remove_file."
+                "unsupported skill_manage action '{other}'. Use status, list_installs, usage, audit, audit_log, check_updates, update, uninstall, list_taps, add_tap, remove_tap, curator_report, curator_status, curator_pause, curator_resume, export_snapshot, import_snapshot, install_file, install_content, create, edit, patch, pin, unpin, archive, restore, delete, write_file, or remove_file."
             )));
         }
     };
+    if let Some(object) = result.as_object_mut() {
+        if !object.contains_key("success") {
+            let ok = object.get("ok").and_then(Value::as_bool).unwrap_or(true);
+            object.insert("success".into(), json!(ok));
+        }
+    }
     Ok(serde_json::to_string_pretty(&result)?)
+}
+
+fn required_skill_name(name: Option<&str>) -> AppResult<&str> {
+    name.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadRequest("skill_manage action requires payload.name".into()))
+}
+
+fn optional_selector(name: Option<&str>) -> Option<&str> {
+    name.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn bool_arg(payload: &Value, keys: &[&str], default: bool) -> bool {
+    keys.iter()
+        .find_map(|key| payload.get(*key).and_then(Value::as_bool))
+        .unwrap_or(default)
+}
+
+fn usize_arg(payload: &Value, keys: &[&str], default: usize) -> usize {
+    keys.iter()
+        .find_map(|key| payload.get(*key).and_then(Value::as_u64))
+        .map(|value| value as usize)
+        .unwrap_or(default)
+}
+
+fn skill_manage_status(store: &AppStore) -> AppResult<Value> {
+    let skills = skills_with_python_plugins(store)?;
+    let installs = skill_library::skill_install_records(store)?;
+    let usage = skill_library::skill_usage_records(store)?;
+    let taps = skill_library::list_skill_taps(store)?;
+    let curator = skill_library::skill_curator_state(store)?;
+    Ok(json!({
+        "ok": true,
+        "action": "status",
+        "totalSkills": skills.len(),
+        "enabledSkills": skills.iter().filter(|skill| skill.enabled).count(),
+        "bundledSkills": skills.iter().filter(|skill| skill.is_bundled).count(),
+        "externalSkills": skills.iter().filter(|skill| !skill.is_bundled).count(),
+        "installRecords": installs.len(),
+        "usageRecords": usage.len(),
+        "taps": taps,
+        "curator": curator
+    }))
+}
+
+fn skill_manage_list_installs(store: &AppStore) -> AppResult<Value> {
+    let records = skill_library::skill_install_records(store)?;
+    Ok(json!({
+        "ok": true,
+        "action": "list_installs",
+        "count": records.len(),
+        "records": records
+    }))
+}
+
+fn skill_manage_usage(store: &AppStore, payload: &Value) -> AppResult<Value> {
+    let limit = usize_arg(payload, &["limit", "max"], 50).clamp(1, 500);
+    let mut records = skill_library::skill_usage_records(store)?;
+    records.truncate(limit);
+    Ok(json!({
+        "ok": true,
+        "action": "usage",
+        "count": records.len(),
+        "records": records
+    }))
+}
+
+fn skill_manage_audit(store: &AppStore, name: Option<&str>, payload: &Value) -> AppResult<Value> {
+    let selector_arg = string_arg(payload, &["selector"]);
+    let selector = optional_selector(name).or_else(|| selector_arg.as_deref());
+    let reports = skill_library::audit_skills(store, selector)?;
+    Ok(json!({
+        "ok": true,
+        "action": "audit",
+        "selector": selector.unwrap_or_default(),
+        "count": reports.len(),
+        "reports": reports
+    }))
+}
+
+fn skill_manage_audit_log(store: &AppStore, payload: &Value) -> AppResult<Value> {
+    let limit = usize_arg(payload, &["limit", "max"], 50).clamp(1, 500);
+    let entries = skill_library::skill_audit_log(store, Some(limit))?;
+    Ok(json!({
+        "ok": true,
+        "action": "audit_log",
+        "count": entries.len(),
+        "entries": entries
+    }))
+}
+
+fn skill_manage_check_updates(store: &AppStore, name: Option<&str>) -> AppResult<Value> {
+    let checks = skill_library::check_skill_updates(store, optional_selector(name))?;
+    Ok(json!({
+        "ok": true,
+        "action": "check_updates",
+        "count": checks.len(),
+        "updates": checks
+    }))
+}
+
+fn skill_manage_update(store: &AppStore, name: Option<&str>, payload: &Value) -> AppResult<Value> {
+    let agent_id = string_arg(payload, &["agentId", "agent_id"]);
+    let force = bool_arg(payload, &["force"], false);
+    let updated = skill_library::update_skills_from_sources(
+        store,
+        optional_selector(name),
+        agent_id.as_deref(),
+        force,
+    )?;
+    Ok(json!({
+        "ok": true,
+        "action": "update",
+        "count": updated.len(),
+        "skills": updated
+    }))
+}
+
+fn skill_manage_uninstall(
+    store: &AppStore,
+    name: Option<&str>,
+    payload: &Value,
+) -> AppResult<Value> {
+    let selector = required_skill_name(name)?;
+    let remove_files = bool_arg(payload, &["removeFiles", "remove_files"], true);
+    let removed = skill_library::uninstall_external_skills(store, Some(selector), remove_files)?;
+    Ok(json!({
+        "ok": true,
+        "action": "uninstall",
+        "count": removed.len(),
+        "records": removed,
+        "removeFiles": remove_files
+    }))
+}
+
+fn skill_manage_list_taps(store: &AppStore) -> AppResult<Value> {
+    let taps = skill_library::list_skill_taps(store)?;
+    Ok(json!({
+        "ok": true,
+        "action": "list_taps",
+        "count": taps.len(),
+        "taps": taps
+    }))
+}
+
+fn skill_manage_add_tap(store: &AppStore, payload: &Value) -> AppResult<Value> {
+    let repo = string_arg(payload, &["repo", "repository"])
+        .ok_or_else(|| AppError::BadRequest("skill_manage add_tap requires payload.repo".into()))?;
+    let path = string_arg(payload, &["path"]);
+    let tap = skill_library::add_skill_tap(store, &repo, path.as_deref())?;
+    Ok(json!({
+        "ok": true,
+        "action": "add_tap",
+        "tap": tap
+    }))
+}
+
+fn skill_manage_remove_tap(store: &AppStore, payload: &Value) -> AppResult<Value> {
+    let repo = string_arg(payload, &["repo", "repository"]).ok_or_else(|| {
+        AppError::BadRequest("skill_manage remove_tap requires payload.repo".into())
+    })?;
+    let removed = skill_library::remove_skill_tap(store, &repo)?;
+    Ok(json!({
+        "ok": true,
+        "action": "remove_tap",
+        "repo": repo,
+        "removed": removed
+    }))
+}
+
+fn skill_manage_curator_report(store: &AppStore) -> AppResult<Value> {
+    let report = skill_library::curate_skills_report(store)?;
+    Ok(json!({
+        "ok": true,
+        "action": "curator_report",
+        "report": report
+    }))
+}
+
+fn skill_manage_curator_status(store: &AppStore) -> AppResult<Value> {
+    let state = skill_library::skill_curator_state(store)?;
+    Ok(json!({
+        "ok": true,
+        "action": "curator_status",
+        "state": state
+    }))
+}
+
+fn skill_manage_curator_pause(store: &AppStore, paused: bool) -> AppResult<Value> {
+    let state = skill_library::set_skill_curator_paused(store, paused)?;
+    Ok(json!({
+        "ok": true,
+        "action": if paused { "curator_pause" } else { "curator_resume" },
+        "state": state
+    }))
+}
+
+fn skill_manage_export_snapshot(store: &AppStore, payload: &Value) -> AppResult<Value> {
+    let path = string_arg(payload, &["path"]).ok_or_else(|| {
+        AppError::BadRequest("skill_manage export_snapshot requires payload.path".into())
+    })?;
+    let path = skill_library::export_skill_snapshot(store, &path)?;
+    Ok(json!({
+        "ok": true,
+        "action": "export_snapshot",
+        "path": path
+    }))
+}
+
+fn skill_manage_import_snapshot(store: &AppStore, payload: &Value) -> AppResult<Value> {
+    let path = string_arg(payload, &["path"]).ok_or_else(|| {
+        AppError::BadRequest("skill_manage import_snapshot requires payload.path".into())
+    })?;
+    let count = skill_library::import_skill_snapshot(store, &path)?;
+    Ok(json!({
+        "ok": true,
+        "action": "import_snapshot",
+        "count": count
+    }))
+}
+
+fn skill_manage_install_file(store: &AppStore, payload: &Value) -> AppResult<Value> {
+    let path = string_arg(payload, &["path", "sourcePath", "source_path"]).ok_or_else(|| {
+        AppError::BadRequest("skill_manage install_file requires payload.path".into())
+    })?;
+    let name = string_arg(payload, &["name", "nameOverride", "name_override"]);
+    let category = string_arg(payload, &["category"]);
+    let agent_id = string_arg(payload, &["agentId", "agent_id"]);
+    let force = bool_arg(payload, &["force"], false);
+    let skill = skill_library::install_external_skill_file(
+        store,
+        &path,
+        name.as_deref(),
+        category.as_deref(),
+        agent_id.as_deref(),
+        force,
+    )?;
+    Ok(json!({
+        "ok": true,
+        "action": "install_file",
+        "skill": skill
+    }))
+}
+
+fn skill_manage_install_content(store: &AppStore, payload: &Value) -> AppResult<Value> {
+    let content = string_arg(payload, &["content", "skillMd", "skill_md"]).ok_or_else(|| {
+        AppError::BadRequest("skill_manage install_content requires payload.content".into())
+    })?;
+    let fallback_name = string_arg(payload, &["name", "fallbackName", "fallback_name"])
+        .unwrap_or_else(|| "external-skill".into());
+    let name = string_arg(payload, &["nameOverride", "name_override"]);
+    let category = string_arg(payload, &["category"]);
+    let agent_id = string_arg(payload, &["agentId", "agent_id"]);
+    let force = bool_arg(payload, &["force"], false);
+    let identifier =
+        string_arg(payload, &["identifier", "source"]).unwrap_or_else(|| "inline".into());
+    let skill = skill_library::install_external_skill_content(
+        store,
+        &content,
+        &fallback_name,
+        name.as_deref(),
+        category.as_deref(),
+        agent_id.as_deref(),
+        force,
+        false,
+        &identifier,
+    )?;
+    Ok(json!({
+        "ok": true,
+        "action": "install_content",
+        "skill": skill
+    }))
 }
 
 fn skill_manage_create(store: &AppStore, name: &str, payload: &Value) -> AppResult<Value> {
@@ -245,6 +595,7 @@ fn skill_manage_create(store: &AppStore, name: &str, payload: &Value) -> AppResu
     skills.push(skill.clone());
     skills.sort_by(|left, right| left.id.cmp(&right.id));
     store.set_skills(skills)?;
+    let _ = skill_library::record_skill_usage(store, &skill, "create", Some("foreground"));
     Ok(json!({
         "ok": true,
         "action": "create",
@@ -276,6 +627,7 @@ fn skill_manage_edit(store: &AppStore, name: &str, payload: &Value) -> AppResult
     updated.config = skills[index].config.clone();
     skills[index] = updated.clone();
     store.set_skills(skills)?;
+    let _ = skill_library::record_skill_usage(store, &updated, "edit", Some("foreground"));
     Ok(json!({
         "ok": true,
         "action": "edit",
@@ -349,8 +701,13 @@ fn skill_manage_patch(store: &AppStore, name: &str, payload: &Value) -> AppResul
         updated.source = skills[index].source.clone();
         updated.agent_id = skills[index].agent_id.clone();
         updated.config = skills[index].config.clone();
+        let usage_skill = updated.clone();
         skills[index] = updated;
         store.set_skills(skills)?;
+        let _ = skill_library::record_skill_usage(store, &usage_skill, "patch", Some("foreground"));
+    } else {
+        let _ =
+            skill_library::record_skill_usage(store, &skills[index], "patch", Some("foreground"));
     }
     Ok(json!({
         "ok": true,
@@ -367,6 +724,17 @@ fn skill_manage_delete(store: &AppStore, name: &str) -> AppResult<Value> {
             "skill_manage could not find skill '{name}'. Use skills_list first."
         ))
     })?;
+    let curator_state = skill_library::skill_curator_state(store)?;
+    if curator_state
+        .pinned_skill_ids
+        .iter()
+        .any(|id| id == &skill.id)
+    {
+        return Err(AppError::BadRequest(format!(
+            "skill '{}' is pinned; unpin it before deleting",
+            skill.id
+        )));
+    }
     if skill.is_core || skill.is_bundled {
         return Err(AppError::BadRequest(format!(
             "skill_manage delete refuses bundled/core skill '{}'",
@@ -374,6 +742,7 @@ fn skill_manage_delete(store: &AppStore, name: &str) -> AppResult<Value> {
         )));
     }
     let skill_dir = skill_dir_for_summary(store, skill)?;
+    let _ = skill_library::record_skill_usage(store, skill, "delete", Some("foreground"));
     fs::remove_dir_all(&skill_dir)?;
     store.remove_skill(&skill.id)?;
     Ok(json!({
@@ -381,6 +750,45 @@ fn skill_manage_delete(store: &AppStore, name: &str) -> AppResult<Value> {
         "action": "delete",
         "id": skill.id,
         "path": skill_dir.display().to_string()
+    }))
+}
+
+fn skill_manage_pin(store: &AppStore, name: &str) -> AppResult<Value> {
+    let state = skill_library::pin_skill_for_curator(store, name)?;
+    Ok(json!({
+        "ok": true,
+        "action": "pin",
+        "name": name,
+        "pinnedSkillIds": state.pinned_skill_ids
+    }))
+}
+
+fn skill_manage_unpin(store: &AppStore, name: &str) -> AppResult<Value> {
+    let state = skill_library::unpin_skill_for_curator(store, name)?;
+    Ok(json!({
+        "ok": true,
+        "action": "unpin",
+        "name": name,
+        "pinnedSkillIds": state.pinned_skill_ids
+    }))
+}
+
+fn skill_manage_archive(store: &AppStore, name: &str, payload: &Value) -> AppResult<Value> {
+    let reason = string_arg(payload, &["reason", "archiveReason", "archive_reason"]);
+    let archived = skill_library::archive_skill_for_curator(store, name, reason.as_deref())?;
+    Ok(json!({
+        "ok": true,
+        "action": "archive",
+        "archive": archived
+    }))
+}
+
+fn skill_manage_restore(store: &AppStore, name: &str) -> AppResult<Value> {
+    let restored = skill_library::restore_skill_for_curator(store, name)?;
+    Ok(json!({
+        "ok": true,
+        "action": "restore",
+        "archive": restored
     }))
 }
 

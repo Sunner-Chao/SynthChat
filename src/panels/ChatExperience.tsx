@@ -36,7 +36,7 @@ import {
 } from "lucide-react";
 import { api } from "../lib/api";
 import { useAppStore } from "../lib/store";
-import type { AgentControlCommand, AgentDefinition, AgentRunRecord, ChatAttachment, ChatMessage, LlmProvider, ManagedProcessEvent, ToolEvent, ToolEventEnvelope } from "../lib/types";
+import type { AgentControlCommand, AgentDefinition, AgentRunRecord, AgentRuntimeEvent, ChatAttachment, ChatMessage, LlmProvider, ManagedProcessEvent, ToolEvent, ToolEventEnvelope } from "../lib/types";
 import { Avatar } from "../components/common";
 
 type ComposerAttachment = ChatAttachment & {
@@ -270,6 +270,15 @@ function queueStatusLabel(status: string) {
   return labels[status] ?? status;
 }
 
+function shortRuntimeId(value?: string | null) {
+  if (!value) return "";
+  const text = value.trim();
+  if (text.length <= 14) return text;
+  const parts = text.split("-");
+  const prefix = parts[0] || "id";
+  return `${prefix}-${text.slice(-8)}`;
+}
+
 function subagentTitle(run: AgentRunRecord) {
   const index = typeof run.subagentIndex === "number" ? `#${run.subagentIndex}` : "";
   const role = run.subagentRole?.trim() || "subagent";
@@ -297,6 +306,26 @@ function managedProcessEventText(event: ManagedProcessEvent) {
     typeof detail.reason === "string" ? detail.reason : ""
   ].filter(Boolean);
   return parts.join(" · ");
+}
+
+function runtimeEventTime(event: AgentRuntimeEvent) {
+  return event.createdAt ?? event.created_at ?? "";
+}
+
+function runtimeEventText(event: AgentRuntimeEvent) {
+  const runId = event.runId ?? event.run_id;
+  const queueItemId = event.queueItemId ?? event.queue_item_id;
+  const taskId = event.taskId ?? event.task_id;
+  const processId = event.processId ?? event.process_id;
+  return [
+    event.kind,
+    event.status,
+    taskId ? `task ${shortRuntimeId(taskId)}` : "",
+    runId ? `run ${shortRuntimeId(runId)}` : "",
+    queueItemId ? `queue ${shortRuntimeId(queueItemId)}` : "",
+    processId ? `process ${shortRuntimeId(processId)}` : "",
+    event.source
+  ].filter(Boolean).join(" · ");
 }
 
 function phaseDetailText(detail: unknown) {
@@ -633,6 +662,8 @@ export const ChatExperience = memo(function ChatExperience() {
   const [skillsCollapsed, setSkillsCollapsed] = useState(true);
   const [compactionTipVisible, setCompactionTipVisible] = useState(false);
   const [compactionRoundTokens, setCompactionRoundTokens] = useState(0);
+  const [runtimeEvents, setRuntimeEvents] = useState<AgentRuntimeEvent[]>([]);
+  const [runtimeCursor, setRuntimeCursor] = useState(0);
 
   useEffect(() => {
     void Promise.all([refreshAgents(), refreshSkills(), refreshMcpServers(), refreshAgentRuns(), refreshAgentQueue()]);
@@ -651,6 +682,11 @@ export const ChatExperience = memo(function ChatExperience() {
   useEffect(() => {
     setPickerEmojiGroups(emojiGroups);
   }, [emojiGroups]);
+
+  useEffect(() => {
+    setRuntimeEvents([]);
+    setRuntimeCursor(0);
+  }, [activeConversationId]);
 
   useEffect(() => {
     if (!emojiPickerOpen) return;
@@ -821,6 +857,16 @@ export const ChatExperience = memo(function ChatExperience() {
     () => agentRuns.find((run) => run.conversationId === activeConversationId && !run.parentRunId),
     [activeConversationId, agentRuns]
   );
+  const runByQueueItemId = useMemo(() => {
+    const entries = new Map<string, { runId: string; state: string }>();
+    for (const run of agentRuns) {
+      if (run.queueItemId) entries.set(run.queueItemId, { runId: run.runId, state: run.state });
+    }
+    for (const run of Object.values(activeAgentRuns)) {
+      if (run.queueItemId) entries.set(run.queueItemId, { runId: run.runId, state: run.state });
+    }
+    return entries;
+  }, [activeAgentRuns, agentRuns]);
   const visibleParentRunId = activeRun?.runId ?? storedRun?.runId ?? null;
   const activeChildRuns = useMemo(
     () => agentRuns
@@ -1182,11 +1228,20 @@ export const ChatExperience = memo(function ChatExperience() {
     const timer = window.setInterval(() => {
       void Promise.all([
         refreshChatData(activeConversationId, selectedPersona?.id),
-        refreshAgentRuns()
+        refreshAgentRuns(),
+        activeConversationId
+          ? api.listAgentRuntimeEvents({ conversationId: activeConversationId, since: runtimeCursor, limit: 80 })
+              .then((stream) => {
+                setRuntimeCursor(stream.cursor);
+                if (stream.events.length > 0) {
+                  setRuntimeEvents((current) => [...current, ...stream.events].slice(-80));
+                }
+              })
+          : Promise.resolve()
       ]);
     }, interval);
     return () => window.clearInterval(timer);
-  }, [activeConversationId, activePollIntervalMs, activeSection, idlePollIntervalMs, isProcessing, refreshAgentRuns, refreshChatData, selectedPersona?.id]);
+  }, [activeConversationId, activePollIntervalMs, activeSection, idlePollIntervalMs, isProcessing, refreshAgentRuns, refreshChatData, runtimeCursor, selectedPersona?.id]);
 
   const stageFiles = useCallback(async (files: FileList | File[]) => {
     const list = Array.from(files);
@@ -1500,18 +1555,24 @@ export const ChatExperience = memo(function ChatExperience() {
                     <span>{activeRunningQueueCount > 0 ? `${activeRunningQueueCount} 个执行中` : `${activePendingQueueCount} 个等待中`}</span>
                   </div>
                   <div className="claw-queue-banner-list">
-                    {activeQueueItems.slice(0, 3).map((item) => (
+                    {activeQueueItems.slice(0, 3).map((item) => {
+                      const linkedRun = runByQueueItemId.get(item.id);
+                      return (
                       <div className={`claw-queue-item is-${item.status}`} key={item.id}>
                         <span>{queueStatusLabel(item.status)}</span>
                         <p>{item.content}</p>
-                        <small>{formatTime(item.updatedAt || item.createdAt)}</small>
+                        <small>
+                          {formatTime(item.updatedAt || item.createdAt)}
+                          {linkedRun ? ` · ${shortRuntimeId(linkedRun.runId)} · ${runStateLabel(linkedRun.state)}` : ` · ${shortRuntimeId(item.id)}`}
+                        </small>
                         {["pending", "running"].includes(item.status) ? (
                           <button onClick={() => void cancelQueuedItem(item.id)} title="取消排队请求" type="button">
                             <X size={12} />
                           </button>
                         ) : null}
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               ) : null}
@@ -1574,11 +1635,16 @@ export const ChatExperience = memo(function ChatExperience() {
                 </div>
                 <div className="claw-panel-body">
                   <div className="claw-agent-queue-list">
-                    {activeQueueItems.slice(0, 6).map((item) => (
+                    {activeQueueItems.slice(0, 6).map((item) => {
+                      const linkedRun = runByQueueItemId.get(item.id);
+                      return (
                       <div className={`claw-agent-queue-row is-${item.status}`} key={item.id}>
                         <div>
                           <span>{queueStatusLabel(item.status)}</span>
-                          <small>{formatTime(item.updatedAt || item.createdAt)}</small>
+                          <small>
+                            {formatTime(item.updatedAt || item.createdAt)}
+                            {linkedRun ? ` · ${shortRuntimeId(linkedRun.runId)} · ${runStateLabel(linkedRun.state)}` : ` · ${shortRuntimeId(item.id)}`}
+                          </small>
                         </div>
                         <p>{item.content}</p>
                         {item.error ? <em>{item.error}</em> : null}
@@ -1588,7 +1654,8 @@ export const ChatExperience = memo(function ChatExperience() {
                           </button>
                         ) : null}
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               </div>
@@ -1624,6 +1691,24 @@ export const ChatExperience = memo(function ChatExperience() {
                       </div>
                     </div>
                   </div>
+                  {runtimeEvents.length > 0 ? (
+                    <div className="claw-tl-node claw-tl-node--phase">
+                      <div className="claw-tl-dot"><Network size={14} /></div>
+                      <div className="claw-tl-content">
+                        <div className="claw-tl-head">
+                          <span className="claw-tl-title">Runtime Stream</span>
+                          <small>{runtimeEvents.length} events · cursor {runtimeCursor}</small>
+                        </div>
+                        <div className="claw-acp-updates">
+                          {runtimeEvents.slice(-5).map((event) => (
+                            <span className="claw-acp-update" key={`${event.id}-${event.kind}-${runtimeEventTime(event)}`}>
+                              {runtimeEventText(event)}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
                   {activeRunPhases.length > 0 ? (
                     activeRunPhases.slice(-8).map((phase, index) => {
                       const acpUpdateLines = acpUpdateLinesFromDetail(phase.detail).slice(-4);
@@ -2291,12 +2376,27 @@ const TimelineStep = memo(function TimelineStep({ step, isLast }: { step: Compac
   );
 });
 
+function toolEventReauthInfo(event: ToolEvent): { state: string; cacheState: string; refreshRisk: string } | null {
+  const raw = event.raw as Record<string, any> | null | undefined;
+  const errorJson = raw?.errorJson as Record<string, any> | null | undefined;
+  const needsReauth = raw?.needsReauth === true || errorJson?.needsReauth === true || errorJson?.needs_reauth === true;
+  if (!needsReauth) return null;
+  const oauthStatus = errorJson?.oauthStatus as Record<string, any> | null | undefined;
+  const tokenStatus = oauthStatus?.tokenStatus as Record<string, any> | null | undefined;
+  return {
+    state: String(oauthStatus?.state ?? "needs_reauth"),
+    cacheState: String(tokenStatus?.cacheState ?? "n/a"),
+    refreshRisk: String(tokenStatus?.refreshRisk ?? "n/a")
+  };
+}
+
 const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
   const [expanded, setExpanded] = useState(event.status === "running");
   const canOpen = Boolean(event.path && event.exists);
   const isToolImage = canOpen && (event.eventType === "screenshot" || event.eventType === "image" || Boolean(event.mimeType?.startsWith("image/")));
   const isRunning = event.status === "running";
-  const hasDetails = Boolean(event.summary || event.path || isToolImage || canOpen || event.text || event.error);
+  const reauthInfo = toolEventReauthInfo(event);
+  const hasDetails = Boolean(event.summary || event.path || isToolImage || canOpen || event.text || event.error || reauthInfo);
 
   return (
     <div className="claw-tool-message">
@@ -2338,6 +2438,13 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
             ) : null}
             {event.text ? <pre>{previewText(event.text, DEFAULT_MESSAGE_PREVIEW_CHARS)}</pre> : null}
             {event.error ? <p className="claw-error-text">{event.error}</p> : null}
+            {reauthInfo ? (
+              <div className="claw-tool-path">
+                <AlertCircle size={14} />
+                <code>OAuth {reauthInfo.state}</code>
+                <span>{reauthInfo.cacheState} · {reauthInfo.refreshRisk}</span>
+              </div>
+            ) : null}
           </div>
         </div>
       </div>

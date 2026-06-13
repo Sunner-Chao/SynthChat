@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
+    process::Command as StdCommand,
 };
 
 use serde_json::Value;
@@ -22,7 +23,7 @@ pub fn list_plugins(store: &AppStore) -> AppResult<Vec<PluginSummary>> {
             if let Some(enabled) = enabled_by_id.get(&plugin.id) {
                 plugin.enabled = *enabled;
             }
-            plugin
+            enrich_plugin_readiness(plugin)
         })
         .collect::<Vec<_>>();
     merged.sort_by(|a, b| a.name.cmp(&b.name));
@@ -50,6 +51,11 @@ fn discover_plugins() -> Vec<PluginSummary> {
                     plugins.push(plugin);
                 }
             }
+        }
+    }
+    for plugin in scan_python_entry_point_plugins() {
+        if seen.insert(plugin.id.clone()) {
+            plugins.push(plugin);
         }
     }
     plugins
@@ -175,11 +181,14 @@ fn parse_plugin_manifest(root: &Path, manifest: &Path, source: &str) -> Option<P
             description: string_field(&value, &["description"]).unwrap_or_default(),
             enabled: false,
             provided_tools: string_array_field(&value, &["providesTools", "provides_tools"]),
+            provided_capabilities: json_plugin_capabilities(&value),
             provided_hooks: string_array_field(
                 &value,
                 &["hooks", "providesHooks", "provides_hooks"],
             ),
             requires_env: string_array_field(&value, &["requiresEnv", "requires_env"]),
+            missing_env: Vec::new(),
+            env_configured: false,
             version: string_field(&value, &["version"]).unwrap_or_default(),
             author: string_field(&value, &["author"]).unwrap_or_default(),
             source: source.into(),
@@ -192,6 +201,7 @@ fn parse_plugin_manifest(root: &Path, manifest: &Path, source: &str) -> Option<P
                 .to_string_lossy()
                 .to_string(),
             manifest_path: manifest.to_string_lossy().to_string(),
+            entry_point: String::new(),
         });
     }
 
@@ -207,11 +217,14 @@ fn parse_plugin_manifest(root: &Path, manifest: &Path, source: &str) -> Option<P
         description: fields.get("description").cloned().unwrap_or_default(),
         enabled: false,
         provided_tools: parse_yaml_list(&raw, "provides_tools"),
+        provided_capabilities: yaml_plugin_capabilities(&raw),
         provided_hooks: merge_lists(
             parse_yaml_list(&raw, "hooks"),
             parse_yaml_list(&raw, "provides_hooks"),
         ),
         requires_env: parse_yaml_list(&raw, "requires_env"),
+        missing_env: Vec::new(),
+        env_configured: false,
         version: fields.get("version").cloned().unwrap_or_default(),
         author: fields.get("author").cloned().unwrap_or_default(),
         source: source.into(),
@@ -227,6 +240,102 @@ fn parse_plugin_manifest(root: &Path, manifest: &Path, source: &str) -> Option<P
             .to_string_lossy()
             .to_string(),
         manifest_path: manifest.to_string_lossy().to_string(),
+        entry_point: String::new(),
+    })
+}
+
+fn scan_python_entry_point_plugins() -> Vec<PluginSummary> {
+    let Some(python) = find_python_command() else {
+        return Vec::new();
+    };
+    let script = r#"
+import importlib.metadata
+import json
+
+GROUP = "hermes_agent.plugins"
+
+try:
+    eps = importlib.metadata.entry_points()
+    if hasattr(eps, "select"):
+        group_eps = eps.select(group=GROUP)
+    elif isinstance(eps, dict):
+        group_eps = eps.get(GROUP, [])
+    else:
+        group_eps = [ep for ep in eps if getattr(ep, "group", "") == GROUP]
+    print(json.dumps([
+        {"name": ep.name, "value": ep.value}
+        for ep in group_eps
+    ]))
+except Exception:
+    print("[]")
+"#;
+    let output = StdCommand::new(python).arg("-c").arg(script).output().ok();
+    let Some(output) = output.filter(|output| output.status.success()) else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<Vec<Value>>(&output.stdout)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| {
+            let id = value.get("name").and_then(Value::as_str)?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let entry_point = value
+                .get("value")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            Some(PluginSummary {
+                id: id.to_string(),
+                name: id.to_string(),
+                description: "Python entry point plugin".into(),
+                enabled: false,
+                provided_tools: Vec::new(),
+                provided_capabilities: Vec::new(),
+                provided_hooks: Vec::new(),
+                requires_env: Vec::new(),
+                missing_env: Vec::new(),
+                env_configured: true,
+                version: String::new(),
+                author: String::new(),
+                source: "entrypoint".into(),
+                homepage_url: String::new(),
+                kind: "standalone".into(),
+                path: entry_point.clone(),
+                manifest_path: String::new(),
+                entry_point,
+            })
+        })
+        .collect()
+}
+
+fn enrich_plugin_readiness(mut plugin: PluginSummary) -> PluginSummary {
+    plugin.missing_env = plugin
+        .requires_env
+        .iter()
+        .filter(|name| !plugin_env_value_configured(name))
+        .cloned()
+        .collect();
+    plugin.env_configured = plugin.missing_env.is_empty();
+    plugin
+}
+
+fn plugin_env_value_configured(name: &str) -> bool {
+    env::var_os(name.trim())
+        .and_then(|value| value.into_string().ok())
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn find_python_command() -> Option<&'static str> {
+    ["python", "py", "python3"].into_iter().find(|command| {
+        StdCommand::new(command)
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     })
 }
 
@@ -290,6 +399,50 @@ fn merge_lists(primary: Vec<String>, secondary: Vec<String>) -> Vec<String> {
     primary
         .into_iter()
         .chain(secondary)
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
+fn yaml_plugin_capabilities(raw: &str) -> Vec<String> {
+    let mut capabilities = Vec::new();
+    for (key, prefix) in [
+        ("provides_tools", "tool"),
+        ("provides_web_providers", "web_provider"),
+        ("provides_browser_providers", "browser_provider"),
+        ("platforms", "platform"),
+    ] {
+        for item in parse_yaml_list(raw, key) {
+            capabilities.push(format!("{prefix}:{item}"));
+        }
+    }
+    dedupe_strings(capabilities)
+}
+
+fn json_plugin_capabilities(value: &Value) -> Vec<String> {
+    let mut capabilities = Vec::new();
+    for (keys, prefix) in [
+        (&["providesTools", "provides_tools"][..], "tool"),
+        (
+            &["providesWebProviders", "provides_web_providers"][..],
+            "web_provider",
+        ),
+        (
+            &["providesBrowserProviders", "provides_browser_providers"][..],
+            "browser_provider",
+        ),
+        (&["platforms"][..], "platform"),
+    ] {
+        for item in string_array_field(value, keys) {
+            capabilities.push(format!("{prefix}:{item}"));
+        }
+    }
+    dedupe_strings(capabilities)
+}
+
+fn dedupe_strings(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
         .filter(|value| seen.insert(value.clone()))
         .collect()
 }
@@ -415,6 +568,7 @@ provides_tools:
         assert_eq!(plugin.source, "bundled");
         assert_eq!(plugin.kind, "backend");
         assert_eq!(plugin.provided_tools, vec!["trace_flush"]);
+        assert_eq!(plugin.provided_capabilities, vec!["tool:trace_flush"]);
         assert_eq!(
             plugin.provided_hooks,
             vec!["pre_api_request", "post_api_request"]
@@ -461,9 +615,58 @@ provides_hooks:
         assert_eq!(plugin.name, "Discord");
         assert_eq!(plugin.kind, "platform");
         assert_eq!(plugin.requires_env, vec!["DISCORD_BOT_TOKEN"]);
+        assert_eq!(plugin.provided_capabilities, Vec::<String>::new());
         assert_eq!(
             plugin.provided_hooks,
             vec!["pre_gateway_dispatch", "post_approval_response"]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parses_hermes_provider_capability_fields_and_env_readiness() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("synthchat-provider-plugin-test-{unique}"));
+        let plugin_dir = root.join("web").join("exa");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        let manifest = plugin_dir.join("plugin.yaml");
+        fs::write(
+            &manifest,
+            r#"
+name: web-exa
+kind: backend
+description: Exa search provider
+requires_env:
+  - SYNTHCHAT_TEST_EXA_API_KEY_THAT_SHOULD_NOT_EXIST
+provides_web_providers:
+  - exa
+provides_browser_providers:
+  - browserbase
+platforms:
+  - teams
+"#,
+        )
+        .expect("write manifest");
+
+        let plugin = parse_plugin_manifest(&root, &manifest, "bundled").expect("parse manifest");
+        assert_eq!(
+            plugin.provided_capabilities,
+            vec![
+                "web_provider:exa",
+                "browser_provider:browserbase",
+                "platform:teams"
+            ]
+        );
+
+        let enriched = enrich_plugin_readiness(plugin);
+        assert_eq!(enriched.env_configured, false);
+        assert_eq!(
+            enriched.missing_env,
+            vec!["SYNTHCHAT_TEST_EXA_API_KEY_THAT_SHOULD_NOT_EXIST"]
         );
 
         let _ = fs::remove_dir_all(root);

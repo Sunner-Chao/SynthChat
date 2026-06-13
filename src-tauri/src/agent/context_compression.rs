@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    env,
     hash::{Hash, Hasher},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -13,9 +14,10 @@ use serde_json::Value;
 
 use super::{
     align_compression_start_forward, complete_chat_with_provider_failover, effective_llm_persona,
-    memory_pre_compress_context, selected_provider_id, strip_historical_media_payloads,
-    tail_start_preserving_latest_user_and_token_budget, LEGACY_SHORT_CONTEXT_SUMMARY_PREFIX,
-    SHORT_CONTEXT_SUMMARY_PREFIX,
+    list_agent_auxiliary_task_assignments, memory_pre_compress_context,
+    run_context_engine_compress, selected_provider_id, strip_historical_media_payloads,
+    tail_start_preserving_latest_user_and_token_budget, ContextEngineCompressedMessage,
+    LEGACY_SHORT_CONTEXT_SUMMARY_PREFIX, SHORT_CONTEXT_SUMMARY_PREFIX,
 };
 
 const SUMMARY_MIN_TARGET_TOKENS: usize = 2_000;
@@ -101,100 +103,133 @@ pub(super) async fn handle_compact_control_command(
             transcript
         );
     }
-    let providers = store.provider_candidates(selected_provider_id(persona, agent))?;
-    let provider = providers
-        .first()
-        .ok_or_else(|| AppError::NotFound("llm provider".into()))?;
-    let effective_persona = effective_llm_persona(persona, agent);
-    let summary_plan =
-        build_summary_provider_plan(store, &config.chat, &providers, &effective_persona)?;
+    let selected_context_engine = selected_context_engine_name();
+    let dynamic_context_summary = selected_context_engine
+        .as_deref()
+        .filter(|engine| !engine.eq_ignore_ascii_case("compressor"))
+        .and_then(|engine| {
+            match run_context_engine_compress(
+                engine,
+                &messages[start..older_count],
+                before_tokens,
+                (!focus.trim().is_empty()).then_some(focus.trim()),
+            ) {
+                Ok(compressed) => Some(context_engine_messages_to_summary(
+                    state.summary.as_str(),
+                    engine,
+                    &compressed,
+                    config.chat.short_context_token_budget,
+                )),
+                Err(error) => {
+                    eprintln!(
+                        "SynthChat context engine '{engine}' manual compress failed: {error}"
+                    );
+                    None
+                }
+            }
+        });
     let mut used_fallback = false;
     let abort_on_summary_failure = config.chat.short_context_abort_on_summary_failure;
     let summary_failure_cooldown = summary_failure_cooldown_remaining_seconds(&state);
-    let summary = if summary_plan.aux_label.is_none()
-        && (provider.provider_type == "echo"
-            || (provider.base_url.trim().is_empty()
-                && provider.provider_type.to_lowercase() != "gemini"))
-    {
-        fallback_short_context_summary(
-            state.summary.as_str(),
-            &transcript,
-            config.chat.short_context_token_budget,
-        )
-    } else if let Some(remaining_seconds) = summary_failure_cooldown.filter(|_| !control_args.force)
-    {
-        if abort_on_summary_failure {
-            state.last_compress_aborted = true;
-            state.last_summary_fallback_used = false;
-            state.last_summary_dropped_count = older_count.saturating_sub(start);
-            let error = state
-                .last_summary_error
-                .clone()
-                .unwrap_or_else(|| "unknown summary error".into());
-            store.save_short_context(state)?;
-            return Ok(format!(
-                "压缩已中止：摘要模型仍在失败 cooldown 中（约 {remaining_seconds}s），未丢弃历史消息。上一错误：{}。请修复摘要模型或关闭 shortContextAbortOnSummaryFailure 后重试 /compact。",
-                compact_text(&error, 500)
-            ));
-        }
-        used_fallback = true;
-        state.last_summary_fallback_used = true;
-        state.last_summary_dropped_count = older_count.saturating_sub(start);
-        fallback_short_context_summary_after_note(
-            state.summary.as_str(),
-            &transcript,
-            config.chat.short_context_token_budget,
-            &format!(
-                "Context summarizer is in failure cooldown for about {remaining_seconds}s after the previous error: {}",
-                state
-                    .last_summary_error
-                    .as_deref()
-                    .unwrap_or("unknown summary error")
-            ),
-        )
+    let mut used_dynamic_context_engine = false;
+    let summary = if let Some(summary) = dynamic_context_summary {
+        used_dynamic_context_engine = true;
+        record_summary_success(&mut state);
+        summary
     } else {
-        let previous_summary = state.summary.clone();
-        match summarize_short_context_with_main_fallback(
-            store,
-            &summary_plan,
-            &providers,
-            &effective_persona,
-            previous_summary.as_str(),
-            &transcript,
-            config.chat.short_context_token_budget,
-            &mut state,
-        )
-        .await
+        let providers = store.provider_candidates(selected_provider_id(persona, agent))?;
+        let provider = providers
+            .first()
+            .ok_or_else(|| AppError::NotFound("llm provider".into()))?;
+        let effective_persona = effective_llm_persona(persona, agent);
+        let summary_plan =
+            build_summary_provider_plan(store, &config.chat, &providers, &effective_persona)?;
+        if summary_plan.aux_label.is_none()
+            && (provider.provider_type == "echo"
+                || (provider.base_url.trim().is_empty()
+                    && provider.provider_type.to_lowercase() != "gemini"))
         {
-            Ok(summary) => {
-                record_summary_success(&mut state);
-                summary
+            fallback_short_context_summary(
+                state.summary.as_str(),
+                &transcript,
+                config.chat.short_context_token_budget,
+            )
+        } else if let Some(remaining_seconds) =
+            summary_failure_cooldown.filter(|_| !control_args.force)
+        {
+            if abort_on_summary_failure {
+                state.last_compress_aborted = true;
+                state.last_summary_fallback_used = false;
+                state.last_summary_dropped_count = older_count.saturating_sub(start);
+                let error = state
+                    .last_summary_error
+                    .clone()
+                    .unwrap_or_else(|| "unknown summary error".into());
+                store.save_short_context(state)?;
+                return Ok(format!(
+                    "压缩已中止：摘要模型仍在失败 cooldown 中（约 {remaining_seconds}s），未丢弃历史消息。上一错误：{}。请修复摘要模型或关闭 shortContextAbortOnSummaryFailure 后重试 /compact。",
+                    compact_text(&error, 500)
+                ));
             }
-            Err(error) => {
-                if abort_on_summary_failure {
-                    record_summary_abort(
+            used_fallback = true;
+            state.last_summary_fallback_used = true;
+            state.last_summary_dropped_count = older_count.saturating_sub(start);
+            fallback_short_context_summary_after_note(
+                state.summary.as_str(),
+                &transcript,
+                config.chat.short_context_token_budget,
+                &format!(
+                    "Context summarizer is in failure cooldown for about {remaining_seconds}s after the previous error: {}",
+                    state
+                        .last_summary_error
+                        .as_deref()
+                        .unwrap_or("unknown summary error")
+                ),
+            )
+        } else {
+            let previous_summary = state.summary.clone();
+            match summarize_short_context_with_main_fallback(
+                store,
+                &summary_plan,
+                &providers,
+                &effective_persona,
+                previous_summary.as_str(),
+                &transcript,
+                config.chat.short_context_token_budget,
+                &mut state,
+            )
+            .await
+            {
+                Ok(summary) => {
+                    record_summary_success(&mut state);
+                    summary
+                }
+                Err(error) => {
+                    if abort_on_summary_failure {
+                        record_summary_abort(
+                            &mut state,
+                            &error.to_string(),
+                            older_count.saturating_sub(start),
+                        );
+                        store.save_short_context(state)?;
+                        return Ok(format!(
+                            "压缩已中止：摘要模型失败，未丢弃历史消息。错误：{}。当前会话会冻结 agent 继续运行，直到手动 /compact 成功或关闭 shortContextAbortOnSummaryFailure。",
+                            compact_text(&error.to_string(), 500)
+                        ));
+                    }
+                    used_fallback = true;
+                    record_summary_failure(
                         &mut state,
                         &error.to_string(),
                         older_count.saturating_sub(start),
                     );
-                    store.save_short_context(state)?;
-                    return Ok(format!(
-                        "压缩已中止：摘要模型失败，未丢弃历史消息。错误：{}。当前会话会冻结 agent 继续运行，直到手动 /compact 成功或关闭 shortContextAbortOnSummaryFailure。",
-                        compact_text(&error.to_string(), 500)
-                    ));
+                    fallback_short_context_summary_after_error(
+                        state.summary.as_str(),
+                        &transcript,
+                        config.chat.short_context_token_budget,
+                        &error,
+                    )
                 }
-                used_fallback = true;
-                record_summary_failure(
-                    &mut state,
-                    &error.to_string(),
-                    older_count.saturating_sub(start),
-                );
-                fallback_short_context_summary_after_error(
-                    state.summary.as_str(),
-                    &transcript,
-                    config.chat.short_context_token_budget,
-                    &error,
-                )
             }
         }
     };
@@ -222,13 +257,22 @@ pub(super) async fn handle_compact_control_command(
     } else {
         ""
     };
+    let context_engine_note = if used_dynamic_context_engine {
+        format!(
+            " contextEngine={}",
+            selected_context_engine.as_deref().unwrap_or("unknown")
+        )
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "{hermes_feedback}\n已手动压缩当前会话历史：compressedMessages={} retainedMessages={} summaryTokens={} boundary={}{}{}\n{}",
+        "{hermes_feedback}\n已手动压缩当前会话历史：compressedMessages={} retainedMessages={} summaryTokens={} boundary={}{}{}{}\n{}",
         older_count.saturating_sub(start),
         retained_messages,
         saved.summary_tokens,
         saved.boundary_id.as_deref().unwrap_or("-"),
         fallback_note,
+        context_engine_note,
         if control_args.force { " force=true" } else { "" },
         feedback
     ))
@@ -246,9 +290,50 @@ fn build_summary_provider_plan(
     main_providers: &[LlmProvider],
     main_persona: &Persona,
 ) -> AppResult<SummaryProviderPlan> {
-    let provider_id = chat_config.short_context_summary_provider_id.trim();
-    let model = chat_config.short_context_summary_model.trim();
-    if provider_id.is_empty() && model.is_empty() {
+    let legacy_provider_id = chat_config.short_context_summary_provider_id.trim();
+    let legacy_model = chat_config.short_context_summary_model.trim();
+    let compression_assignment = if legacy_provider_id.is_empty() && legacy_model.is_empty() {
+        list_agent_auxiliary_task_assignments(store)?
+            .into_iter()
+            .find(|assignment| assignment.key == "compression")
+    } else {
+        None
+    };
+    let assignment_provider = compression_assignment
+        .as_ref()
+        .map(|assignment| assignment.provider.trim())
+        .unwrap_or("");
+    let assignment_provider_id = if assignment_provider.eq_ignore_ascii_case("auto") {
+        ""
+    } else {
+        assignment_provider
+    };
+    let provider_id = legacy_provider_id
+        .to_string()
+        .or_else_nonempty(|| Some(assignment_provider_id.to_string()))
+        .unwrap_or_default();
+    let model = legacy_model
+        .to_string()
+        .or_else_nonempty(|| {
+            compression_assignment
+                .as_ref()
+                .map(|assignment| assignment.model.clone())
+        })
+        .unwrap_or_default();
+    let custom_base_url = compression_assignment
+        .as_ref()
+        .map(|assignment| assignment.base_url.trim())
+        .unwrap_or("");
+    let custom_api_key = compression_assignment
+        .as_ref()
+        .map(|assignment| assignment.api_key.trim())
+        .unwrap_or("");
+    let custom_timeout = compression_assignment
+        .as_ref()
+        .map(|assignment| assignment.timeout)
+        .unwrap_or(60);
+
+    if provider_id.is_empty() && model.is_empty() && custom_base_url.is_empty() {
         return Ok(SummaryProviderPlan {
             providers: main_providers.to_vec(),
             persona: main_persona.clone(),
@@ -256,11 +341,31 @@ fn build_summary_provider_plan(
         });
     }
 
-    let mut providers = if provider_id.is_empty() {
+    let mut providers = if !custom_base_url.is_empty() {
+        vec![LlmProvider {
+            id: "auxiliary-compression-custom".into(),
+            name: "Compression auxiliary".into(),
+            provider_type: "openai_compatible".into(),
+            base_url: custom_base_url.into(),
+            append_chat_path: true,
+            api_key: (!custom_api_key.is_empty()).then(|| custom_api_key.to_string()),
+            model: model
+                .to_string()
+                .or_else_nonempty(|| {
+                    main_providers
+                        .first()
+                        .map(|provider| provider.model.clone())
+                })
+                .unwrap_or_default(),
+            enabled: true,
+            timeout_seconds: custom_timeout,
+            ..LlmProvider::default()
+        }]
+    } else if provider_id.is_empty() {
         main_providers.to_vec()
     } else {
-        let mut candidates = store.provider_candidates(Some(provider_id))?;
-        let credential_prefix = format!("{provider_id}:cred-");
+        let mut candidates = store.provider_candidates(Some(&provider_id))?;
+        let credential_prefix = format!("{}:cred-", provider_id);
         candidates.retain(|provider| {
             provider.id == provider_id || provider.id.starts_with(&credential_prefix)
         });
@@ -283,12 +388,15 @@ fn build_summary_provider_plan(
             provider.model = model.to_string();
         }
     }
-    let provider_label = provider_id
-        .to_string()
-        .or_else_nonempty(|| providers.first().map(|provider| provider.id.clone()))
-        .unwrap_or_else(|| "main".into());
+    let provider_label = if !custom_base_url.is_empty() {
+        "custom".to_string()
+    } else {
+        provider_id.to_string()
+    }
+    .or_else_nonempty(|| providers.first().map(|provider| provider.id.clone()))
+    .unwrap_or_else(|| "main".into());
     let model_label = model
-        .to_string()
+        .clone()
         .or_else_nonempty(|| providers.first().map(|provider| provider.model.clone()))
         .unwrap_or_else(|| "default".into());
     Ok(SummaryProviderPlan {
@@ -319,6 +427,46 @@ impl NonEmptyStringOption for String {
 
 fn compressed_request_message_count(summary: &str, visible_messages: usize) -> usize {
     visible_messages + usize::from(!summary.trim().is_empty())
+}
+
+pub(super) fn selected_context_engine_name() -> Option<String> {
+    env::var("SYNTHCHAT_CONTEXT_ENGINE")
+        .or_else(|_| env::var("HERMES_CONTEXT_ENGINE"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+pub(super) fn context_engine_messages_to_summary(
+    previous_summary: &str,
+    engine_name: &str,
+    messages: &[ContextEngineCompressedMessage],
+    token_budget: usize,
+) -> String {
+    let mut sections = Vec::new();
+    let previous = strip_short_context_summary_prefix(previous_summary)
+        .trim()
+        .to_string();
+    if !previous.is_empty() {
+        sections.push(format!("## Previous Summary\n{previous}"));
+    }
+    sections.push(format!(
+        "## Dynamic Context Engine Output\nengine={engine_name}\n{}",
+        messages
+            .iter()
+            .map(|message| format!(
+                "[{}] {}",
+                message.role,
+                compact_text(&message.content, 2400)
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
+    ));
+    sections.push(
+        "## Critical Context\nThis summary was produced by a Hermes context-engine plugin through SynthChat's bounded Python bridge. Treat it as compressed historical context; the latest visible user message remains authoritative."
+            .into(),
+    );
+    normalize_short_context_summary(&sections.join("\n\n"), token_budget.max(500) * 4)
 }
 
 fn estimate_compressed_request_tokens(summary: &str, visible_messages: &[ChatMessage]) -> usize {

@@ -68,7 +68,7 @@ normalize_version_tag() {
         return
     fi
     
-    local normalized=$(ech/home/sunner/demo_vscode/LS-ZGTo "$input_version" | tr -d '[:space:]')
+    local normalized=$(echo "$input_version" | tr -d '[:space:]')
     if [ -z "$normalized" ]; then
         echo ""
         return
@@ -198,16 +198,14 @@ ensure_version_tag() {
     
     if git rev-parse "refs/tags/$version_tag" >/dev/null 2>&1; then
         echo -e "\033[33m[push-github] 本地已存在标签 $version_tag，正在删除旧标签以便重建...\033[0m"
-        git tag -d "$version_tag" >/dev/null 2>&1
-        if [ $? -ne 0 ]; then
+        if ! git tag -d "$version_tag" >/dev/null 2>&1; then
             echo "删除本地旧标签 $version_tag 失败。" >&2
             exit 1
         fi
     fi
     
     echo -e "\033[36m[push-github] 创建版本标签: $version_tag\033[0m"
-    git tag -a "$version_tag" -m "release: $version_tag"
-    if [ $? -ne 0 ]; then
+    if ! git tag -a "$version_tag" -m "release: $version_tag"; then
         echo "git tag 创建失败。" >&2
         exit 1
     fi
@@ -250,11 +248,13 @@ fi
 
 echo -e "\033[33m[push-github] 当前分支: $branch\033[0m"
 echo -e "\033[36m[push-github] 获取远端当前分支信息...\033[0m"
-git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1
-remote_branch_exists=$?
+if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+    remote_branch_exists=0
+else
+    remote_branch_exists=1
+fi
 if [ $remote_branch_exists -eq 0 ]; then
-    git fetch origin "$branch"
-    if [ $? -ne 0 ]; then
+    if ! git fetch origin "$branch"; then
         echo "git fetch 当前分支失败。请检查远端仓库地址、SSH/网络，或确认远端分支状态是否异常。" >&2
         exit 1
     fi
@@ -312,8 +312,7 @@ write_status_summary "$status_lines"
 version_tag=""
 if [ -n "$(echo "$status_lines" | tr -d '[:space:]')" ]; then
     echo -e "\033[36m[push-github] 暂存当前仓库的所有本地改动...\033[0m"
-    git add -A
-    if [ $? -ne 0 ]; then
+    if ! git add -A; then
         echo "git add -A 失败。" >&2
         exit 1
     fi
@@ -329,8 +328,7 @@ if [ -n "$(echo "$status_lines" | tr -d '[:space:]')" ]; then
         fi
         
         echo -e "\033[33m[push-github] 提交信息: $MESSAGE\033[0m"
-        git commit -m "$MESSAGE"
-        if [ $? -ne 0 ]; then
+        if ! git commit -m "$MESSAGE"; then
             echo "git commit 失败。" >&2
             exit 1
         fi
@@ -350,8 +348,7 @@ else
 fi
 
 echo -e "\033[36m[push-github] 推送到 GitHub...\033[0m"
-invoke_push "$branch" "$force_push"
-if [ $? -ne 0 ]; then
+if ! invoke_push "$branch" "$force_push"; then
     if [ "$push_mode" = "full_override" ]; then
         echo "git push 失败。当前已按全量推模式执行。常见原因：远端分支受保护、权限不足、SSH 配置错误。" >&2
     else
@@ -363,8 +360,7 @@ fi
 if [ -n "$version_tag" ]; then
     echo -e "\033[36m[push-github] 推送版本标签: $version_tag\033[0m"
     echo -e "\033[37m[push-github] 若远端已存在同名标签，将按当前本地版本覆盖...\033[0m"
-    git push --force origin "refs/tags/${version_tag}:refs/tags/${version_tag}"
-    if [ $? -ne 0 ]; then
+    if ! git push --force origin "refs/tags/${version_tag}:refs/tags/${version_tag}"; then
         echo "git push tag 失败。" >&2
         exit 1
     fi
@@ -407,8 +403,7 @@ push_submodules() {
 
             read -p "是否提交子模块 $sub_path 的改动并推送？(Y/n): " sub_commit_choice
             if [ -z "$sub_commit_choice" ] || [[ "$sub_commit_choice" =~ ^(y|yes)$ ]]; then
-                git add -A
-                if [ $? -ne 0 ]; then
+                if ! git add -A; then
                     echo -e "\033[33m[push-github] 子模块 $sub_path git add 失败，跳过。\033[0m" >&2
                     cd "$project_root"
                     continue
@@ -421,8 +416,7 @@ push_submodules() {
                     if [ -z "$(echo "$sub_message" | tr -d '[:space:]')" ]; then
                         sub_message="update submodule $sub_path"
                     fi
-                    git commit -m "$sub_message"
-                    if [ $? -ne 0 ]; then
+                    if ! git commit -m "$sub_message"; then
                         echo -e "\033[33m[push-github] 子模块 $sub_path git commit 失败，跳过。\033[0m" >&2
                         cd "$project_root"
                         continue
@@ -440,16 +434,18 @@ push_submodules() {
         fi
 
         if [ "$force" = true ]; then
-            git push --force-with-lease -u origin "$sub_branch"
+            if ! git push --force-with-lease -u origin "$sub_branch"; then
+                echo -e "\033[33m[push-github] 子模块 $sub_path 推送失败，请手动检查。\033[0m" >&2
+                cd "$project_root"
+                continue
+            fi
         else
-            git push -u origin "$sub_branch"
+            if ! git push -u origin "$sub_branch"; then
+                echo -e "\033[33m[push-github] 子模块 $sub_path 推送失败，请手动检查。\033[0m" >&2
+                cd "$project_root"
+                continue
+            fi
         fi
-        if [ $? -ne 0 ]; then
-            echo -e "\033[33m[push-github] 子模块 $sub_path 推送失败，请手动检查。\033[0m" >&2
-            cd "$project_root"
-            continue
-        fi
-
         echo -e "\033[32m[push-github] 子模块 $sub_path 推送完成。分支: $sub_branch\033[0m"
         cd "$project_root"
     done
@@ -470,14 +466,22 @@ if [ -f "$PROJECT_ROOT/.gitmodules" ]; then
     submodules_changed=$(git diff --name-only 2>/dev/null || true)
     if [ -n "$(echo "$submodules_changed" | tr -d '[:space:]')" ]; then
         echo -e "\033[36m[push-github] 子模块引用已变更，提交并推送主仓库更新...\033[0m"
-        git add -A
-        git commit -m "update submodule references"
-        if [ "$force_push" = true ]; then
-            git push --force-with-lease -u origin "$branch"
-        else
-            git push -u origin "$branch"
+        if ! git add -A; then
+            echo -e "\033[33m[push-github] 主仓库子模块引用 git add 失败，请手动检查。\033[0m" >&2
+            cd "$ORIGINAL_DIR"
+            exit 1
         fi
-        if [ $? -ne 0 ]; then
+        if ! git commit -m "update submodule references"; then
+            echo -e "\033[33m[push-github] 主仓库子模块引用 git commit 失败，请手动检查。\033[0m" >&2
+            cd "$ORIGINAL_DIR"
+            exit 1
+        fi
+        if [ "$force_push" = true ]; then
+            main_push_cmd=(git push --force-with-lease -u origin "$branch")
+        else
+            main_push_cmd=(git push -u origin "$branch")
+        fi
+        if ! "${main_push_cmd[@]}"; then
             echo -e "\033[33m[push-github] 主仓库子模块引用推送失败，请手动检查。\033[0m" >&2
         else
             echo -e "\033[32m[push-github] 主仓库子模块引用已推送。\033[0m"

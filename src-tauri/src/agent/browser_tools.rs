@@ -7,6 +7,7 @@ use std::{
 };
 
 use futures::{SinkExt, StreamExt};
+use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tokio::task::AbortHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -19,13 +20,14 @@ use crate::{
 
 use super::{
     build_browser_snapshot, extract_images, fetch_url_text_for_store, format_list,
-    openai_compatible_vision_analyze, provider_api_key, string_arg, truncate_for_prompt,
-    truncate_output, validate_web_url,
+    openai_compatible_vision_analyze, provider_api_key, resolve_vision_provider, string_arg,
+    truncate_for_prompt, truncate_output, validate_web_url,
 };
 
 static LAST_BROWSER_URLS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 static BROWSER_HISTORIES: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
 static BROWSER_RECORDERS: OnceLock<Mutex<HashMap<String, AbortHandle>>> = OnceLock::new();
+static BROWSER_USE_PENDING_CREATE_KEYS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 const HERMES_BROWSER_LEGACY_PREFERENCE: [&str; 2] = ["browser-use", "browserbase"];
 
 pub(super) async fn browser_provider_tool(store: &AppStore, payload: &Value) -> AppResult<String> {
@@ -267,7 +269,7 @@ fn browser_provider_lifecycle_preview(provider: &BrowserProvider, selected_by: &
     let create_url = browser_session_create_url(provider)
         .map(|url| url.to_string())
         .map_err(|error| error.to_string());
-    let create_body = browser_session_create_body(provider, "diagnostic-task", &json!({}));
+    let create_request = browser_session_create_request(provider, "diagnostic-task", &json!({}));
     let close_request = browser_session_close_request(provider, "diagnostic-session")
         .map(|request| {
             json!({
@@ -288,7 +290,14 @@ fn browser_provider_lifecycle_preview(provider: &BrowserProvider, selected_by: &
                 Ok(value) => json!(value),
                 Err(error) => json!({"error": error}),
             },
-            "body": create_body,
+            "body": create_request.body,
+            "features": create_request.features,
+            "fallbacks": {
+                "browserbase402": [
+                    "remove keepAlive and retry when Browserbase returns 402",
+                    "remove proxies and retry when Browserbase still returns 402"
+                ]
+            },
             "auth": browser_provider_auth_preview(provider),
             "responseExtraction": {
                 "sessionIdKeys": ["id", "sessionId", "session_id", "bbSessionId", "browserId"],
@@ -298,8 +307,12 @@ fn browser_provider_lifecycle_preview(provider: &BrowserProvider, selected_by: &
                     "connectUrl",
                     "connect_url",
                     "webSocketDebuggerUrl",
-                    "wsEndpoint"
-                ]
+                    "wsEndpoint",
+                    "wsUrl",
+                    "ws_url"
+                ],
+                "recursive": true,
+                "websocketSchemes": ["ws", "wss"]
             }
         },
         "close": match close_request {
@@ -382,6 +395,13 @@ fn browser_provider_auth_preview(provider: &BrowserProvider) -> Value {
         json!({
             "type": "header",
             "header": "x-bb-api-key",
+            "credentialConfigured": credential_configured,
+            "value": if credential_configured { "<redacted>" } else { "" }
+        })
+    } else if provider_type == "browser-use" || provider_type == "browser_use" {
+        json!({
+            "type": "header",
+            "header": "X-Browser-Use-API-Key",
             "credentialConfigured": credential_configured,
             "value": if credential_configured { "<redacted>" } else { "" }
         })
@@ -538,7 +558,7 @@ pub(super) async fn browser_create_session_tool(
         .unwrap_or_else(|| format!("synthchat-{run_id}"));
     let api_key = provider_api_key(&provider.api_key, &provider.api_key_env);
     let create_url = browser_session_create_url(&provider)?;
-    let body = browser_session_create_body(&provider, &task_id, payload);
+    let create_request = browser_session_create_request(&provider, &task_id, payload);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(provider.timeout_seconds.max(1)))
         .user_agent("SynthChat-agent/1.0")
@@ -546,16 +566,16 @@ pub(super) async fn browser_create_session_tool(
         .map_err(|error| {
             AppError::BadRequest(format!("failed to build browser client: {error}"))
         })?;
-    let mut request = client.post(create_url.clone()).json(&body);
-    request = apply_browser_provider_auth(request, &provider, api_key.as_deref())?;
-    let response = request
-        .send()
-        .await
-        .map_err(|error| AppError::BadRequest(format!("browser_create_session failed: {error}")))?;
-    let status = response.status();
-    let text = response.text().await.map_err(|error| {
-        AppError::BadRequest(format!("failed to read browser session response: {error}"))
-    })?;
+    let create_response = send_browser_session_create_request(
+        &client,
+        &provider,
+        api_key.as_deref(),
+        create_url.clone(),
+        create_request,
+    )
+    .await?;
+    let status = create_response.status;
+    let text = create_response.text;
     if !status.is_success() {
         return Err(AppError::BadRequest(format!(
             "browser_create_session returned HTTP {}: {}",
@@ -609,6 +629,10 @@ pub(super) async fn browser_create_session_tool(
         "sessionId": session_id,
         "cdpUrl": cdp_url,
         "createUrl": create_url,
+        "features": create_response.features,
+        "fallbacks": create_response.fallbacks,
+        "external_call_id": create_response.external_call_id,
+        "externalCallId": create_response.external_call_id,
         "supervisor": supervisor,
         "autoRecording": auto_recording,
         "raw": value
@@ -704,19 +728,94 @@ pub(super) fn browser_session_create_url(provider: &BrowserProvider) -> AppResul
         if !path.ends_with("/browsers") {
             url.set_path(&format!("{path}/browsers"));
         }
+    } else if provider_type == "firecrawl" {
+        if path.ends_with("/v2") {
+            url.set_path(&format!("{path}/browser"));
+        } else if !path.ends_with("/v2/browser") {
+            url.set_path(&format!("{path}/v2/browser"));
+        }
     }
     Ok(url)
 }
 
-fn browser_session_create_body(
+#[derive(Debug, Clone)]
+pub(super) struct BrowserSessionCreateRequest {
+    pub(super) body: Value,
+    pub(super) features: Value,
+    pub(super) task_id: String,
+    pub(super) idempotency_key: Option<String>,
+}
+
+#[derive(Debug)]
+struct BrowserSessionCreateResponse {
+    status: StatusCode,
+    text: String,
+    features: Value,
+    fallbacks: Value,
+    external_call_id: Option<String>,
+}
+
+pub(super) fn browser_session_create_request(
     provider: &BrowserProvider,
     task_id: &str,
     payload: &Value,
-) -> Value {
+) -> BrowserSessionCreateRequest {
     let mut body = json!({
         "taskId": task_id,
         "name": task_id
     });
+    let mut features = json!({});
+    let provider_type = normalize_browser_provider_name(&provider.provider_type);
+    if provider_type == "browserbase" {
+        features = json!({
+            "basic_stealth": true,
+            "proxies": true,
+            "advanced_stealth": false,
+            "keep_alive": true,
+            "custom_timeout": false,
+        });
+        body["keepAlive"] = json!(true);
+        body["proxies"] = json!(true);
+        if env_flag_enabled("BROWSERBASE_ADVANCED_STEALTH", false) {
+            body["browserSettings"] = json!({"advancedStealth": true});
+            features["advanced_stealth"] = json!(true);
+        }
+        if let Some(timeout) = browserbase_session_timeout(payload) {
+            body["timeout"] = json!(timeout);
+            features["custom_timeout"] = json!(true);
+        }
+        if !env_flag_enabled("BROWSERBASE_KEEP_ALIVE", true) {
+            body.as_object_mut()
+                .map(|object| object.remove("keepAlive"));
+            features["keep_alive"] = json!(false);
+        }
+        if !env_flag_enabled("BROWSERBASE_PROXIES", true) {
+            body.as_object_mut().map(|object| object.remove("proxies"));
+            features["proxies"] = json!(false);
+        }
+    } else if provider_type == "browser-use" {
+        let managed_mode = browser_use_managed_mode(provider, payload);
+        let idempotency_key = managed_mode.then(|| browser_use_pending_create_key(task_id));
+        features = json!({
+            "browser_use": true,
+            "managed_mode": managed_mode,
+            "idempotency_key": idempotency_key.as_deref().unwrap_or("")
+        });
+        if managed_mode {
+            body["timeout"] = json!(5);
+            body["proxyCountryCode"] = json!("us");
+            features["managed_timeout_minutes"] = json!(5);
+            features["managed_proxy_country_code"] = json!("us");
+        }
+    } else if provider_type == "firecrawl" {
+        body = json!({
+            "ttl": firecrawl_browser_ttl(payload)
+        });
+        features = json!({
+            "firecrawl": true,
+            "ttl": body["ttl"]
+        });
+    }
     if !provider.project_id.trim().is_empty() {
         body["projectId"] = json!(provider.project_id.trim());
     }
@@ -725,7 +824,247 @@ fn browser_session_create_body(
             body[key] = value.clone();
         }
     }
-    body
+    let idempotency_key = features
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    BrowserSessionCreateRequest {
+        body,
+        features,
+        task_id: task_id.to_string(),
+        idempotency_key,
+    }
+}
+
+async fn send_browser_session_create_request(
+    client: &reqwest::Client,
+    provider: &BrowserProvider,
+    api_key: Option<&str>,
+    create_url: reqwest::Url,
+    mut create_request: BrowserSessionCreateRequest,
+) -> AppResult<BrowserSessionCreateResponse> {
+    let provider_type = normalize_browser_provider_name(&provider.provider_type);
+    let mut fallbacks = Vec::new();
+    let mut response = post_browser_session_create(
+        client,
+        provider,
+        api_key,
+        create_url.clone(),
+        &create_request.body,
+        create_request.idempotency_key.as_deref(),
+    )
+    .await?;
+
+    if provider_type == "browserbase" && response.0 == StatusCode::PAYMENT_REQUIRED {
+        if create_request.body.get("keepAlive").is_some() {
+            if let Some(object) = create_request.body.as_object_mut() {
+                object.remove("keepAlive");
+            }
+            create_request.features["keep_alive"] = json!(false);
+            fallbacks.push(json!({"feature": "keepAlive", "reason": "browserbase_402"}));
+            response = post_browser_session_create(
+                client,
+                provider,
+                api_key,
+                create_url.clone(),
+                &create_request.body,
+                create_request.idempotency_key.as_deref(),
+            )
+            .await?;
+        }
+        if response.0 == StatusCode::PAYMENT_REQUIRED
+            && create_request.body.get("proxies").is_some()
+        {
+            if let Some(object) = create_request.body.as_object_mut() {
+                object.remove("proxies");
+            }
+            create_request.features["proxies"] = json!(false);
+            fallbacks.push(json!({"feature": "proxies", "reason": "browserbase_402"}));
+            response = post_browser_session_create(
+                client,
+                provider,
+                api_key,
+                create_url,
+                &create_request.body,
+                create_request.idempotency_key.as_deref(),
+            )
+            .await?;
+        }
+    }
+    if provider_type == "browser-use" && create_request.idempotency_key.is_some() {
+        if response.0.is_success()
+            || !browser_use_should_preserve_create_key(response.0, &response.1)
+        {
+            browser_use_clear_pending_create_key(&create_request.task_id);
+        }
+    }
+
+    Ok(BrowserSessionCreateResponse {
+        status: response.0,
+        text: response.1,
+        features: create_request.features,
+        fallbacks: Value::Array(fallbacks),
+        external_call_id: response.2,
+    })
+}
+
+async fn post_browser_session_create(
+    client: &reqwest::Client,
+    provider: &BrowserProvider,
+    api_key: Option<&str>,
+    create_url: reqwest::Url,
+    body: &Value,
+    idempotency_key: Option<&str>,
+) -> AppResult<(StatusCode, String, Option<String>)> {
+    let mut request = client.post(create_url).json(body);
+    request = apply_browser_provider_auth(request, provider, api_key)?;
+    if let Some(idempotency_key) = idempotency_key.filter(|value| !value.trim().is_empty()) {
+        request = request.header("X-Idempotency-Key", idempotency_key.trim());
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("browser_create_session failed: {error}")))?;
+    let status = response.status();
+    let external_call_id = response
+        .headers()
+        .get("x-external-call-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let text = response.text().await.map_err(|error| {
+        AppError::BadRequest(format!("failed to read browser session response: {error}"))
+    })?;
+    Ok((status, text, external_call_id))
+}
+
+fn browserbase_session_timeout(payload: &Value) -> Option<u64> {
+    payload
+        .get("session")
+        .and_then(|session| session.get("timeout"))
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .or_else(|| {
+            std::env::var("BROWSERBASE_SESSION_TIMEOUT")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|value| *value > 0)
+        })
+}
+
+fn firecrawl_browser_ttl(payload: &Value) -> u64 {
+    payload
+        .get("ttl")
+        .or_else(|| payload.get("browserTtl"))
+        .or_else(|| payload.get("browser_ttl"))
+        .or_else(|| {
+            payload
+                .get("session")
+                .and_then(|session| session.get("ttl"))
+        })
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .or_else(|| {
+            std::env::var("FIRECRAWL_BROWSER_TTL")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|value| *value > 0)
+        })
+        .unwrap_or(300)
+}
+
+fn env_flag_enabled(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            if matches!(value.as_str(), "1" | "true" | "yes" | "on") {
+                true
+            } else if matches!(value.as_str(), "0" | "false" | "no" | "off") {
+                false
+            } else {
+                default
+            }
+        }
+        Err(_) => default,
+    }
+}
+
+fn browser_use_managed_mode(provider: &BrowserProvider, payload: &Value) -> bool {
+    if let Some(value) = payload
+        .get("managedMode")
+        .or_else(|| payload.get("managed_mode"))
+        .and_then(Value::as_bool)
+    {
+        return value;
+    }
+    if let Some(value) = payload
+        .get("session")
+        .and_then(|session| {
+            session
+                .get("managedMode")
+                .or_else(|| session.get("managed_mode"))
+        })
+        .and_then(Value::as_bool)
+    {
+        return value;
+    }
+    env_flag_enabled("BROWSER_USE_MANAGED_MODE", false)
+        || env_flag_enabled("HERMES_BROWSER_USE_MANAGED_MODE", false)
+        || normalize_browser_provider_name(&provider.id).contains("managed")
+        || normalize_browser_provider_name(&provider.name).contains("managed")
+        || provider
+            .base_url
+            .to_ascii_lowercase()
+            .contains("managed-tool")
+}
+
+fn browser_use_pending_create_key(task_id: &str) -> String {
+    let task_id = task_id.trim();
+    let key = if task_id.is_empty() {
+        "default"
+    } else {
+        task_id
+    };
+    let mut pending = BROWSER_USE_PENDING_CREATE_KEYS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    pending
+        .entry(key.to_string())
+        .or_insert_with(|| format!("browser-use-session-create:{}", new_id("browser-use")))
+        .clone()
+}
+
+fn browser_use_clear_pending_create_key(task_id: &str) {
+    let task_id = task_id.trim();
+    let key = if task_id.is_empty() {
+        "default"
+    } else {
+        task_id
+    };
+    if let Some(pending) = BROWSER_USE_PENDING_CREATE_KEYS.get() {
+        pending.lock().unwrap().remove(key);
+    }
+}
+
+fn browser_use_should_preserve_create_key(status: StatusCode, text: &str) -> bool {
+    if status.is_server_error() {
+        return true;
+    }
+    if status != StatusCode::CONFLICT {
+        return false;
+    }
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .map(|message| message.to_ascii_lowercase())
+        })
+        .map(|message| message.contains("already in progress"))
+        .unwrap_or(false)
 }
 
 pub(super) fn browser_session_close_request(
@@ -753,6 +1092,19 @@ pub(super) fn browser_session_close_request(
     } else if provider_type == "browser-use" || provider_type == "browser_use" {
         url.set_path(&format!("{path}/browsers/{encoded}"));
         Ok(BrowserCloseRequest {
+            method: "PATCH".into(),
+            url,
+            body: json!({"action": "stop"}),
+        })
+    } else if provider_type == "firecrawl" {
+        if path.ends_with("/v2") {
+            url.set_path(&format!("{path}/browser/{encoded}"));
+        } else if path.ends_with("/v2/browser") {
+            url.set_path(&format!("{path}/{encoded}"));
+        } else {
+            url.set_path(&format!("{path}/v2/browser/{encoded}"));
+        }
+        Ok(BrowserCloseRequest {
             method: "DELETE".into(),
             url,
             body: json!({}),
@@ -778,6 +1130,8 @@ fn apply_browser_provider_auth(
     let provider_type = provider.provider_type.trim().to_lowercase();
     let request = if provider_type == "browserbase" {
         request.header("x-bb-api-key", api_key)
+    } else if provider_type == "browser-use" || provider_type == "browser_use" {
+        request.header("X-Browser-Use-API-Key", api_key)
     } else {
         request.bearer_auth(api_key)
     };
@@ -933,14 +1287,14 @@ pub(super) async fn browser_cdp_tool(
     }
     match action.as_str() {
         "" | "snapshot" => browser_cdp_snapshot_tool(cdp_url, payload).await,
-        "navigate" => browser_cdp_navigate_tool(cdp_url, payload).await,
+        "navigate" => browser_cdp_navigate_tool(store, run_id, cdp_url, payload).await,
         "click" => browser_click_tool(payload).await,
         "type" => browser_type_tool(payload).await,
         "press" => browser_press_tool(payload).await,
         "scroll" => browser_scroll_tool(payload).await,
         "back" => browser_cdp_back_tool(cdp_url).await,
         "screenshot" => browser_cdp_screenshot_tool(store, run_id, cdp_url, payload).await,
-        "console" | "evaluate" => browser_console_tool(payload).await,
+        "console" | "evaluate" => browser_console_tool(store, run_id, payload).await,
         "dialog" => browser_dialog_with_cdp(cdp_url, payload).await,
         "frame_tree" | "frametree" => {
             let result = send_cdp_message(cdp_url, "Page.getFrameTree", json!({})).await?;
@@ -975,21 +1329,48 @@ async fn browser_cdp_raw_tool(
         .and_then(Value::as_u64)
         .unwrap_or(10_000)
         .clamp(1_000, 120_000);
-    let result = tokio::time::timeout(
-        Duration::from_millis(timeout_ms),
-        send_cdp_message_with_options(
-            cdp_url,
-            method,
-            params,
-            cdp_call_options_from_payload(store, run_id, payload)?,
-        ),
+    let options = cdp_call_options_from_payload(store, run_id, payload)?;
+    let target_id = options.target_id.clone();
+    let session_id = options.session_id.clone();
+    let result = await_browser_future_interruptible(
+        store,
+        run_id,
+        timeout_ms,
+        format!("browser_cdp timed out after {timeout_ms}ms"),
+        send_cdp_message_with_options(cdp_url, method, params, options),
     )
-    .await
-    .map_err(|_| AppError::BadRequest(format!("browser_cdp timed out after {timeout_ms}ms")))??;
-    Ok(serde_json::to_string_pretty(&result)?)
+    .await??;
+    Ok(serde_json::to_string_pretty(&browser_cdp_success_payload(
+        method, result, target_id, session_id,
+    ))?)
 }
 
-async fn browser_cdp_navigate_tool(cdp_url: &str, payload: &Value) -> AppResult<String> {
+pub(super) fn browser_cdp_success_payload(
+    method: &str,
+    result: Value,
+    target_id: Option<String>,
+    session_id: Option<String>,
+) -> Value {
+    let mut payload = json!({
+        "success": true,
+        "method": method,
+        "result": result,
+    });
+    if let Some(target_id) = target_id.filter(|value| !value.trim().is_empty()) {
+        payload["target_id"] = json!(target_id);
+    }
+    if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
+        payload["session_id"] = json!(session_id);
+    }
+    payload
+}
+
+async fn browser_cdp_navigate_tool(
+    store: &AppStore,
+    run_id: &str,
+    cdp_url: &str,
+    payload: &Value,
+) -> AppResult<String> {
     let url = payload.get("url").and_then(Value::as_str).ok_or_else(|| {
         AppError::BadRequest("browser_cdp action=navigate requires payload.url".into())
     })?;
@@ -1002,7 +1383,7 @@ async fn browser_cdp_navigate_tool(cdp_url: &str, payload: &Value) -> AppResult<
         .unwrap_or(750)
         .clamp(0, 10_000);
     if wait_ms > 0 {
-        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+        wait_browser_run_interruptible(store, run_id, wait_ms).await?;
     }
     let snapshot = browser_cdp_snapshot_tool(cdp_url, payload).await?;
     Ok(format!(
@@ -1010,6 +1391,67 @@ async fn browser_cdp_navigate_tool(cdp_url: &str, payload: &Value) -> AppResult<
         serde_json::to_string_pretty(&navigate)?,
         snapshot
     ))
+}
+
+pub(super) async fn wait_browser_run_interruptible(
+    store: &AppStore,
+    run_id: &str,
+    wait_ms: u64,
+) -> AppResult<()> {
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_millis(wait_ms);
+    loop {
+        if browser_run_interrupted(store, run_id)? {
+            return Err(AppError::BadRequest(
+                "browser wait interrupted because the agent run is no longer active".into(),
+            ));
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        tokio::time::sleep((deadline - now).min(Duration::from_millis(100))).await;
+    }
+}
+
+pub(super) async fn await_browser_future_interruptible<F, T>(
+    store: &AppStore,
+    run_id: &str,
+    timeout_ms: u64,
+    timeout_message: String,
+    future: F,
+) -> AppResult<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            output = &mut future => return Ok(output),
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(AppError::BadRequest(timeout_message));
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if browser_run_interrupted(store, run_id)? {
+                    return Err(AppError::BadRequest(
+                        "browser operation interrupted because the agent run is no longer active".into(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn browser_run_interrupted(store: &AppStore, run_id: &str) -> AppResult<bool> {
+    match store.agent_run(run_id) {
+        Ok(run) => Ok(matches!(
+            run.state.as_str(),
+            "completed" | "failed" | "aborted"
+        )),
+        Err(AppError::NotFound(_)) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 async fn browser_cdp_back_tool(cdp_url: &str) -> AppResult<String> {
@@ -2358,17 +2800,18 @@ mod tests {
         );
         assert_eq!(
             preview["create"]["auth"]["header"].as_str(),
-            Some("Authorization")
+            Some("X-Browser-Use-API-Key")
         );
         assert_eq!(
             preview["create"]["auth"]["value"].as_str(),
-            Some("Bearer <redacted>")
+            Some("<redacted>")
         );
-        assert_eq!(preview["close"]["method"].as_str(), Some("DELETE"));
+        assert_eq!(preview["close"]["method"].as_str(), Some("PATCH"));
         assert_eq!(
             preview["close"]["url"].as_str(),
             Some("https://api.browser-use.com/browsers/diagnostic-session")
         );
+        assert_eq!(preview["close"]["body"]["action"].as_str(), Some("stop"));
     }
 
     #[test]
@@ -2550,6 +2993,29 @@ mod tests {
         ));
         assert!(cdp_evaluate_serialization_guidance().contains("browser_snapshot"));
     }
+
+    #[test]
+    fn browser_console_formats_supervisor_history_like_hermes() {
+        let state = json!({
+            "consoleHistory": [
+                {
+                    "method": "Runtime.consoleAPICalled",
+                    "level": "log",
+                    "text": "ready"
+                },
+                {
+                    "method": "Runtime.exceptionThrown",
+                    "level": "exception",
+                    "text": "boom"
+                }
+            ]
+        });
+        let messages = browser_console_messages_from_state(&state);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["type"].as_str(), Some("log"));
+        assert_eq!(messages[0]["source"].as_str(), Some("console"));
+        assert_eq!(messages[1]["source"].as_str(), Some("exception"));
+    }
 }
 
 pub(super) async fn browser_vision_tool(
@@ -2577,7 +3043,7 @@ pub(super) async fn browser_vision_tool(
         "image/png"
     };
     let image_url = format!("data:{mime};base64,{screenshot}");
-    let Some(provider) = store.enabled_vision_provider()? else {
+    let Some(provider) = resolve_vision_provider(store)? else {
         return Ok(serde_json::to_string_pretty(&json!({
             "ok": false,
             "screenshotPath": path.to_string_lossy(),
@@ -2587,7 +3053,7 @@ pub(super) async fn browser_vision_tool(
         }))?);
     };
     match provider.provider_type.trim().to_lowercase().as_str() {
-        "openai" | "openai-compatible" | "compatible" | "" => {
+        "openai" | "openai-compatible" | "openai_compatible" | "compatible" | "custom" | "" => {
             let analysis = openai_compatible_vision_analyze(
                 store, agent, run_id, &provider, &question, &image_url, payload,
             )
@@ -2657,15 +3123,87 @@ async fn capture_browser_screenshot(cdp_url: &str, payload: &Value) -> AppResult
         .ok_or_else(|| AppError::BadRequest("browser screenshot response missing data".into()))
 }
 
-pub(super) async fn browser_console_tool(payload: &Value) -> AppResult<String> {
-    let cdp_url = cdp_url_from_payload(payload)?;
-    let expression = payload
-        .get("expression")
-        .and_then(Value::as_str)
-        .unwrap_or(
-            "JSON.stringify({url: location.href, title: document.title, readyState: document.readyState})",
-        );
-    cdp_evaluate(cdp_url, expression).await
+pub(super) async fn browser_console_tool(
+    store: &AppStore,
+    run_id: &str,
+    payload: &Value,
+) -> AppResult<String> {
+    if let Some(expression) = payload.get("expression").and_then(Value::as_str) {
+        let cdp_url = cdp_url_from_payload(payload)?;
+        return cdp_evaluate(cdp_url, expression).await;
+    }
+    let cdp_url = cdp_url_from_payload(payload).ok();
+    browser_console_from_supervisor_state(store, run_id, payload, cdp_url)
+}
+
+fn browser_console_from_supervisor_state(
+    store: &AppStore,
+    run_id: &str,
+    payload: &Value,
+    cdp_url: Option<&str>,
+) -> AppResult<String> {
+    let requested_run_id =
+        string_arg(payload, &["runId", "run_id"]).unwrap_or_else(|| run_id.into());
+    let session_id = string_arg(payload, &["sessionId", "session_id"]);
+    let state = if let Some(session_id) = session_id.as_deref() {
+        store.browser_supervisor_state_for_session(session_id)?
+    } else {
+        store.browser_supervisor_state(&requested_run_id)?
+    };
+    let Some(state) = state else {
+        return Ok(serde_json::to_string_pretty(&json!({
+            "success": false,
+            "error": "no active browser supervisor console buffer; call browser_supervisor_register or browser_create_session first, or pass browser_console.expression to evaluate JavaScript",
+            "runId": requested_run_id,
+            "sessionId": session_id,
+            "cdpUrl": cdp_url.unwrap_or("")
+        }))?);
+    };
+    let console_messages = browser_console_messages_from_state(&state);
+    let js_errors = state
+        .get("consoleErrors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let clear = payload
+        .get("clear")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let cleared = if clear {
+        store
+            .clear_browser_supervisor_console(session_id.as_deref(), Some(&requested_run_id))?
+            .is_some()
+    } else {
+        false
+    };
+    Ok(serde_json::to_string_pretty(&json!({
+        "success": true,
+        "console_messages": console_messages,
+        "js_errors": js_errors,
+        "total_messages": console_messages.len(),
+        "total_errors": js_errors.len(),
+        "cleared": cleared,
+        "runId": state.get("runId").cloned().unwrap_or_else(|| json!(requested_run_id)),
+        "sessionId": state.get("sessionId").cloned().unwrap_or_else(|| json!(session_id.unwrap_or_default())),
+    }))?)
+}
+
+fn browser_console_messages_from_state(state: &Value) -> Vec<Value> {
+    state
+        .get("consoleHistory")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "type": entry.get("level").and_then(Value::as_str).unwrap_or("log"),
+                "text": entry.get("text").and_then(Value::as_str).unwrap_or(""),
+                "source": if entry.get("method").and_then(Value::as_str) == Some("Runtime.exceptionThrown") { "exception" } else { "console" },
+                "raw": entry
+            })
+        })
+        .collect()
 }
 
 pub(super) async fn browser_supervisor_register_tool(
@@ -2799,16 +3337,35 @@ fn browser_supervisor_config_from_payload(payload: &Value) -> Value {
 }
 
 pub(super) fn cdp_url_from_payload(payload: &Value) -> AppResult<&str> {
-    payload
-        .get("cdpUrl")
-        .or_else(|| payload.get("cdp_url"))
-        .or_else(|| payload.get("webSocketDebuggerUrl"))
-        .or_else(|| payload.get("wsUrl"))
-        .or_else(|| payload.get("ws_url"))
-        .or_else(|| payload.get("connectUrl"))
-        .or_else(|| payload.get("connect_url"))
+    find_browser_cdp_url_value(payload)
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| value.starts_with("ws://") || value.starts_with("wss://"))
         .ok_or_else(|| AppError::BadRequest("CDP browser tool requires payload.cdpUrl".into()))
+}
+
+fn find_browser_cdp_url_value(value: &Value) -> Option<&Value> {
+    match value {
+        Value::Object(map) => {
+            for key in [
+                "cdpUrl",
+                "cdp_url",
+                "connectUrl",
+                "connect_url",
+                "webSocketDebuggerUrl",
+                "wsUrl",
+                "ws_url",
+            ] {
+                if let Some(found) = map.get(key) {
+                    return Some(found);
+                }
+            }
+            map.values().find_map(find_browser_cdp_url_value)
+        }
+        Value::Array(items) => items.iter().find_map(find_browser_cdp_url_value),
+        _ => None,
+    }
 }
 
 async fn cdp_evaluate(cdp_url: &str, expression: &str) -> AppResult<String> {

@@ -74,12 +74,7 @@ pub(super) async fn terminal_tool(
         .get("command")
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::BadRequest("terminal requires payload.command".into()))?;
-    let timeout_seconds = payload
-        .get("timeoutSeconds")
-        .or_else(|| payload.get("timeout"))
-        .and_then(Value::as_u64)
-        .unwrap_or(60)
-        .clamp(1, 600);
+    let timeout_seconds = terminal_timeout_seconds(payload)?;
     let chat_config = store.config().map(|config| config.chat).unwrap_or_default();
     let max_output_chars = positive_or_default(chat_config.tool_output_max_bytes, 50_000);
     let allowed_env = tool_env_passthrough(store, Some(agent), &chat_config.tool_env_passthrough);
@@ -182,6 +177,7 @@ pub(super) async fn terminal_tool(
             let session_cwd = terminal_session_cwd(&session_id).unwrap_or(cwd);
             return run_shell_command_with_cwd_capture(
                 store,
+                shell_hook_run_id(payload, "terminal"),
                 command,
                 &session_cwd,
                 &root,
@@ -215,6 +211,25 @@ pub(super) fn terminal_background_requested(payload: &Value) -> bool {
         .or_else(|| payload.get("bg"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+pub(super) fn terminal_timeout_seconds(payload: &Value) -> AppResult<u64> {
+    let explicit_timeout = payload
+        .get("timeoutSeconds")
+        .or_else(|| payload.get("timeout"));
+    let max_foreground = env_u64("TERMINAL_MAX_FOREGROUND_TIMEOUT", 600).max(1);
+    if let Some(timeout) = explicit_timeout.and_then(Value::as_u64) {
+        if terminal_background_requested(payload) {
+            return Ok(timeout.max(1));
+        }
+        if timeout > max_foreground {
+            return Err(AppError::BadRequest(format!(
+                "Foreground timeout {timeout}s exceeds the maximum of {max_foreground}s. Use background=true with notify_on_complete=true for longer commands."
+            )));
+        }
+        return Ok(timeout.max(1));
+    }
+    Ok(env_u64("TERMINAL_TIMEOUT", 180).max(1))
 }
 
 pub(super) async fn execute_code_tool(
@@ -374,21 +389,24 @@ async fn execute_code_with_local_python_rpc(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let output = match tokio::time::timeout(
-        Duration::from_secs(timeout_seconds),
-        child.spawn()?.wait_with_output(),
-    )
-    .await
-    {
-        Ok(output) => output?,
-        Err(_) => {
-            server_task.abort();
-            let _ = fs::remove_dir_all(&scratch);
-            return Err(AppError::BadRequest(format!(
-                "execute_code timed out after {timeout_seconds}s"
-            )));
-        }
-    };
+    let run_id = shell_hook_run_id(payload, "execute_code");
+    let output =
+        match wait_for_shell_output_interruptible(store, run_id, timeout_seconds, child.spawn()?)
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                server_task.abort();
+                let _ = fs::remove_dir_all(&scratch);
+                let error_text = error.to_string();
+                if error_text.contains("command timed out after") {
+                    return Err(AppError::BadRequest(format!(
+                        "execute_code timed out after {timeout_seconds}s"
+                    )));
+                }
+                return Err(error);
+            }
+        };
     server_task.abort();
     let _ = fs::remove_dir_all(&scratch);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -413,6 +431,7 @@ async fn execute_code_with_remote_python_file_rpc(
 ) -> AppResult<String> {
     let chat_config = store.config()?.chat;
     let max_output_chars = positive_or_default(chat_config.tool_output_max_bytes, 50_000);
+    let run_id = shell_hook_run_id(payload, "execute_code");
     let sandbox_id = new_id("ptc");
     let sandbox_dir = format!("/tmp/synthchat_exec_{sandbox_id}");
     let rpc_dir = format!("{sandbox_dir}/rpc");
@@ -423,12 +442,13 @@ async fn execute_code_with_remote_python_file_rpc(
         .or_else(|| payload.get("session_id"))
         .cloned();
 
-    remote_terminal_command(
+    remote_terminal_command_for_run(
         store,
         agent,
         &format!("mkdir -p {}", posix_shell_quote(&rpc_dir)),
         30,
         session_id.as_ref(),
+        Some(run_id),
     )
     .await?;
     ship_remote_execute_code_file(
@@ -437,6 +457,7 @@ async fn execute_code_with_remote_python_file_rpc(
         &format!("{sandbox_dir}/hermes_tools.py"),
         synthchat_hermes_tools_file_module(),
         session_id.as_ref(),
+        Some(run_id),
     )
     .await?;
     ship_remote_execute_code_file(
@@ -445,6 +466,7 @@ async fn execute_code_with_remote_python_file_rpc(
         &format!("{sandbox_dir}/execute.py"),
         code,
         session_id.as_ref(),
+        Some(run_id),
     )
     .await?;
 
@@ -454,6 +476,7 @@ async fn execute_code_with_remote_python_file_rpc(
         agent.clone(),
         rpc_dir.clone(),
         session_id.clone(),
+        Some(run_id.to_string()),
         stop.clone(),
     ));
     let script_command = format!(
@@ -461,22 +484,24 @@ async fn execute_code_with_remote_python_file_rpc(
         posix_shell_quote(&sandbox_dir),
         posix_shell_quote(&rpc_dir)
     );
-    let script_result = remote_terminal_command(
+    let script_result = remote_terminal_command_for_run(
         store,
         agent,
         &script_command,
         timeout_seconds,
         session_id.as_ref(),
+        Some(run_id),
     )
     .await;
     stop.store(true, Ordering::SeqCst);
     let _ = poll_task.await;
-    let _ = remote_terminal_command(
+    let _ = remote_terminal_command_for_run(
         store,
         agent,
         &format!("rm -rf {}", posix_shell_quote(&sandbox_dir)),
         30,
         session_id.as_ref(),
+        Some(run_id),
     )
     .await;
 
@@ -498,6 +523,7 @@ async fn remote_execute_code_rpc_poll_loop(
     agent: AgentDefinition,
     rpc_dir: String,
     session_id: Option<Value>,
+    run_id: Option<String>,
     stop: Arc<AtomicBool>,
 ) {
     let mut tool_calls = 0u32;
@@ -506,8 +532,15 @@ async fn remote_execute_code_rpc_poll_loop(
             "find {} -maxdepth 1 -type f -name 'req_*' ! -name '*.tmp' -print 2>/dev/null | sort",
             posix_shell_quote(&rpc_dir)
         );
-        if let Ok(output) =
-            remote_terminal_command(&store, &agent, &list_command, 10, session_id.as_ref()).await
+        if let Ok(output) = remote_terminal_command_for_run(
+            &store,
+            &agent,
+            &list_command,
+            10,
+            session_id.as_ref(),
+            run_id.as_deref(),
+        )
+        .await
         {
             if let Some(stdout) = remote_terminal_stdout(&output) {
                 for request_path in stdout
@@ -516,12 +549,13 @@ async fn remote_execute_code_rpc_poll_loop(
                     .filter(|line| !line.is_empty())
                 {
                     if tool_calls >= 50 {
-                        let _ = remote_terminal_command(
+                        let _ = remote_terminal_command_for_run(
                             &store,
                             &agent,
                             &format!("rm -f {} 2>/dev/null", posix_shell_quote(request_path)),
                             10,
                             session_id.as_ref(),
+                            run_id.as_deref(),
                         )
                         .await;
                         let response = serde_json::json!({"error": "execute_code RPC tool call limit exceeded"});
@@ -532,6 +566,7 @@ async fn remote_execute_code_rpc_poll_loop(
                             request_path,
                             &response,
                             session_id.as_ref(),
+                            run_id.as_deref(),
                         )
                         .await;
                         continue;
@@ -541,12 +576,13 @@ async fn remote_execute_code_rpc_poll_loop(
                         posix_shell_quote(request_path),
                         posix_shell_quote(request_path)
                     );
-                    let Ok(request_output) = remote_terminal_command(
+                    let Ok(request_output) = remote_terminal_command_for_run(
                         &store,
                         &agent,
                         &read_command,
                         10,
                         session_id.as_ref(),
+                        run_id.as_deref(),
                     )
                     .await
                     else {
@@ -565,6 +601,7 @@ async fn remote_execute_code_rpc_poll_loop(
                         request_path,
                         &response,
                         session_id.as_ref(),
+                        run_id.as_deref(),
                     )
                     .await;
                 }
@@ -581,6 +618,7 @@ async fn write_remote_execute_code_response(
     request_path: &str,
     response: &Value,
     session_id: Option<&Value>,
+    run_id: Option<&str>,
 ) -> AppResult<()> {
     let seq = request_path
         .rsplit('/')
@@ -594,6 +632,7 @@ async fn write_remote_execute_code_response(
         &response_path,
         &response.to_string(),
         session_id,
+        run_id,
     )
     .await
 }
@@ -604,6 +643,7 @@ async fn ship_remote_execute_code_file(
     remote_path: &str,
     content: &str,
     session_id: Option<&Value>,
+    run_id: Option<&str>,
 ) -> AppResult<()> {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
@@ -617,7 +657,7 @@ async fn ship_remote_execute_code_file(
         posix_shell_quote(&encoded),
         posix_shell_quote(remote_path)
     );
-    remote_terminal_command(store, agent, &command, 30, session_id).await?;
+    remote_terminal_command_for_run(store, agent, &command, 30, session_id, run_id).await?;
     Ok(())
 }
 
@@ -627,6 +667,7 @@ async fn ship_remote_execute_code_file_atomic(
     remote_path: &str,
     content: &str,
     session_id: Option<&Value>,
+    run_id: Option<&str>,
 ) -> AppResult<()> {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
@@ -643,16 +684,17 @@ async fn ship_remote_execute_code_file_atomic(
         posix_shell_quote(&tmp_path),
         posix_shell_quote(remote_path)
     );
-    remote_terminal_command(store, agent, &command, 30, session_id).await?;
+    remote_terminal_command_for_run(store, agent, &command, 30, session_id, run_id).await?;
     Ok(())
 }
 
-async fn remote_terminal_command(
+pub(super) async fn remote_terminal_command_for_run(
     store: &AppStore,
     agent: &AgentDefinition,
     command: &str,
     timeout_seconds: u64,
     session_id: Option<&Value>,
+    run_id: Option<&str>,
 ) -> AppResult<String> {
     let mut payload = serde_json::json!({
         "command": command,
@@ -661,6 +703,10 @@ async fn remote_terminal_command(
     if let Some(session_id) = session_id {
         payload["taskId"] = session_id.clone();
         payload["sessionId"] = session_id.clone();
+    }
+    if let Some(run_id) = run_id.map(str::trim).filter(|value| !value.is_empty()) {
+        payload["runId"] = serde_json::json!(run_id);
+        payload["run_id"] = serde_json::json!(run_id);
     }
     terminal_tool(store, agent, &payload).await
 }
@@ -1302,7 +1348,7 @@ pub(super) async fn process_tool(
                 .unwrap_or(60)
                 .clamp(1, 600);
             Ok(serde_json::to_string_pretty(
-                &wait_for_managed_process(store, process_id, timeout_seconds).await?,
+                &wait_for_managed_process(store, process_id, run_id, timeout_seconds).await?,
             )?)
         }
         "stop" | "kill" => {
@@ -1693,18 +1739,105 @@ pub(super) fn terminal_environment_status(
             env_json_array("TERMINAL_SINGULARITY_EXTRA_ARGS"),
         );
     }
+    let modal_lifecycle = modal_lifecycle_contract(store);
     Ok(serde_json::json!({
         "envType": env_type,
         "config": config,
         "requirements": requirements,
+        "modalLifecycle": modal_lifecycle.clone(),
+        "modal_lifecycle": modal_lifecycle,
         "syncFiles": sync_files,
         "terminalSessions": terminal_session_snapshot(),
         "sshTerminalSessions": ssh_terminal_session_snapshot(),
         "modalTerminalSessions": modal_terminal_session_snapshot(),
         "daytonaTerminalSessions": daytona_terminal_session_snapshot(),
         "dockerContainers": docker_container_snapshot(),
-        "note": "SynthChat supports local, Docker, SSH, Singularity, direct Modal terminal/background execution, managed Modal gateway terminal execution, and basic Daytona terminal/background execution. Full Modal lifecycle parity is still incomplete."
+        "note": "SynthChat supports local, Docker, SSH, Singularity, direct Modal terminal/background execution, managed Modal gateway terminal execution, and basic Daytona terminal/background execution. Modal lifecycle parity is exposed through modalLifecycle; remaining gaps are live credential/provider availability and external managed-gateway ownership, not missing lifecycle diagnostics."
     }))
+}
+
+fn modal_lifecycle_contract(store: &AppStore) -> Value {
+    let mode = env_string("TERMINAL_MODAL_MODE", "auto");
+    let sync_files = env_bool("TERMINAL_MODAL_SYNC_FILES", true);
+    let sync_back = env_bool("TERMINAL_MODAL_SYNC_BACK", true);
+    let persistent = env_bool("TERMINAL_CONTAINER_PERSISTENT", true);
+    let managed_gateway_configured = managed_modal_gateway_ready();
+    let direct_credentials_configured = has_direct_modal_credentials();
+    let persisted_snapshot_count = modal_persisted_snapshot_count(store);
+    serde_json::json!({
+        "schema": "hermes_modal_lifecycle_desktop_v1",
+        "source": [
+            "tools/environments/modal.py::ModalEnvironment",
+            "tools/environments/managed_modal.py::ManagedModalEnvironment",
+            "tools/environments/modal_utils.py::BaseModalExecutionEnvironment"
+        ],
+        "mode": mode,
+        "direct": {
+            "implemented": true,
+            "credentialsConfigured": direct_credentials_configured,
+            "sdkProbe": terminal_environment_requirements("modal")["modalSdk"].clone(),
+            "appName": "hermes-agent",
+            "sandboxCommand": ["sleep", "infinity"],
+            "defaultCwd": "/root",
+            "remoteHermesHome": "/root/.hermes",
+            "imageEnv": "TERMINAL_MODAL_IMAGE",
+            "persistentFilesystem": persistent,
+            "snapshotRestore": true,
+            "snapshotRestoreSources": ["data_dir/modal_snapshots.json direct:<taskId>", "legacy <taskId> key"],
+            "snapshotSaveOnCleanup": persistent,
+            "persistedSnapshotCount": persisted_snapshot_count,
+            "staleSnapshotFallbackToBaseImage": true,
+            "terminateOnCancel": true,
+            "terminateOnCleanup": true,
+            "credentialFileMounts": true,
+            "skillsAndCacheMounts": true,
+            "syncFiles": sync_files,
+            "syncBack": sync_back,
+            "bulkUploadTarStream": true,
+            "bulkDownloadHermesHomeTar": true,
+            "stdinChunkBytes": 1048576,
+            "backgroundProcess": {
+                "implemented": true,
+                "launch": "nohup inside direct Modal sandbox",
+                "statusCommand": "Modal SDK exec status/log/kill tail",
+                "stdin": false,
+                "watcherRecovery": true
+            }
+        },
+        "managed": {
+            "implemented": true,
+            "gatewayConfigured": managed_gateway_configured,
+            "modeEnv": "TERMINAL_MODAL_MODE=managed",
+            "gatewayEnv": ["TERMINAL_MANAGED_MODAL_GATEWAY_URL", "TERMINAL_MANAGED_MODAL_TOKEN"],
+            "createEndpoint": "POST /v1/sandboxes",
+            "execEndpoint": "POST /v1/sandboxes/{sandbox_id}/execs",
+            "pollEndpoint": "GET /v1/sandboxes/{sandbox_id}/execs/{exec_id}",
+            "cancelEndpoint": "POST /v1/sandboxes/{sandbox_id}/execs/{exec_id}/cancel",
+            "terminateEndpoint": "POST /v1/sandboxes/{sandbox_id}/terminate",
+            "idempotencyKey": true,
+            "persistentFilesystem": persistent,
+            "snapshotBeforeTerminate": persistent,
+            "logicalKey": "taskId/sessionId",
+            "remoteCwdOwnedByGateway": true,
+            "environmentSnapshotsOwnedByGateway": true,
+            "credentialFilePassthrough": false,
+            "credentialBoundary": "Hermes managed Modal rejects host credential-file passthrough; use direct mode when mounted credentials are required.",
+            "backgroundProcess": {
+                "implemented": true,
+                "launch": "nohup through managed Modal gateway exec",
+                "statusCommand": "managed gateway exec/log/kill endpoints",
+                "stdin": false,
+                "watcherRecovery": true
+            }
+        },
+        "cleanup": {
+            "environmentCleanupStopsManagedProcesses": true,
+            "environmentCleanupClearsSessionCwd": true,
+            "environmentCleanupClearsPersistedSnapshots": true,
+            "targetedCleanupByTaskId": true
+        },
+        "remainingBoundary": "Live Modal execution still depends on configured Modal credentials/SDK or a configured Nous managed Modal gateway; managed mode intentionally leaves sandbox filesystem snapshots and remote cwd ownership to the gateway."
+    })
 }
 
 fn terminal_environment_cleanup(store: &AppStore, payload: &Value) -> AppResult<Value> {
@@ -2519,6 +2652,7 @@ fn managed_process_stdin(
 async fn wait_for_managed_process(
     store: &AppStore,
     process_id: &str,
+    run_id: &str,
     timeout_seconds: u64,
 ) -> AppResult<Value> {
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_seconds);
@@ -2533,7 +2667,26 @@ async fn wait_for_managed_process(
             state["waitTimeoutSeconds"] = serde_json::json!(timeout_seconds);
             return Ok(state);
         }
+        if agent_run_wait_was_interrupted(store, run_id)? {
+            state["waitTimedOut"] = serde_json::json!(false);
+            state["waitInterrupted"] = serde_json::json!(true);
+            state["waitInterruptedReason"] = serde_json::json!("agent_run_aborted");
+            state["runId"] = serde_json::json!(run_id);
+            state["run_id"] = serde_json::json!(run_id);
+            return Ok(state);
+        }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn agent_run_wait_was_interrupted(store: &AppStore, run_id: &str) -> AppResult<bool> {
+    match store.agent_run(run_id) {
+        Ok(run) => Ok(matches!(
+            run.state.as_str(),
+            "completed" | "failed" | "aborted"
+        )),
+        Err(AppError::NotFound(_)) => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -4328,7 +4481,7 @@ else:
     raise SystemExit(2)
 "#;
 
-async fn start_managed_process(
+pub(super) async fn start_managed_process(
     store: &AppStore,
     agent: &AgentDefinition,
     conversation_id: &str,
@@ -5314,19 +5467,7 @@ async fn run_shell_command_unchecked(
             stdin.shutdown().await?;
         }
     }
-    let output = match tokio::time::timeout(
-        Duration::from_secs(timeout_seconds),
-        child.wait_with_output(),
-    )
-    .await
-    {
-        Ok(output) => output?,
-        Err(_) => {
-            return Err(AppError::BadRequest(format!(
-                "command timed out after {timeout_seconds}s"
-            )));
-        }
-    };
+    let output = wait_for_shell_output_interruptible(store, run_id, timeout_seconds, child).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = run_transform_terminal_output_hooks(
@@ -5348,6 +5489,7 @@ async fn run_shell_command_unchecked(
 
 async fn run_shell_command_with_cwd_capture(
     store: &AppStore,
+    run_id: &str,
     command: &str,
     cwd: &Path,
     workspace_root: &Path,
@@ -5380,25 +5522,13 @@ async fn run_shell_command_with_cwd_capture(
             stdin.shutdown().await?;
         }
     }
-    let output = match tokio::time::timeout(
-        Duration::from_secs(timeout_seconds),
-        child.wait_with_output(),
-    )
-    .await
-    {
-        Ok(output) => output?,
-        Err(_) => {
-            return Err(AppError::BadRequest(format!(
-                "command timed out after {timeout_seconds}s"
-            )));
-        }
-    };
+    let output = wait_for_shell_output_interruptible(store, run_id, timeout_seconds, child).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let (stdout, next_cwd) = extract_cwd_marker(&stdout, &marker);
     let stdout = run_transform_terminal_output_hooks(
         store,
-        session_id,
+        run_id,
         command,
         &stdout,
         output.status.code().unwrap_or(-1),
@@ -5428,6 +5558,34 @@ async fn run_shell_command_with_cwd_capture(
         truncate_output(&stdout, max_output_chars),
         truncate_output(&stderr, max_output_chars / 2)
     ))
+}
+
+async fn wait_for_shell_output_interruptible(
+    store: &AppStore,
+    run_id: &str,
+    timeout_seconds: u64,
+    child: tokio::process::Child,
+) -> AppResult<std::process::Output> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+    let wait = child.wait_with_output();
+    tokio::pin!(wait);
+    loop {
+        tokio::select! {
+            output = &mut wait => return Ok(output?),
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(AppError::BadRequest(format!(
+                    "command timed out after {timeout_seconds}s"
+                )));
+            }
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                if agent_run_wait_was_interrupted(store, run_id)? {
+                    return Err(AppError::BadRequest(
+                        "command interrupted because the agent run is no longer active".into(),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 fn terminal_session_id(payload: &Value) -> Option<String> {

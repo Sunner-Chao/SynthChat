@@ -993,6 +993,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         subagentTask: event.subagentTask ?? null,
         subagentToolsets: event.subagentToolsets ?? [],
         subagentMaxIterations: event.subagentMaxIterations ?? null,
+        queueItemId: event.queueItemId ?? null,
         userRequest: "",
         state: event.state,
         startedAt: event.updatedAt,
@@ -1017,6 +1018,7 @@ export const useAppStore = create<AppState>((set, get) => ({
             subagentTask: event.subagentTask ?? run.subagentTask ?? null,
             subagentToolsets: event.subagentToolsets ?? run.subagentToolsets ?? [],
             subagentMaxIterations: event.subagentMaxIterations ?? run.subagentMaxIterations ?? null,
+            queueItemId: event.queueItemId ?? run.queueItemId ?? null,
             state: event.state,
             updatedAt: event.updatedAt,
             lastActivityAt: event.lastActivityAt ?? run.lastActivityAt ?? event.updatedAt,
@@ -1030,7 +1032,19 @@ export const useAppStore = create<AppState>((set, get) => ({
           }
           : run)
         : [fallbackRun, ...state.agentRuns];
-      return { activeAgentRuns, agentRuns };
+      const agentQueue = event.queueItemId
+        ? state.agentQueue.map((item) => item.id === event.queueItemId
+          ? {
+            ...item,
+            status: terminal ? event.state : "running",
+            updatedAt: event.updatedAt,
+            startedAt: item.startedAt ?? event.updatedAt,
+            completedAt: terminal ? event.updatedAt : item.completedAt,
+            error: event.error ?? item.error
+          }
+          : item)
+        : state.agentQueue;
+      return { activeAgentRuns, agentRuns, agentQueue };
     });
   },
   handleManagedProcessEvent: (event) => {

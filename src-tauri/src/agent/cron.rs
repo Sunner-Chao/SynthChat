@@ -21,6 +21,7 @@ pub(super) fn cronjob_tool(
         .to_lowercase();
     let result = match action.as_str() {
         "list" => cronjob_list(store, payload)?,
+        "status" => cronjob_status(store)?,
         "create" => cronjob_create(store, conversation_id, payload)?,
         "update" | "edit" => cronjob_update(store, payload)?,
         "pause" | "resume" => cronjob_set_enabled(store, payload, action == "resume")?,
@@ -28,7 +29,7 @@ pub(super) fn cronjob_tool(
         "trigger" | "run" => cronjob_trigger(store, payload)?,
         other => {
             return Err(AppError::BadRequest(format!(
-                "unsupported cronjob action '{other}'. Use list, create, update, pause, resume, delete, or trigger."
+                "unsupported cronjob action '{other}'. Use list, status, create, update, pause, resume, delete, or trigger."
             )));
         }
     };
@@ -51,8 +52,40 @@ fn cronjob_list(store: &AppStore, payload: &Value) -> AppResult<Value> {
     jobs.truncate(limit);
     Ok(json!({
         "ok": true,
+        "success": true,
         "action": "list",
         "count": jobs.len(),
+        "jobs": jobs
+    }))
+}
+
+fn cronjob_status(store: &AppStore) -> AppResult<Value> {
+    let jobs = store.scheduled_agent_jobs()?;
+    let active_jobs = jobs
+        .iter()
+        .filter(|job| job.enabled && job.status != "completed")
+        .collect::<Vec<_>>();
+    let paused_count = jobs.iter().filter(|job| !job.enabled).count();
+    let completed_count = jobs.iter().filter(|job| job.status == "completed").count();
+    let next_run_at = active_jobs
+        .iter()
+        .filter_map(|job| job.next_run_at.as_deref())
+        .min()
+        .map(str::to_string);
+    Ok(json!({
+        "ok": true,
+        "success": true,
+        "action": "status",
+        "status": if active_jobs.is_empty() { "idle" } else { "active" },
+        "count": jobs.len(),
+        "activeCount": active_jobs.len(),
+        "active_count": active_jobs.len(),
+        "pausedCount": paused_count,
+        "paused_count": paused_count,
+        "completedCount": completed_count,
+        "completed_count": completed_count,
+        "nextRunAt": next_run_at,
+        "next_run_at": next_run_at,
         "jobs": jobs
     }))
 }
@@ -172,8 +205,15 @@ fn cronjob_create(store: &AppStore, conversation_id: &str, payload: &Value) -> A
     let saved = store.save_scheduled_agent_job(job)?;
     Ok(json!({
         "ok": true,
+        "success": true,
         "action": "create",
         "jobId": saved.id,
+        "job_id": saved.id,
+        "name": saved.name,
+        "schedule": saved.schedule_display,
+        "nextRunAt": saved.next_run_at,
+        "next_run_at": saved.next_run_at,
+        "skills": saved.skills,
         "job": saved
     }))
 }
@@ -325,8 +365,15 @@ fn cronjob_update(store: &AppStore, payload: &Value) -> AppResult<Value> {
     let saved = store.save_scheduled_agent_job(job)?;
     Ok(json!({
         "ok": true,
+        "success": true,
         "action": "update",
         "jobId": saved.id,
+        "job_id": saved.id,
+        "name": saved.name,
+        "schedule": saved.schedule_display,
+        "nextRunAt": saved.next_run_at,
+        "next_run_at": saved.next_run_at,
+        "skills": saved.skills,
         "job": saved
     }))
 }
@@ -336,8 +383,12 @@ fn cronjob_set_enabled(store: &AppStore, payload: &Value, enabled: bool) -> AppR
     let job = store.set_scheduled_agent_job_enabled(&job_id, enabled)?;
     Ok(json!({
         "ok": true,
+        "success": true,
         "action": if enabled { "resume" } else { "pause" },
         "jobId": job.id,
+        "job_id": job.id,
+        "nextRunAt": job.next_run_at,
+        "next_run_at": job.next_run_at,
         "job": job
     }))
 }
@@ -347,8 +398,10 @@ fn cronjob_delete(store: &AppStore, payload: &Value) -> AppResult<Value> {
     store.delete_scheduled_agent_job(&job_id)?;
     Ok(json!({
         "ok": true,
+        "success": true,
         "action": "delete",
-        "jobId": job_id
+        "jobId": job_id,
+        "job_id": job_id
     }))
 }
 
@@ -357,8 +410,12 @@ fn cronjob_trigger(store: &AppStore, payload: &Value) -> AppResult<Value> {
     let job = store.trigger_scheduled_agent_job(&job_id)?;
     Ok(json!({
         "ok": true,
+        "success": true,
         "action": "trigger",
         "jobId": job.id,
+        "job_id": job.id,
+        "nextRunAt": job.next_run_at,
+        "next_run_at": job.next_run_at,
         "job": job,
         "started": false,
         "queued": true,

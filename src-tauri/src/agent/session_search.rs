@@ -28,7 +28,7 @@ pub(super) fn execute_session_search(
     conversation: &Conversation,
     payload: &Value,
 ) -> AppResult<(String, Value)> {
-    let anchor_conversation_id = string_arg(
+    let anchor_conversation_id = session_search_payload_string(
         payload,
         &[
             "conversationId",
@@ -37,7 +37,7 @@ pub(super) fn execute_session_search(
             "session_id",
         ],
     );
-    let anchor_message_id = string_arg(
+    let anchor_message_id = session_search_payload_string(
         payload,
         &[
             "messageId",
@@ -284,7 +284,10 @@ pub(super) fn execute_session_search(
                 "kind": row.kind,
                 "score": row.score,
                 "conversationId": row.conversation_id,
+                "session_id": row.conversation_id,
                 "messageId": row.message_id,
+                "match_message_id": row.message_id,
+                "snippet": row.content,
                 "content": row.content,
                 "metadata": row.metadata
             })
@@ -292,7 +295,21 @@ pub(super) fn execute_session_search(
         .collect::<Vec<_>>();
     Ok((
         text,
-        json!({"mode": "discover", "query": query, "kind": kind, "limit": limit, "offset": offset, "total": total, "window": window, "sort": sort, "includeSubagents": include_subagents, "results": raw_results}),
+        json!({
+            "success": true,
+            "mode": "discover",
+            "query": query,
+            "kind": kind,
+            "limit": limit,
+            "offset": offset,
+            "total": total,
+            "count": raw_results.len(),
+            "sessions_searched": total,
+            "window": window,
+            "sort": sort,
+            "includeSubagents": include_subagents,
+            "results": raw_results
+        }),
     ))
 }
 
@@ -377,17 +394,29 @@ fn execute_session_browse(
         .map(|item| {
             json!({
                 "conversationId": item.id,
+                "session_id": item.id,
                 "title": item.title,
                 "updatedAt": item.updated_at,
+                "last_active": item.updated_at,
                 "createdAt": item.created_at,
+                "started_at": item.created_at,
                 "lastMessage": item.last_message,
+                "preview": item.last_message,
                 "current": item.id == current_conversation.id
             })
         })
         .collect::<Vec<_>>();
     Ok((
         text,
-        json!({"mode": "browse", "limit": limit, "offset": offset, "results": raw_results}),
+        json!({
+            "success": true,
+            "mode": "browse",
+            "limit": limit,
+            "offset": offset,
+            "count": raw_results.len(),
+            "results": raw_results,
+            "message": format!("Showing {} most recent sessions. Pass query to search, or session_id + around_message_id to scroll.", raw_results.len())
+        }),
     ))
 }
 
@@ -437,6 +466,7 @@ fn execute_session_scroll(
                 "role": message.role,
                 "content": message.content,
                 "createdAt": message.created_at,
+                "timestamp": message.created_at,
                 "anchor": message.id == message_id
             })
         })
@@ -451,17 +481,34 @@ fn execute_session_scroll(
             text
         ),
         json!({
+            "success": true,
             "mode": "scroll",
             "conversationId": conversation.id,
+            "session_id": conversation.id,
             "title": conversation.title,
             "messageId": message_id,
+            "around_message_id": message_id,
             "found": true,
             "window": window,
             "messagesBefore": start,
+            "messages_before": start,
             "messagesAfter": messages.len().saturating_sub(end),
+            "messages_after": messages.len().saturating_sub(end),
             "messages": raw_messages
         }),
     ))
+}
+
+fn session_search_payload_string(payload: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| payload.get(*key))
+        .and_then(|value| match value {
+            Value::String(raw) => Some(raw.trim().to_string()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        })
+        .filter(|value| !value.is_empty())
+        .or_else(|| string_arg(payload, keys))
 }
 
 pub(super) fn sort_session_search_candidates(

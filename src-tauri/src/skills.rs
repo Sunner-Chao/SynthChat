@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::{
     error::{AppError, AppResult},
@@ -183,7 +183,9 @@ pub fn curate_skills_report(store: &AppStore) -> AppResult<SkillCuratorReport> {
     let bundled_skills = skills.iter().filter(|skill| skill.is_bundled).count();
     let overlap_clusters = detect_skill_overlap_clusters(&skills);
     let state = read_skill_curator_state(store)?;
-    let archive_candidates = detect_skill_archive_candidates(&skills, &overlap_clusters, &state);
+    let usage = read_skill_usage_records(store)?;
+    let archive_candidates =
+        detect_skill_archive_candidates(&skills, &overlap_clusters, &state, &usage);
     let mut recommendations = Vec::new();
     if !overlap_clusters.is_empty() {
         recommendations.push(format!(
@@ -233,6 +235,30 @@ pub fn curate_skills_report(store: &AppStore) -> AppResult<SkillCuratorReport> {
     Ok(report)
 }
 
+pub fn maybe_curate_skills_report(
+    store: &AppStore,
+    interval_hours: usize,
+) -> AppResult<Option<SkillCuratorReport>> {
+    let mut state = read_skill_curator_state(store)?;
+    if state.paused {
+        return Ok(None);
+    }
+    let now = chrono::Utc::now();
+    let Some(last_run_at) = state.last_run_at.as_deref() else {
+        state.last_run_at = Some(now.to_rfc3339());
+        write_skill_curator_state(store, state)?;
+        return Ok(None);
+    };
+    let last_run_at = chrono::DateTime::parse_from_rfc3339(last_run_at)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .unwrap_or(now);
+    let interval = chrono::Duration::hours(interval_hours.max(1) as i64);
+    if now.signed_duration_since(last_run_at) < interval {
+        return Ok(None);
+    }
+    curate_skills_report(store).map(Some)
+}
+
 pub fn skill_curator_state(store: &AppStore) -> AppResult<SkillCuratorState> {
     read_skill_curator_state(store)
 }
@@ -271,13 +297,41 @@ pub fn archive_skill_for_curator(
     selector: &str,
     reason: Option<&str>,
 ) -> AppResult<SkillCuratorArchiveRecord> {
-    let mut records = select_skill_install_records(store, Some(selector))?;
-    if records.len() != 1 {
-        return Err(AppError::BadRequest(format!(
-            "skill selector must match exactly one external skill: {selector}"
-        )));
-    }
-    let record = records.remove(0);
+    let (record, remove_from_lock) = match select_skill_install_records(store, Some(selector)) {
+        Ok(mut records) if records.len() == 1 => (records.remove(0), true),
+        Ok(records) if records.len() > 1 => {
+            return Err(AppError::BadRequest(format!(
+                "skill selector must match exactly one skill: {selector}"
+            )))
+        }
+        _ => {
+            let skills = list_skills(store)?;
+            let Some(skill_id) = resolve_skill_selector(&skills, selector)? else {
+                return Err(AppError::NotFound(format!("skill {selector}")));
+            };
+            let Some(skill) = skills.iter().find(|skill| skill.id == skill_id) else {
+                return Err(AppError::NotFound(format!("skill {selector}")));
+            };
+            if skill.is_core || skill.is_bundled {
+                return Err(AppError::BadRequest(format!(
+                    "refusing to archive bundled/core skill '{}'",
+                    skill.id
+                )));
+            }
+            (
+                SkillInstallRecord {
+                    skill_id: skill.id.clone(),
+                    name: skill.name.clone(),
+                    source: skill.source.clone(),
+                    identifier: skill.path.clone(),
+                    install_path: skill.path.clone(),
+                    audit_status: "unknown".into(),
+                    installed_at: now_iso(),
+                },
+                false,
+            )
+        }
+    };
     let mut state = read_skill_curator_state(store)?;
     if state
         .pinned_skill_ids
@@ -295,10 +349,12 @@ pub fn archive_skill_for_curator(
             "skill install path has no parent".into(),
         ));
     };
-    let external_root = store.data_dir().join("skills").join("external");
-    if !original_dir.starts_with(&external_root) {
+    let skills_root = store.data_dir().join("skills");
+    if !original_dir.starts_with(&skills_root)
+        || original_dir.starts_with(skills_root.join("curator"))
+    {
         return Err(AppError::BadRequest(format!(
-            "refusing to archive skill outside external skills dir: {}",
+            "refusing to archive skill outside managed skills dir: {}",
             original_dir.to_string_lossy()
         )));
     }
@@ -316,9 +372,11 @@ pub fn archive_skill_for_curator(
     fs::create_dir_all(archive_dir.parent().unwrap_or_else(|| Path::new(".")))?;
     fs::rename(original_dir, &archive_dir)?;
     store.remove_skill(&record.skill_id)?;
-    let mut lock_records = read_skill_install_records(store)?;
-    lock_records.retain(|item| item.skill_id != record.skill_id);
-    write_skill_install_records(store, &lock_records)?;
+    if remove_from_lock {
+        let mut lock_records = read_skill_install_records(store)?;
+        lock_records.retain(|item| item.skill_id != record.skill_id);
+        write_skill_install_records(store, &lock_records)?;
+    }
 
     let archived = SkillCuratorArchiveRecord {
         archive_id,
@@ -388,18 +446,20 @@ pub fn restore_skill_for_curator(
         &original_path,
         &record.name,
         &record.skill_id,
-        "external",
+        &record.install_record.source,
     );
-    let mut skills = list_skills(store)?;
+    let mut skills = store.skills()?;
     skills.retain(|skill| skill.id != restored_skill.id);
     skills.push(restored_skill);
     skills.sort_by(|a, b| a.id.cmp(&b.id));
     store.set_skills(skills)?;
-    let mut lock_records = read_skill_install_records(store)?;
-    lock_records.retain(|item| item.skill_id != record.install_record.skill_id);
-    lock_records.push(record.install_record.clone());
-    lock_records.sort_by(|a, b| a.skill_id.cmp(&b.skill_id));
-    write_skill_install_records(store, &lock_records)?;
+    if record.install_record.source == "external" {
+        let mut lock_records = read_skill_install_records(store)?;
+        lock_records.retain(|item| item.skill_id != record.install_record.skill_id);
+        lock_records.push(record.install_record.clone());
+        lock_records.sort_by(|a, b| a.skill_id.cmp(&b.skill_id));
+        write_skill_install_records(store, &lock_records)?;
+    }
 
     record.restored_at = Some(now_iso());
     state.archived[index] = record.clone();
@@ -548,6 +608,108 @@ pub fn install_external_skill_content(
 
 pub fn skill_install_records(store: &AppStore) -> AppResult<Vec<SkillInstallRecord>> {
     read_skill_install_records(store)
+}
+
+pub fn skill_usage_records(store: &AppStore) -> AppResult<Vec<Value>> {
+    let mut records = read_skill_usage_records(store)?
+        .into_values()
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        right
+            .get("lastUsedAt")
+            .and_then(Value::as_str)
+            .cmp(&left.get("lastUsedAt").and_then(Value::as_str))
+            .then_with(|| {
+                left.get("skillId")
+                    .and_then(Value::as_str)
+                    .cmp(&right.get("skillId").and_then(Value::as_str))
+            })
+    });
+    Ok(records)
+}
+
+pub fn record_skill_usage(
+    store: &AppStore,
+    skill: &EnhancedSkillSummary,
+    context: &str,
+    origin: Option<&str>,
+) -> AppResult<Value> {
+    let mut records = read_skill_usage_records(store)?;
+    let now = now_iso();
+    let context = normalize_skill_usage_context(context);
+    let origin = origin
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("foreground");
+    let mut record = records.remove(&skill.id).unwrap_or_else(|| {
+        json!({
+            "skillId": skill.id,
+            "name": skill.name,
+            "path": skill.path,
+            "source": skill.source,
+            "firstSeenAt": now,
+            "lastUsedAt": null,
+            "useCount": 0,
+            "contexts": {},
+            "provenance": {
+                "origin": origin,
+                "agentCreated": skill.source == "agent-managed" || skill.id.contains("agent-managed"),
+                "backgroundCreated": origin == "background_review" || skill.id.contains("background-review")
+            }
+        })
+    });
+    record["name"] = json!(skill.name);
+    record["path"] = json!(skill.path);
+    record["source"] = json!(skill.source);
+    record["lastUsedAt"] = json!(now);
+    record["lastContext"] = json!(context);
+    record["lastOrigin"] = json!(origin);
+    let use_count = record
+        .get("useCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(1);
+    record["useCount"] = json!(use_count);
+    let mut contexts = record
+        .get("contexts")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let next_context_count = contexts
+        .get(context)
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(1);
+    contexts.insert(context.to_string(), json!(next_context_count));
+    record["contexts"] = json!(contexts);
+    if let Some(provenance) = record.get_mut("provenance").and_then(Value::as_object_mut) {
+        provenance.insert("origin".into(), json!(origin));
+        provenance.insert(
+            "agentCreated".into(),
+            json!(
+                provenance
+                    .get("agentCreated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    || skill.source == "agent-managed"
+                    || skill.id.contains("agent-managed")
+            ),
+        );
+        provenance.insert(
+            "backgroundCreated".into(),
+            json!(
+                provenance
+                    .get("backgroundCreated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    || origin == "background_review"
+                    || skill.id.contains("background-review")
+            ),
+        );
+    }
+    records.insert(skill.id.clone(), record.clone());
+    write_skill_usage_records(store, &records)?;
+    Ok(record)
 }
 
 pub fn skill_audit_log(
@@ -822,6 +984,7 @@ fn detect_skill_archive_candidates(
     skills: &[EnhancedSkillSummary],
     overlap_clusters: &[SkillCuratorOverlap],
     state: &SkillCuratorState,
+    usage: &BTreeMap<String, Value>,
 ) -> Vec<SkillCuratorArchiveCandidate> {
     let mut duplicate_members = HashSet::new();
     for cluster in overlap_clusters {
@@ -833,6 +996,14 @@ fn detect_skill_archive_candidates(
         .iter()
         .filter(|skill| !skill.is_bundled && duplicate_members.contains(&skill.id))
         .filter(|skill| !state.pinned_skill_ids.iter().any(|id| id == &skill.id))
+        .filter(|skill| {
+            usage
+                .get(&skill.id)
+                .and_then(|record| record.get("useCount"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                == 0
+        })
         .take(20)
         .map(|skill| SkillCuratorArchiveCandidate {
             skill_id: skill.id.clone(),
@@ -1001,6 +1172,7 @@ fn record_skill_install(
         skills_dir.join("skills-lock.json"),
         serde_json::to_vec_pretty(&records)?,
     )?;
+    let _ = record_skill_usage(store, skill, "install", Some("foreground"));
     append_skill_audit_log(store, &record, audit)
 }
 
@@ -1076,6 +1248,57 @@ fn read_skill_install_records(store: &AppStore) -> AppResult<Vec<SkillInstallRec
         return Ok(Vec::new());
     }
     Ok(serde_json::from_str(&raw)?)
+}
+
+fn skill_usage_path(store: &AppStore) -> PathBuf {
+    store.data_dir().join("skills").join("usage.json")
+}
+
+fn read_skill_usage_records(store: &AppStore) -> AppResult<BTreeMap<String, Value>> {
+    let path = skill_usage_path(store);
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let raw = fs::read_to_string(path)?;
+    if raw.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let value = serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({}));
+    let items = value
+        .get("records")
+        .and_then(Value::as_array)
+        .cloned()
+        .or_else(|| value.as_array().cloned())
+        .unwrap_or_default();
+    let mut records = BTreeMap::new();
+    for item in items {
+        if let Some(skill_id) = item.get("skillId").and_then(Value::as_str) {
+            records.insert(skill_id.to_string(), item);
+        }
+    }
+    Ok(records)
+}
+
+fn write_skill_usage_records(store: &AppStore, records: &BTreeMap<String, Value>) -> AppResult<()> {
+    let path = skill_usage_path(store);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let payload = json!({
+        "schema": "synthchat.skills.usage.v1",
+        "updatedAt": now_iso(),
+        "records": records.values().cloned().collect::<Vec<_>>()
+    });
+    fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
+    Ok(())
+}
+
+fn normalize_skill_usage_context(context: &str) -> &str {
+    match context.trim() {
+        "prompt" | "view" | "install" | "create" | "edit" | "patch" | "write_file"
+        | "remove_file" | "delete" | "archive" | "restore" => context.trim(),
+        _ => "other",
+    }
 }
 
 fn read_skill_taps(store: &AppStore) -> AppResult<Vec<SkillTap>> {
@@ -1244,7 +1467,7 @@ pub fn prompt_blocks_for_request(
 
     let skills = list_skills(store)?;
     let requested = requested_skill_names(user_request);
-    let selected = skills
+    let selected_skills = skills
         .into_iter()
         .filter(|skill| {
             agent.enabled_skills.contains(&skill.id)
@@ -1252,16 +1475,19 @@ pub fn prompt_blocks_for_request(
                 || requested.contains(&skill.id.to_lowercase())
         })
         .take(6)
-        .filter_map(|skill| {
-            fs::read_to_string(&skill.path)
-                .ok()
-                .map(|content| SkillPromptBlock {
-                    id: skill.id,
-                    name: skill.name,
-                    content: truncate_chars(content, MAX_SKILL_PROMPT_CHARS),
-                })
-        })
-        .collect();
+        .collect::<Vec<_>>();
+    let mut selected = Vec::new();
+    for skill in selected_skills {
+        let Ok(content) = fs::read_to_string(&skill.path) else {
+            continue;
+        };
+        let _ = record_skill_usage(store, &skill, "prompt", Some("foreground"));
+        selected.push(SkillPromptBlock {
+            id: skill.id,
+            name: skill.name,
+            content: truncate_chars(content, MAX_SKILL_PROMPT_CHARS),
+        });
+    }
     Ok(selected)
 }
 
@@ -1851,6 +2077,27 @@ mod tests {
                     .iter()
                     .any(|id| id.ends_with("provider-b"))
         }));
+    }
+
+    #[test]
+    fn maybe_curate_skills_report_seeds_then_runs_after_interval() {
+        let dir = std::env::temp_dir().join(format!("synthchat-curator-{}", new_id("test")));
+        fs::create_dir_all(&dir).unwrap();
+        let store = AppStore::new(dir.join("state.json")).unwrap();
+
+        let first = maybe_curate_skills_report(&store, 1).unwrap();
+        assert!(first.is_none());
+        let mut state = read_skill_curator_state(&store).unwrap();
+        assert!(state.last_run_at.is_some());
+        assert_eq!(state.run_count, 0);
+
+        state.last_run_at = Some((chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339());
+        write_skill_curator_state(&store, state).unwrap();
+        let report = maybe_curate_skills_report(&store, 1).unwrap().unwrap();
+        assert!(PathBuf::from(&report.report_path).exists());
+        assert_eq!(read_skill_curator_state(&store).unwrap().run_count, 1);
+
+        let _ = fs::remove_dir_all(dir);
     }
 }
 

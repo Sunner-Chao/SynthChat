@@ -10,6 +10,9 @@ use serde_json::{json, Value};
 
 use crate::{
     error::{AppError, AppResult},
+    hermes_auth::{
+        mark_hermes_credential_pool_failure, mark_hermes_credential_pool_failure_for_source,
+    },
     models::{
         new_id, now_iso, AgentCheckpointRecord, AgentRunRecord, ChatConfig, ChatMessage,
         LlmProvider, Persona, ShortContextState, ToolDefinition,
@@ -18,7 +21,8 @@ use crate::{
 };
 
 use super::context_compression::{
-    compression_anti_thrash_skip_note, record_compression_effectiveness,
+    compression_anti_thrash_skip_note, context_engine_messages_to_summary,
+    record_compression_effectiveness, record_summary_success, selected_context_engine_name,
 };
 use super::llm_failure::{llm_classified_error_detail, llm_failure_recovery_hints};
 use super::shell_hooks::{run_post_api_request_hooks, run_pre_api_request_hooks};
@@ -27,8 +31,69 @@ use super::{
     fallback_short_context_summary, genuine_rate_limit_guard_state,
     llm_credential_variant_should_skip_retry, llm_failure_is_retryable, llm_retry_delay_ms,
     memory_pre_compress_context, redact_json_value, redact_sensitive_text,
-    render_messages_for_summary, spawn_session_finished_hooks, truncate_for_prompt,
+    render_messages_for_summary, run_context_engine_compress, run_context_engine_should_compress,
+    run_context_engine_update_from_response, run_context_engine_update_model,
+    spawn_session_finished_hooks, truncate_for_prompt,
 };
+
+fn llm_failure_kind_should_rotate_credential(kind: &str) -> bool {
+    matches!(
+        kind,
+        "rate_limit"
+            | "terminal_auth"
+            | "auth"
+            | "quota"
+            | "long_context_tier"
+            | "oauth_long_context_beta_forbidden"
+    )
+}
+
+fn persona_with_max_tokens_override(
+    persona: &Persona,
+    max_tokens_override: Option<u32>,
+) -> Persona {
+    let mut persona = persona.clone();
+    if let Some(max_tokens) = max_tokens_override {
+        persona.max_tokens = max_tokens.max(1);
+    }
+    persona
+}
+
+pub(super) fn next_max_tokens_override(
+    current_override: Option<u32>,
+    configured_max_tokens: u32,
+    message: &str,
+) -> Option<u32> {
+    let available = parse_available_output_tokens_from_error(message)?;
+    let available = available.min(u32::MAX as usize) as u32;
+    let ceiling = current_override.unwrap_or(configured_max_tokens).max(1);
+    Some(available.max(1).min(ceiling))
+}
+
+pub(super) async fn wait_llm_retry_delay_interruptible(
+    store: &AppStore,
+    run_id: Option<&str>,
+    delay_ms: u64,
+) -> AppResult<bool> {
+    let Some(run_id) = run_id else {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        return Ok(true);
+    };
+    let started = Instant::now();
+    let total = Duration::from_millis(delay_ms);
+    loop {
+        let state = store.agent_run(run_id)?.state;
+        if matches!(state.as_str(), "completed" | "failed" | "aborted") {
+            return Ok(false);
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= total {
+            return Ok(true);
+        }
+        tokio::time::sleep((total - elapsed).min(Duration::from_millis(250))).await;
+    }
+}
+
 pub(super) fn record_llm_usage(store: &AppStore, reply: &crate::llm::LlmReply) -> AppResult<()> {
     store.add_usage_detail(json!({
         "providerId": reply.provider_id.clone().unwrap_or_else(|| "unknown".into()),
@@ -76,7 +141,7 @@ pub(super) fn recover_llm_failure_for_agent_run(
             )?
         }
         "image_too_large" | "multimodal_tool_content_unsupported" => {
-            recover_image_payloads_for_retry(history, kind)?
+            recover_image_payloads_for_retry_persisted(store, conversation_id, history, kind)?
         }
         "thinking_signature" => recover_reasoning_replay_text_for_retry(history, kind)?,
         "invalid_encrypted_content" => recover_invalid_encrypted_content_for_retry(
@@ -93,6 +158,8 @@ pub(super) fn recover_llm_failure_for_agent_run(
     };
 
     if let Some(note) = recovery.as_ref() {
+        let context_recovery =
+            llm_context_error_recovery_detail(kind, &error.to_string(), token_budget);
         append_parent_phase_event(
             store,
             run_id,
@@ -103,6 +170,7 @@ pub(super) fn recover_llm_failure_for_agent_run(
                 "note": note,
                 "recoveryHints": llm_failure_recovery_hints(kind, &error.to_string()),
                 "classifiedError": llm_classified_error_detail(kind, &error.to_string(), None, None),
+                "contextRecovery": context_recovery,
             }),
         )?;
     }
@@ -118,6 +186,21 @@ fn recover_invalid_encrypted_content_for_retry(
     let in_memory = recover_reasoning_replay_text_for_retry(history, kind)?;
     let mut persisted = store.messages(conversation_id, None)?;
     let persisted_note = recover_reasoning_replay_text_for_retry(&mut persisted, kind)?;
+    if persisted_note.is_some() {
+        store.replace_conversation_messages(conversation_id, persisted)?;
+    }
+    Ok(combine_recovery_notes(in_memory, persisted_note))
+}
+
+fn recover_image_payloads_for_retry_persisted(
+    store: &AppStore,
+    conversation_id: &str,
+    history: &mut [ChatMessage],
+    kind: &str,
+) -> AppResult<Option<String>> {
+    let in_memory = recover_image_payloads_for_retry(history, kind)?;
+    let mut persisted = store.messages(conversation_id, None)?;
+    let persisted_note = recover_image_payloads_for_retry(&mut persisted, kind)?;
     if persisted_note.is_some() {
         store.replace_conversation_messages(conversation_id, persisted)?;
     }
@@ -182,6 +265,35 @@ pub(super) fn preflight_compact_context_for_agent_run(
             return Ok(None);
         }
     }
+    if let Some(engine_name) =
+        selected_context_engine_name().filter(|engine| !engine.eq_ignore_ascii_case("compressor"))
+    {
+        match run_context_engine_should_compress(&engine_name, &messages, rough_tokens, true) {
+            Ok(Some(false)) if rough_tokens <= chat_config.short_context_token_budget => {
+                append_parent_phase_event(
+                    store,
+                    run_id,
+                    "llm_preflight_compaction_skipped",
+                    json!({
+                        "reason": "context_engine_declined_preflight",
+                        "contextEngine": engine_name,
+                        "roughTokens": rough_tokens,
+                        "thresholdTokens": chat_config.short_context_token_budget,
+                    }),
+                )?;
+                return Ok(Some(format!(
+                    "LLM preflight compaction skipped: contextEngine={engine_name} should_compress_preflight=false at ~{rough_tokens} tokens."
+                )));
+            }
+            Ok(Some(false)) => {}
+            Ok(Some(true)) | Ok(None) => {}
+            Err(error) => {
+                eprintln!(
+                    "SynthChat context engine '{engine_name}' preflight should_compress failed: {error}"
+                );
+            }
+        }
+    }
     if let Some(note) = compression_anti_thrash_skip_note(short_context) {
         append_parent_phase_event(
             store,
@@ -197,7 +309,7 @@ pub(super) fn preflight_compact_context_for_agent_run(
         return Ok(Some(format!("LLM preflight compaction skipped: {note}")));
     }
 
-    let Some(note) = compact_conversation_history_for_context(
+    let dynamic_note = compact_conversation_history_with_context_engine(
         store,
         Some(run_id),
         conversation_id,
@@ -207,8 +319,23 @@ pub(super) fn preflight_compact_context_for_agent_run(
         keep_messages,
         "llm_preflight_compacted",
         "Preflight context budget management before LLM request.",
-    )?
-    else {
+    )?;
+    let note = if let Some(note) = dynamic_note {
+        Some(note)
+    } else {
+        compact_conversation_history_for_context(
+            store,
+            Some(run_id),
+            conversation_id,
+            history,
+            short_context,
+            chat_config.short_context_token_budget,
+            keep_messages,
+            "llm_preflight_compacted",
+            "Preflight context budget management before LLM request.",
+        )?
+    };
+    let Some(note) = note else {
         return Ok(None);
     };
 
@@ -236,18 +363,314 @@ pub(super) fn recover_context_overflow_for_retry(
     kind: &str,
     error: &AppError,
 ) -> AppResult<Option<String>> {
+    let detail = context_error_recovery_detail(&error.to_string(), token_budget);
+    let recovery_budget = detail
+        .provider_context_limit_tokens
+        .filter(|limit| *limit < token_budget)
+        .map(|limit| limit.saturating_mul(80) / 100)
+        .map(|budget| budget.max(1_000))
+        .unwrap_or(token_budget);
     let note = compact_conversation_history_for_context(
         store,
         Some(run_id),
         conversation_id,
         history,
         short_context,
-        token_budget,
+        recovery_budget,
         8,
         "llm_context_recovered",
-        &format!("Automatic LLM recovery for {kind}: {error}."),
+        &format!(
+            "Automatic LLM recovery for {kind}: {error}.{}",
+            detail.reason_suffix(recovery_budget)
+        ),
     )?;
-    Ok(note.map(|note| format!("Recovered {kind}: {note}")))
+    Ok(note.map(|note| {
+        format!(
+            "Recovered {kind}: {note}{}",
+            detail.note_suffix(recovery_budget)
+        )
+    }))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ContextErrorRecoveryDetail {
+    provider_context_limit_tokens: Option<usize>,
+    available_output_tokens: Option<usize>,
+}
+
+impl ContextErrorRecoveryDetail {
+    fn reason_suffix(self, recovery_budget: usize) -> String {
+        match self.provider_context_limit_tokens {
+            Some(limit) => format!(
+                " Provider reported context limit {limit} tokens; using recovery budget {recovery_budget} tokens."
+            ),
+            None => String::new(),
+        }
+    }
+
+    fn note_suffix(self, recovery_budget: usize) -> String {
+        let mut parts = Vec::new();
+        if let Some(limit) = self.provider_context_limit_tokens {
+            parts.push(format!(
+                "providerContextLimitTokens={limit}, recoveryTokenBudget={recovery_budget}"
+            ));
+        }
+        if let Some(tokens) = self.available_output_tokens {
+            parts.push(format!("availableOutputTokens={tokens}"));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", parts.join(", "))
+        }
+    }
+}
+
+fn context_error_recovery_detail(
+    message: &str,
+    current_token_budget: usize,
+) -> ContextErrorRecoveryDetail {
+    let available_output_tokens = parse_available_output_tokens_from_error(message);
+    let provider_context_limit_tokens = if available_output_tokens.is_some() {
+        None
+    } else {
+        parse_context_limit_from_error(message).filter(|limit| *limit < current_token_budget)
+    };
+    ContextErrorRecoveryDetail {
+        provider_context_limit_tokens,
+        available_output_tokens,
+    }
+}
+
+fn llm_context_error_recovery_detail(kind: &str, message: &str, token_budget: usize) -> Value {
+    if !matches!(
+        kind,
+        "context_overflow" | "payload_too_large" | "long_context_tier"
+    ) {
+        return Value::Null;
+    }
+    let detail = context_error_recovery_detail(message, token_budget);
+    if detail.provider_context_limit_tokens.is_none() && detail.available_output_tokens.is_none() {
+        return Value::Null;
+    }
+    let recovery_budget = detail
+        .provider_context_limit_tokens
+        .map(|limit| limit.saturating_mul(80) / 100)
+        .map(|budget| budget.max(1_000));
+    json!({
+        "providerContextLimitTokens": detail.provider_context_limit_tokens,
+        "recoveryTokenBudget": recovery_budget,
+        "availableOutputTokens": detail.available_output_tokens,
+    })
+}
+
+pub(super) fn parse_context_limit_from_error(message: &str) -> Option<usize> {
+    let lower = message.to_ascii_lowercase();
+    for phrase in [
+        "context_window",
+        "context window",
+        "context_length",
+        "context length",
+        "context size",
+        "max_model_len",
+        "maximum context",
+        "max context",
+        "context_length_exceeded",
+    ] {
+        if let Some(number) = first_reasonable_number_after(&lower, phrase, 80) {
+            return Some(number);
+        }
+    }
+    for (start, end, number) in digit_spans(&lower) {
+        if !(1024..=10_000_000).contains(&number) {
+            continue;
+        }
+        let window_start = start.saturating_sub(48);
+        let window_end = (end + 48).min(lower.len());
+        let window = &lower[window_start..window_end];
+        if contains_any(window, &["context", "max_model_len", "limit", "maximum"]) {
+            return Some(number);
+        }
+    }
+    None
+}
+
+pub(super) fn parse_available_output_tokens_from_error(message: &str) -> Option<usize> {
+    let lower = message.to_ascii_lowercase();
+    if !lower.contains("max_tokens")
+        || !contains_any(&lower, &["available_tokens", "available tokens"])
+    {
+        return None;
+    }
+    first_number_after(&lower, "available_tokens", 48)
+        .or_else(|| first_number_after(&lower, "available tokens", 48))
+        .or_else(|| {
+            lower.rsplit_once('=').and_then(|(_, tail)| {
+                digit_spans(tail)
+                    .last()
+                    .map(|(_, _, number)| number)
+                    .copied()
+            })
+        })
+        .filter(|tokens| *tokens >= 1)
+}
+
+fn first_number_after(text: &str, phrase: &str, max_chars: usize) -> Option<usize> {
+    let start = text.find(phrase)? + phrase.len();
+    let end = (start + max_chars).min(text.len());
+    digit_spans(&text[start..end])
+        .into_iter()
+        .map(|(_, _, number)| number)
+        .next()
+}
+
+fn first_reasonable_number_after(text: &str, phrase: &str, max_chars: usize) -> Option<usize> {
+    let start = text.find(phrase)? + phrase.len();
+    let end = (start + max_chars).min(text.len());
+    digit_spans(&text[start..end])
+        .into_iter()
+        .map(|(_, _, number)| number)
+        .find(|number| (1024..=10_000_000).contains(number))
+}
+
+fn digit_spans(text: &str) -> Vec<(usize, usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (index, ch) in text.char_indices() {
+        if ch.is_ascii_digit() {
+            start.get_or_insert(index);
+            continue;
+        }
+        if let Some(begin) = start.take() {
+            push_digit_span(text, begin, index, &mut spans);
+        }
+    }
+    if let Some(begin) = start {
+        push_digit_span(text, begin, text.len(), &mut spans);
+    }
+    spans
+}
+
+fn push_digit_span(text: &str, start: usize, end: usize, spans: &mut Vec<(usize, usize, usize)>) {
+    if end.saturating_sub(start) < 1 {
+        return;
+    }
+    if let Ok(number) = text[start..end].parse::<usize>() {
+        spans.push((start, end, number));
+    }
+}
+
+fn compact_conversation_history_with_context_engine(
+    store: &AppStore,
+    run_id: Option<&str>,
+    conversation_id: &str,
+    history: &mut Vec<ChatMessage>,
+    short_context: &mut ShortContextState,
+    token_budget: usize,
+    keep_messages: usize,
+    checkpoint_state: &str,
+    reason: &str,
+) -> AppResult<Option<String>> {
+    let Some(engine_name) =
+        selected_context_engine_name().filter(|engine| !engine.eq_ignore_ascii_case("compressor"))
+    else {
+        return Ok(None);
+    };
+    let messages = store.messages(conversation_id, None)?;
+    if messages.len() < 4 {
+        return Ok(None);
+    }
+    let keep_messages = keep_messages.max(1).min(messages.len());
+    let older_count = tail_start_preserving_latest_user_and_token_budget(
+        &messages,
+        messages.len().saturating_sub(keep_messages),
+        token_budget / 2,
+    );
+    if older_count < 2 {
+        return Ok(None);
+    }
+    let boundary_message = &messages[older_count - 1];
+    if short_context.boundary_id.as_deref() == Some(boundary_message.id.as_str()) {
+        return Ok(None);
+    }
+    let start = short_context
+        .boundary_id
+        .as_deref()
+        .and_then(|id| messages.iter().position(|message| message.id == id))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let start = align_compression_start_forward(&messages, start);
+    if start >= older_count {
+        return Ok(None);
+    }
+
+    let before_tokens = estimate_tokens(&format!(
+        "{}\n{}",
+        short_context.summary,
+        render_messages_for_summary(&messages[start..])
+    ));
+    let compressed = match run_context_engine_compress(
+        &engine_name,
+        &messages[start..older_count],
+        before_tokens,
+        Some(reason),
+    ) {
+        Ok(compressed) => compressed,
+        Err(error) => {
+            eprintln!(
+                "SynthChat context engine '{engine_name}' preflight compress failed: {error}"
+            );
+            return Ok(None);
+        }
+    };
+    let summary = context_engine_messages_to_summary(
+        short_context.summary.as_str(),
+        &engine_name,
+        &compressed,
+        token_budget,
+    );
+    let after_tokens = estimate_tokens(&format!(
+        "{}\n{}",
+        summary,
+        render_messages_for_summary(&messages[older_count..])
+    ));
+    short_context.boundary_id = Some(boundary_message.id.clone());
+    short_context.summary_tokens = estimate_tokens(&summary);
+    short_context.summary_messages = older_count;
+    short_context.summary = summary;
+    record_summary_success(short_context);
+    record_compression_effectiveness(short_context, before_tokens, after_tokens);
+    short_context.last_compression_rough_tokens = before_tokens;
+    short_context.awaiting_real_usage_after_compression = true;
+    *short_context = store.save_short_context(short_context.clone())?;
+    *history = sanitize_retained_tool_pairs(messages[older_count..].to_vec());
+
+    if let Some(run_id) = run_id {
+        let mut run = store.agent_run(run_id)?;
+        run.checkpoints.push(AgentCheckpointRecord {
+            checkpoint_id: new_id("ckpt"),
+            run_id: run_id.to_string(),
+            iteration: 0,
+            created_at: now_iso(),
+            state: checkpoint_state.into(),
+            completed_call_ids: Vec::new(),
+            event_refs: Vec::new(),
+            summary: format!(
+                "{checkpoint_state}: compacted {} message(s) through context engine {engine_name}.",
+                older_count.saturating_sub(start)
+            ),
+        });
+        run.updated_at = now_iso();
+        store.save_agent_run(run)?;
+    }
+
+    Ok(Some(format!(
+        "compacted {} message(s), retained {} message(s), summaryTokens={}, contextEngine={}.",
+        older_count.saturating_sub(start),
+        history.len(),
+        short_context.summary_tokens,
+        engine_name
+    )))
 }
 
 pub(super) fn compact_conversation_history_for_context(
@@ -381,12 +804,13 @@ pub(super) fn should_defer_preflight_to_real_usage(
     true
 }
 
-fn record_short_context_real_usage_for_run(
+pub(super) fn record_short_context_real_usage_for_run(
     store: &AppStore,
     run_id: &str,
-    prompt_tokens: usize,
+    reply: &crate::llm::LlmReply,
     threshold_tokens: usize,
 ) -> AppResult<()> {
+    let prompt_tokens = reply.prompt_tokens;
     if prompt_tokens == 0 {
         return Ok(());
     }
@@ -394,7 +818,170 @@ fn record_short_context_real_usage_for_run(
     let mut short_context = store.short_context(&run.conversation_id)?;
     update_short_context_real_usage(&mut short_context, prompt_tokens, threshold_tokens);
     store.save_short_context(short_context)?;
+    notify_context_engine_update_from_response(store, run_id, reply, threshold_tokens)?;
     Ok(())
+}
+
+fn notify_context_engine_update_from_response(
+    store: &AppStore,
+    run_id: &str,
+    reply: &crate::llm::LlmReply,
+    threshold_tokens: usize,
+) -> AppResult<()> {
+    let Some(engine_name) =
+        selected_context_engine_name().filter(|engine| !engine.eq_ignore_ascii_case("compressor"))
+    else {
+        return Ok(());
+    };
+    let total_tokens = reply
+        .prompt_tokens
+        .saturating_add(reply.completion_tokens)
+        .saturating_add(reply.reasoning_tokens);
+    let usage = json!({
+        "prompt_tokens": reply.prompt_tokens,
+        "completion_tokens": reply.completion_tokens,
+        "total_tokens": total_tokens,
+        "input_tokens": reply.prompt_tokens,
+        "output_tokens": reply.completion_tokens,
+        "cache_read_tokens": reply.cache_read_tokens,
+        "cache_write_tokens": reply.cache_write_tokens,
+        "reasoning_tokens": reply.reasoning_tokens,
+        "provider_id": reply.provider_id.clone(),
+        "provider_type": reply.provider_type.clone(),
+        "model": reply.model.clone(),
+        "base_url": reply.base_url.clone(),
+    });
+    let model_context = json!({
+        "model": reply.model.clone().unwrap_or_default(),
+        "context_length": threshold_tokens,
+        "base_url": reply.base_url.clone().unwrap_or_default(),
+        "api_key": "",
+        "provider": reply.provider_id.clone().unwrap_or_default(),
+        "api_mode": reply.provider_type.clone().unwrap_or_default(),
+    });
+    match run_context_engine_update_model(&engine_name, &model_context) {
+        Ok(implemented) => {
+            if implemented {
+                append_parent_phase_event(
+                    store,
+                    run_id,
+                    "context_engine_update_model",
+                    json!({
+                        "contextEngine": engine_name,
+                        "model": reply.model.clone(),
+                        "contextLength": threshold_tokens,
+                        "provider": reply.provider_id.clone(),
+                        "providerType": reply.provider_type.clone(),
+                        "baseUrlConfigured": reply
+                            .base_url
+                            .as_ref()
+                            .is_some_and(|value| !value.trim().is_empty()),
+                        "apiKeyForwarded": false,
+                    }),
+                )?;
+            }
+        }
+        Err(error) => {
+            eprintln!("SynthChat context engine '{engine_name}' update_model failed: {error}");
+        }
+    }
+    match run_context_engine_update_from_response(&engine_name, &usage) {
+        Ok(implemented) => {
+            if implemented {
+                append_parent_phase_event(
+                    store,
+                    run_id,
+                    "context_engine_update_from_response",
+                    json!({
+                        "contextEngine": engine_name,
+                        "promptTokens": reply.prompt_tokens,
+                        "completionTokens": reply.completion_tokens,
+                        "totalTokens": total_tokens,
+                    }),
+                )?;
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "SynthChat context engine '{engine_name}' update_from_response failed: {error}"
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn maybe_post_turn_compress_with_context_engine(
+    store: &AppStore,
+    run_id: &str,
+    conversation_id: &str,
+    prompt_tokens: usize,
+    token_budget: usize,
+    keep_messages: usize,
+) -> AppResult<Option<String>> {
+    let Some(engine_name) =
+        selected_context_engine_name().filter(|engine| !engine.eq_ignore_ascii_case("compressor"))
+    else {
+        return Ok(None);
+    };
+    let messages = store.messages(conversation_id, None)?;
+    let should_compress = match run_context_engine_should_compress(
+        &engine_name,
+        &messages,
+        prompt_tokens,
+        false,
+    ) {
+        Ok(Some(decision)) => decision,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            eprintln!(
+                    "SynthChat context engine '{engine_name}' post-turn should_compress failed: {error}"
+                );
+            return Ok(None);
+        }
+    };
+    if !should_compress {
+        append_parent_phase_event(
+            store,
+            run_id,
+            "context_engine_post_turn_compression_skipped",
+            json!({
+                "reason": "context_engine_declined_post_turn",
+                "contextEngine": engine_name,
+                "promptTokens": prompt_tokens,
+            }),
+        )?;
+        return Ok(Some(format!(
+            "Context engine post-turn compression skipped: contextEngine={engine_name} should_compress=false at {prompt_tokens} prompt tokens."
+        )));
+    }
+    let mut history = messages.clone();
+    let mut short_context = store.short_context(conversation_id)?;
+    let note = compact_conversation_history_with_context_engine(
+        store,
+        Some(run_id),
+        conversation_id,
+        &mut history,
+        &mut short_context,
+        token_budget,
+        keep_messages,
+        "context_engine_post_turn_compacted",
+        "Post-turn context engine compression after LLM response.",
+    )?;
+    if let Some(note) = note.as_ref() {
+        append_parent_phase_event(
+            store,
+            run_id,
+            "context_engine_post_turn_compression",
+            json!({
+                "contextEngine": engine_name,
+                "promptTokens": prompt_tokens,
+                "summaryMessages": short_context.summary_messages,
+                "summaryTokens": short_context.summary_tokens,
+                "note": note,
+            }),
+        )?;
+    }
+    Ok(note.map(|note| format!("Context engine post-turn compression: {note}")))
 }
 
 pub(super) fn update_short_context_real_usage(
@@ -1047,10 +1634,15 @@ pub(super) async fn complete_chat_with_provider_failover(
     let mut failed_providers = Vec::new();
     let mut attempts = Vec::new();
     for (index, provider) in providers.iter().enumerate() {
+        let credential_binding = crate::llm::bind_runtime_credential_for_attempt(provider);
+        let attempt_provider = credential_binding.provider;
+        let credential_source = credential_binding.source;
         let mut attempt_index = 0usize;
+        let mut max_tokens_override = None;
         let result = loop {
             let attempt_number = attempt_index + 1;
             let attempt_started = Instant::now();
+            let attempt_persona = persona_with_max_tokens_override(persona, max_tokens_override);
             let api_hook_payload = llm_api_request_hook_payload(
                 run_id,
                 provider,
@@ -1068,8 +1660,8 @@ pub(super) async fn complete_chat_with_provider_failover(
                 chat_config.agent_post_tool_quiet_timeout_seconds,
                 attempt_started,
                 crate::llm::complete_chat_with_options(
-                    provider,
-                    persona,
+                    &attempt_provider,
+                    &attempt_persona,
                     system_prompt.clone(),
                     history.clone(),
                     user_content,
@@ -1077,6 +1669,7 @@ pub(super) async fn complete_chat_with_provider_failover(
                     &crate::llm::LlmCallOptions {
                         responses_reasoning_replay_enabled: chat_config
                             .responses_reasoning_replay_enabled,
+                        fast_mode_enabled: chat_config.fast_mode_enabled,
                         stream_delta_callback: stream_delta_callback.clone(),
                     },
                 ),
@@ -1146,10 +1739,29 @@ pub(super) async fn complete_chat_with_provider_failover(
                         kind: kind.to_string(),
                         message: message.clone(),
                     });
-                    let rotate_credential =
+                    let next_max_tokens_override =
+                        next_max_tokens_override(max_tokens_override, persona.max_tokens, &message);
+                    let rotate_local_credential =
                         llm_credential_variant_should_skip_retry(provider, kind);
+                    let rotate_hermes_credential = if rotate_local_credential {
+                        false
+                    } else if llm_failure_kind_should_rotate_credential(kind) {
+                        if let Some(source) = credential_source.as_deref() {
+                            mark_hermes_credential_pool_failure_for_source(
+                                provider, source, kind, &message,
+                            )?
+                            .is_some()
+                        } else {
+                            mark_hermes_credential_pool_failure(provider, kind, &message)?.is_some()
+                        }
+                    } else {
+                        false
+                    };
+                    let rotate_credential = rotate_local_credential || rotate_hermes_credential;
                     if rotate_credential {
-                        store.mark_llm_credential_cooldown(&provider.id, kind, &message)?;
+                        if rotate_local_credential {
+                            store.mark_llm_credential_cooldown(&provider.id, kind, &message)?;
+                        }
                         if let Some(run_id) = run_id {
                             append_parent_phase_event(
                                 store,
@@ -1172,6 +1784,7 @@ pub(super) async fn complete_chat_with_provider_failover(
                         break Err(error);
                     }
                     attempt_index += 1;
+                    max_tokens_override = next_max_tokens_override;
                     let delay_ms = llm_retry_delay_ms(retry_backoff_ms, attempt_index, kind);
                     if let Some(run_id) = run_id {
                         let rate_limit_guard = if kind == "rate_limit" {
@@ -1193,12 +1806,32 @@ pub(super) async fn complete_chat_with_provider_failover(
                                 "attempt": attempt_index,
                                 "maxRetries": retry_count,
                                 "delayMs": delay_ms,
+                                "maxTokensOverride": max_tokens_override,
                                 "rateLimitGuard": rate_limit_guard.unwrap_or(Value::Null),
                                 "message": message,
                             }),
                         )?;
                     }
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    if !wait_llm_retry_delay_interruptible(store, run_id, delay_ms).await? {
+                        if let Some(run_id) = run_id {
+                            append_parent_phase_event(
+                                store,
+                                run_id,
+                                "llm_retry_interrupted",
+                                json!({
+                                    "providerId": provider.id.clone(),
+                                    "providerType": provider.provider_type.clone(),
+                                    "model": provider.model.clone(),
+                                    "kind": kind,
+                                    "attempt": attempt_index,
+                                    "delayMs": delay_ms,
+                                }),
+                            )?;
+                        }
+                        break Err(AppError::Llm(
+                            "Agent run interrupted during LLM retry wait.".into(),
+                        ));
+                    }
                 }
             }
         };
@@ -1210,7 +1843,7 @@ pub(super) async fn complete_chat_with_provider_failover(
                     record_short_context_real_usage_for_run(
                         store,
                         run_id,
-                        reply.prompt_tokens,
+                        &reply,
                         chat_config.short_context_token_budget,
                     )?;
                 }

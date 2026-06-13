@@ -222,6 +222,9 @@ fn acp_tool_complete_includes_raw_output(tool_name: &str, raw_output_text: Optio
             | "vision_analyze"
             | "image_generate"
             | "text_to_speech"
+            | "voice_status"
+            | "voice_playback"
+            | "voice_recording"
             | "cronjob"
             | "send_message"
             | "clarify"
@@ -234,14 +237,20 @@ fn acp_tool_complete_includes_raw_output(tool_name: &str, raw_output_text: Optio
             | "feishu_doc_read"
             | "feishu_drive_list_comments"
             | "feishu_drive_list_comment_replies"
+            | "feishu_drive_update_comment_reaction"
             | "feishu_drive_reply_comment"
             | "feishu_drive_add_comment"
             | "kanban_create"
+            | "kanban_specify"
             | "kanban_show"
+            | "kanban_update"
+            | "kanban_delete"
             | "kanban_comment"
             | "kanban_complete"
             | "kanban_block"
             | "kanban_link"
+            | "kanban_unlink"
+            | "kanban_bulk_update"
             | "kanban_heartbeat"
             | "yb_query_group_info"
             | "yb_query_group_members"
@@ -301,6 +310,7 @@ pub(super) fn acp_tool_event_kind(server_id: &str, tool_name: &str) -> String {
         | "skills_list"
         | "vision_analyze"
         | "video_analyze"
+        | "voice_status"
         | "recall_memory"
         | "feishu_doc_read"
         | "feishu_drive_list_comments"
@@ -320,13 +330,16 @@ pub(super) fn acp_tool_event_kind(server_id: &str, tool_name: &str) -> String {
         | "manage_memory"
         | "send_message"
         | "cronjob"
+        | "feishu_drive_update_comment_reaction"
         | "feishu_drive_reply_comment"
         | "feishu_drive_add_comment" => "edit".into(),
         "terminal" | "process" | "execute_code" | "computer_use" | "browser_click"
         | "browser_press" | "browser_type" | "browser_scroll" | "browser_back" | "browser_cdp"
         | "browser_dialog" | "delegate_task" | "image_generate" | "video_generate"
-        | "text_to_speech" | "yb_send_dm" | "yb_search_sticker" | "yb_send_sticker"
-        | "ha_call_service" | "mixture_of_agents" => "execute".into(),
+        | "text_to_speech" | "voice_playback" | "voice_recording" | "yb_send_dm"
+        | "yb_search_sticker" | "yb_send_sticker" | "ha_call_service" | "mixture_of_agents" => {
+            "execute".into()
+        }
         "web_request" | "web_extract" | "web_search" | "x_search" | "browser_navigate" => {
             "fetch".into()
         }

@@ -1,11 +1,17 @@
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
+
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
+use tokio::sync::broadcast;
 
 use crate::{
     error::{AppError, AppResult},
     models::{
-        new_id, now_iso, tool_event_kind, AgentRunPhaseRecord, AgentRunRecord, ChatMessage,
-        PlannerTraceRecord, ToolDefinition, ToolEvent,
+        new_id, now_iso, tool_event_kind, AgentGoalState, AgentRunPhaseRecord, AgentRunRecord,
+        ChatMessage, PlannerTraceRecord, ToolDefinition, ToolEvent,
     },
     store::AppStore,
 };
@@ -15,6 +21,42 @@ use super::{
     is_internal_tool, redact_json_value, redact_sensitive_text, resolve_mcp_tool,
     truncate_for_prompt,
 };
+
+static AGENT_RUN_BROADCASTERS: OnceLock<Mutex<HashMap<String, broadcast::Sender<AgentRunRecord>>>> =
+    OnceLock::new();
+
+fn agent_run_broadcasters() -> &'static Mutex<HashMap<String, broadcast::Sender<AgentRunRecord>>> {
+    AGENT_RUN_BROADCASTERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn subscribe_agent_run_record(run_id: &str) -> broadcast::Receiver<AgentRunRecord> {
+    let mut broadcasters = agent_run_broadcasters()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    broadcasters
+        .entry(run_id.to_string())
+        .or_insert_with(|| {
+            let (sender, _) = broadcast::channel(256);
+            sender
+        })
+        .subscribe()
+}
+
+pub(crate) fn publish_agent_run_record(run: &AgentRunRecord) {
+    let sender = {
+        let mut broadcasters = agent_run_broadcasters()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        broadcasters
+            .entry(run.run_id.clone())
+            .or_insert_with(|| {
+                let (sender, _) = broadcast::channel(256);
+                sender
+            })
+            .clone()
+    };
+    let _ = sender.send(run.clone());
+}
 
 pub(super) fn record_tool_event_for_run(
     store: &AppStore,
@@ -66,8 +108,23 @@ pub(super) fn record_tool_failed_for_run(
     error: &AppError,
 ) -> AppResult<()> {
     let (server_id, tool_name) = tool_event_target_for_request(requested_tool_name, mcp_tools);
-    let event = tool_failed_event(run_id, &server_id, &tool_name, payload, &error.to_string());
+    let (started, event) =
+        tool_failed_transition_events(run_id, &server_id, &tool_name, payload, &error.to_string());
+    record_tool_event_for_run(store, app, conversation_id, run_id, started)?;
     record_tool_event_for_run(store, app, conversation_id, run_id, event)
+}
+
+pub(super) fn tool_failed_transition_events(
+    run_id: &str,
+    server_id: &str,
+    tool_name: &str,
+    payload: &Value,
+    error: &str,
+) -> (ToolEvent, ToolEvent) {
+    (
+        tool_started_event(run_id, server_id, tool_name, payload),
+        tool_failed_event(run_id, server_id, tool_name, payload, error),
+    )
 }
 
 fn tool_event_target_for_request(
@@ -88,6 +145,7 @@ pub(super) fn emit_agent_run_record(
     run: &AgentRunRecord,
     message: Option<&ChatMessage>,
 ) {
+    publish_agent_run_record(run);
     let Some(app) = app else {
         return;
     };
@@ -106,6 +164,7 @@ pub(super) fn emit_agent_run_record(
         "subagentTask": &run.subagent_task,
         "subagentToolsets": &run.subagent_toolsets,
         "subagentMaxIterations": run.subagent_max_iterations,
+        "queueItemId": &run.queue_item_id,
         "state": &run.state,
         "message": message,
         "toolEvent": tool_event,
@@ -136,6 +195,25 @@ pub(crate) fn emit_agent_queue_event(
         "item": item,
     });
     let _ = app.emit("synthchat-agent-queue-event", payload);
+}
+
+pub(crate) fn emit_agent_goal_event(
+    app: Option<&AppHandle>,
+    event_type: &str,
+    conversation_id: &str,
+    goal: Option<&AgentGoalState>,
+    reason: Option<&str>,
+) {
+    let Some(app) = app else {
+        return;
+    };
+    let payload = json!({
+        "type": event_type,
+        "conversationId": conversation_id,
+        "goal": goal,
+        "reason": reason,
+    });
+    let _ = app.emit("synthchat-agent-goal-event", payload);
 }
 
 pub(super) fn record_tool_started_for_run(
@@ -319,7 +397,32 @@ pub(super) fn tool_failed_event(
     payload: &Value,
     error: &str,
 ) -> ToolEvent {
-    let error = redact_sensitive_text(error);
+    let error_json = serde_json::from_str::<Value>(error).ok();
+    let error = error_json
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(Value::as_str)
+        .map(redact_sensitive_text)
+        .unwrap_or_else(|| redact_sensitive_text(error));
+    let needs_reauth = error_json
+        .as_ref()
+        .and_then(|value| {
+            value
+                .get("needsReauth")
+                .or_else(|| value.get("needs_reauth"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false);
+    let raw = if let Some(error_json) = error_json {
+        json!({
+            "payload": payload,
+            "error": error,
+            "errorJson": error_json,
+            "needsReauth": needs_reauth
+        })
+    } else {
+        json!({"payload": payload, "error": error})
+    };
     ToolEvent {
         status: Some("failed".into()),
         reference_id: None,
@@ -354,9 +457,7 @@ pub(super) fn tool_failed_event(
         mime_type: Some("text/plain".into()),
         text: None,
         error: Some(error.clone()),
-        raw: Some(redact_json_value(
-            json!({"payload": payload, "error": error}),
-        )),
+        raw: Some(redact_json_value(raw)),
     }
 }
 

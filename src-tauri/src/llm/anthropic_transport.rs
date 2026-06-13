@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, time::Instant};
 
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
@@ -38,7 +35,10 @@ pub(super) async fn complete_anthropic_compatible(
     let effective_base_url = effective_anthropic_base_url(provider, api_key.as_deref());
     let url = anthropic_messages_url(provider, api_key.as_deref());
 
-    let headers = anthropic_headers(provider, api_key.as_deref(), &effective_base_url)?;
+    let mut headers = anthropic_headers(provider, api_key.as_deref(), &effective_base_url)?;
+    if options.fast_mode_enabled {
+        append_anthropic_beta_header(&mut headers, "fast-mode-2026-02-01")?;
+    }
 
     let messages = build_anthropic_messages(history);
 
@@ -53,6 +53,9 @@ pub(super) async fn complete_anthropic_compatible(
         "max_tokens": max_tokens,
         "stream": options.stream_delta_callback.is_some()
     });
+    if options.fast_mode_enabled {
+        body["speed"] = json!("fast");
+    }
     if anthropic_model_forbids_sampling_params(model) {
         if let Some(object) = body.as_object_mut() {
             object.remove("temperature");
@@ -63,18 +66,19 @@ pub(super) async fn complete_anthropic_compatible(
     }
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(provider.timeout_seconds.max(1)))
+        .timeout(provider_request_timeout_duration(provider, model))
         .default_headers(headers)
         .build()
         .map_err(|e| AppError::Llm(e.to_string()))?;
 
     let started_at = Instant::now();
-    let response = client
-        .post(url.clone())
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AppError::Llm(e.to_string()))?;
+    let response = send_llm_request_with_stale_timeout(
+        client.post(url.clone()).json(&body),
+        provider,
+        model,
+        "anthropic messages request",
+    )
+    .await?;
 
     let status = response.status();
     let response_headers = response.headers().clone();
@@ -99,7 +103,12 @@ pub(super) async fn complete_anthropic_compatible(
         retry_reason: None,
     };
     if let Some(callback) = options.stream_delta_callback.as_ref() {
-        let reply = read_anthropic_sse_stream(response, callback).await?;
+        let reply = read_anthropic_sse_stream(
+            response,
+            callback,
+            provider_stream_stale_timeout_duration(provider, model),
+        )
+        .await?;
         return Ok(with_reply_metadata_and_transport(
             reply,
             provider,
@@ -115,8 +124,8 @@ pub(super) async fn complete_anthropic_compatible(
         .map_err(|e| AppError::Llm(format!("failed to read llm response: {e}")))?;
     let payload: Value = serde_json::from_str(&text).map_err(|e| {
         AppError::Llm(format!(
-            "invalid anthropic response ({status}): {e}; body: {}",
-            response_preview(&text)
+            "invalid anthropic response ({status}): {e}; {}",
+            invalid_response_body_detail(&text, &response_headers)
         ))
     })?;
 
@@ -134,6 +143,7 @@ pub(super) async fn complete_anthropic_compatible(
 async fn read_anthropic_sse_stream(
     response: reqwest::Response,
     callback: &LlmDeltaCallback,
+    stale_timeout: Option<std::time::Duration>,
 ) -> AppResult<LlmReply> {
     let mut buffer = String::new();
     let mut content = String::new();
@@ -145,7 +155,22 @@ async fn read_anthropic_sse_stream(
     let mut tool_calls = BTreeMap::<usize, AnthropicStreamToolCall>::new();
     let mut stream = response.bytes_stream();
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next_chunk = if let Some(timeout) = stale_timeout {
+            tokio::time::timeout(timeout, stream.next())
+                .await
+                .map_err(|_| {
+                    AppError::Llm(format!(
+                        "anthropic stream stale: no provider bytes for {}s",
+                        timeout.as_secs_f64()
+                    ))
+                })?
+        } else {
+            stream.next().await
+        };
+        let Some(chunk) = next_chunk else {
+            break;
+        };
         let chunk =
             chunk.map_err(|e| AppError::Llm(format!("failed to read anthropic stream: {e}")))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -415,6 +440,7 @@ fn push_anthropic_text_message(messages: &mut Vec<Value>, role: &str, content: &
 }
 
 pub(super) fn is_anthropic_compatible(provider: &LlmProvider) -> bool {
+    let provider_id = provider.id.to_lowercase();
     let provider_type = provider.provider_type.to_lowercase();
     let preset = provider
         .preset
@@ -422,8 +448,11 @@ pub(super) fn is_anthropic_compatible(provider: &LlmProvider) -> bool {
         .unwrap_or_default()
         .to_lowercase();
     let base_url = provider_base_url(provider).to_lowercase();
-    provider_type == "anthropic"
+    provider_id.contains("minimax")
+        || provider_type == "anthropic"
+        || provider_type.contains("minimax")
         || preset.contains("anthropic")
+        || preset.contains("minimax")
         || base_url.contains("/anthropic")
         || base_url.ends_with("/v1/messages")
         || provider_uses_kimi_code_endpoint(provider, resolve_api_key(provider).as_deref())
@@ -552,6 +581,27 @@ pub(super) fn anthropic_headers(
         headers.insert("x-api-key", x_api_key);
     }
     Ok(headers)
+}
+
+fn append_anthropic_beta_header(headers: &mut HeaderMap, beta: &str) -> AppResult<()> {
+    let existing = headers
+        .get("anthropic-beta")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let combined = if existing
+        .split(',')
+        .any(|item| item.trim().eq_ignore_ascii_case(beta))
+    {
+        existing.to_string()
+    } else if existing.trim().is_empty() {
+        beta.to_string()
+    } else {
+        format!("{existing},{beta}")
+    };
+    let value = HeaderValue::from_str(&combined)
+        .map_err(|e| AppError::Llm(format!("invalid anthropic-beta header: {e}")))?;
+    headers.insert("anthropic-beta", value);
+    Ok(())
 }
 
 pub(super) fn anthropic_uses_oauth_bearer_auth(base_url: &str, key: &str) -> bool {
