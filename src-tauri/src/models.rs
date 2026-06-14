@@ -299,26 +299,56 @@ impl Default for ProfileConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct EmojiGroupConfig {
+    pub id: String,
+    pub name: String,
+    pub emotions: Vec<String>,
+    pub images: Vec<String>,
+    #[serde(default)]
+    pub emotion_images: std::collections::HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(default)]
 pub struct Persona {
     pub id: String,
     pub name: String,
+    #[serde(default)]
     pub agent_id: String,
+    #[serde(default)]
     pub avatar_path: Option<String>,
+    #[serde(default)]
     pub system_prompt: String,
+    #[serde(default)]
     pub character_prompt: String,
+    #[serde(default)]
     pub output_examples: String,
+    #[serde(default = "default_system_instructions")]
     pub system_instructions: String,
+    #[serde(default)]
     pub llm_provider: String,
+    #[serde(default)]
     pub llm_model: String,
+    #[serde(default = "default_temperature")]
     pub temperature: f32,
+    #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    #[serde(default = "default_tool_policy")]
     pub tool_policy: Value,
+    #[serde(default)]
     pub emoji_enabled: bool,
+    #[serde(default)]
     pub emoji_group: String,
+    #[serde(default = "default_emoji_send_probability")]
     pub emoji_send_probability: u8,
+    #[serde(default = "default_memory_config")]
     pub memory: Value,
+    #[serde(default = "default_proactive_config")]
     pub proactive: Value,
+    #[serde(default = "default_voice_reply_config")]
     pub voice_reply: Value,
+    #[serde(default = "default_image_generation_config")]
     pub image_generation: Value,
 }
 
@@ -332,21 +362,57 @@ impl Default for Persona {
             system_prompt: "你是一个友好、稳定的聊天助手。".into(),
             character_prompt: String::new(),
             output_examples: String::new(),
-            system_instructions: "请始终保持角色一致性。".into(),
+            system_instructions: default_system_instructions(),
             llm_provider: String::new(),
             llm_model: String::new(),
-            temperature: 0.8,
-            max_tokens: 2048,
-            tool_policy: json!({"enabled": true, "timeoutSeconds": 30, "maxIterations": 8, "maxFailureReplans": 2, "retryCount": 1, "retryBackoffMs": 300}),
+            temperature: default_temperature(),
+            max_tokens: default_max_tokens(),
+            tool_policy: default_tool_policy(),
             emoji_enabled: true,
             emoji_group: "default".into(),
-            emoji_send_probability: 25,
-            memory: json!({"enabled": true, "triggerRounds": 10, "maxMemories": 50, "includeInPrompt": true}),
-            proactive: json!({"enabled": false, "minIdleHours": 1, "maxIdleHours": 3, "maxConsecutive": 3, "prompt": "", "quietHours": {"enabled": true, "start": "22:00", "end": "08:00"}}),
-            voice_reply: json!({"enabled": false, "engine": "chattts", "pythonPath": "", "modelDir": "", "sampleRate": 16000, "speed": 5, "oral": 5, "laugh": 0, "breakLevel": 3, "speakerSeed": 0, "speakerEmbedding": "", "temperature": 0.3, "topP": 0.7, "topK": 20, "refineTextEnabled": true, "refinePrompt": "", "refineTemperature": 0.7}),
-            image_generation: json!({"enabled": false, "provider": "", "model": "", "stylePrefix": "", "artStyle": "", "negativePrompt": "", "negativeEnabled": false, "refMode": "avatar"}),
+            emoji_send_probability: default_emoji_send_probability(),
+            memory: default_memory_config(),
+            proactive: default_proactive_config(),
+            voice_reply: default_voice_reply_config(),
+            image_generation: default_image_generation_config(),
         }
     }
+}
+
+fn default_system_instructions() -> String {
+    "请始终保持角色一致性，结合角色详情、世界书与长期记忆作答。".into()
+}
+
+fn default_temperature() -> f32 {
+    0.8
+}
+
+fn default_max_tokens() -> u32 {
+    2048
+}
+
+fn default_tool_policy() -> Value {
+    json!({"enabled": true, "timeoutSeconds": 30, "maxIterations": 8, "maxFailureReplans": 2, "retryCount": 1, "retryBackoffMs": 300})
+}
+
+fn default_emoji_send_probability() -> u8 {
+    25
+}
+
+fn default_memory_config() -> Value {
+    json!({"enabled": true, "triggerRounds": 10, "maxMemories": 50, "includeInPrompt": true})
+}
+
+fn default_proactive_config() -> Value {
+    json!({"enabled": false, "minIdleHours": 1, "maxIdleHours": 3, "maxConsecutive": 3, "prompt": "用户已经一段时间没有回复了。请根据角色设定与近期对话，主动发起一条贴合角色的简短消息。", "quietHours": {"enabled": true, "start": "22:00", "end": "08:00"}})
+}
+
+fn default_voice_reply_config() -> Value {
+    json!({"enabled": false, "engine": "chattts", "pythonPath": "", "modelDir": "", "sampleRate": 16000, "speed": 5, "oral": 2, "laugh": 0, "breakLevel": 4, "speakerSeed": 20240, "speakerEmbedding": "models/ChatTTS/speaker/speaker_20240.pt", "temperature": 0.3, "topP": 0.7, "topK": 20, "refineTextEnabled": true, "refinePrompt": "[oral_2][laugh_0][break_4]", "refineTemperature": 0.7})
+}
+
+fn default_image_generation_config() -> Value {
+    json!({"enabled": false, "provider": "", "model": "", "stylePrefix": "", "artStyle": "anime style, masterpiece, best quality", "negativePrompt": "low quality, blurry, watermark, text, signature, lowres, bad anatomy, extra fingers, jpeg artifacts", "negativeEnabled": true, "refMode": "avatar"})
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,6 +459,24 @@ pub struct ChatMessage {
     pub account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_data: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProactiveStatus {
+    pub persona_id: String,
+    pub persona_name: String,
+    pub enabled: bool,
+    pub conversation_id: Option<String>,
+    pub last_user_at: i64,
+    pub seconds_since_last_user: i64,
+    pub wait_seconds: u64,
+    pub ready_in_seconds: i64,
+    pub consecutive_count: u32,
+    pub max_consecutive: u32,
+    pub in_quiet_hours: bool,
+    pub can_fire: bool,
+    pub blocked_reason: String,
 }
 
 impl ChatMessage {

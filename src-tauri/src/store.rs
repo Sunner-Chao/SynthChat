@@ -4824,6 +4824,84 @@ fn normalize_persisted_config(state: &mut PersistedState) {
         normalize_credential_pool_strategy(&state.config.chat.llm_credential_pool_strategy).into();
 }
 
+fn import_legacy_v0_personas_if_needed(state: &mut PersistedState) -> AppResult<bool> {
+    if !state.personas.is_empty() && !state.personas.iter().all(is_builtin_placeholder_persona) {
+        return Ok(false);
+    }
+    let Some(path) = legacy_v0_config_path() else {
+        return Ok(false);
+    };
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(false),
+    };
+    let root: Value = serde_json::from_slice(&bytes)?;
+    let Some(personas_value) = root.get("personas") else {
+        return Ok(false);
+    };
+    let personas = serde_json::from_value::<Vec<Persona>>(personas_value.clone())?
+        .into_iter()
+        .filter(|persona| !persona.id.trim().is_empty() && !persona.name.trim().is_empty())
+        .collect::<Vec<_>>();
+    if personas.is_empty() {
+        return Ok(false);
+    }
+    state.personas = personas;
+    state
+        .personas
+        .sort_by(|left, right| left.name.cmp(&right.name));
+
+    if let Some(profile_value) = root.get("profile") {
+        if let Ok(profile) = serde_json::from_value::<ProfileConfig>(profile_value.clone()) {
+            state.profile = profile;
+        }
+    }
+    if let Some(providers_value) = root.get("llmProviders") {
+        if let Ok(providers) = serde_json::from_value::<Vec<LlmProvider>>(providers_value.clone()) {
+            if !providers.is_empty() {
+                state.llm_providers = providers;
+            }
+        }
+    }
+    if let Some(image_value) = root.get("imageProviders") {
+        if let Ok(providers) = serde_json::from_value::<Vec<ImageProvider>>(image_value.clone()) {
+            state.image_providers = providers;
+        }
+    }
+    if let Some(worldbooks_value) = root.get("worldbooks").and_then(Value::as_array) {
+        state.worldbooks = worldbooks_value.clone();
+    }
+    Ok(true)
+}
+
+fn is_builtin_placeholder_persona(persona: &Persona) -> bool {
+    persona.id == "default"
+        && (persona.name == "小可" || persona.name == "默认角色")
+        && persona.character_prompt.trim().is_empty()
+        && persona.output_examples.trim().is_empty()
+}
+
+fn legacy_v0_config_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("SYNTHCHAT_LEGACY_V0_CONFIG_PATH") {
+        let path = PathBuf::from(path.trim());
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let manifest_parent = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()?
+        .to_path_buf();
+    let root = manifest_parent.parent()?;
+    [
+        root.join("SynthChat-V0.1.8").join("config.json"),
+        root.join("SynthChat-V0.1.8")
+            .join("src-tauri")
+            .join("config.json"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+}
+
 fn normalize_interrupted_runs(state: &mut PersistedState) {
     let now = now_iso();
     let mut interrupted_conversations = HashSet::new();
@@ -5307,6 +5385,7 @@ fn mark_agent_run_aborted(run: &mut AgentRunRecord, now: &str, summary: &str) {
 
 impl AppStore {
     pub fn new(path: PathBuf) -> AppResult<Self> {
+        let state_existed = path.exists();
         let mut state = if path.exists() {
             let raw = fs::read_to_string(&path)?;
             match serde_json::from_str(&raw) {
@@ -5320,6 +5399,17 @@ impl AppStore {
             PersistedState::default()
         };
         normalize_persisted_config(&mut state);
+        if import_legacy_v0_personas_if_needed(&mut state)? {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&path, serde_json::to_vec_pretty(&state)?)?;
+        } else if !state_existed {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&path, serde_json::to_vec_pretty(&state)?)?;
+        }
         normalize_interrupted_runs(&mut state);
         let store = Self {
             path,
@@ -7195,6 +7285,29 @@ impl AppStore {
         })
     }
 
+    pub fn delete_persona(&self, id: &str) -> AppResult<Persona> {
+        self.with_state(|s| {
+            let index = s
+                .personas
+                .iter()
+                .position(|persona| persona.id == id)
+                .ok_or_else(|| AppError::NotFound(format!("persona not found: {id}")))?;
+            let removed = s.personas.remove(index);
+            let fallback_id = s
+                .personas
+                .first()
+                .map(|persona| persona.id.clone())
+                .unwrap_or_else(|| "default".to_string());
+            for conversation in &mut s.conversations {
+                if conversation.persona_id.as_deref() == Some(id) {
+                    conversation.persona_id = Some(fallback_id.clone());
+                }
+            }
+            self.persist(s)?;
+            Ok(removed)
+        })
+    }
+
     pub fn conversations(&self) -> AppResult<Vec<Conversation>> {
         self.with_state(|s| {
             let mut items = s.conversations.clone();
@@ -7494,6 +7607,133 @@ impl AppStore {
                 object.insert(key.to_string(), value);
             }
             let saved = conv.clone();
+            self.persist(s)?;
+            Ok(saved)
+        })
+    }
+
+    pub fn set_conversation_wechat_account(
+        &self,
+        id: &str,
+        account_id: Option<String>,
+    ) -> AppResult<Conversation> {
+        self.with_state(|s| {
+            let conv = s
+                .conversations
+                .iter_mut()
+                .find(|c| c.id == id)
+                .ok_or_else(|| AppError::NotFound(format!("conversation {id}")))?;
+            conv.wechat_account_id = account_id;
+            let saved = conv.clone();
+            self.persist(s)?;
+            Ok(saved)
+        })
+    }
+
+    pub fn merge_conversation_into(
+        &self,
+        source_id: &str,
+        target_id: &str,
+    ) -> AppResult<Conversation> {
+        if source_id == target_id {
+            return self.conversation(target_id);
+        }
+        self.with_state(|s| {
+            let source = s
+                .conversations
+                .iter()
+                .find(|c| c.id == source_id)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("conversation {source_id}")))?;
+            let mut saved = {
+                let target = s
+                    .conversations
+                    .iter_mut()
+                    .find(|c| c.id == target_id)
+                    .ok_or_else(|| AppError::NotFound(format!("conversation {target_id}")))?;
+                if target.wechat_account_id.is_none() {
+                    target.wechat_account_id = source.wechat_account_id.clone();
+                }
+                if !target.metadata.is_object() {
+                    target.metadata = json!({});
+                }
+                if let Some(target_object) = target.metadata.as_object_mut() {
+                    if let Some(source_object) = source.metadata.as_object() {
+                        for key in ["platform", "wechatAccountId"] {
+                            if !target_object.contains_key(key) {
+                                if let Some(value) = source_object.get(key) {
+                                    target_object.insert(key.to_string(), value.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                target.clone()
+            };
+
+            let mut moved = s.messages.remove(source_id).unwrap_or_default();
+            for message in &mut moved {
+                message.conversation_id = target_id.to_string();
+            }
+            let target_messages = s.messages.entry(target_id.to_string()).or_default();
+            target_messages.append(&mut moved);
+            target_messages.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+            let last_message_update = target_messages.last().map(|last| {
+                (
+                    last.content.chars().take(120).collect(),
+                    last.created_at.clone(),
+                )
+            });
+            if let Some((last_message, updated_at)) = last_message_update {
+                if let Some(target) = s.conversations.iter_mut().find(|c| c.id == target_id) {
+                    target.last_message = last_message;
+                    target.updated_at = updated_at;
+                    saved = target.clone();
+                }
+            }
+
+            for run in &mut s.agent_runs {
+                if run.conversation_id == source_id {
+                    run.conversation_id = target_id.to_string();
+                }
+            }
+            for item in &mut s.agent_queue {
+                if item.conversation_id == source_id {
+                    item.conversation_id = target_id.to_string();
+                }
+            }
+            for item in &mut s.agent_todos {
+                if item.conversation_id == source_id {
+                    item.conversation_id = target_id.to_string();
+                }
+            }
+            for approval in &mut s.tool_approvals {
+                if approval.conversation_id.as_deref() == Some(source_id) {
+                    approval.conversation_id = Some(target_id.to_string());
+                }
+            }
+            for trace in &mut s.planner_traces {
+                if trace.conversation_id == source_id {
+                    trace.conversation_id = target_id.to_string();
+                }
+            }
+            for trace in &mut s.tool_router_traces {
+                if trace.conversation_id == source_id {
+                    trace.conversation_id = target_id.to_string();
+                }
+            }
+            if let Some(short_context) = s.short_context.remove(source_id) {
+                s.short_context
+                    .entry(target_id.to_string())
+                    .or_insert(short_context);
+            }
+            for job in &mut s.scheduled_agent_jobs {
+                if job.conversation_id.as_deref() == Some(source_id) {
+                    job.conversation_id = Some(target_id.to_string());
+                    job.updated_at = now_iso();
+                }
+            }
+            s.conversations.retain(|c| c.id != source_id);
             self.persist(s)?;
             Ok(saved)
         })

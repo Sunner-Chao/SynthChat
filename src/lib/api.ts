@@ -16,6 +16,7 @@ import type {
   ChatAttachment,
   ChatMessage,
   Conversation,
+  EmojiGroup,
   EnvCheckResult,
   HermesCredentialPoolEntryStatus,
   ImageProvider,
@@ -27,6 +28,7 @@ import type {
   Persona,
   PluginAuxiliaryTaskSummary,
   ProfileConfig,
+  ProactiveStatus,
   SearchProvider,
   ScheduledAgentJob,
   ScheduledJobOutputRecord,
@@ -38,7 +40,14 @@ import type {
   VideoProvider,
   VisionProvider,
   WorkspaceSnapshotManifest,
-  WorkspaceSnapshotRestoreResult
+  WorkspaceSnapshotRestoreResult,
+  AccountConfig,
+  WechatConfig,
+  WechatInboundResult,
+  WechatLinkSummary,
+  WechatPollResult,
+  WechatQrStartResult,
+  WechatQrStatusResult
 } from "./types";
 
 const fallbackConfig: AppConfig = {
@@ -697,12 +706,29 @@ export const api: Record<string, any> = {
   clearMomentCover: (postId: string) => pass({ id: postId, personaId: "default", body: "", likedBy: [], comments: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }),
   listCapabilityAdapters: () => call("list_capability_adapters", {}, () => []),
   saveCapabilityAdapters: (adapters: unknown[]) => call("save_capability_adapters", { adapters }, () => adapters),
-  listProactiveStatuses: () => empty(),
-  triggerProactiveOnce: async () => undefined,
-  listAccounts: () => empty(),
-  saveAccounts: async () => undefined,
-  linkWechatAccount: async () => [],
-  unlinkWechatAccount: async () => [],
+  listProactiveStatuses: () => call<ProactiveStatus[]>("list_proactive_statuses", {}, () => []),
+  triggerProactiveOnce: (personaId: string) =>
+    call<ProactiveStatus>("trigger_proactive_once", { personaId }, () => ({
+      personaId,
+      personaName: "",
+      enabled: false,
+      conversationId: null,
+      lastUserAt: 0,
+      secondsSinceLastUser: 0,
+      waitSeconds: 0,
+      readyInSeconds: 0,
+      consecutiveCount: 0,
+      maxConsecutive: 1,
+      inQuietHours: false,
+      canFire: false,
+      blockedReason: "主动消息后端不可用"
+    })),
+  listAccounts: () => call<AccountConfig[]>("list_accounts", {}, () => []),
+  saveAccounts: (accounts: AccountConfig[]) => call("save_accounts", { accounts }, () => undefined),
+  linkWechatAccount: (personaId: string, accountId: string) =>
+    call<AccountConfig[]>("link_wechat_account", { personaId, accountId }, () => []),
+  unlinkWechatAccount: (personaId: string) =>
+    call<AccountConfig[]>("unlink_wechat_account", { personaId }, () => []),
   listImageProviders: () => call<ImageProvider[]>("list_image_providers", {}, () => []),
   saveImageProviders: (providers: ImageProvider[]) => call("save_image_providers", { providers }, () => undefined),
   listVideoProviders: () => call<VideoProvider[]>("list_video_providers", {}, () => []),
@@ -713,17 +739,24 @@ export const api: Record<string, any> = {
   saveVisionProviders: (providers: VisionProvider[]) => call("save_vision_providers", { providers }, () => undefined),
   listBrowserProviders: () => call<BrowserProvider[]>("list_browser_providers", {}, () => []),
   saveBrowserProviders: (providers: BrowserProvider[]) => call("save_browser_providers", { providers }, () => undefined),
-  listEmojiGroups: () => empty(),
-  saveEmojiGroups: async () => undefined,
-  uploadEmojiImage: async () => [],
-  createEmojiGroup: async () => [],
-  renameEmojiGroup: async () => [],
-  deleteEmojiGroup: async () => [],
-  createEmojiEmotion: async () => [],
-  renameEmojiEmotion: async () => [],
-  deleteEmojiEmotion: async () => [],
-  renameEmojiImage: async () => [],
-  deleteEmojiImage: async () => [],
+  listEmojiGroups: () => call<EmojiGroup[]>("list_emoji_groups", {}, () => []),
+  saveEmojiGroups: (groups: EmojiGroup[]) => call("save_emoji_groups", { groups }, () => undefined),
+  uploadEmojiImage: (groupId: string, emotion: string, fileName: string, bytes: number[]) =>
+    call<EmojiGroup[]>("upload_emoji_image", { groupId, emotion, fileName, bytes }, () => []),
+  createEmojiGroup: (name: string) => call<EmojiGroup[]>("create_emoji_group", { name }, () => []),
+  renameEmojiGroup: (groupId: string, newName: string) =>
+    call<EmojiGroup[]>("rename_emoji_group", { groupId, newName }, () => []),
+  deleteEmojiGroup: (groupId: string) => call<EmojiGroup[]>("delete_emoji_group", { groupId }, () => []),
+  createEmojiEmotion: (groupId: string, emotion: string) =>
+    call<EmojiGroup[]>("create_emoji_emotion", { groupId, emotion }, () => []),
+  renameEmojiEmotion: (groupId: string, emotion: string, newName: string) =>
+    call<EmojiGroup[]>("rename_emoji_emotion", { groupId, emotion, newName }, () => []),
+  deleteEmojiEmotion: (groupId: string, emotion: string) =>
+    call<EmojiGroup[]>("delete_emoji_emotion", { groupId, emotion }, () => []),
+  renameEmojiImage: (groupId: string, emotion: string, fileName: string, newName: string) =>
+    call<EmojiGroup[]>("rename_emoji_image", { groupId, emotion, fileName, newName }, () => []),
+  deleteEmojiImage: (groupId: string, emotion: string, fileName: string) =>
+    call<EmojiGroup[]>("delete_emoji_image", { groupId, emotion, fileName }, () => []),
   cleanupHistoricalResources: () => call("cleanup_historical_resources", {}, () => ({
     skipped: true,
     removedConversations: 0,
@@ -806,10 +839,13 @@ export const api: Record<string, any> = {
   denyToolCall: (approvalId: string, reason?: string) => call("deny_tool_call", { approvalId, reason }, () => null),
   refreshToolRegistry: () => call("refresh_tool_registry", {}, () => []),
   saveProfileAvatar: async () => fallbackProfile,
-  uploadProfileAvatar: async () => fallbackProfile,
-  clearProfileAvatar: async () => fallbackProfile,
-  uploadPersonaAvatar: (personaId: string) => pass({ ...defaultPersona, id: personaId }),
-  clearPersonaAvatar: (personaId: string) => pass({ ...defaultPersona, id: personaId, avatarPath: "" }),
+  uploadProfileAvatar: (fileName: string, bytes: number[]) =>
+    call<ProfileConfig>("upload_profile_avatar", { fileName, bytes }, () => fallbackProfile),
+  clearProfileAvatar: () => call<ProfileConfig>("clear_profile_avatar", {}, () => fallbackProfile),
+  uploadPersonaAvatar: (personaId: string, fileName: string, bytes: number[]) =>
+    call<Persona>("upload_persona_avatar", { personaId, fileName, bytes }, () => ({ ...defaultPersona, id: personaId })),
+  clearPersonaAvatar: (personaId: string) =>
+    call<Persona>("clear_persona_avatar", { personaId }, () => ({ ...defaultPersona, id: personaId, avatarPath: "" })),
   importThemeCss: async () => [],
   exportThemesCss: async () => "",
   pickFile: async () => null,
@@ -825,11 +861,18 @@ export const api: Record<string, any> = {
   installChatttsDeps: async () => ok(),
   installAllMissing: async () => ok(),
   cancelEnvironmentAction: async () => ok(),
-  getWechatConfig: async () => ({ baseUrl: "", timeoutSeconds: 15 }),
-  saveWechatConfig: async () => undefined,
-  startWechatQr: async () => ({ qrcode: "", baseUrl: "", raw: null }),
-  checkWechatQrStatus: async () => ({ status: "idle", raw: null }),
-  wechatPollOnce: async () => ({ account: null, processed: [], receivedCount: 0, skippedCount: 0, updatedBuffer: false, raw: null }),
+  getWechatConfig: () => call<WechatConfig>("get_wechat_config", {}, () => ({ baseUrl: "", timeoutSeconds: 35 })),
+  saveWechatConfig: (config: WechatConfig) =>
+    call<WechatConfig>("save_wechat_config", { config }, () => config),
+  startWechatQr: (baseUrl?: string) =>
+    call<WechatQrStartResult>("start_wechat_qr", { baseUrl: baseUrl || null }, () => ({ qrcode: "", baseUrl: baseUrl || "", raw: null })),
+  checkWechatQrStatus: (qrcode: string, baseUrl?: string) =>
+    call<WechatQrStatusResult>("check_wechat_qr_status", { qrcode, baseUrl: baseUrl || null }, () => ({ status: "idle", raw: null })),
+  listWechatLinks: () => call<WechatLinkSummary[]>("list_wechat_links", {}, () => []),
+  wechatInboundText: (accountId: string, userId: string, text: string, contextToken?: string) =>
+    call<WechatInboundResult>("wechat_inbound_text", { accountId, userId, text, contextToken: contextToken || null }, () => ({ messages: [], delivered: false, deliveryError: "wechat runtime unavailable" })),
+  wechatPollOnce: (accountId: string, timeoutSeconds?: number) =>
+    call<WechatPollResult>("wechat_poll_once", { accountId, timeoutSeconds: timeoutSeconds ?? null }, () => ({ account: null as unknown as AccountConfig, processed: [], receivedCount: 0, skippedCount: 0, updatedBuffer: false, raw: null })),
   openai: {},
   anthropic: {},
   deepseek: {},

@@ -16,7 +16,10 @@ export function PersonaPanel() {
     saveConfig,
     deletePersona,
     uploadPersonaAvatar,
-    clearPersonaAvatar
+    clearPersonaAvatar,
+    proactiveStatuses,
+    refreshProactiveStatuses,
+    triggerProactiveOnce
   } = useAppStore();
   const [selectedId, setSelectedId] = useState(personas[0]?.id ?? "default");
   const selectedPersona = personas.find((persona) => persona.id === selectedId) ?? personas[0] ?? createDraftPersona();
@@ -34,7 +37,12 @@ export function PersonaPanel() {
     }
   }, [personas, selectedId]);
 
+  useEffect(() => {
+    void refreshProactiveStatuses();
+  }, [refreshProactiveStatuses, personas.length]);
+
   const provider = llmProviders.find((item) => item.id === draft.llmProvider) ?? llmProviders[0];
+  const proactiveStatus = proactiveStatuses.find((status) => status.personaId === draft.id);
 
   const updateDraft = <K extends keyof Persona>(key: K, value: Persona[K]) => {
     setDraft((current) => ({ ...current, [key]: value }));
@@ -361,6 +369,23 @@ export function PersonaPanel() {
               主动消息提示词
               <textarea value={draft.proactive?.prompt ?? ""} onChange={(event) => setDraft((current) => ({ ...current, proactive: { ...(current.proactive ?? defaultProactiveConfig()), prompt: event.target.value } }))} />
             </label>
+            <div className="memory-item" style={{ alignItems: "center" }}>
+              <div className="memory-content">
+                <strong>{proactiveStatus?.canFire ? "主动消息已就绪" : proactiveStatus?.blockedReason || "主动消息状态未同步"}</strong>
+                <span className="memory-meta">
+                  间隔 {Math.ceil((proactiveStatus?.waitSeconds ?? 0) / 60)} 分钟 · 连续 {proactiveStatus?.consecutiveCount ?? 0}/{proactiveStatus?.maxConsecutive ?? 1}
+                </span>
+              </div>
+              <button
+                onClick={async () => {
+                  await savePersona(draft);
+                  await triggerProactiveOnce(draft.id);
+                }}
+                type="button"
+              >
+                立即触发
+              </button>
+            </div>
             <div className="form-section-title" style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
               <Mic size={15} style={{ color: "var(--primary)" }} />
               微信语音回复

@@ -74,6 +74,7 @@ pub(super) fn agent_planner_prompt_for_agent_context(
         mcp_tools,
         tool_context,
         agent,
+        None,
         &InternalToolAvailability::all_available(),
         "Current LLM model metadata: unavailable.",
     )
@@ -88,6 +89,7 @@ pub(super) fn agent_planner_prompt_for_agent_context_with_store(
     mcp_tools: &[ToolDefinition],
     tool_context: ToolExecutionContext,
     agent: &AgentDefinition,
+    persona: Option<&Persona>,
 ) -> String {
     let availability = internal_tool_availability(store);
     let model_metadata_block = agent_model_metadata_prompt_block(store, agent);
@@ -99,6 +101,7 @@ pub(super) fn agent_planner_prompt_for_agent_context_with_store(
         mcp_tools,
         tool_context,
         agent,
+        persona,
         &availability,
         &model_metadata_block,
     )
@@ -112,6 +115,7 @@ pub(super) fn agent_planner_prompt_for_agent_context_with_availability(
     mcp_tools: &[ToolDefinition],
     tool_context: ToolExecutionContext,
     agent: &AgentDefinition,
+    persona: Option<&Persona>,
     availability: &InternalToolAvailability,
     model_metadata_block: &str,
 ) -> String {
@@ -126,6 +130,7 @@ pub(super) fn agent_planner_prompt_for_agent_context_with_availability(
     let mcp_tool_block = render_mcp_tool_definitions(mcp_tools);
     let internal_tool_block = render_internal_tool_prompt_block(agent, tool_context, availability);
     let environment_probe_block = environment_probe_prompt_block();
+    let persona_block = render_persona_prompt_block(persona);
     format!(
         r#"You are SynthChat's recovered agent runtime. Decide the next step from the user request and current observations.
 
@@ -136,6 +141,9 @@ When tools are available and the task needs inspection, commands, file edits, br
 
 Skill instructions:
 {skill_block}
+
+Current persona:
+{persona_block}
 
 Relevant memory:
 {memory_block}
@@ -156,6 +164,7 @@ Environment notes:
 {environment_probe_block}
 
 Use tools when the answer needs project context. Prefer search_files before read_file when you do not know the exact file.
+When the user explicitly asks you to check, query, inspect, run a tool, or needs current local environment information such as the current date/time, you must use an available tool before the final answer. Do not claim you cannot check if terminal/env_probe or another relevant tool is available.
 Use session_search when the user asks what happened earlier, asks to resume prior work, or needs evidence from previous conversations/runs/tool outputs.
 Use clarify only when required information is missing and no safe tool action or partial answer can move the task forward.
 Use cronjob only when the user asks to schedule, remind, recur, automate later, pause, resume, delete, list, or manually trigger scheduled work.
@@ -175,6 +184,42 @@ If no tool is needed, answer directly with final.
 Current observations:
 {observation_block}"#
     )
+}
+
+fn render_persona_prompt_block(persona: Option<&Persona>) -> String {
+    let Some(persona) = persona else {
+        return "No persona context provided.".into();
+    };
+    let mut parts = Vec::new();
+    if !persona.name.trim().is_empty() {
+        parts.push(format!("Name: {}", persona.name.trim()));
+    }
+    if !persona.system_prompt.trim().is_empty() {
+        parts.push(format!("System prompt:\n{}", persona.system_prompt.trim()));
+    }
+    if !persona.system_instructions.trim().is_empty() {
+        parts.push(format!(
+            "System instructions:\n{}",
+            persona.system_instructions.trim()
+        ));
+    }
+    if !persona.character_prompt.trim().is_empty() {
+        parts.push(format!(
+            "Character profile:\n{}",
+            persona.character_prompt.trim()
+        ));
+    }
+    if !persona.output_examples.trim().is_empty() {
+        parts.push(format!(
+            "Output examples:\n{}",
+            persona.output_examples.trim()
+        ));
+    }
+    if parts.is_empty() {
+        "No persona context provided.".into()
+    } else {
+        truncate_for_prompt(&parts.join("\n\n"), 24_000)
+    }
 }
 
 fn agent_model_metadata_prompt_block(store: &AppStore, agent: &AgentDefinition) -> String {

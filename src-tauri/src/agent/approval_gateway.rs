@@ -157,6 +157,7 @@ async fn continue_agent_run_after_approval(
             &mcp_tools,
             ToolExecutionContext::Interactive,
             &agent,
+            Some(&effective_persona),
         );
         let pre_llm_contexts = run_pre_llm_call_hooks(store, &run.run_id, &run.user_request).await;
         let llm_user_content = inject_pre_llm_hook_context(&run.user_request, &pre_llm_contexts);

@@ -667,8 +667,9 @@ function AccountsSettings({
         setTimeout(() => {
           setShowQrSheet(false);
           setScanSuccess(false);
-          setPendingNoteId(status.account!.id);
-          setNoteDraft(status.account!.note || "");
+          setDetailId(status.account!.id);
+          setBindDraft(status.account!.linkedPersona || "");
+          setPollStatus("扫码成功。请选择并保存链接角色，保存后后台会自动同步手机消息。");
         }, 1200);
       }
     } catch {
@@ -796,7 +797,9 @@ function AccountsSettings({
             <div className="detail-row"><span>创建时间</span><strong>{detail.createdAt ? formatTime(detail.createdAt) : "未知"}</strong></div>
             <div className="detail-row"><span>最后登录</span><strong>{detail.lastLoginAt ? formatTime(detail.lastLoginAt) : "未记录"}</strong></div>
           </div>
-          <div className="form-hint">点击保存按钮更新账号配置</div>
+          <div className="form-hint">
+            保存链接角色后，后台会自动轮询该微信账号并把手机消息送入对应角色会话。
+          </div>
         </div>
         <div className="card" style={{ margin: "0 16px 12px" }}>
           <div className="card-header">操作</div>
@@ -873,7 +876,15 @@ function AccountsSettings({
             ) : (
               <>
                 {qr?.qrImage ? <img className="qr-sheet-img" alt="QR Code" src={qr.qrImage} /> : null}
-                <div className="qr-status">等待扫码确认...</div>
+                {qrError ? <div className="qr-error">{qrError}</div> : null}
+                {!qr?.qrImage && qr?.qrcode ? (
+                  <div className="qr-raw">
+                    <span>接口已返回二维码内容，但图片未生成</span>
+                    <code>{qr.qrcode}</code>
+                  </div>
+                ) : null}
+                <div className="qr-status">{qrError ? "二维码获取失败" : qr?.qrImage ? "等待扫码确认..." : "正在等待二维码..."}</div>
+                {!busy && !qr?.qrImage ? <button className="qr-check-btn" onClick={() => void startQr()} type="button">重新获取二维码</button> : null}
               </>
             )}
             <button className="btn-text" onClick={() => setShowQrSheet(false)} type="button">取消</button>

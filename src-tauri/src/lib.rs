@@ -9,24 +9,26 @@ mod plugins;
 mod skills;
 mod store;
 mod threat_patterns;
+mod wechat_settings;
 
 use std::{
     collections::HashMap,
     fs,
     hash::{Hash, Hasher},
     io::{self, BufRead, IsTerminal, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use chrono::Timelike;
 use error::{AppError, AppResult};
 use model_catalog::{ModelCapabilities, ModelCatalogEntry, ProviderCatalogInfo};
 use models::{
-    new_id, AgentDefinition, AppConfig, BrowserProvider, ImageProvider, LlmProvider, Persona,
-    ProfileConfig, ScheduledAgentJob, ScheduledJobOutputRecord, SearchProvider, SendChatRequest,
-    VideoProvider, VisionProvider,
+    new_id, AgentDefinition, AppConfig, BrowserProvider, EmojiGroupConfig, ImageProvider,
+    LlmProvider, Persona, ProactiveStatus, ProfileConfig, ScheduledAgentJob,
+    ScheduledJobOutputRecord, SearchProvider, SendChatRequest, VideoProvider, VisionProvider,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -35,6 +37,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 const REMOTE_SKILL_FETCH_TIMEOUT_SECS: u64 = 20;
 const MAX_CHAT_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
+const MAX_AVATAR_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcpCliAction {
@@ -541,6 +544,35 @@ fn save_profile(store: State<'_, AppStore>, profile: ProfileConfig) -> AppResult
 }
 
 #[tauri::command(rename_all = "camelCase")]
+fn upload_profile_avatar(
+    store: State<'_, AppStore>,
+    file_name: String,
+    bytes: Vec<u8>,
+) -> AppResult<ProfileConfig> {
+    validate_avatar_bytes(&bytes)?;
+    let ext = image_ext_from_bytes(&bytes).unwrap_or(normalized_image_ext(&file_name)?);
+    let mut profile = store.profile()?;
+    if let Some(path) = &profile.avatar_path {
+        remove_file_if_local(path);
+    }
+    let dir = store.data_dir().join("profile");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("avatar-{}.{}", new_id("profile"), ext));
+    fs::write(&path, bytes)?;
+    profile.avatar_path = Some(path.to_string_lossy().to_string());
+    store.set_profile(profile)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn clear_profile_avatar(store: State<'_, AppStore>) -> AppResult<ProfileConfig> {
+    let mut profile = store.profile()?;
+    if let Some(path) = profile.avatar_path.take() {
+        remove_file_if_local(&path);
+    }
+    store.set_profile(profile)
+}
+
+#[tauri::command(rename_all = "camelCase")]
 fn list_personas(store: State<'_, AppStore>) -> AppResult<Vec<Persona>> {
     store.personas()
 }
@@ -551,13 +583,428 @@ fn get_persona(store: State<'_, AppStore>, id: String) -> AppResult<Persona> {
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn save_persona(store: State<'_, AppStore>, persona: Persona) -> AppResult<Persona> {
+fn save_persona(store: State<'_, AppStore>, mut persona: Persona) -> AppResult<Persona> {
+    persona.name = persona.name.trim().to_string();
+    if persona.name.is_empty() {
+        return Err(AppError::BadRequest("persona name is required".into()));
+    }
+    if persona.name.chars().count() > 100 {
+        return Err(AppError::BadRequest(
+            "persona name must be 100 characters or less".into(),
+        ));
+    }
+    persona.id = persona.id.trim().to_string();
+    if persona.id.is_empty() || persona.id.starts_with("persona-") {
+        persona.id = new_id("persona");
+    }
+    if persona
+        .id
+        .chars()
+        .any(|ch| matches!(ch, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+    {
+        return Err(AppError::BadRequest(
+            "persona id contains invalid characters".into(),
+        ));
+    }
+    persona.temperature = persona.temperature.clamp(0.0, 2.0);
+    persona.max_tokens = persona.max_tokens.clamp(128, 65536);
+    normalize_persona_number(&mut persona.tool_policy, "timeoutSeconds", 1.0, 86400.0);
+    normalize_persona_number(&mut persona.tool_policy, "maxIterations", 1.0, 64.0);
+    normalize_persona_number(&mut persona.tool_policy, "maxFailureReplans", 0.0, 32.0);
+    normalize_persona_number(&mut persona.tool_policy, "retryCount", 0.0, 5.0);
+    normalize_persona_number(&mut persona.tool_policy, "retryBackoffMs", 0.0, 10000.0);
+    persona.emoji_send_probability = persona.emoji_send_probability.min(100);
+    normalize_persona_number(&mut persona.memory, "triggerRounds", 1.0, 1000.0);
+    normalize_persona_number(&mut persona.memory, "maxMemories", 1.0, 10000.0);
+    normalize_persona_number(&mut persona.proactive, "minIdleHours", 0.0, 8760.0);
+    normalize_persona_number(&mut persona.proactive, "maxIdleHours", 0.0, 8760.0);
+    normalize_persona_number(&mut persona.proactive, "maxConsecutive", 1.0, 100.0);
+    normalize_persona_number(&mut persona.voice_reply, "sampleRate", 8000.0, 48000.0);
+    normalize_persona_number(&mut persona.voice_reply, "speed", 1.0, 9.0);
+    normalize_persona_number(&mut persona.voice_reply, "oral", 0.0, 9.0);
+    normalize_persona_number(&mut persona.voice_reply, "laugh", 0.0, 9.0);
+    normalize_persona_number(&mut persona.voice_reply, "breakLevel", 0.0, 9.0);
+    normalize_persona_number(&mut persona.voice_reply, "temperature", 0.01, 2.0);
+    normalize_persona_number(&mut persona.voice_reply, "topP", 0.01, 1.0);
+    normalize_persona_number(&mut persona.voice_reply, "topK", 1.0, 100.0);
+    normalize_persona_number(&mut persona.voice_reply, "refineTemperature", 0.01, 2.0);
+    normalize_persona_string(&mut persona.voice_reply, "engine", "chattts");
+    normalize_persona_string(&mut persona.voice_reply, "pythonPath", "");
+    normalize_persona_string(&mut persona.voice_reply, "modelDir", "");
+    normalize_persona_string(&mut persona.voice_reply, "speakerEmbedding", "");
+    normalize_persona_string(&mut persona.voice_reply, "refinePrompt", "");
+    normalize_persona_string(&mut persona.image_generation, "refMode", "avatar");
+    let ref_mode = persona
+        .image_generation
+        .get("refMode")
+        .and_then(Value::as_str)
+        .unwrap_or("avatar");
+    if !matches!(ref_mode, "avatar" | "custom" | "none") {
+        persona.image_generation["refMode"] = json!("avatar");
+    }
+    let personas = store.personas()?;
+    if personas
+        .iter()
+        .any(|item| item.id != persona.id && item.name.eq_ignore_ascii_case(&persona.name))
+    {
+        return Err(AppError::BadRequest("persona name already exists".into()));
+    }
+    if persona.avatar_path.is_none() {
+        if let Some(existing) = personas.iter().find(|item| item.id == persona.id) {
+            persona.avatar_path = existing.avatar_path.clone();
+        }
+    }
     store.save_persona(persona)
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn delete_persona(_store: State<'_, AppStore>, _id: String) -> AppResult<()> {
+fn upload_persona_avatar(
+    store: State<'_, AppStore>,
+    persona_id: String,
+    file_name: String,
+    bytes: Vec<u8>,
+) -> AppResult<Persona> {
+    validate_avatar_bytes(&bytes)?;
+    let ext = image_ext_from_bytes(&bytes).unwrap_or(normalized_image_ext(&file_name)?);
+    let mut persona = store.persona(Some(&persona_id))?;
+    if let Some(path) = &persona.avatar_path {
+        remove_file_if_local(path);
+    }
+    let dir = store.data_dir().join("personas").join(&persona_id);
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("avatar-{}.{}", new_id("persona"), ext));
+    fs::write(&path, bytes)?;
+    persona.avatar_path = Some(path.to_string_lossy().to_string());
+    store.save_persona(persona)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn clear_persona_avatar(store: State<'_, AppStore>, persona_id: String) -> AppResult<Persona> {
+    let mut persona = store.persona(Some(&persona_id))?;
+    if let Some(path) = persona.avatar_path.take() {
+        remove_file_if_local(&path);
+    }
+    store.save_persona(persona)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn list_emoji_groups(store: State<'_, AppStore>) -> AppResult<Vec<EmojiGroupConfig>> {
+    ensure_default_emoji_assets(&store)?;
+    scan_emoji_groups(&store)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn save_emoji_groups(
+    store: State<'_, AppStore>,
+    mut groups: Vec<EmojiGroupConfig>,
+) -> AppResult<()> {
+    ensure_default_emoji_assets(&store)?;
+    for group in &mut groups {
+        if group.id.trim().is_empty() {
+            group.id = unique_emoji_name(&store, "group")?;
+        }
+        group.name = group.name.trim().to_string();
+        if group.name.is_empty() {
+            return Err(AppError::BadRequest("emoji group name is required".into()));
+        }
+        let group_dir = emoji_group_dir(&store, &group.id)?;
+        fs::create_dir_all(&group_dir)?;
+        if group.emotions.is_empty() {
+            group.emotions.push("default".into());
+        }
+        for emotion in &group.emotions {
+            fs::create_dir_all(emoji_emotion_dir(&store, &group.id, emotion)?)?;
+        }
+    }
+    write_emoji_groups_snapshot(&store, &groups)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn upload_emoji_image(
+    store: State<'_, AppStore>,
+    group_id: String,
+    emotion: Option<String>,
+    file_name: String,
+    bytes: Vec<u8>,
+) -> AppResult<Vec<EmojiGroupConfig>> {
+    const MAX_EMOJI_BYTES: usize = 10 * 1024 * 1024;
+    if bytes.is_empty() || bytes.len() > MAX_EMOJI_BYTES {
+        return Err(AppError::BadRequest(
+            "emoji image must be between 1 byte and 10 MiB".into(),
+        ));
+    }
+    let ext = image_ext_from_bytes(&bytes).unwrap_or(normalized_image_ext(&file_name)?);
+    let group_id = validate_emoji_name(&group_id)?;
+    let emotion = validate_emoji_name(
+        emotion
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("default"),
+    )?;
+    let dir = emoji_emotion_dir(&store, &group_id, &emotion)?;
+    if !dir.exists() {
+        return Err(AppError::NotFound(format!(
+            "emoji emotion not found: {group_id}/{emotion}"
+        )));
+    }
+    let stem = PathBuf::from(&file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(sanitize_emoji_file_stem)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "emoji".into());
+    let mut path = dir.join(format!("{stem}.{ext}"));
+    let mut suffix = 2;
+    while path.exists() {
+        path = dir.join(format!("{stem}_{suffix}.{ext}"));
+        suffix += 1;
+    }
+    fs::write(&path, bytes)?;
+    scan_emoji_groups(&store)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn create_emoji_group(
+    store: State<'_, AppStore>,
+    name: String,
+) -> AppResult<Vec<EmojiGroupConfig>> {
+    ensure_default_emoji_assets(&store)?;
+    let name = validate_emoji_name(&name)?;
+    let group = unique_emoji_name(&store, &name)?;
+    fs::create_dir_all(emoji_emotion_dir(&store, &group, "default")?)?;
+    scan_emoji_groups(&store)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn rename_emoji_group(
+    store: State<'_, AppStore>,
+    group_id: String,
+    new_name: String,
+) -> AppResult<Vec<EmojiGroupConfig>> {
+    let group_id = validate_emoji_name(&group_id)?;
+    let new_name = validate_emoji_name(&new_name)?;
+    let src = emoji_group_dir(&store, &group_id)?;
+    let dst = emoji_group_dir(&store, &new_name)?;
+    if !src.is_dir() {
+        return Err(AppError::NotFound(format!(
+            "emoji group not found: {group_id}"
+        )));
+    }
+    if dst.exists() {
+        return Err(AppError::BadRequest(format!(
+            "emoji group already exists: {new_name}"
+        )));
+    }
+    fs::rename(src, dst)?;
+    sync_persona_emoji_group(&store, &group_id, Some(&new_name))?;
+    scan_emoji_groups(&store)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn delete_emoji_group(
+    store: State<'_, AppStore>,
+    group_id: String,
+) -> AppResult<Vec<EmojiGroupConfig>> {
+    let group_id = validate_emoji_name(&group_id)?;
+    let dir = emoji_group_dir(&store, &group_id)?;
+    if dir.is_dir() {
+        fs::remove_dir_all(dir)?;
+    }
+    sync_persona_emoji_group(&store, &group_id, None)?;
+    scan_emoji_groups(&store)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn create_emoji_emotion(
+    store: State<'_, AppStore>,
+    group_id: String,
+    emotion: String,
+) -> AppResult<Vec<EmojiGroupConfig>> {
+    let group_id = validate_emoji_name(&group_id)?;
+    let emotion = validate_emoji_name(&emotion)?;
+    fs::create_dir_all(emoji_emotion_dir(&store, &group_id, &emotion)?)?;
+    scan_emoji_groups(&store)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn rename_emoji_emotion(
+    store: State<'_, AppStore>,
+    group_id: String,
+    emotion: String,
+    new_name: String,
+) -> AppResult<Vec<EmojiGroupConfig>> {
+    let group_id = validate_emoji_name(&group_id)?;
+    let emotion = validate_emoji_name(&emotion)?;
+    let new_name = validate_emoji_name(&new_name)?;
+    let src = emoji_emotion_dir(&store, &group_id, &emotion)?;
+    let dst = emoji_emotion_dir(&store, &group_id, &new_name)?;
+    if !src.is_dir() {
+        return Err(AppError::NotFound(format!(
+            "emoji emotion not found: {emotion}"
+        )));
+    }
+    if dst.exists() {
+        return Err(AppError::BadRequest(format!(
+            "emoji emotion already exists: {new_name}"
+        )));
+    }
+    fs::rename(src, dst)?;
+    scan_emoji_groups(&store)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn delete_emoji_emotion(
+    store: State<'_, AppStore>,
+    group_id: String,
+    emotion: String,
+) -> AppResult<Vec<EmojiGroupConfig>> {
+    let group_id = validate_emoji_name(&group_id)?;
+    let emotion = validate_emoji_name(&emotion)?;
+    let dir = emoji_emotion_dir(&store, &group_id, &emotion)?;
+    if dir.is_dir() {
+        fs::remove_dir_all(dir)?;
+    }
+    scan_emoji_groups(&store)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn delete_emoji_image(
+    store: State<'_, AppStore>,
+    group_id: String,
+    emotion: String,
+    file_name: String,
+) -> AppResult<Vec<EmojiGroupConfig>> {
+    let path = emoji_image_path(&store, &group_id, &emotion, &file_name)?;
+    if path.is_file() {
+        fs::remove_file(path)?;
+    }
+    scan_emoji_groups(&store)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn rename_emoji_image(
+    store: State<'_, AppStore>,
+    group_id: String,
+    emotion: String,
+    file_name: String,
+    new_name: String,
+) -> AppResult<Vec<EmojiGroupConfig>> {
+    let src = emoji_image_path(&store, &group_id, &emotion, &file_name)?;
+    let dst = emoji_image_path(&store, &group_id, &emotion, &new_name)?;
+    if !src.is_file() {
+        return Err(AppError::NotFound(format!(
+            "emoji image not found: {file_name}"
+        )));
+    }
+    if dst.exists() {
+        return Err(AppError::BadRequest(format!(
+            "emoji image already exists: {new_name}"
+        )));
+    }
+    fs::rename(src, dst)?;
+    scan_emoji_groups(&store)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn delete_persona(store: State<'_, AppStore>, id: String) -> AppResult<()> {
+    if id == "default" {
+        return Err(AppError::BadRequest(
+            "default persona cannot be deleted".into(),
+        ));
+    }
+    let removed = store.delete_persona(&id)?;
+    if let Some(path) = removed.avatar_path {
+        remove_file_if_local(&path);
+    }
     Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn list_accounts() -> AppResult<Vec<wechat_settings::AccountConfig>> {
+    wechat_settings::list_accounts()
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn save_accounts(accounts: Vec<wechat_settings::AccountConfig>) -> AppResult<()> {
+    wechat_settings::save_accounts(accounts)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn get_wechat_config() -> AppResult<wechat_settings::WechatConfig> {
+    wechat_settings::get_wechat_config()
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn save_wechat_config(
+    config: wechat_settings::WechatConfig,
+) -> AppResult<wechat_settings::WechatConfig> {
+    wechat_settings::save_wechat_config(config)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn start_wechat_qr(
+    base_url: Option<String>,
+) -> AppResult<wechat_settings::WechatQrStartResult> {
+    wechat_settings::start_wechat_qr(base_url).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn check_wechat_qr_status(
+    qrcode: String,
+    base_url: Option<String>,
+) -> AppResult<wechat_settings::WechatQrStatusResult> {
+    wechat_settings::check_wechat_qr_status(qrcode, base_url).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn list_wechat_links(
+    store: State<'_, AppStore>,
+) -> AppResult<Vec<wechat_settings::WechatLinkSummary>> {
+    wechat_settings::list_wechat_links(store.personas()?)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn link_wechat_account(
+    persona_id: String,
+    account_id: String,
+) -> AppResult<Vec<wechat_settings::AccountConfig>> {
+    wechat_settings::link_wechat_account(persona_id, account_id)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn unlink_wechat_account(persona_id: String) -> AppResult<Vec<wechat_settings::AccountConfig>> {
+    wechat_settings::unlink_wechat_account(persona_id)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn wechat_poll_once(
+    app: AppHandle,
+    store: State<'_, AppStore>,
+    account_id: String,
+    timeout_seconds: Option<u64>,
+) -> AppResult<wechat_settings::WechatPollResult> {
+    wechat_settings::wechat_poll_once(&store, Some(&app), account_id, timeout_seconds).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn wechat_inbound_text(
+    app: AppHandle,
+    store: State<'_, AppStore>,
+    account_id: String,
+    user_id: String,
+    text: String,
+    context_token: Option<String>,
+) -> AppResult<wechat_settings::WechatInboundResult> {
+    wechat_settings::wechat_inbound_text(
+        &store,
+        Some(&app),
+        account_id,
+        user_id,
+        text,
+        context_token,
+    )
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -602,12 +1049,320 @@ async fn send_chat_message(
     store: State<'_, AppStore>,
     request: SendChatRequest,
 ) -> AppResult<Vec<models::ChatMessage>> {
-    agent::run_chat_turn(&store, request, Some(&app)).await
+    let mut messages = agent::run_chat_turn(&store, request, Some(&app)).await?;
+    let assistant_index = messages
+        .iter()
+        .rev()
+        .position(|message| message.role == "assistant")
+        .map(|reverse_index| messages.len() - 1 - reverse_index);
+    if let Some(index) = assistant_index {
+        let conversation_id = messages[index].conversation_id.clone();
+        if let Ok(conversation) = store.conversation(&conversation_id) {
+            if let Ok(persona) = store.persona(conversation.persona_id.as_deref()) {
+                let resolved =
+                    apply_persona_emoji(&store, &persona, messages[index].content.clone());
+                if resolved != messages[index].content {
+                    messages[index].content = resolved;
+                    store.replace_conversation_messages(&conversation_id, messages.clone())?;
+                }
+            }
+            let assistant = &messages[index];
+            wechat_settings::dispatch_desktop_reply_to_wechat(&conversation, &assistant.content);
+        }
+    }
+    Ok(messages)
 }
 
 #[tauri::command(rename_all = "camelCase")]
 fn delete_message(_store: State<'_, AppStore>, _message_id: String) -> AppResult<()> {
     Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn list_proactive_statuses(store: State<'_, AppStore>) -> AppResult<Vec<ProactiveStatus>> {
+    store
+        .personas()?
+        .iter()
+        .map(|persona| proactive_status_for_persona(&store, persona))
+        .collect()
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn trigger_proactive_once(
+    app: AppHandle,
+    store: State<'_, AppStore>,
+    persona_id: String,
+) -> AppResult<ProactiveStatus> {
+    let persona = store.persona(Some(&persona_id))?;
+    Box::pin(trigger_proactive_for_persona(&app, &store, &persona, true)).await?;
+    proactive_status_for_persona(&store, &persona)
+}
+
+async fn trigger_proactive_for_persona(
+    app: &AppHandle,
+    store: &AppStore,
+    persona: &Persona,
+    force: bool,
+) -> AppResult<bool> {
+    let status = proactive_status_for_persona(&store, &persona)?;
+    if !force && !status.can_fire {
+        return Ok(false);
+    }
+    let conversation_id = status
+        .conversation_id
+        .clone()
+        .ok_or_else(|| AppError::BadRequest("没有该角色的会话，无法发送主动消息".into()))?;
+    let prompt = persona
+        .proactive
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("用户已经一段时间没有回复了。请根据角色设定与近期对话，主动发起一条贴合角色的简短消息。")
+        .to_string();
+    let before_ids = store
+        .messages(&conversation_id, None)?
+        .into_iter()
+        .map(|message| message.id)
+        .collect::<std::collections::HashSet<_>>();
+    let request = SendChatRequest {
+        conversation_id: Some(conversation_id.clone()),
+        persona_id: Some(persona.id.clone()),
+        agent_id: None,
+        content: prompt,
+        provider_data: Some(json!({"source": "proactive-internal", "silent": true})),
+        queue_item_id: None,
+    };
+    let generated = agent::run_chat_turn(store, request, Some(app)).await?;
+    let mut messages = store.messages(&conversation_id, None)?;
+    let internal_user_ids = generated
+        .iter()
+        .filter(|message| message.role == "user" && message.source == "proactive-internal")
+        .map(|message| message.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for message in &mut messages {
+        if !before_ids.contains(&message.id) && message.role == "assistant" {
+            message.source = "proactive".into();
+            break;
+        }
+    }
+    messages.retain(|message| !internal_user_ids.contains(&message.id));
+    store.replace_conversation_messages(&conversation_id, messages.clone())?;
+    if let Some(assistant) = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant" && message.source == "proactive")
+    {
+        if let Ok(conversation) = store.conversation(&conversation_id) {
+            wechat_settings::dispatch_desktop_reply_to_wechat(&conversation, &assistant.content);
+        }
+        let _ = app.emit(
+            "synthchat-chat-event",
+            json!({
+                "type": "new_message",
+                "personaId": persona.id,
+                "conversationId": conversation_id,
+                "message": assistant,
+                "isLast": true,
+            }),
+        );
+    }
+    Ok(true)
+}
+
+async fn run_proactive_loop(app: AppHandle, store: AppStore) {
+    let interval_seconds = std::env::var("SYNTHCHAT_PROACTIVE_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30)
+        .clamp(5, 3600);
+    let mut next_fire_at = HashMap::<String, i64>::new();
+    loop {
+        tokio::time::sleep(Duration::from_secs(interval_seconds)).await;
+        let Ok(personas) = store.personas() else {
+            continue;
+        };
+        let now = epoch_seconds_now();
+        for persona in personas {
+            if !persona
+                .proactive
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if next_fire_at
+                .get(&persona.id)
+                .is_some_and(|scheduled| *scheduled > now)
+            {
+                continue;
+            }
+            if let Err(error) =
+                Box::pin(trigger_proactive_for_persona(&app, &store, &persona, false)).await
+            {
+                eprintln!("SynthChat proactive failed: {error}");
+            } else if let Ok(status) = proactive_status_for_persona(&store, &persona) {
+                next_fire_at.insert(persona.id.clone(), now + status.wait_seconds as i64);
+            }
+        }
+    }
+}
+
+fn proactive_status_for_persona(store: &AppStore, persona: &Persona) -> AppResult<ProactiveStatus> {
+    let conversation = store
+        .conversations()?
+        .into_iter()
+        .filter(|conversation| conversation.persona_id.as_deref() == Some(persona.id.as_str()))
+        .max_by(|left, right| left.updated_at.cmp(&right.updated_at));
+    let messages = if let Some(conversation) = &conversation {
+        store.messages(&conversation.id, None)?
+    } else {
+        Vec::new()
+    };
+    let last_user_at = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .and_then(|message| epoch_seconds_from_iso(&message.created_at))
+        .unwrap_or(0);
+    let consecutive_count = messages
+        .iter()
+        .rev()
+        .take_while(|message| message.role != "user")
+        .filter(|message| message.role == "assistant" && message.source == "proactive")
+        .count() as u32;
+    let wait_seconds = proactive_wait_seconds(&persona.id, &persona.proactive);
+    let now = epoch_seconds_now();
+    let seconds_since_last_user = if last_user_at > 0 {
+        now.saturating_sub(last_user_at)
+    } else {
+        0
+    };
+    let in_quiet_hours = proactive_in_quiet_hours(&persona.proactive);
+    let ready_in_seconds = wait_seconds as i64 - seconds_since_last_user;
+    let enabled = persona
+        .proactive
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let max_consecutive = persona
+        .proactive
+        .get("maxConsecutive")
+        .and_then(Value::as_u64)
+        .unwrap_or(3)
+        .clamp(1, 100) as u32;
+    let mut blocked_reason = String::new();
+    if !enabled {
+        blocked_reason = "主动消息未启用".into();
+    } else if conversation.is_none() {
+        blocked_reason = "没有该角色的会话".into();
+    } else if last_user_at <= 0 {
+        blocked_reason = "没有历史用户消息，无法锚定空闲时间".into();
+    } else if in_quiet_hours {
+        blocked_reason = "当前处于静默时段".into();
+    } else if consecutive_count >= max_consecutive {
+        blocked_reason = "已达到用户回复前的连续主动消息上限".into();
+    } else if ready_in_seconds > 0 {
+        blocked_reason = format!("还需等待 {} 秒", ready_in_seconds);
+    } else if let Some(conversation) = &conversation {
+        if conversation.wechat_account_id.is_some() && seconds_since_last_user > 82_800 {
+            blocked_reason = "微信上下文超过 23 小时安全窗口".into();
+        }
+    }
+    Ok(ProactiveStatus {
+        persona_id: persona.id.clone(),
+        persona_name: persona.name.clone(),
+        enabled,
+        conversation_id: conversation.map(|conversation| conversation.id),
+        last_user_at,
+        seconds_since_last_user,
+        wait_seconds,
+        ready_in_seconds: ready_in_seconds.max(0),
+        consecutive_count,
+        max_consecutive,
+        in_quiet_hours,
+        can_fire: blocked_reason.is_empty(),
+        blocked_reason,
+    })
+}
+
+fn proactive_wait_seconds(persona_id: &str, config: &Value) -> u64 {
+    let min = config
+        .get("minIdleHours")
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0)
+        .max(0.0);
+    let max = config
+        .get("maxIdleHours")
+        .and_then(Value::as_f64)
+        .unwrap_or(3.0)
+        .max(min)
+        .max(0.0);
+    let min_seconds = (min * 3600.0).round() as u64;
+    let max_seconds = (max * 3600.0).round() as u64;
+    if max_seconds <= min_seconds {
+        return min_seconds;
+    }
+    let salt = persona_id
+        .bytes()
+        .fold(epoch_seconds_now().unsigned_abs(), |acc, value| {
+            acc + value as u64
+        });
+    min_seconds + salt % (max_seconds - min_seconds + 1)
+}
+
+fn proactive_in_quiet_hours(config: &Value) -> bool {
+    let quiet = config.get("quietHours").unwrap_or(&Value::Null);
+    if !quiet
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    let start = quiet
+        .get("start")
+        .and_then(Value::as_str)
+        .and_then(parse_hhmm_minutes);
+    let end = quiet
+        .get("end")
+        .and_then(Value::as_str)
+        .and_then(parse_hhmm_minutes);
+    let (Some(start), Some(end)) = (start, end) else {
+        return false;
+    };
+    let now = chrono::Local::now();
+    let current = now.hour() as u32 * 60 + now.minute();
+    if start <= end {
+        current >= start && current <= end
+    } else {
+        current >= start || current <= end
+    }
+}
+
+fn parse_hhmm_minutes(value: &str) -> Option<u32> {
+    let mut parts = value.trim().split(':');
+    let hour = parts.next()?.parse::<u32>().ok()?;
+    let minute = parts.next()?.parse::<u32>().ok()?;
+    if hour < 24 && minute < 60 {
+        Some(hour * 60 + minute)
+    } else {
+        None
+    }
+}
+
+fn epoch_seconds_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn epoch_seconds_from_iso(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|datetime| datetime.timestamp())
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -2177,6 +2932,381 @@ fn sanitize_attachment_file_name(file_name: &str) -> String {
     }
 }
 
+fn validate_avatar_bytes(bytes: &[u8]) -> AppResult<()> {
+    if bytes.is_empty() || bytes.len() > MAX_AVATAR_BYTES {
+        return Err(AppError::BadRequest(
+            "avatar image must be between 1 byte and 10 MiB".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalized_image_ext(file_name: &str) -> AppResult<&'static str> {
+    let ext = PathBuf::from(file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Ok("png"),
+        "jpg" | "jpeg" => Ok("jpg"),
+        "webp" => Ok("webp"),
+        "gif" => Ok("gif"),
+        "bmp" => Ok("bmp"),
+        _ => Err(AppError::BadRequest(
+            "avatar image must be png, jpg, jpeg, webp, gif, or bmp".into(),
+        )),
+    }
+}
+
+fn image_ext_from_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("jpg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else if bytes.starts_with(b"BM") {
+        Some("bmp")
+    } else {
+        None
+    }
+}
+
+fn remove_file_if_local(path: &str) {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return;
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_file() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn normalize_persona_number(value: &mut Value, key: &str, min: f64, max: f64) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let number = object
+        .get(key)
+        .and_then(Value::as_f64)
+        .unwrap_or(min)
+        .clamp(min, max);
+    let next = if number.fract() == 0.0 {
+        json!(number as u64)
+    } else {
+        json!(number)
+    };
+    object.insert(key.to_string(), next);
+}
+
+fn normalize_persona_string(value: &mut Value, key: &str, fallback: &str) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let next = object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .unwrap_or(fallback)
+        .to_string();
+    object.insert(key.to_string(), json!(next));
+}
+
+fn emoji_root_dir(store: &AppStore) -> AppResult<PathBuf> {
+    if let Ok(path) = std::env::var("SYNTHCHAT_EMOJI_DIR") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            let dir = PathBuf::from(trimmed);
+            fs::create_dir_all(&dir)?;
+            return Ok(dir);
+        }
+    }
+    let dir = store.data_dir().join("emoji");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn bundled_emoji_dir() -> Option<PathBuf> {
+    std::env::var("SYNTHCHAT_BUNDLED_EMOJI_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|dir| dir.join("data").join("emoji"))
+                .filter(|path| path.is_dir())
+        })
+        .or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .map(|path| path.join("data").join("emoji"))
+                .filter(|path| path.is_dir())
+        })
+}
+
+fn ensure_default_emoji_assets(store: &AppStore) -> AppResult<()> {
+    let root = emoji_root_dir(store)?;
+    if root
+        .read_dir()
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    if let Some(source) = bundled_emoji_dir() {
+        copy_dir_contents(&source, &root)?;
+    }
+    Ok(())
+}
+
+fn copy_dir_contents(source: &std::path::Path, destination: &std::path::Path) -> AppResult<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_dir_contents(&source_path, &destination_path)?;
+        } else if source_path.is_file() {
+            if let Some(parent) = destination_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(source_path, destination_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn scan_emoji_groups(store: &AppStore) -> AppResult<Vec<EmojiGroupConfig>> {
+    let root = emoji_root_dir(store)?;
+    let mut groups = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let group_dir = entry.path();
+        if !group_dir.is_dir() {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().to_string();
+        let mut emotions = Vec::new();
+        let mut images = Vec::new();
+        let mut emotion_images = HashMap::new();
+        for emotion_entry in fs::read_dir(&group_dir)? {
+            let emotion_entry = emotion_entry?;
+            let emotion_dir = emotion_entry.path();
+            if !emotion_dir.is_dir() {
+                continue;
+            }
+            let emotion = emotion_entry.file_name().to_string_lossy().to_string();
+            let mut emotion_files = Vec::new();
+            for file in fs::read_dir(&emotion_dir)? {
+                let file = file?;
+                let path = file.path();
+                if path.is_file() && is_supported_emoji_image(&path) {
+                    let path = path.to_string_lossy().to_string();
+                    images.push(path.clone());
+                    emotion_files.push(path);
+                }
+            }
+            emotion_files.sort();
+            emotions.push(emotion.clone());
+            emotion_images.insert(emotion, emotion_files);
+        }
+        emotions.sort();
+        images.sort();
+        groups.push(EmojiGroupConfig {
+            id: id.clone(),
+            name: id,
+            emotions,
+            images,
+            emotion_images,
+        });
+    }
+    groups.sort_by(|left, right| left.name.cmp(&right.name));
+    write_emoji_groups_snapshot(store, &groups)?;
+    Ok(groups)
+}
+
+fn write_emoji_groups_snapshot(store: &AppStore, groups: &[EmojiGroupConfig]) -> AppResult<()> {
+    let path = store.data_dir().join("emoji_groups.json");
+    fs::write(path, serde_json::to_vec_pretty(groups)?)?;
+    Ok(())
+}
+
+fn is_supported_emoji_image(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
+    )
+}
+
+fn emoji_group_dir(store: &AppStore, group_id: &str) -> AppResult<PathBuf> {
+    Ok(emoji_root_dir(store)?.join(validate_emoji_name(group_id)?))
+}
+
+fn emoji_emotion_dir(store: &AppStore, group_id: &str, emotion: &str) -> AppResult<PathBuf> {
+    Ok(emoji_group_dir(store, group_id)?.join(validate_emoji_name(emotion)?))
+}
+
+fn emoji_image_path(
+    store: &AppStore,
+    group_id: &str,
+    emotion: &str,
+    file_name: &str,
+) -> AppResult<PathBuf> {
+    let file_name = file_name
+        .rsplit(['/', '\\'])
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadRequest("emoji file name is required".into()))?;
+    normalized_image_ext(file_name)
+        .map_err(|_| AppError::BadRequest("unsupported emoji image file".into()))?;
+    Ok(emoji_emotion_dir(store, group_id, emotion)?.join(file_name))
+}
+
+fn validate_emoji_name(name: &str) -> AppResult<String> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 50 {
+        return Err(AppError::BadRequest(
+            "emoji name must be 1-50 characters".into(),
+        ));
+    }
+    if name.starts_with([' ', '.']) || name.ends_with([' ', '.']) {
+        return Err(AppError::BadRequest(
+            "emoji name cannot start or end with space/dot".into(),
+        ));
+    }
+    if name
+        .chars()
+        .any(|ch| matches!(ch, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+    {
+        return Err(AppError::BadRequest(
+            "emoji name contains invalid characters".into(),
+        ));
+    }
+    Ok(name.to_string())
+}
+
+fn sanitize_emoji_file_stem(name: &str) -> String {
+    name.chars()
+        .filter(|ch| ch.is_alphanumeric() || matches!(*ch, '-' | '_' | ' ' | '(' | ')'))
+        .take(60)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn unique_emoji_name(store: &AppStore, base: &str) -> AppResult<String> {
+    let base = validate_emoji_name(base)?;
+    let root = emoji_root_dir(store)?;
+    if !root.join(&base).exists() {
+        return Ok(base);
+    }
+    for index in 2..10000 {
+        let candidate = format!("{base}_{index}");
+        if !root.join(&candidate).exists() {
+            return Ok(candidate);
+        }
+    }
+    Ok(format!("{}_{}", base, new_id("emoji")))
+}
+
+fn sync_persona_emoji_group(
+    store: &AppStore,
+    old_name: &str,
+    new_name: Option<&str>,
+) -> AppResult<()> {
+    let personas = store
+        .personas()?
+        .into_iter()
+        .map(|mut persona| {
+            if persona.emoji_group == old_name {
+                persona.emoji_group = new_name.unwrap_or("").to_string();
+                if new_name.is_none() {
+                    persona.emoji_enabled = false;
+                }
+            }
+            persona
+        })
+        .collect::<Vec<_>>();
+    for persona in personas {
+        store.save_persona(persona)?;
+    }
+    Ok(())
+}
+
+fn apply_persona_emoji(store: &AppStore, persona: &Persona, reply: String) -> String {
+    if !persona.emoji_enabled || persona.emoji_send_probability == 0 || reply.trim().is_empty() {
+        return reply;
+    }
+    let probability = persona.emoji_send_probability.min(100) as u64;
+    let roll = (utc_epoch_seconds().wrapping_add(hash_to_u64(&reply))) % 100;
+    if roll >= probability {
+        return reply;
+    }
+    let Ok(groups) = scan_emoji_groups(store) else {
+        return reply;
+    };
+    let Some(group) = groups
+        .iter()
+        .find(|group| group.id == persona.emoji_group || group.name == persona.emoji_group)
+    else {
+        return reply;
+    };
+    let available = group
+        .emotion_images
+        .iter()
+        .filter(|(_, images)| !images.is_empty())
+        .collect::<Vec<_>>();
+    if available.is_empty() {
+        return reply;
+    }
+    let seed = utc_epoch_seconds()
+        .wrapping_add(hash_to_u64(&persona.id))
+        .wrapping_add(hash_to_u64(&reply));
+    let (_, images) = available[(seed as usize) % available.len()];
+    let path = &images[(seed as usize + persona.id.len() + reply.len()) % images.len()];
+    let mime = mime_for_image_path(path);
+    format!("{reply}\n\n[media attached: {path} ({mime})]")
+}
+
+fn hash_to_u64(value: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn utc_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn mime_for_image_path(path: &str) -> &'static str {
+    match Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        _ => "image/png",
+    }
+}
+
 #[tauri::command(rename_all = "camelCase")]
 fn environment_check(store: State<'_, AppStore>) -> AppResult<Value> {
     let providers = store.providers()?;
@@ -2273,6 +3403,24 @@ pub fn run() {
         .setup(|app| {
             let store = app.state::<AppStore>();
             mcp::start_mcp_keepalive_loop(store.inner().clone());
+            let wechat_store = store.inner().clone();
+            let wechat_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                wechat_settings::run_wechat_poll_loop(wechat_store, wechat_app).await;
+            });
+            let proactive_store = store.inner().clone();
+            let proactive_app = app.handle().clone();
+            std::thread::Builder::new()
+                .name("synthchat-proactive-loop".into())
+                .stack_size(16 * 1024 * 1024)
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to build proactive runtime");
+                    runtime.block_on(run_proactive_loop(proactive_app, proactive_store));
+                })
+                .map_err(|error| AppError::Io(error))?;
             let reattached = agent::reattach_managed_process_watchers(&store, Some(&app.handle()));
             if reattached > 0 {
                 let _ = app.emit(
@@ -2320,10 +3468,36 @@ pub fn run() {
             cleanup_historical_resources,
             get_profile,
             save_profile,
+            upload_profile_avatar,
+            clear_profile_avatar,
             list_personas,
             get_persona,
             save_persona,
+            upload_persona_avatar,
+            clear_persona_avatar,
+            list_emoji_groups,
+            save_emoji_groups,
+            upload_emoji_image,
+            create_emoji_group,
+            rename_emoji_group,
+            delete_emoji_group,
+            create_emoji_emotion,
+            rename_emoji_emotion,
+            delete_emoji_emotion,
+            delete_emoji_image,
+            rename_emoji_image,
             delete_persona,
+            list_accounts,
+            save_accounts,
+            get_wechat_config,
+            save_wechat_config,
+            start_wechat_qr,
+            check_wechat_qr_status,
+            list_wechat_links,
+            link_wechat_account,
+            unlink_wechat_account,
+            wechat_poll_once,
+            wechat_inbound_text,
             list_conversations,
             create_conversation,
             delete_conversation,
@@ -2331,6 +3505,8 @@ pub fn run() {
             list_messages,
             send_chat_message,
             delete_message,
+            list_proactive_statuses,
+            trigger_proactive_once,
             list_llm_providers,
             save_llm_providers,
             refresh_model_catalog,

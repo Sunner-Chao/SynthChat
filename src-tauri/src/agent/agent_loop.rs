@@ -6,7 +6,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 use crate::{
     error::AppResult,
@@ -153,10 +153,30 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         conversation.id.clone(),
         "user",
         request.content.clone(),
-        "desktop",
+        request
+            .provider_data
+            .as_ref()
+            .and_then(|data| data.get("source"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|source| !source.is_empty())
+            .unwrap_or("desktop"),
     );
     user_message.provider_data = request.provider_data.clone();
     let user = store.append_message(user_message)?;
+    let silent_user_message = user.source == "proactive-internal";
+    if let Some(app) = app.filter(|_| !silent_user_message) {
+        let _ = app.emit(
+            "synthchat-chat-event",
+            json!({
+                "type": "new_message",
+                "personaId": persona.id,
+                "conversationId": conversation.id,
+                "message": user,
+                "isLast": false,
+            }),
+        );
+    }
 
     let requested_api_run_id = request
         .provider_data
@@ -331,6 +351,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
             &mcp_tools,
             tool_context,
             &agent,
+            Some(&effective_persona),
         );
         let pre_llm_contexts =
             run_pre_llm_call_hooks(store, &saved_run.run_id, &enriched_user_content).await;
@@ -1463,11 +1484,6 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     )? {
         return Ok(vec![user]);
     }
-    run.state = "completed".into();
-    run.updated_at = now_iso();
-    run.completed_at = Some(run.updated_at.clone());
-    let saved_completed_run = store.save_agent_run(run)?;
-
     let mut assistant_message = ChatMessage::new(
         conversation.id.clone(),
         "assistant",
@@ -1476,6 +1492,11 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     );
     assistant_message.provider_data = assistant_provider_data;
     let assistant = store.append_message(assistant_message)?;
+
+    run.state = "completed".into();
+    run.updated_at = now_iso();
+    run.completed_at = Some(run.updated_at.clone());
+    let saved_completed_run = store.save_agent_run(run)?;
     if assistant_prompt_tokens > 0 {
         if let Some(note) = maybe_post_turn_compress_with_context_engine(
             store,

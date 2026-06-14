@@ -202,6 +202,25 @@ function plainText(content: string) {
   return content.trim();
 }
 
+function isAttachmentContextLine(line: string) {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("{") || !trimmed.includes("\"attachment\"")) return false;
+  try {
+    const parsed = JSON.parse(trimmed) as { type?: string };
+    return parsed?.type === "attachment";
+  } catch {
+    return false;
+  }
+}
+
+function displayTextForMessage(content: string) {
+  return content
+    .split(/\r?\n/)
+    .filter((line) => !isAttachmentContextLine(line))
+    .join("\n")
+    .trim();
+}
+
 function formatTime(value?: string | number | null) {
   if (!value) return "";
   const date = typeof value === "number" ? new Date(value) : new Date(value);
@@ -1305,7 +1324,10 @@ export const ChatExperience = memo(function ChatExperience() {
           recommendedTool: file.mimeType?.startsWith("image/") ? "vision_analyze" : undefined
         }))
         .join("\n");
-      const outbound = [content, attachmentContext].filter(Boolean).join("\n\n");
+      const attachmentMarkers = readyAttachments
+        .map((file) => `[media attached: "${file.path}" (${file.mimeType || "application/octet-stream"})] ${file.fileName}`)
+        .join("\n");
+      const outbound = [content, attachmentMarkers, attachmentContext].filter(Boolean).join("\n\n");
       setAttachments([]);
       await sendMessage(outbound, selectedPersona?.id, activeAgent?.id);
       window.setTimeout(() => void refreshChatData(activeConversationId, selectedPersona?.id), 500);
@@ -2125,7 +2147,7 @@ const MessageRow = memo(function MessageRow({
   const toolEvent = message.role === "tool" ? parseToolEvent(message.content) : null;
   const processEvent = message.role === "tool" ? parseManagedProcessEvent(message.content) : null;
   const isUser = message.role === "user";
-  const text = previewText(plainText(message.content), previewCharLimit);
+  const text = previewText(displayTextForMessage(plainText(message.content)), previewCharLimit);
   const isStreaming = !isUser && !toolEvent && !processEvent && (message.source === "desktop-stream" || animateText);
   const displayText = useRevealedText(text, isStreaming, streamCharsPerSecond, onAnimationDone);
   if (toolEvent) return <ToolMessage event={toolEvent} />;

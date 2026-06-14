@@ -2917,6 +2917,38 @@ button {
   text-align: center;
 }
 
+.qr-error {
+  max-height: 96px;
+  margin: 0 0 12px;
+  overflow: auto;
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: left;
+  word-break: break-word;
+}
+
+.qr-raw {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 12px;
+  color: var(--text-2);
+  font-size: 12px;
+  text-align: left;
+}
+
+.qr-raw code {
+  max-height: 88px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+  color: var(--text-1);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 .qr-check-btn {
   width: 100%;
   margin-bottom: 10px;
