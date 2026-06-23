@@ -243,7 +243,7 @@ export function App() {
           }
         }
       }
-      if ((payload.type === "assistant_stream" || payload.type === "new_message" || payload.type === "tool_message") && payload.message && isVisibleChatEventMessage(payload.message)) {
+      if ((payload.type === "assistant_stream" || payload.type === "new_message" || payload.type === "tool_message" || payload.type === "assistant_message") && payload.message && isVisibleChatEventMessage(payload.message)) {
         upsertIncomingMessage(payload.message);
       }
       if (payload.type === "assistant_stream") {

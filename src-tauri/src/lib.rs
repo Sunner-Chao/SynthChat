@@ -38,7 +38,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 const REMOTE_SKILL_FETCH_TIMEOUT_SECS: u64 = 20;
 const MAX_CHAT_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 const MAX_AVATAR_BYTES: usize = 10 * 1024 * 1024;
-const SYNTHCHAT_TOKIO_WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
+const DEFAULT_SYNTHCHAT_TOKIO_WORKER_STACK_SIZE: usize = 64 * 1024 * 1024;
+const MIN_SYNTHCHAT_TOKIO_WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
+const MAX_SYNTHCHAT_TOKIO_WORKER_STACK_SIZE: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcpCliAction {
@@ -286,11 +288,23 @@ pub fn run_mcp_stdio() -> AppResult<()> {
     Ok(())
 }
 
+fn synthchat_tokio_worker_stack_size() -> usize {
+    std::env::var("SYNTHCHAT_TOKIO_WORKER_STACK_MB")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(DEFAULT_SYNTHCHAT_TOKIO_WORKER_STACK_SIZE)
+        .clamp(
+            MIN_SYNTHCHAT_TOKIO_WORKER_STACK_SIZE,
+            MAX_SYNTHCHAT_TOKIO_WORKER_STACK_SIZE,
+        )
+}
+
 fn synthchat_multi_thread_runtime(thread_name: &str) -> AppResult<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name(thread_name)
-        .thread_stack_size(SYNTHCHAT_TOKIO_WORKER_STACK_SIZE)
+        .thread_stack_size(synthchat_tokio_worker_stack_size())
         .build()
         .map_err(AppError::Io)
 }
@@ -3411,6 +3425,9 @@ fn reveal_local_file(path: String) -> AppResult<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let runtime = synthchat_multi_thread_runtime("synthchat-tauri-worker")
+        .expect("failed to initialize SynthChat async runtime");
+    tauri::async_runtime::set(runtime.handle().clone());
     let store = AppStore::new(state_path()).expect("failed to initialize SynthChat state");
     sync_runtime_env_from_store(&store);
     tauri::Builder::default()

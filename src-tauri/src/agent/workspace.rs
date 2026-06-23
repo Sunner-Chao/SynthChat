@@ -1,9 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::{
-    error::{AppError, AppResult},
-    models::AgentDefinition,
-};
+use crate::{error::AppResult, models::AgentDefinition};
 
 pub(super) fn workspace_root(agent: &AgentDefinition) -> AppResult<PathBuf> {
     let root = if agent.workspace_dir.trim().is_empty() {
@@ -23,15 +20,7 @@ pub(super) fn resolve_workspace_path(root: &Path, input: &str) -> AppResult<Path
             root.join(path)
         }
     };
-    let canonical = candidate.canonicalize()?;
-    if canonical.starts_with(root) {
-        Ok(canonical)
-    } else {
-        Err(AppError::BadRequest(format!(
-            "path is outside workspace: {}",
-            candidate.display()
-        )))
-    }
+    Ok(candidate.canonicalize()?)
 }
 
 pub(super) fn resolve_workspace_target_path(root: &Path, input: &str) -> AppResult<PathBuf> {
@@ -44,22 +33,21 @@ pub(super) fn resolve_workspace_target_path(root: &Path, input: &str) -> AppResu
         }
     };
     if candidate.exists() {
-        return resolve_workspace_path(root, input);
+        return Ok(candidate.canonicalize()?);
     }
     let mut existing_ancestor = candidate.as_path();
     while !existing_ancestor.exists() {
-        existing_ancestor = existing_ancestor.parent().ok_or_else(|| {
-            AppError::BadRequest(format!("path has no existing ancestor: {input}"))
-        })?;
+        if let Some(parent) = existing_ancestor.parent() {
+            existing_ancestor = parent;
+        } else {
+            return Ok(candidate);
+        }
     }
     let ancestor_canonical = existing_ancestor.canonicalize()?;
-    if !ancestor_canonical.starts_with(root) {
-        return Err(AppError::BadRequest(format!(
-            "path is outside workspace: {}",
-            candidate.display()
-        )));
-    }
-    Ok(candidate)
+    let relative_target = candidate
+        .strip_prefix(existing_ancestor)
+        .unwrap_or_else(|_| Path::new(""));
+    Ok(ancestor_canonical.join(relative_target))
 }
 
 pub(super) fn should_skip_dir(name: &str) -> bool {

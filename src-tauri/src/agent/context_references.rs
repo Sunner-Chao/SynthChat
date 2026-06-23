@@ -737,9 +737,6 @@ fn collect_context_folder_entries(
             continue;
         }
         let canonical = child.canonicalize()?;
-        if !canonical.starts_with(root) {
-            continue;
-        }
         output.push(canonical.clone());
         if canonical.is_dir() {
             collect_context_folder_entries(root, &canonical, output, limit)?;

@@ -35,7 +35,9 @@ const WECHAT_FILE_ITEM_TYPE: i64 = 4;
 const WECHAT_IMAGE_MAX_BYTES: u64 = 20 * 1024 * 1024;
 const WECHAT_FILE_MAX_BYTES: u64 = 100 * 1024 * 1024;
 const WECHAT_VOICE_MAX_BYTES: u64 = 10 * 1024 * 1024;
-const WECHAT_CHAT_THREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
+const DEFAULT_WECHAT_CHAT_THREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
+const MIN_WECHAT_CHAT_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
+const MAX_WECHAT_CHAT_THREAD_STACK_SIZE: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2275,6 +2277,18 @@ fn find_or_create_wechat_conversation(
     Ok(conversation.id)
 }
 
+fn wechat_chat_thread_stack_size() -> usize {
+    std::env::var("SYNTHCHAT_WECHAT_CHAT_STACK_MB")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(DEFAULT_WECHAT_CHAT_THREAD_STACK_SIZE)
+        .clamp(
+            MIN_WECHAT_CHAT_THREAD_STACK_SIZE,
+            MAX_WECHAT_CHAT_THREAD_STACK_SIZE,
+        )
+}
+
 async fn run_wechat_chat_turn(
     store: &AppStore,
     request: SendChatRequest,
@@ -2285,7 +2299,7 @@ async fn run_wechat_chat_turn(
     let (tx, rx) = mpsc::channel();
     thread::Builder::new()
         .name("synthchat-wechat-chat-turn".to_string())
-        .stack_size(WECHAT_CHAT_THREAD_STACK_SIZE)
+        .stack_size(wechat_chat_thread_stack_size())
         .spawn(move || {
             let result = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2596,10 +2610,17 @@ pub async fn wechat_inbound_text(
     .await;
     emit_wechat_processing(app, &conversation_id, &persona.id, false);
     let messages = messages_result?;
-    let reply = messages
+    let reply_message = messages
         .iter()
         .rev()
         .find(|message| message.role == "assistant")
+        .cloned();
+    if let Some(message) = reply_message.as_ref() {
+        persist_wechat_assistant_message_if_missing(store, message)?;
+        emit_wechat_assistant_message(app, &conversation_id, &persona.id, message);
+    }
+    let reply = reply_message
+        .as_ref()
         .map(|message| message.content.clone())
         .unwrap_or_default();
     let (delivered, delivery_error) =
@@ -2612,6 +2633,42 @@ pub async fn wechat_inbound_text(
         delivered,
         delivery_error,
     })
+}
+
+fn persist_wechat_assistant_message_if_missing(
+    store: &AppStore,
+    message: &ChatMessage,
+) -> AppResult<()> {
+    let exists = store
+        .messages(&message.conversation_id, None)?
+        .iter()
+        .any(|candidate| candidate.id == message.id);
+    if !exists {
+        let _ = store.append_message(message.clone())?;
+    }
+    Ok(())
+}
+
+fn emit_wechat_assistant_message(
+    app: Option<&AppHandle>,
+    conversation_id: &str,
+    persona_id: &str,
+    message: &ChatMessage,
+) {
+    let Some(app) = app else {
+        return;
+    };
+    let _ = app.emit(
+        "synthchat-chat-event",
+        json!({
+            "type": "assistant_message",
+            "source": "wechat",
+            "personaId": persona_id,
+            "conversationId": conversation_id,
+            "message": message,
+            "isLast": true,
+        }),
+    );
 }
 
 fn emit_wechat_processing(

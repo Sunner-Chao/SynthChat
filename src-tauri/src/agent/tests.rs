@@ -52689,11 +52689,17 @@ fn file_mutation_result_classifier_requires_landed_json() {
 }
 
 #[test]
-fn delete_and_move_file_tools_stay_inside_workspace() {
+fn delete_and_move_file_tools_accept_paths_outside_workspace() {
     let dir = std::env::temp_dir().join(format!("synthchat-file-move-{}", new_id("test")));
+    let outside = std::env::temp_dir().join(format!(
+        "synthchat-file-outside-{}",
+        new_id("test")
+    ));
     fs::create_dir_all(&dir).unwrap();
+    fs::create_dir_all(&outside).unwrap();
     fs::write(dir.join("move-me.txt"), "move").unwrap();
     fs::write(dir.join("delete-me.txt"), "delete").unwrap();
+    fs::write(outside.join("outside.txt"), "outside").unwrap();
     let mut agent = AgentDefinition::default();
     agent.workspace_dir = dir.to_string_lossy().to_string();
     let store = AppStore::new(dir.join("state.json")).unwrap();
@@ -52723,9 +52729,18 @@ fn delete_and_move_file_tools_stay_inside_workspace() {
         "lsp_clear_baseline"
     );
     assert!(!dir.join("delete-me.txt").exists());
-    assert!(delete_file_tool(&store, &agent, &json!({"path": "..\\outside.txt"})).is_err());
+    let deleted_outside = delete_file_tool(
+        &store,
+        &agent,
+        &json!({"path": outside.join("outside.txt").to_string_lossy()}),
+    )
+    .unwrap();
+    let deleted_outside: Value = serde_json::from_str(&deleted_outside).unwrap();
+    assert_eq!(deleted_outside["deleted"], true);
+    assert!(!outside.join("outside.txt").exists());
 
     let _ = fs::remove_dir_all(dir);
+    let _ = fs::remove_dir_all(outside);
 }
 
 #[test]
@@ -53653,10 +53668,16 @@ fn context_reference_collector_supports_quoted_file_ranges() {
 }
 
 #[test]
-fn context_reference_file_read_stays_inside_workspace() {
+fn context_reference_file_read_accepts_paths_outside_workspace() {
     let dir = std::env::temp_dir().join(format!("synthchat-context-ref-{}", new_id("test")));
+    let outside = std::env::temp_dir().join(format!(
+        "synthchat-context-ref-outside-{}",
+        new_id("test")
+    ));
     fs::create_dir_all(dir.join("src")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
     fs::write(dir.join("src").join("note.txt"), "reference body").unwrap();
+    fs::write(outside.join("outside.txt"), "outside body").unwrap();
     let root = dir.canonicalize().unwrap();
     let text = read_context_reference_file(
         &root,
@@ -53672,20 +53693,22 @@ fn context_reference_file_read_stays_inside_workspace() {
     )
     .unwrap();
     assert_eq!(text, "reference body");
-    assert!(read_context_reference_file(
+    let outside_text = read_context_reference_file(
         &root,
         &ContextReference {
-            raw: "../outside.txt".into(),
+            raw: outside.join("outside.txt").to_string_lossy().to_string(),
             kind: ContextReferenceKind::File,
-            target: "../outside.txt".into(),
+            target: outside.join("outside.txt").to_string_lossy().to_string(),
             start: 0,
             end: 0,
             line_start: None,
             line_end: None,
         },
     )
-    .is_err());
+    .unwrap();
+    assert_eq!(outside_text, "outside body");
     let _ = fs::remove_dir_all(dir);
+    let _ = fs::remove_dir_all(outside);
 }
 
 #[test]
