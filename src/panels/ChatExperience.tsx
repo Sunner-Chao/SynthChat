@@ -36,7 +36,7 @@ import {
 } from "lucide-react";
 import { api } from "../lib/api";
 import { useAppStore } from "../lib/store";
-import type { AgentControlCommand, AgentDefinition, AgentRunRecord, AgentRuntimeEvent, ChatAttachment, ChatMessage, LlmProvider, ManagedProcessEvent, ToolEvent, ToolEventEnvelope } from "../lib/types";
+import type { AgentControlCommand, AgentDefinition, AgentRunRecord, AgentRuntimeEvent, ChatAttachment, ChatMessage, LlmProvider, ManagedProcessEvent, ModelCatalogEntry, ToolEvent, ToolEventEnvelope } from "../lib/types";
 import { Avatar } from "../components/common";
 
 type ComposerAttachment = ChatAttachment & {
@@ -74,6 +74,10 @@ function clampCount(value: number | undefined, fallback: number, min: number, ma
 function previewText(text: string, limit: number) {
   if (text.length <= limit) return text;
   return `${text.slice(0, limit)}\n\n[内容过长，界面仅预览前 ${limit} 个字符；复制按钮仍会复制完整消息。]`;
+}
+
+function normalizeToolDetailText(text: string) {
+  return text.trim().replace(/\s+/g, " ");
 }
 
 function estimateMessageTokens(text: string): number {
@@ -653,6 +657,7 @@ export const ChatExperience = memo(function ChatExperience() {
   const refreshAgentQueue = useAppStore((state) => state.refreshAgentQueue);
   const refreshAgentRuns = useAppStore((state) => state.refreshAgentRuns);
   const savePersona = useAppStore((state) => state.savePersona);
+  const saveAgent = useAppStore((state) => state.saveAgent);
   const [draft, setDraft] = useState("");
   const [controlCommands, setControlCommands] = useState<AgentControlCommand[]>([]);
   const [selectedSlashCommandIndex, setSelectedSlashCommandIndex] = useState(0);
@@ -683,6 +688,7 @@ export const ChatExperience = memo(function ChatExperience() {
   const [compactionRoundTokens, setCompactionRoundTokens] = useState(0);
   const [runtimeEvents, setRuntimeEvents] = useState<AgentRuntimeEvent[]>([]);
   const [runtimeCursor, setRuntimeCursor] = useState(0);
+  const [catalogModels, setCatalogModels] = useState<ModelCatalogEntry[]>([]);
 
   useEffect(() => {
     void Promise.all([refreshAgents(), refreshSkills(), refreshMcpServers(), refreshAgentRuns(), refreshAgentQueue()]);
@@ -833,8 +839,9 @@ export const ChatExperience = memo(function ChatExperience() {
   const activeAgent = useMemo(() => {
     if (selectedAgentId) return agents.find((agent) => agent.id === selectedAgentId) ?? defaultAgent;
     if (selectedPersona?.agentId) return agents.find((agent) => agent.id === selectedPersona.agentId) ?? defaultAgent;
+    if (activeConversation?.agentId) return agents.find((agent) => agent.id === activeConversation.agentId) ?? defaultAgent;
     return defaultAgent;
-  }, [agents, defaultAgent, selectedAgentId, selectedPersona?.agentId]);
+  }, [activeConversation?.agentId, agents, defaultAgent, selectedAgentId, selectedPersona?.agentId]);
   const activeRun = useMemo(
     () => Object.values(activeAgentRuns).find((run) => run.conversationId === activeConversationId && !run.parentRunId),
     [activeAgentRuns, activeConversationId]
@@ -843,8 +850,6 @@ export const ChatExperience = memo(function ChatExperience() {
     .filter((item) => item.conversationId === activeConversationId)
     .filter((item) => item.status !== "completed")
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt)), [activeConversationId, agentQueue]);
-  const activePendingQueueCount = activeQueueItems.filter((item) => item.status === "pending").length;
-  const activeRunningQueueCount = activeQueueItems.filter((item) => item.status === "running").length;
   const slashCommandQuery = useMemo(() => {
     const value = draft.trimStart();
     if (!value.startsWith("/") && !value.startsWith("／")) return null;
@@ -924,9 +929,39 @@ export const ChatExperience = memo(function ChatExperience() {
     .map((message) => (message.role === "tool" ? parseToolEvent(message.content) : null))
     .filter((event): event is ToolEvent => Boolean(event)), [recentMessages]);
   const graphEvents = activeToolEvents.length > 0 ? activeToolEvents : messageToolEvents;
-  const modelOptions = useMemo(() => providerModelOptions(llmProviders), [llmProviders]);
-  const selectedModelKey = selectedPersona?.llmProvider && selectedPersona?.llmModel
-    ? `${selectedPersona.llmProvider}::${selectedPersona.llmModel}`
+  const currentProvider = useMemo(() => {
+    const providerId = selectedPersona?.llmProvider || activeAgent?.llmProvider || "";
+    return llmProviders.find((provider) => provider.id === providerId) ?? llmProviders[0] ?? null;
+  }, [activeAgent?.llmProvider, llmProviders, selectedPersona?.llmProvider]);
+  const effectiveModelValue = selectedPersona?.llmModel || activeAgent?.llmModel || currentProvider?.model || "";
+  useEffect(() => {
+    if (!currentProvider) {
+      setCatalogModels([]);
+      return;
+    }
+    let cancelled = false;
+    api.detectProviderModels(currentProvider).then((result) => {
+      if (!cancelled) setCatalogModels(result.models ?? []);
+    }).catch(() => {
+      if (!cancelled) setCatalogModels([]);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentProvider]);
+  const modelOptions = useMemo(() => {
+    if (catalogModels.length > 0 && currentProvider) {
+      return catalogModels.map((model) => ({
+        key: `${currentProvider.id}::${model.id}`,
+        providerId: currentProvider.id,
+        model: model.id,
+        label: model.name || model.id
+      }));
+    }
+    return currentProvider ? providerModelOptions([currentProvider]) : [];
+  }, [catalogModels, currentProvider]);
+  const selectedModelKey = currentProvider && effectiveModelValue
+    ? `${currentProvider.id}::${effectiveModelValue}`
     : "";
   const artifacts = useMemo(() => {
     const results: ArtifactTarget[] = [];
@@ -1291,15 +1326,40 @@ export const ChatExperience = memo(function ChatExperience() {
     setAttachments((current) => current.filter((item) => item.id !== id));
   };
 
-  const switchPersonaModel = async (key: string) => {
-    if (!selectedPersona || !key) return;
+  const switchAgentModel = async (key: string) => {
+    if (!key) return;
     const option = modelOptions.find((item) => item.key === key);
     if (!option) return;
-    await savePersona({
-      ...selectedPersona,
-      llmProvider: option.providerId,
-      llmModel: option.model
-    });
+    let nextAgent = activeAgent;
+    if (nextAgent && (nextAgent.llmProvider !== option.providerId || nextAgent.llmModel !== option.model)) {
+      nextAgent = {
+        ...nextAgent,
+        llmProvider: option.providerId,
+        llmModel: option.model
+      };
+      await saveAgent(nextAgent);
+    }
+    if (selectedPersona) {
+      const savedPersona = await savePersona({
+        ...selectedPersona,
+        agentId: nextAgent?.id ?? selectedPersona.agentId,
+        llmProvider: option.providerId,
+        llmModel: option.model
+      });
+      if (activeConversationId && nextAgent && activeConversation?.agentId !== nextAgent.id) {
+        await api.setConversationAgent(activeConversationId, nextAgent.id);
+      }
+      await refreshChatData(activeConversationId, savedPersona.id);
+    } else if (activeConversationId) {
+      await refreshChatData(activeConversationId, activeConversation?.personaId);
+    }
+  };
+
+  const switchConversationAgent = async (agentId: string) => {
+    setSelectedAgentId(agentId);
+    if (!activeConversationId) return;
+    const conversation = await api.setConversationAgent(activeConversationId, agentId);
+    await refreshChatData(conversation.id, conversation.personaId ?? selectedPersona?.id);
   };
 
   const submit = async () => {
@@ -1493,13 +1553,13 @@ export const ChatExperience = memo(function ChatExperience() {
             </label>
             <label className="claw-select">
               <Network size={14} />
-              <select value={activeAgent?.id ?? ""} onChange={(event) => setSelectedAgentId(event.target.value)}>
+              <select value={activeAgent?.id ?? ""} onChange={(event) => void switchConversationAgent(event.target.value)}>
                 {agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
               </select>
             </label>
             <label className="claw-select">
               <ChevronIcon />
-              <select value={selectedModelKey} onChange={(event) => void switchPersonaModel(event.target.value)}>
+              <select value={selectedModelKey} onChange={(event) => void switchAgentModel(event.target.value)}>
                 <option value="">选择模型</option>
                 {modelOptions.map((option) => <option key={option.key} value={option.key}>{option.label}</option>)}
               </select>
@@ -1569,35 +1629,6 @@ export const ChatExperience = memo(function ChatExperience() {
         >
           <div className="claw-message-stream-wrap">
             <div className="claw-message-stream" ref={scrollRef} onScroll={handleScroll}>
-              {activeQueueItems.length > 0 ? (
-                <div className="claw-queue-banner">
-                  <div className="claw-queue-banner-head">
-                    <Clock size={15} />
-                    <strong>当前会话队列</strong>
-                    <span>{activeRunningQueueCount > 0 ? `${activeRunningQueueCount} 个执行中` : `${activePendingQueueCount} 个等待中`}</span>
-                  </div>
-                  <div className="claw-queue-banner-list">
-                    {activeQueueItems.slice(0, 3).map((item) => {
-                      const linkedRun = runByQueueItemId.get(item.id);
-                      return (
-                      <div className={`claw-queue-item is-${item.status}`} key={item.id}>
-                        <span>{queueStatusLabel(item.status)}</span>
-                        <p>{item.content}</p>
-                        <small>
-                          {formatTime(item.updatedAt || item.createdAt)}
-                          {linkedRun ? ` · ${shortRuntimeId(linkedRun.runId)} · ${runStateLabel(linkedRun.state)}` : ` · ${shortRuntimeId(item.id)}`}
-                        </small>
-                        {["pending", "running"].includes(item.status) ? (
-                          <button onClick={() => void cancelQueuedItem(item.id)} title="取消排队请求" type="button">
-                            <X size={12} />
-                          </button>
-                        ) : null}
-                      </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              ) : null}
               {messages.length === 0 ? (
                 <WelcomePanel
                   disabled={!selectedPersona}
@@ -2417,12 +2448,18 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
   const canOpen = Boolean(event.path && event.exists);
   const isToolImage = canOpen && (event.eventType === "screenshot" || event.eventType === "image" || Boolean(event.mimeType?.startsWith("image/")));
   const isRunning = event.status === "running";
+  const isFailed = !isRunning && (!event.ok || Boolean(event.error));
   const reauthInfo = toolEventReauthInfo(event);
-  const hasDetails = Boolean(event.summary || event.path || isToolImage || canOpen || event.text || event.error || reauthInfo);
+  const summaryText = event.summary?.trim() ?? "";
+  const bodyText = event.text?.trim() ?? "";
+  const errorText = event.error?.trim() ?? "";
+  const duplicateBody = Boolean(summaryText && bodyText && normalizeToolDetailText(summaryText) === normalizeToolDetailText(bodyText));
+  const duplicateError = Boolean(errorText && (normalizeToolDetailText(errorText) === normalizeToolDetailText(summaryText) || normalizeToolDetailText(errorText) === normalizeToolDetailText(bodyText)));
+  const hasDetails = Boolean(summaryText || event.path || isToolImage || canOpen || (bodyText && !duplicateBody) || (errorText && !duplicateError) || reauthInfo);
 
   return (
     <div className="claw-tool-message">
-      <div className={`claw-tool-card${isRunning ? " claw-tool-card--running" : ""}${expanded ? " claw-tool-card--expanded" : ""}`}>
+      <div className={`claw-tool-card${isRunning ? " claw-tool-card--running" : ""}${isFailed ? " claw-tool-card--failed" : ""}${expanded ? " claw-tool-card--expanded" : ""}`}>
         <div
           className="claw-tool-head"
           onClick={() => hasDetails && setExpanded((v) => !v)}
@@ -2441,7 +2478,7 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
         </div>
         <div className={`claw-tool-body${expanded ? " claw-tool-body--open" : ""}`}>
           <div className="claw-tool-body-inner">
-            {event.summary ? <p>{event.summary}</p> : null}
+            {summaryText ? <p>{summaryText}</p> : null}
             {event.path ? (
               <div className="claw-tool-path">
                 <FileText size={14} />
@@ -2458,8 +2495,8 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
                 <button onClick={() => void api.revealLocalFile(event.path || "")} type="button"><FolderOpen size={13} />定位</button>
               </div>
             ) : null}
-            {event.text ? <pre>{previewText(event.text, DEFAULT_MESSAGE_PREVIEW_CHARS)}</pre> : null}
-            {event.error ? <p className="claw-error-text">{event.error}</p> : null}
+            {bodyText && !duplicateBody ? <pre>{previewText(bodyText, DEFAULT_MESSAGE_PREVIEW_CHARS)}</pre> : null}
+            {errorText && !duplicateError ? <p className="claw-error-text">{errorText}</p> : null}
             {reauthInfo ? (
               <div className="claw-tool-path">
                 <AlertCircle size={14} />

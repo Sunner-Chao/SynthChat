@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -66,6 +67,18 @@ pub struct ModelCatalogEntry {
     pub name: String,
     pub family: String,
     pub capabilities: ModelCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedModelList {
+    pub ok: bool,
+    pub source: String,
+    pub provider_id: String,
+    pub provider_type: String,
+    pub base_url: String,
+    pub models: Vec<ModelCatalogEntry>,
+    pub error: Option<String>,
 }
 
 fn provider_mapping() -> &'static HashMap<&'static str, &'static str> {
@@ -611,6 +624,283 @@ fn looks_like_noise_model(model_id: &str) -> bool {
         || model.contains("-customtools")
         || model.contains("-preview-")
         || model.contains("-exp-")
+}
+
+pub async fn detect_provider_models(provider: LlmProvider) -> AppResult<DetectedModelList> {
+    let provider_id = provider.id.trim().to_string();
+    let provider_type = provider.provider_type.trim().to_ascii_lowercase();
+    let base_url = live_model_base_url(&provider);
+    let api_key = live_model_api_key(&provider);
+    let static_provider_id = if provider_type.is_empty() {
+        provider_id.as_str()
+    } else {
+        provider_type.as_str()
+    };
+    let fallback = list_agentic_models(static_provider_id);
+
+    if base_url.trim().is_empty() {
+        return Ok(DetectedModelList {
+            ok: !fallback.is_empty(),
+            source: "catalog".into(),
+            provider_id,
+            provider_type,
+            base_url,
+            models: fallback,
+            error: Some("baseUrl is empty; using built-in catalog".into()),
+        });
+    }
+
+    let live = match provider_type.as_str() {
+        "anthropic" => fetch_anthropic_models(&provider, &base_url, api_key.as_deref()).await,
+        "gemini" | "google" => fetch_gemini_models(&provider, &base_url, api_key.as_deref()).await,
+        "echo" => Ok(Vec::new()),
+        _ => fetch_openai_compatible_models(&provider, &base_url, api_key.as_deref()).await,
+    };
+
+    match live {
+        Ok(models) if !models.is_empty() => Ok(DetectedModelList {
+            ok: true,
+            source: "live".into(),
+            provider_id,
+            provider_type,
+            base_url,
+            models,
+            error: None,
+        }),
+        Ok(_) => Ok(DetectedModelList {
+            ok: !fallback.is_empty(),
+            source: "catalog".into(),
+            provider_id,
+            provider_type,
+            base_url,
+            models: fallback,
+            error: Some("live model endpoint returned no models; using built-in catalog".into()),
+        }),
+        Err(error) => Ok(DetectedModelList {
+            ok: !fallback.is_empty(),
+            source: "catalog".into(),
+            provider_id,
+            provider_type,
+            base_url,
+            models: fallback,
+            error: Some(error),
+        }),
+    }
+}
+
+fn live_model_base_url(provider: &LlmProvider) -> String {
+    let configured = provider.base_url.trim().trim_end_matches('/');
+    if !configured.is_empty() {
+        return configured.to_string();
+    }
+    match provider.provider_type.trim().to_ascii_lowercase().as_str() {
+        "anthropic" => "https://api.anthropic.com".into(),
+        "gemini" | "google" => "https://generativelanguage.googleapis.com/v1beta".into(),
+        "openai" | "openai_compatible" => "https://api.openai.com/v1".into(),
+        _ => String::new(),
+    }
+}
+
+fn live_model_api_key(provider: &LlmProvider) -> Option<String> {
+    provider
+        .api_key
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| usable_live_secret(value))
+        .or_else(|| {
+            let env_name = provider.api_key_env.trim();
+            if env_name.is_empty() {
+                None
+            } else if usable_live_secret(env_name) && looks_like_inline_live_key(env_name) {
+                Some(env_name.to_string())
+            } else {
+                std::env::var(env_name)
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| usable_live_secret(value))
+            }
+        })
+}
+
+fn usable_live_secret(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && !matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "none" | "null" | "undefined" | "your_api_key" | "your_api_key_here"
+        )
+}
+
+fn looks_like_inline_live_key(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with("sk-")
+        || trimmed.starts_with("AIza")
+        || trimmed.starts_with("eyJ")
+        || trimmed.len() > 32 && !trimmed.chars().any(char::is_whitespace)
+}
+
+fn live_model_entry(provider_id: &str, model_id: &str, name: Option<&str>) -> ModelCatalogEntry {
+    let fallback = infer_model_capabilities(&LlmProvider {
+        id: provider_id.to_string(),
+        provider_type: provider_id.to_string(),
+        model: model_id.to_string(),
+        ..LlmProvider::default()
+    });
+    ModelCatalogEntry {
+        id: model_id.to_string(),
+        name: name.unwrap_or(model_id).to_string(),
+        family: fallback.model_family.clone(),
+        capabilities: ModelCapabilities {
+            source: "live".into(),
+            ..fallback
+        },
+    }
+}
+
+async fn fetch_openai_compatible_models(
+    provider: &LlmProvider,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<ModelCatalogEntry>, String> {
+    let url = if base_url.ends_with("/models") {
+        base_url.to_string()
+    } else if base_url.ends_with("/v1") {
+        format!("{base_url}/models")
+    } else {
+        format!("{base_url}/v1/models")
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    if let Some(key) = api_key {
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {key}"))
+                .map_err(|error| format!("invalid Authorization header: {error}"))?,
+        );
+    }
+    let body = fetch_model_json(&url, headers).await?;
+    let items = body
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(models_from_live_items(provider, items))
+}
+
+async fn fetch_anthropic_models(
+    provider: &LlmProvider,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<ModelCatalogEntry>, String> {
+    let url = if base_url.ends_with("/models") {
+        base_url.to_string()
+    } else if base_url.ends_with("/v1") {
+        format!("{base_url}/models")
+    } else {
+        format!("{base_url}/v1/models")
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    if let Some(key) = api_key {
+        headers.insert(
+            "x-api-key",
+            HeaderValue::from_str(key).map_err(|error| format!("invalid x-api-key header: {error}"))?,
+        );
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    }
+    let body = fetch_model_json(&url, headers).await?;
+    let items = body
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(models_from_live_items(provider, items))
+}
+
+async fn fetch_gemini_models(
+    provider: &LlmProvider,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<ModelCatalogEntry>, String> {
+    let mut url = if base_url.ends_with("/models") {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/models")
+    };
+    if let Some(key) = api_key {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        url = format!("{url}{separator}key={key}");
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    let body = fetch_model_json(&url, headers).await?;
+    let items = body
+        .get("models")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(models_from_live_items(provider, items))
+}
+
+async fn fetch_model_json(url: &str, headers: HeaderMap) -> Result<Value, String> {
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .default_headers(headers)
+        .build()
+        .map_err(|error| error.to_string())?
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "model endpoint returned {status}: {}",
+            body.chars().take(300).collect::<String>()
+        ));
+    }
+    serde_json::from_str(&body).map_err(|error| format!("invalid model endpoint JSON: {error}"))
+}
+
+fn models_from_live_items(provider: &LlmProvider, items: Vec<Value>) -> Vec<ModelCatalogEntry> {
+    let provider_key = if provider.id.trim().is_empty() {
+        provider.provider_type.as_str()
+    } else {
+        provider.id.as_str()
+    };
+    let mut entries = Vec::new();
+    for item in items {
+        let Some(raw_id) = live_item_model_id(&item).map(str::to_string) else {
+            continue;
+        };
+        if looks_like_noise_model(&raw_id) {
+            continue;
+        }
+        let name = item
+            .get("displayName")
+            .or_else(|| item.get("display_name"))
+            .or_else(|| item.get("name"))
+            .and_then(Value::as_str)
+            .map(|value| value.trim_start_matches("models/"));
+        entries.push(live_model_entry(
+            provider_key,
+            raw_id.trim_start_matches("models/"),
+            name,
+        ));
+    }
+    entries.sort_by(|left, right| left.id.cmp(&right.id));
+    entries.dedup_by(|left, right| left.id == right.id);
+    entries
+}
+
+fn live_item_model_id(item: &Value) -> Option<&str> {
+    item.get("id")
+        .or_else(|| item.get("model"))
+        .or_else(|| item.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 pub fn list_agentic_models(provider_id: &str) -> Vec<ModelCatalogEntry> {

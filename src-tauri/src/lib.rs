@@ -24,7 +24,7 @@ use std::{
 
 use chrono::Timelike;
 use error::{AppError, AppResult};
-use model_catalog::{ModelCapabilities, ModelCatalogEntry, ProviderCatalogInfo};
+use model_catalog::{DetectedModelList, ModelCapabilities, ModelCatalogEntry, ProviderCatalogInfo};
 use models::{
     new_id, AgentDefinition, AppConfig, BrowserProvider, EmojiGroupConfig, ImageProvider,
     LlmProvider, Persona, ProactiveStatus, ProfileConfig, ScheduledAgentJob,
@@ -1420,6 +1420,11 @@ fn get_provider_catalog_info(provider_id: String) -> AppResult<Option<ProviderCa
 #[tauri::command(rename_all = "camelCase")]
 fn list_agentic_models(provider_id: String) -> AppResult<Vec<ModelCatalogEntry>> {
     Ok(model_catalog::list_agentic_models(&provider_id))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn detect_provider_models(provider: LlmProvider) -> AppResult<DetectedModelList> {
+    model_catalog::detect_provider_models(provider).await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -3514,6 +3519,7 @@ pub fn run() {
             infer_provider_model_capabilities,
             get_provider_catalog_info,
             list_agentic_models,
+            detect_provider_models,
             list_image_providers,
             save_image_providers,
             list_video_providers,

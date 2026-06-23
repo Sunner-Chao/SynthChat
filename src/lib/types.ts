@@ -1276,6 +1276,38 @@ export interface TokenUsageStats {
   callCount: number;
 }
 
+export interface TokenUsageResponse {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  callCount: number;
+  byProvider?: Record<string, TokenUsageStats>;
+  byModel?: Record<string, TokenUsageStats>;
+}
+
+export interface ModelCatalogEntry {
+  id: string;
+  name: string;
+  family?: string;
+  capabilities?: {
+    supports_tools?: boolean;
+    supports_vision?: boolean;
+    supports_reasoning?: boolean;
+    context_window?: number;
+    max_output_tokens?: number;
+  };
+}
+
+export interface DetectedModelList {
+  ok: boolean;
+  source: "live" | "catalog" | string;
+  providerId: string;
+  providerType: string;
+  baseUrl: string;
+  models: ModelCatalogEntry[];
+  error?: string | null;
+}
+
 // ── Environment Check Types ──
 
 export interface CheckItem {

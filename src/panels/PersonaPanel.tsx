@@ -2,7 +2,7 @@ import { ChangeEvent, useEffect, useState } from "react";
 import { Camera, Check, FileAudio, FolderOpen, Image, ImagePlus, Mic, Pencil, Plus, Settings, Sparkles, Trash2, Wand2 } from "lucide-react";
 import { api } from "../lib/api";
 import { useAppStore } from "../lib/store";
-import type { ChatConfig, Persona } from "../lib/types";
+import type { ChatConfig, ModelCatalogEntry, Persona } from "../lib/types";
 import { Avatar } from "../components/common";
 export function PersonaPanel() {
   const {
@@ -27,6 +27,24 @@ export function PersonaPanel() {
   const [tab, setTab] = useState<"detail" | "persona" | "behavior" | "image" | "tools">("detail");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [catalogModels, setCatalogModels] = useState<ModelCatalogEntry[]>([]);
+
+  useEffect(() => {
+    const provider = llmProviders.find((p) => p.id === draft.llmProvider);
+    if (!provider) {
+      setCatalogModels([]);
+      return;
+    }
+    let cancelled = false;
+    api.detectProviderModels(provider).then((result) => {
+      if (!cancelled) setCatalogModels(result.models ?? []);
+    }).catch(() => {
+      if (!cancelled) setCatalogModels([]);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [draft.llmProvider, llmProviders]);
 
   useEffect(() => {
     const next = personas.find((persona) => persona.id === selectedId) ?? personas[0];
@@ -199,7 +217,27 @@ export function PersonaPanel() {
             </label>
             <label>
               模型 ID
-              <input value={draft.llmModel || provider?.model || ""} onChange={(event) => updateDraft("llmModel", event.target.value)} />
+              <div className="model-select-row">
+                {catalogModels.length > 0 ? (
+                  <select
+                    value={catalogModels.some((model) => model.id === draft.llmModel) ? draft.llmModel : ""}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      if (value) updateDraft("llmModel", value);
+                    }}
+                  >
+                    <option value="">从目录选择模型</option>
+                    {catalogModels.map((model) => (
+                      <option key={model.id} value={model.id}>{model.name || model.id}{model.family ? ` (${model.family})` : ""}</option>
+                    ))}
+                  </select>
+                ) : null}
+                <input
+                  value={draft.llmModel || provider?.model || ""}
+                  onChange={(event) => updateDraft("llmModel", event.target.value)}
+                  placeholder={catalogModels.length > 0 ? "或手动输入" : "模型 ID"}
+                />
+              </div>
             </label>
             <label>
               绑定智能体

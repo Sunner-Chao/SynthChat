@@ -1574,10 +1574,89 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         app,
     )
     .await?;
+    spawn_user_queue_drain_after_turn(store, &conversation.id, app);
     maybe_run_background_skill_curator(store, &chat_config)?;
     let saved_completed_run = store.agent_run(&saved_completed_run.run_id)?;
     emit_agent_run_record(app, &saved_completed_run, Some(&assistant));
     Ok(vec![user, assistant])
+}
+
+fn spawn_user_queue_drain_after_turn(store: &AppStore, conversation_id: &str, app: Option<&AppHandle>) {
+    let Some(app) = app.cloned() else {
+        return;
+    };
+    let store = store.clone();
+    let conversation_id = conversation_id.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let Ok(has_pending_user_queue) = pending_user_queue_exists(&store, &conversation_id) else {
+            return;
+        };
+        if !has_pending_user_queue {
+            return;
+        }
+        let _ = drain_queued_requests_for_conversation(&store, &conversation_id, Some(&app)).await;
+    });
+}
+
+async fn drain_queued_requests_for_conversation(
+    store: &AppStore,
+    conversation_id: &str,
+    app: Option<&AppHandle>,
+) -> AppResult<usize> {
+    let mut count = 0usize;
+    while let Some(item) = store.claim_next_agent_request(conversation_id)? {
+        emit_agent_queue_event(app, "claimed", Some(&item), Some(conversation_id));
+        let request = SendChatRequest {
+            conversation_id: Some(item.conversation_id.clone()),
+            persona_id: Some(item.persona_id.clone()),
+            agent_id: None,
+            content: item.content.clone(),
+            provider_data: None,
+            queue_item_id: Some(item.id.clone()),
+        };
+        let status = match Box::pin(run_chat_turn_with_app(
+            store,
+            request,
+            ToolExecutionContext::Interactive,
+            app,
+        ))
+        .await
+        {
+            Ok(_) => "completed",
+            Err(error) => {
+                let failed = store
+                    .complete_agent_queue_item(&item.id, "failed", Some(error.to_string()))?
+                    .unwrap_or_else(|| {
+                        let mut fallback = item.clone();
+                        fallback.status = "failed".into();
+                        fallback.error = Some(error.to_string());
+                        fallback.updated_at = now_iso();
+                        fallback.completed_at = Some(now_iso());
+                        fallback
+                    });
+                emit_agent_queue_event(app, &failed.status, Some(&failed), Some(conversation_id));
+                return Err(error);
+            }
+        };
+        let completed = store
+            .complete_agent_queue_item(&item.id, status, None)?
+            .unwrap_or_else(|| {
+                let mut fallback = item;
+                fallback.status = status.into();
+                fallback.updated_at = now_iso();
+                fallback.completed_at = Some(now_iso());
+                fallback
+            });
+        emit_agent_queue_event(
+            app,
+            &completed.status,
+            Some(&completed),
+            Some(conversation_id),
+        );
+        count += 1;
+    }
+    Ok(count)
 }
 
 async fn maybe_enqueue_goal_continuation_after_turn(

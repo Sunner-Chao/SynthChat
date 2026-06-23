@@ -16,6 +16,7 @@ import type {
   ChatAttachment,
   ChatMessage,
   Conversation,
+  DetectedModelList,
   EmojiGroup,
   EnvCheckResult,
   HermesCredentialPoolEntryStatus,
@@ -25,6 +26,7 @@ import type {
   ManagedProcessSnapshot,
   MemoryEntry,
   MemoryStatus,
+  ModelCatalogEntry,
   Persona,
   PluginAuxiliaryTaskSummary,
   ProfileConfig,
@@ -36,6 +38,7 @@ import type {
   StateSnapshotManifest,
   StateSnapshotRestoreResult,
   TokenUsageStats,
+  TokenUsageResponse,
   ToolArtifactRecord,
   VideoProvider,
   VisionProvider,
@@ -426,8 +429,24 @@ export async function saveLlmProviders(providers: LlmProvider[]): Promise<void> 
   return call("save_llm_providers", { providers }, () => undefined);
 }
 
-export async function getTokenUsageStats(): Promise<TokenUsageStats> {
-  return call("get_token_usage_stats", {}, () => ({ promptTokens: 0, completionTokens: 0, totalTokens: 0, callCount: 0 }));
+export async function getTokenUsageStats(): Promise<TokenUsageResponse> {
+  return call("get_token_usage_stats", {}, () => ({ promptTokens: 0, completionTokens: 0, totalTokens: 0, callCount: 0, byProvider: {}, byModel: {} }));
+}
+
+export async function listAgenticModels(providerId: string): Promise<ModelCatalogEntry[]> {
+  return call("list_agentic_models", { providerId }, () => []);
+}
+
+export async function detectProviderModels(provider: LlmProvider): Promise<DetectedModelList> {
+  return call("detect_provider_models", { provider }, () => ({
+    ok: false,
+    source: "catalog",
+    providerId: provider.id,
+    providerType: provider.providerType || "",
+    baseUrl: provider.baseUrl || "",
+    models: [],
+    error: "model detection unavailable"
+  }));
 }
 
 export async function environmentCheck(): Promise<EnvCheckResult> {
@@ -672,6 +691,8 @@ export const api: Record<string, any> = {
   saveThemes: (themes: unknown[]) => call("save_themes", { themes }, () => themes),
   getTokenUsageStats,
   resetTokenUsage: () => ok("已重置"),
+  listAgenticModels,
+  detectProviderModels,
   environmentCheck,
   checkEnvironment: environmentCheck,
   getShortContextState: (conversationId: string) => call("get_short_context_state", { conversationId }, () => ({

@@ -67,6 +67,14 @@ function limitMessages(messages: ChatMessage[], limit: number) {
   return messages.length > limit ? messages.slice(-limit) : messages;
 }
 
+function isVisibleChatMessage(message: ChatMessage) {
+  return !(message.role === "user" && message.source === "proactive-internal");
+}
+
+function visibleChatMessages(messages: ChatMessage[]) {
+  return messages.filter(isVisibleChatMessage);
+}
+
 function sameConversations(left: Conversation[], right: Conversation[]) {
   return left.length === right.length && left.every((item, index) => {
     const other = right[index];
@@ -407,7 +415,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       : conversations[0]?.id ?? null;
     const messageLimit = uiMessageLimit(config);
     const previewChars = uiMessagePreviewChars(config);
-    const messages = activeConversationId ? await api.listMessages(activeConversationId, messageLimit, previewChars) : [];
+    const messages = activeConversationId ? visibleChatMessages(await api.listMessages(activeConversationId, messageLimit, previewChars)) : [];
     set({
       config,
       conversations,
@@ -452,7 +460,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       const messageLimit = uiMessageLimit(state.config);
       const previewChars = uiMessagePreviewChars(state.config);
       const nextMessages = state.activeConversationId
-        ? await api.listMessages(state.activeConversationId, messageLimit, previewChars)
+        ? visibleChatMessages(await api.listMessages(state.activeConversationId, messageLimit, previewChars))
         : [];
       set({
         agentRuns: nextRuns,
@@ -485,7 +493,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       ?? null;
     const messageLimit = uiMessageLimit(state.config);
     const previewChars = uiMessagePreviewChars(state.config);
-    const messages = activeConversationId ? await api.listMessages(activeConversationId, messageLimit, previewChars) : [];
+    const messages = activeConversationId ? visibleChatMessages(await api.listMessages(activeConversationId, messageLimit, previewChars)) : [];
     if (
       state.activeConversationId === activeConversationId
       && sameConversations(state.conversations, conversations)
@@ -524,6 +532,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
   },
   upsertIncomingMessage: (message) => {
+    if (!isVisibleChatMessage(message)) return;
     set((state) => {
       if (state.activeConversationId && message.conversationId !== state.activeConversationId) {
         return state;
@@ -542,7 +551,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const conversations = await api.listConversations();
     const messageLimit = uiMessageLimit(get().config);
     const previewChars = uiMessagePreviewChars(get().config);
-    const messages = await api.listMessages(conversation.id, messageLimit, previewChars);
+    const messages = visibleChatMessages(await api.listMessages(conversation.id, messageLimit, previewChars));
     set({
       conversations,
       activeConversationId: conversation.id,
@@ -555,7 +564,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const conversations = await api.listConversations();
     const messageLimit = uiMessageLimit(get().config);
     const previewChars = uiMessagePreviewChars(get().config);
-    const messages = await api.listMessages(conversation.id, messageLimit, previewChars);
+    const messages = visibleChatMessages(await api.listMessages(conversation.id, messageLimit, previewChars));
     set({
       conversations,
       activeConversationId: conversation.id,
@@ -570,7 +579,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       : get().activeConversationId;
     const messageLimit = uiMessageLimit(get().config);
     const previewChars = uiMessagePreviewChars(get().config);
-    const messages = activeConversationId ? await api.listMessages(activeConversationId, messageLimit, previewChars) : [];
+    const messages = activeConversationId ? visibleChatMessages(await api.listMessages(activeConversationId, messageLimit, previewChars)) : [];
     const { [conversationId]: _, ...unreadCounts } = get().conversationUnreadCounts;
     set({ conversations, activeConversationId, messages, conversationUnreadCounts: unreadCounts });
   },
@@ -584,7 +593,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         });
     const messageLimit = uiMessageLimit(get().config);
     const previewChars = uiMessagePreviewChars(get().config);
-    const messages = await api.listMessages(conversationId, messageLimit, previewChars);
+    const messages = visibleChatMessages(await api.listMessages(conversationId, messageLimit, previewChars));
     if (get().activeConversationId === conversationId) {
       set({ activeConversationId: conversationId, messages });
     }
@@ -603,7 +612,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({
         conversations,
         activeConversationId: conversation.id,
-        messages: await api.listMessages(conversation.id, messageLimit, previewChars),
+        messages: visibleChatMessages(await api.listMessages(conversation.id, messageLimit, previewChars)),
         processingConversationIds: state.processingConversationIds.filter((id) => id !== state.activeConversationId)
       });
       return;
@@ -624,7 +633,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         set({
           conversations,
           activeConversationId: conversation.id,
-          messages: await api.listMessages(conversation.id, messageLimit, previewChars),
+          messages: visibleChatMessages(await api.listMessages(conversation.id, messageLimit, previewChars)),
           conversationUnreadCounts: { ...state.conversationUnreadCounts, [conversation.id]: 0 },
           processingConversationIds: state.processingConversationIds.filter((id) => id !== state.activeConversationId)
         });
@@ -640,7 +649,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       const conversations = await api.listConversations();
       const messageLimit = uiMessageLimit(state.config);
       const previewChars = uiMessagePreviewChars(state.config);
-      set({ conversations, activeConversationId, messages: await api.listMessages(conversation.id, messageLimit, previewChars) });
+      set({ conversations, activeConversationId, messages: visibleChatMessages(await api.listMessages(conversation.id, messageLimit, previewChars)) });
     }
     const temporaryMessage: ChatMessage = {
       id: `local-${crypto.randomUUID()}`,
@@ -675,19 +684,20 @@ export const useAppStore = create<AppState>((set, get) => ({
         get().setConversationProcessing(activeConversationId ?? "", false);
         return;
       }
-      const hasAssistantReply = responseMessages.some((m) => m.role === "assistant" && m.content.trim());
+      const visibleResponseMessages = visibleChatMessages(responseMessages);
+      const hasAssistantReply = visibleResponseMessages.some((m) => m.role === "assistant" && m.content.trim());
       const messageLimit = uiMessageLimit(get().config);
       set((current) => {
         // 去重：用后端返回的消息替换本地临时消息
         const backendUserIds = new Set(
-          responseMessages.filter((m) => m.role === "user").map((m) => m.id)
+          visibleResponseMessages.filter((m) => m.role === "user").map((m) => m.id)
         );
         // 移除本地临时 user 消息（id 以 "local-" 开头），保留后端返回的
         const withoutTemp = current.messages.filter(
           (m) => !(m.id.startsWith("local-") && m.role === "user" && backendUserIds.size > 0)
         );
         const existingIds = new Set(withoutTemp.map((m) => m.id));
-        const newMessages = responseMessages.filter((m) => !existingIds.has(m.id));
+        const newMessages = visibleResponseMessages.filter((m) => !existingIds.has(m.id));
         const merged = [...withoutTemp, ...newMessages];
         return { messages: limitMessages(merged, messageLimit) };
       });

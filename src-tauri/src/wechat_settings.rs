@@ -2542,10 +2542,11 @@ pub async fn wechat_inbound_text(
     let persona = store.persona(Some(account.linked_persona.as_str()))?;
     let conversation_id =
         find_or_create_wechat_conversation(store, &account.linked_persona, &account.id)?;
-    let messages = run_wechat_chat_turn(
+    emit_wechat_processing(app, &conversation_id, &persona.id, true);
+    let messages_result = run_wechat_chat_turn(
         store,
         SendChatRequest {
-            conversation_id: Some(conversation_id),
+            conversation_id: Some(conversation_id.clone()),
             persona_id: Some(persona.id.clone()),
             agent_id: Some(persona.agent_id.clone()),
             content,
@@ -2559,7 +2560,9 @@ pub async fn wechat_inbound_text(
         },
         app,
     )
-    .await?;
+    .await;
+    emit_wechat_processing(app, &conversation_id, &persona.id, false);
+    let messages = messages_result?;
     let reply = messages
         .iter()
         .rev()
@@ -2576,6 +2579,25 @@ pub async fn wechat_inbound_text(
         delivered,
         delivery_error,
     })
+}
+
+fn emit_wechat_processing(
+    app: Option<&AppHandle>,
+    conversation_id: &str,
+    persona_id: &str,
+    processing: bool,
+) {
+    let Some(app) = app else {
+        return;
+    };
+    let _ = app.emit(
+        "synthchat-chat-event",
+        json!({
+            "type": if processing { "processing" } else { "conversation_updated" },
+            "personaId": persona_id,
+            "conversationId": conversation_id,
+        }),
+    );
 }
 
 pub fn dispatch_desktop_reply_to_wechat(conversation: &crate::models::Conversation, text: &str) {

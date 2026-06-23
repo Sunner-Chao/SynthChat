@@ -287,6 +287,11 @@ fn order_llm_provider_credentials(
     ordered
 }
 
+fn conversation_preview_message(message: &ChatMessage) -> bool {
+    matches!(message.role.as_str(), "user" | "assistant")
+        && !(message.role == "user" && message.source == "proactive-internal")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmCredentialCooldown {
@@ -7678,12 +7683,16 @@ impl AppStore {
             let target_messages = s.messages.entry(target_id.to_string()).or_default();
             target_messages.append(&mut moved);
             target_messages.sort_by(|left, right| left.created_at.cmp(&right.created_at));
-            let last_message_update = target_messages.last().map(|last| {
-                (
-                    last.content.chars().take(120).collect(),
-                    last.created_at.clone(),
-                )
-            });
+            let last_message_update = target_messages
+                .iter()
+                .rev()
+                .find(|message| conversation_preview_message(message))
+                .map(|last| {
+                    (
+                        last.content.chars().take(120).collect(),
+                        last.created_at.clone(),
+                    )
+                });
             if let Some((last_message, updated_at)) = last_message_update {
                 if let Some(target) = s.conversations.iter_mut().find(|c| c.id == target_id) {
                     target.last_message = last_message;
@@ -7807,10 +7816,11 @@ impl AppStore {
                 .find(|c| c.id == message.conversation_id)
             {
                 conv.updated_at = message.created_at.clone();
-                if message.role == "user" || message.role == "assistant" {
+                if conversation_preview_message(&message) {
                     conv.last_message = message.content.chars().take(120).collect();
                 }
                 if message.role == "user"
+                    && message.source != "proactive-internal"
                     && (conv.title.is_empty() || conv.title == "新会话" || conv.title == "小可")
                 {
                     conv.title = message.content.chars().take(24).collect();
@@ -7840,7 +7850,7 @@ impl AppStore {
                 if let Some(last) = messages
                     .iter()
                     .rev()
-                    .find(|message| matches!(message.role.as_str(), "user" | "assistant"))
+                    .find(|message| conversation_preview_message(message))
                 {
                     conv.last_message = last.content.chars().take(120).collect();
                     conv.updated_at = last.created_at.clone();
@@ -7875,7 +7885,7 @@ impl AppStore {
                     if let Some(last) = messages
                         .iter()
                         .rev()
-                        .find(|message| message.role == "user" || message.role == "assistant")
+                        .find(|message| conversation_preview_message(message))
                     {
                         conv.updated_at = last.created_at.clone();
                         conv.last_message = last.content.chars().take(120).collect();

@@ -14,6 +14,7 @@ use crate::{
         ChatMessage, PlannerTraceRecord, ToolDefinition, ToolEvent,
     },
     store::AppStore,
+    wechat_settings,
 };
 
 use super::{
@@ -94,7 +95,47 @@ pub(super) fn record_tool_event_for_run(
         let saved_run = store.save_agent_run(run)?;
         emit_agent_run_record(app, &saved_run, Some(&tool_message));
     }
+    dispatch_tool_progress_to_wechat(store, conversation_id, &event);
     Ok(())
+}
+
+fn dispatch_tool_progress_to_wechat(store: &AppStore, conversation_id: &str, event: &ToolEvent) {
+    if event.status.as_deref() == Some("running") {
+        return;
+    }
+    let Ok(conversation) = store.conversation(conversation_id) else {
+        return;
+    };
+    if conversation.wechat_account_id.is_none()
+        && conversation
+            .metadata
+            .get("wechatAccountId")
+            .and_then(Value::as_str)
+            .is_none()
+    {
+        return;
+    }
+    let title = if event.title.trim().is_empty() {
+        format!("{}.{}", event.server_id, event.tool_name)
+    } else {
+        event.title.trim().to_string()
+    };
+    let detail = event
+        .error
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            (!event.summary.trim().is_empty()).then_some(event.summary.as_str())
+        })
+        .or_else(|| event.text.as_deref().filter(|value| !value.trim().is_empty()))
+        .unwrap_or("");
+    let status = if event.ok { "完成" } else { "失败" };
+    let mut message = format!("工具调用{status}: {title}");
+    if !detail.trim().is_empty() {
+        message.push('\n');
+        message.push_str(&truncate_for_prompt(detail.trim(), 300));
+    }
+    wechat_settings::dispatch_desktop_reply_to_wechat(&conversation, &message);
 }
 
 pub(super) fn record_tool_failed_for_run(

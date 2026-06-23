@@ -75,6 +75,7 @@ pub(super) fn agent_planner_prompt_for_agent_context(
         tool_context,
         agent,
         None,
+        None,
         &InternalToolAvailability::all_available(),
         "Current LLM model metadata: unavailable.",
     )
@@ -93,6 +94,11 @@ pub(super) fn agent_planner_prompt_for_agent_context_with_store(
 ) -> String {
     let availability = internal_tool_availability(store);
     let model_metadata_block = agent_model_metadata_prompt_block(store, agent);
+    let user_profile_name = store
+        .profile()
+        .ok()
+        .map(|profile| profile.name.trim().to_string())
+        .filter(|name| !name.is_empty() && name != "用户");
     agent_planner_prompt_for_agent_context_with_availability(
         observations,
         skill_blocks,
@@ -102,6 +108,7 @@ pub(super) fn agent_planner_prompt_for_agent_context_with_store(
         tool_context,
         agent,
         persona,
+        user_profile_name.as_deref(),
         &availability,
         &model_metadata_block,
     )
@@ -116,6 +123,7 @@ pub(super) fn agent_planner_prompt_for_agent_context_with_availability(
     tool_context: ToolExecutionContext,
     agent: &AgentDefinition,
     persona: Option<&Persona>,
+    user_profile_name: Option<&str>,
     availability: &InternalToolAvailability,
     model_metadata_block: &str,
 ) -> String {
@@ -130,7 +138,7 @@ pub(super) fn agent_planner_prompt_for_agent_context_with_availability(
     let mcp_tool_block = render_mcp_tool_definitions(mcp_tools);
     let internal_tool_block = render_internal_tool_prompt_block(agent, tool_context, availability);
     let environment_probe_block = environment_probe_prompt_block();
-    let persona_block = render_persona_prompt_block(persona);
+    let persona_block = render_persona_prompt_block(persona, user_profile_name);
     format!(
         r#"You are SynthChat's recovered agent runtime. Decide the next step from the user request and current observations.
 
@@ -174,7 +182,7 @@ For MCP/capability tools, use the listed tool name exactly and provide payload m
 Before write_file, patch, delete_file, or move_file, inspect the target file unless the user explicitly provided the full intended content. When modifying a file you just read, pass read_file's sha256/modifiedUnixMs back as expectedSha256/expectedModifiedUnixMs so stale edits fail instead of overwriting newer content.
 Use terminal/process/execute_code only when command execution is necessary and the agent is configured to allow shell access.
 Use workspace_diagnostics after code changes or when build/type/test failures are relevant; it runs bounded read-only diagnostics.
-File tools can access only the configured agent workspace. If a requested local path is outside that workspace, explain the workspace limitation and ask the user to switch or configure the workspace instead of repeatedly retrying the same path.
+Direct file tools can access only the configured agent workspace. Do not generalize this into "I can only access workspace files": terminal/process/computer-use tools may access broader local paths when configured, available, and appropriate. If read_file/search_files rejects a local path outside the workspace, either use an appropriate available non-file tool or explain the file-tool workspace limitation and ask the user to switch/configure the workspace.
 When you create or identify a file the user should open/download, use artifact with action=publish_file for an existing workspace file or content for generated text, then mention the artifact path in the final answer.
 Use web_extract when the user gives specific HTTP(S) URLs or after web_search when page content, documentation, article text, or source evidence is needed.
 For web page tasks, prefer browser_snapshot/browser_navigate first for static pages and browser_cdp action=snapshot for dynamic pages; inspect forms, inputs, links, refs, and request clues before choosing click/type/fetch-style actions.
@@ -186,9 +194,11 @@ Current observations:
     )
 }
 
-fn render_persona_prompt_block(persona: Option<&Persona>) -> String {
+fn render_persona_prompt_block(persona: Option<&Persona>, user_profile_name: Option<&str>) -> String {
     let Some(persona) = persona else {
-        return "No persona context provided.".into();
+        return user_profile_name
+            .map(|name| format!("User profile: The user's preferred display name is {name}."))
+            .unwrap_or_else(|| "No persona context provided.".into());
     };
     let mut parts = Vec::new();
     if !persona.name.trim().is_empty() {
@@ -213,6 +223,11 @@ fn render_persona_prompt_block(persona: Option<&Persona>) -> String {
         parts.push(format!(
             "Output examples:\n{}",
             persona.output_examples.trim()
+        ));
+    }
+    if let Some(name) = user_profile_name {
+        parts.push(format!(
+            "User profile: The user's preferred display name is {name}."
         ));
     }
     if parts.is_empty() {

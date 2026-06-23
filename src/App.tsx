@@ -108,6 +108,10 @@ function formatTime(value: string) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
+function isVisibleChatEventMessage(message: ChatMessage) {
+  return !(message.role === "user" && message.source === "proactive-internal");
+}
+
 function maskSecret(value?: string | null) {
   const text = value?.trim() ?? "";
   if (!text) return "未记录";
@@ -232,7 +236,7 @@ export function App() {
           }
         }
       }
-      if ((payload.type === "assistant_stream" || payload.type === "new_message" || payload.type === "tool_message") && payload.message) {
+      if ((payload.type === "assistant_stream" || payload.type === "new_message" || payload.type === "tool_message") && payload.message && isVisibleChatEventMessage(payload.message)) {
         upsertIncomingMessage(payload.message);
       }
       if (payload.type === "assistant_stream") {

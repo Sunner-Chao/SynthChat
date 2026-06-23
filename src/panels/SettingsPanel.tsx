@@ -31,6 +31,7 @@ import type {
   EmojiGroup,
   ImageProvider,
   LlmProvider,
+  ModelCatalogEntry,
   McpServer,
   Persona,
   ProfileConfig,
@@ -927,13 +928,35 @@ function ProviderSettings({
   const [tokenStats, setTokenStats] = useState<Record<string, TokenUsageStats>>({});
   const emptyTokenStats: TokenUsageStats = { promptTokens: 0, completionTokens: 0, totalTokens: 0, callCount: 0 };
   useEffect(() => {
-    api.getTokenUsageStats().then(setTokenStats).catch(() => {});
+    api.getTokenUsageStats().then((response) => setTokenStats(response.byProvider ?? {})).catch(() => {});
   }, [messages]);
   const resetTokenStats = async (providerId?: string) => {
     await api.resetTokenUsage(providerId).catch(() => {});
-    const stats = await api.getTokenUsageStats().catch(() => ({}));
-    setTokenStats(stats);
+    const response = await api.getTokenUsageStats().catch(() => ({ byProvider: {} }));
+    setTokenStats(response.byProvider ?? {});
   };
+  const [catalogModels, setCatalogModels] = useState<ModelCatalogEntry[]>([]);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [catalogSource, setCatalogSource] = useState("");
+  const [catalogError, setCatalogError] = useState("");
+  const fetchCatalogModels = async (provider: LlmProvider) => {
+    setCatalogLoading(true);
+    try {
+      const result = await api.detectProviderModels(provider);
+      setCatalogModels(result.models ?? []);
+      setCatalogSource(result.source ?? "");
+      setCatalogError(result.error ?? "");
+    } catch (error) {
+      setCatalogModels([]);
+      setCatalogSource("");
+      setCatalogError(String(error));
+    } finally {
+      setCatalogLoading(false);
+    }
+  };
+  useEffect(() => {
+    if (draft) void fetchCatalogModels(draft);
+  }, [draft?.id, draft?.providerType, draft?.baseUrl, draft?.apiKeyEnv, draft?.apiKey]);
   useEffect(() => {
     if (selectedId && !selected) {
       setSelectedId("");
@@ -1079,7 +1102,44 @@ function ProviderSettings({
             {(draft.providerType ?? "openai_compatible") === "openai_compatible" ? (
               <label className="checkbox-row"><input checked={draft.appendChatPath ?? true} onChange={(event) => setDraft((d) => d ? { ...d, appendChatPath: event.target.checked } : d)} type="checkbox" />拼接 /chat/completions</label>
             ) : null}
-            <label>模型<input value={draft.model} onChange={(event) => setDraft((d) => d ? { ...d, model: event.target.value } : d)} /></label>
+            <label>模型
+              <div className="model-select-row">
+                {catalogModels.length > 0 ? (
+                  <select
+                    value={catalogModels.some((model) => model.id === draft.model) ? draft.model : ""}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      if (value) setDraft((d) => d ? { ...d, model: value } : d);
+                    }}
+                  >
+                    <option value="">{catalogLoading ? "加载中..." : "从目录选择模型"}</option>
+                    {catalogModels.map((model) => (
+                      <option key={model.id} value={model.id}>{model.name || model.id}{model.family ? ` (${model.family})` : ""}</option>
+                    ))}
+                  </select>
+                ) : null}
+                <input
+                  value={draft.model}
+                  onChange={(event) => setDraft((d) => d ? { ...d, model: event.target.value } : d)}
+                  placeholder={catalogModels.length > 0 ? "或手动输入模型 ID" : "模型 ID"}
+                />
+                <button
+                  className="model-refresh-btn"
+                  disabled={catalogLoading}
+                  onClick={() => void fetchCatalogModels(draft)}
+                  title="刷新模型目录"
+                  type="button"
+                >
+                  {catalogLoading ? "..." : "↻"}
+                </button>
+              </div>
+              {catalogSource || catalogError ? (
+                <small className="form-hint">
+                  {catalogSource === "live" ? "已通过当前 Base URL/API Key 检测模型" : "使用内置模型目录"}
+                  {catalogError ? `：${catalogError}` : ""}
+                </small>
+              ) : null}
+            </label>
             <div className="two-column">
               <label>API Key 环境变量<input value={draft.apiKeyEnv} onChange={(event) => setDraft((d) => d ? { ...d, apiKeyEnv: event.target.value } : d)} /></label>
               <label>超时秒数<input min={1} type="number" value={draft.timeoutSeconds} onChange={(event) => setDraft((d) => d ? { ...d, timeoutSeconds: Number(event.target.value) } : d)} /></label>
