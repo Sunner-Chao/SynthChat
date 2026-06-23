@@ -217,10 +217,29 @@ function isAttachmentContextLine(line: string) {
   }
 }
 
-function displayTextForMessage(content: string) {
-  return content
+function isMediaDirectiveLine(line: string) {
+  const trimmed = line.trim();
+  return trimmed.includes("[media attached:") || /^`?MEDIA:\s*(?:"[^"]+"|'[^']+'|`[^`]+`|.+)`?$/i.test(trimmed);
+}
+
+function stripToolDirectiveBlocks(content: string) {
+  const match = /(^|\n)\s*<(?:tool_call|tool_calls|function=|function_call|function_calls|tool_result)(?:\s|>|=)/i.exec(content);
+  if (!match || match.index < 0) return content;
+  return content.slice(0, match.index).trimEnd();
+}
+
+function renderTextForMessage(content: string) {
+  return stripToolDirectiveBlocks(content)
     .split(/\r?\n/)
     .filter((line) => !isAttachmentContextLine(line))
+    .join("\n")
+    .trim();
+}
+
+function displayTextForMessage(content: string) {
+  return stripToolDirectiveBlocks(content)
+    .split(/\r?\n/)
+    .filter((line) => !isAttachmentContextLine(line) && !isMediaDirectiveLine(line))
     .join("\n")
     .trim();
 }
@@ -524,6 +543,10 @@ function extractArtifactPaths(text: string): ArtifactTarget[] {
     if (!clean || seen.has(clean)) continue;
     seen.add(clean);
     targets.push({ path: clean, title: fileNameFromPath(clean), kind: artifactKind(clean, mimeType), source: "message" });
+  }
+  const mediaTag = /(?:^|\n)\s*`?MEDIA:\s*(?:"([^"\n]+)"|'([^'\n]+)'|`([^`\n]+)`|([A-Za-z]:[\\/][^\n]+|\/[^\n]+|~\/[^\n]+))`?/gi;
+  while ((match = mediaTag.exec(text)) !== null) {
+    push((match[1] || match[2] || match[3] || match[4] || "").trim(), "message");
   }
   const tagged = /(?:MEDIA|media|文件|路径|保存到|saved(?: at| to)?)[：:\s]+[`"]?((?:[A-Za-z]:\\|\/|~\/)[^\s`"'<>]+)[`"]?/g;
   while ((match = tagged.exec(text)) !== null) push(match[1], "message");
@@ -1420,7 +1443,7 @@ export const ChatExperience = memo(function ChatExperience() {
 
   const copyMessage = async (message: ChatMessage) => {
     const content = await api.getMessageContent(message.id).catch(() => message.content);
-    await navigator.clipboard?.writeText(content);
+    await navigator.clipboard?.writeText(displayTextForMessage(plainText(content)));
     setCopiedMessageId(message.id);
     window.setTimeout(() => setCopiedMessageId(null), 1200);
   };
@@ -2178,7 +2201,7 @@ const MessageRow = memo(function MessageRow({
   const toolEvent = message.role === "tool" ? parseToolEvent(message.content) : null;
   const processEvent = message.role === "tool" ? parseManagedProcessEvent(message.content) : null;
   const isUser = message.role === "user";
-  const text = previewText(displayTextForMessage(plainText(message.content)), previewCharLimit);
+  const text = previewText(renderTextForMessage(plainText(message.content)), previewCharLimit);
   const isStreaming = !isUser && !toolEvent && !processEvent && (message.source === "desktop-stream" || animateText);
   const displayText = useRevealedText(text, isStreaming, streamCharsPerSecond, onAnimationDone);
   if (toolEvent) return <ToolMessage event={toolEvent} />;
@@ -2224,6 +2247,7 @@ type MediaSegment =
   | { kind: "file"; path: string; mimeType: string };
 
 const MEDIA_MARKER = /\[media attached:\s*(?:"([^"]+)"|`([^`]+)`|([^\]\(]+?))\s*(?:\(([^)]+)\))?\]/gi;
+const MEDIA_TAG_MARKER = /`?MEDIA:\s*(?:"([^"\n]+)"|'([^'\n]+)'|`([^`\n]+)`|([A-Za-z]:[\\/][^\n]+|\/[^\n]+|~\/[^\n]+))`?/gi;
 
 function parseMediaSegments(text: string): MediaSegment[] {
   const segments: MediaSegment[] = [];
@@ -2237,6 +2261,24 @@ function parseMediaSegments(text: string): MediaSegment[] {
     const path = (match[1] || match[2] || match[3] || "").trim();
     const mimeType = (match[4] || (isImagePath(path) ? imageMimeType(path) : "application/octet-stream")).trim();
     if (path) segments.push({ kind: isImagePath(path) || mimeType.startsWith("image/") ? "image" : "file", path, mimeType });
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < text.length) segments.push({ kind: "text", value: text.slice(lastIndex) });
+  return segments.flatMap((segment) => segment.kind === "text" ? parseMediaTagSegments(segment.value) : [segment]);
+}
+
+function parseMediaTagSegments(text: string): MediaSegment[] {
+  const segments: MediaSegment[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  MEDIA_TAG_MARKER.lastIndex = 0;
+  while ((match = MEDIA_TAG_MARKER.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push({ kind: "text", value: text.slice(lastIndex, match.index) });
+    }
+    const path = (match[1] || match[2] || match[3] || match[4] || "").trim();
+    const mimeType = isImagePath(path) ? imageMimeType(path) : "application/octet-stream";
+    if (path) segments.push({ kind: isImagePath(path) ? "image" : "file", path, mimeType });
     lastIndex = match.index + match[0].length;
   }
   if (lastIndex < text.length) segments.push({ kind: "text", value: text.slice(lastIndex) });
@@ -2444,7 +2486,7 @@ function toolEventReauthInfo(event: ToolEvent): { state: string; cacheState: str
 }
 
 const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
-  const [expanded, setExpanded] = useState(event.status === "running");
+  const [expanded, setExpanded] = useState(false);
   const canOpen = Boolean(event.path && event.exists);
   const isToolImage = canOpen && (event.eventType === "screenshot" || event.eventType === "image" || Boolean(event.mimeType?.startsWith("image/")));
   const isRunning = event.status === "running";
@@ -2453,6 +2495,7 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
   const summaryText = event.summary?.trim() ?? "";
   const bodyText = event.text?.trim() ?? "";
   const errorText = event.error?.trim() ?? "";
+  const pathState = typeof event.exists === "boolean" ? (event.exists ? "存在" : "不存在") : "未确认";
   const duplicateBody = Boolean(summaryText && bodyText && normalizeToolDetailText(summaryText) === normalizeToolDetailText(bodyText));
   const duplicateError = Boolean(errorText && (normalizeToolDetailText(errorText) === normalizeToolDetailText(summaryText) || normalizeToolDetailText(errorText) === normalizeToolDetailText(bodyText)));
   const hasDetails = Boolean(summaryText || event.path || isToolImage || canOpen || (bodyText && !duplicateBody) || (errorText && !duplicateError) || reauthInfo);
@@ -2483,7 +2526,7 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
               <div className="claw-tool-path">
                 <FileText size={14} />
                 <code>{event.path}</code>
-                <span>{event.exists ? "存在" : "不存在"}</span>
+                <span>{pathState}</span>
               </div>
             ) : null}
             {isToolImage && event.path ? (
@@ -2517,7 +2560,7 @@ const ManagedProcessMessage = memo(function ManagedProcessMessage({ event }: { e
   const line = typeof detail.line === "string" ? detail.line : "";
   const reason = typeof detail.reason === "string" ? detail.reason : "";
   const hasDetails = Boolean(line || reason || event.command || event.cwd);
-  const [expanded, setExpanded] = useState(event.type !== "completed");
+  const [expanded, setExpanded] = useState(false);
 
   return (
     <div className="claw-tool-message">

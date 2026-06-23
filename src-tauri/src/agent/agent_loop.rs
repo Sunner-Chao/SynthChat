@@ -1456,6 +1456,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     }
     normalize_guardrail_halt_reply(&mut assistant_text, &observations);
     append_file_mutation_footer(&mut assistant_text, &failed_file_mutations);
+    assistant_text = sanitize_visible_assistant_reply(&assistant_text);
     assistant_text = run_transform_llm_output_hooks(
         store,
         &saved_run.run_id,

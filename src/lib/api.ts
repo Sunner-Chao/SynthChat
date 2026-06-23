@@ -88,6 +88,7 @@ const fallbackConfig: AppConfig = {
     toolUseEnforcement: "auto",
     toolParallelEnabled: true,
     toolParallelLimit: 4,
+    sendMessageToolEnabled: false,
     toolApprovalMode: "risky",
     cronApprovalMode: "deny",
     trustedToolPatterns: [],

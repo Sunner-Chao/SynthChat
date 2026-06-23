@@ -1528,10 +1528,28 @@ fn remove_closed_xml_blocks_with_attrs(
         let Some(close_idx) = find_ascii_case_insensitive(&output, &close, open_end) else {
             break;
         };
+        if closed_xml_block_should_survive_for_tool_parser(
+            tag,
+            &output[open_idx..close_idx + close.len()],
+        ) {
+            cursor = open_end;
+            continue;
+        }
         output.replace_range(open_idx..close_idx + close.len(), "");
         cursor = open_idx;
     }
     output
+}
+
+fn closed_xml_block_should_survive_for_tool_parser(tag: &str, block: &str) -> bool {
+    if !matches!(
+        tag,
+        "tool_calls" | "tool_call" | "function_calls" | "function_call"
+    ) {
+        return false;
+    }
+    let lower = block.to_ascii_lowercase();
+    lower.contains("<function=")
 }
 
 fn find_xml_open_tag(content: &str, tag: &str, start: usize) -> Option<(usize, usize)> {

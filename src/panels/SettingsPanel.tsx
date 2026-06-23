@@ -2146,6 +2146,7 @@ function ChatSettings({
   const [toolUseEnforcement, setToolUseEnforcement] = useState(config.toolUseEnforcement ?? "auto");
   const [toolParallelEnabled, setToolParallelEnabled] = useState(config.toolParallelEnabled !== false);
   const [toolParallelLimit, setToolParallelLimit] = useState(config.toolParallelLimit ?? 4);
+  const [sendMessageToolEnabled, setSendMessageToolEnabled] = useState(config.sendMessageToolEnabled === true);
   const [toolApprovalMode, setToolApprovalMode] = useState(config.toolApprovalMode ?? "risky");
   const [trustedToolPatterns, setTrustedToolPatterns] = useState(config.trustedToolPatterns ?? []);
   const [trustedToolPatternDraft, setTrustedToolPatternDraft] = useState("");
@@ -2218,6 +2219,7 @@ function ChatSettings({
     setToolUseEnforcement(config.toolUseEnforcement ?? "auto");
     setToolParallelEnabled(config.toolParallelEnabled !== false);
     setToolParallelLimit(config.toolParallelLimit ?? 4);
+    setSendMessageToolEnabled(config.sendMessageToolEnabled === true);
     setToolApprovalMode(config.toolApprovalMode ?? "risky");
     setTrustedToolPatterns(config.trustedToolPatterns ?? []);
     setTrustedToolPatternDraft("");
@@ -2251,7 +2253,7 @@ function ChatSettings({
     setStoredMessages(config.maxStoredMessagesPerConversation ?? 300);
     setStoredRuns(config.maxStoredAgentRuns ?? 50);
     setStoredTraces(config.maxStoredToolTraces ?? 100);
-  }, [config.activePollIntervalMs, config.agentRunTimeoutSeconds, config.artifactScanLimit, config.autoTitleEnabled, config.backgroundMemoryReviewEnabled, config.backgroundMemoryReviewMinMessages, config.backgroundSkillCuratorEnabled, config.backgroundSkillCuratorIntervalHours, config.backgroundSkillReviewAutoCreateEnabled, config.backgroundSkillReviewEnabled, config.bottomFollowThresholdPx, config.busyInputMode, config.delegationInheritMcpToolsets, config.delegationMaxConcurrentChildren, config.delegationOrchestratorEnabled, config.delegationSubagentAutoApprove, config.delegationSubagentModel, config.delegationSubagentProviderId, config.historyCleanupEnabled, config.historyRetentionDays, config.idlePollIntervalMs, config.intentAnalyzerMode, config.intentAnalyzerModel, config.intentAnalyzerProviderId, config.intentEmbeddingMinConfidence, config.intentLlmMaxTokens, config.intentLlmMinConfidence, config.intentLlmPrompt, config.intentLlmTimeoutSeconds, config.llmCredentialPoolStrategy, config.llmRetryBackoffMs, config.llmRetryCount, config.maxStoredAgentRuns, config.maxStoredMessagesPerConversation, config.maxStoredToolTraces, config.queueWaitSeconds, config.responsesReasoningReplayEnabled, config.shortContextAbortOnSummaryFailure, config.shortContextSummaryModel, config.shortContextSummaryProviderId, config.skillHotReloadEnabled, config.skillHotReloadIntervalSeconds, config.thinkingMinVisibleMs, config.toolApprovalMode, config.toolCallRetryBackoffMs, config.toolCallRetryCount, config.toolEnvPassthrough, config.toolGuardrailExactFailureLimit, config.toolGuardrailExactFailureWarnAfter, config.toolGuardrailHardStopEnabled, config.toolGuardrailNoProgressLimit, config.toolGuardrailNoProgressWarnAfter, config.toolGuardrailSameToolFailureLimit, config.toolGuardrailSameToolFailureWarnAfter, config.toolGuardrailWarningsEnabled, config.toolParallelEnabled, config.toolParallelLimit, config.toolRouterLlmEnabled, config.toolRouterLlmMaxTokens, config.toolRouterLlmMinConfidence, config.toolRouterLlmPrompt, config.toolRouterLlmTimeoutSeconds, config.toolUseEnforcement, config.trustedCommandPatterns, config.trustedToolPatterns, config.uiMessageLimit, config.uiMessagePreviewChars, config.uiStreamCharsPerSecond]);
+  }, [config.activePollIntervalMs, config.agentRunTimeoutSeconds, config.artifactScanLimit, config.autoTitleEnabled, config.backgroundMemoryReviewEnabled, config.backgroundMemoryReviewMinMessages, config.backgroundSkillCuratorEnabled, config.backgroundSkillCuratorIntervalHours, config.backgroundSkillReviewAutoCreateEnabled, config.backgroundSkillReviewEnabled, config.bottomFollowThresholdPx, config.busyInputMode, config.delegationInheritMcpToolsets, config.delegationMaxConcurrentChildren, config.delegationOrchestratorEnabled, config.delegationSubagentAutoApprove, config.delegationSubagentModel, config.delegationSubagentProviderId, config.historyCleanupEnabled, config.historyRetentionDays, config.idlePollIntervalMs, config.intentAnalyzerMode, config.intentAnalyzerModel, config.intentAnalyzerProviderId, config.intentEmbeddingMinConfidence, config.intentLlmMaxTokens, config.intentLlmMinConfidence, config.intentLlmPrompt, config.intentLlmTimeoutSeconds, config.llmCredentialPoolStrategy, config.llmRetryBackoffMs, config.llmRetryCount, config.maxStoredAgentRuns, config.maxStoredMessagesPerConversation, config.maxStoredToolTraces, config.queueWaitSeconds, config.responsesReasoningReplayEnabled, config.sendMessageToolEnabled, config.shortContextAbortOnSummaryFailure, config.shortContextSummaryModel, config.shortContextSummaryProviderId, config.skillHotReloadEnabled, config.skillHotReloadIntervalSeconds, config.thinkingMinVisibleMs, config.toolApprovalMode, config.toolCallRetryBackoffMs, config.toolCallRetryCount, config.toolEnvPassthrough, config.toolGuardrailExactFailureLimit, config.toolGuardrailExactFailureWarnAfter, config.toolGuardrailHardStopEnabled, config.toolGuardrailNoProgressLimit, config.toolGuardrailNoProgressWarnAfter, config.toolGuardrailSameToolFailureLimit, config.toolGuardrailSameToolFailureWarnAfter, config.toolGuardrailWarningsEnabled, config.toolParallelEnabled, config.toolParallelLimit, config.toolRouterLlmEnabled, config.toolRouterLlmMaxTokens, config.toolRouterLlmMinConfidence, config.toolRouterLlmPrompt, config.toolRouterLlmTimeoutSeconds, config.toolUseEnforcement, config.trustedCommandPatterns, config.trustedToolPatterns, config.uiMessageLimit, config.uiMessagePreviewChars, config.uiStreamCharsPerSecond]);
 
   const save = () => void onSave({
     busyInputMode: busyInputMode,
@@ -2292,6 +2294,7 @@ function ChatSettings({
     toolUseEnforcement: toolUseEnforcement,
     toolParallelEnabled: toolParallelEnabled,
     toolParallelLimit: toolParallelLimit,
+    sendMessageToolEnabled: sendMessageToolEnabled,
     toolApprovalMode: toolApprovalMode,
     trustedToolPatterns: trustedToolPatterns,
     trustedCommandPatterns: trustedCommandPatterns,
@@ -2573,6 +2576,11 @@ function ChatSettings({
             <label>并行工具</label>
             <input checked={toolParallelEnabled} onChange={(event) => setToolParallelEnabled(event.target.checked)} type="checkbox" />
           </div>
+          <div className="form-row">
+            <label>send_message 工具</label>
+            <input checked={sendMessageToolEnabled} onChange={(event) => setSendMessageToolEnabled(event.target.checked)} type="checkbox" />
+          </div>
+          <div className="form-hint">关闭时 Agent 不会看到或调用 Hermes send_message；扫码微信通道不依赖它。</div>
           <div className="form-row">
             <label>并行上限</label>
             <div className="stepper">

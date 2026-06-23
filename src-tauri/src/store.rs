@@ -10691,6 +10691,25 @@ impl AppStore {
         Ok(path)
     }
 
+    pub fn save_tool_named_binary_artifact(
+        &self,
+        run_id: &str,
+        file_name: &str,
+        content: &[u8],
+    ) -> AppResult<PathBuf> {
+        let artifact_dir = self
+            .path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("artifacts")
+            .join(run_id);
+        fs::create_dir_all(&artifact_dir)?;
+        let safe_name = safe_artifact_file_name(file_name);
+        let path = unique_artifact_path(&artifact_dir, &safe_name);
+        fs::write(&path, content)?;
+        Ok(path)
+    }
+
     fn save_scheduled_job_output(
         &self,
         job_id: &str,
@@ -11458,6 +11477,57 @@ fn normalize_trusted_tool_pattern(pattern: &str) -> AppResult<String> {
         ));
     }
     Ok(normalized.into())
+}
+
+fn safe_artifact_file_name(file_name: &str) -> String {
+    let trimmed = file_name.trim().trim_matches(['.', ' ']);
+    let mut output = trimmed
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .trim_matches('.')
+        .to_string();
+    if output.is_empty() {
+        output = "document".into();
+    }
+    output.chars().take(120).collect()
+}
+
+fn unique_artifact_path(dir: &Path, file_name: &str) -> PathBuf {
+    let initial = dir.join(file_name);
+    if !initial.exists() {
+        return initial;
+    }
+    let path = Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("document");
+    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+    for index in 1..1000 {
+        let candidate = if ext.is_empty() {
+            dir.join(format!("{stem} ({index})"))
+        } else {
+            dir.join(format!("{stem} ({index}).{ext}"))
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    let fallback = if ext.is_empty() {
+        format!("{stem}-{}", new_id("artifact"))
+    } else {
+        format!("{stem}-{}.{ext}", new_id("artifact"))
+    };
+    dir.join(fallback)
 }
 
 fn normalize_trusted_command_pattern(pattern: &str) -> AppResult<String> {

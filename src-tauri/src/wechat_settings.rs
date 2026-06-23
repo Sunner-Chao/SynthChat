@@ -35,6 +35,7 @@ const WECHAT_FILE_ITEM_TYPE: i64 = 4;
 const WECHAT_IMAGE_MAX_BYTES: u64 = 20 * 1024 * 1024;
 const WECHAT_FILE_MAX_BYTES: u64 = 100 * 1024 * 1024;
 const WECHAT_VOICE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const WECHAT_CHAT_THREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -752,7 +753,35 @@ fn is_audio_file_path(path: &str) -> bool {
     )
 }
 
-fn extract_media_path_from_line(line: &str) -> Option<String> {
+fn line_is_wechat_media_directive(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.contains("[media attached:")
+        || trimmed
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("MEDIA:"))
+}
+
+fn extract_media_tag_path_from_line(line: &str) -> Option<String> {
+    let trimmed = line.trim().trim_matches('`');
+    let (prefix, rest) = trimmed.split_at(trimmed.get(..6)?.len());
+    if !prefix.eq_ignore_ascii_case("MEDIA:") {
+        return None;
+    }
+    let path = rest
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_end_matches(['，', '。', ',', '.', ';', '；'])
+        .to_string();
+    if PathBuf::from(&path).is_file() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn extract_media_attached_path_from_line(line: &str) -> Option<String> {
     let cleaned = line
         .trim()
         .trim_matches('`')
@@ -792,6 +821,10 @@ fn extract_media_path_from_line(line: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn extract_media_path_from_line(line: &str) -> Option<String> {
+    extract_media_tag_path_from_line(line).or_else(|| extract_media_attached_path_from_line(line))
 }
 
 fn extract_wechat_image_paths(text: &str) -> Vec<String> {
@@ -838,7 +871,7 @@ fn extract_wechat_voice_paths(text: &str) -> Vec<String> {
 
 fn strip_wechat_media_marker_lines(text: &str) -> String {
     text.lines()
-        .filter(|line| !line.contains("[media attached:"))
+        .filter(|line| !line_is_wechat_media_directive(line))
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
@@ -2252,7 +2285,7 @@ async fn run_wechat_chat_turn(
     let (tx, rx) = mpsc::channel();
     thread::Builder::new()
         .name("synthchat-wechat-chat-turn".to_string())
-        .stack_size(32 * 1024 * 1024)
+        .stack_size(WECHAT_CHAT_THREAD_STACK_SIZE)
         .spawn(move || {
             let result = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2594,6 +2627,7 @@ fn emit_wechat_processing(
         "synthchat-chat-event",
         json!({
             "type": if processing { "processing" } else { "conversation_updated" },
+            "source": "wechat",
             "personaId": persona_id,
             "conversationId": conversation_id,
         }),
@@ -2720,14 +2754,17 @@ mod tests {
         let image = dir.join("a.png");
         let voice = dir.join("b.mp3");
         let file = dir.join("c.pdf");
+        let media_tag_file = dir.join("d.docx");
         fs::write(&image, b"png").unwrap();
         fs::write(&voice, b"mp3").unwrap();
         fs::write(&file, b"pdf").unwrap();
+        fs::write(&media_tag_file, b"docx").unwrap();
         let text = format!(
-            "hello\n[media attached: {} (image/png)]\n[media attached: \"{}\" (audio/mpeg)]\n[media attached: `{}` (application/pdf)]",
+            "hello\n[media attached: {} (image/png)]\n[media attached: \"{}\" (audio/mpeg)]\n[media attached: `{}` (application/pdf)]\nMEDIA:\"{}\"",
             image.display(),
             voice.display(),
-            file.display()
+            file.display(),
+            media_tag_file.display()
         );
         assert_eq!(
             extract_wechat_image_paths(&text),
@@ -2739,7 +2776,10 @@ mod tests {
         );
         assert_eq!(
             extract_wechat_file_paths(&text),
-            vec![file.to_string_lossy().to_string()]
+            vec![
+                file.to_string_lossy().to_string(),
+                media_tag_file.to_string_lossy().to_string()
+            ]
         );
         assert_eq!(strip_wechat_media_marker_lines(&text), "hello");
         let _ = fs::remove_dir_all(dir);

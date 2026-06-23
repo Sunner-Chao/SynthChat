@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::{Cursor, Write},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -540,15 +541,27 @@ pub(super) fn artifact_tool(
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or("artifact_file");
-        let artifact_path = store.save_tool_binary_artifact(run_id, name, extension, &bytes)?;
+            .unwrap_or_else(|| {
+                source
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("artifact_file")
+            });
+        let file_name = ensure_extension(name, extension);
+        let artifact_path = store.save_tool_named_binary_artifact(run_id, &file_name, &bytes)?;
+        let mime_type = mime_from_path(&source);
+        let path_text = artifact_path.to_string_lossy().to_string();
+        let media_tag = format!(r#"MEDIA:"{}""#, path_text);
         return Ok(serde_json::to_string_pretty(&json!({
             "runId": run_id,
             "name": name,
             "sourcePath": source.to_string_lossy(),
-            "path": artifact_path.to_string_lossy(),
-            "mimeType": mime_from_path(&source),
+            "path": path_text,
+            "mimeType": mime_type,
             "sizeBytes": bytes.len(),
+            "mediaTag": media_tag,
+            "wechatMarker": media_tag,
+            "wechatSendHint": "To send this file to the linked WeChat mobile user, include mediaTag as its own line in the final assistant reply. The bridge hides this internal MEDIA directive from visible text and uploads the file."
         }))?);
     }
     let content = payload
@@ -580,6 +593,69 @@ pub(super) fn list_artifacts_tool(store: &AppStore, run_id: &str) -> AppResult<S
     }))?)
 }
 
+pub(super) fn document_tool(store: &AppStore, run_id: &str, payload: &Value) -> AppResult<String> {
+    let format = payload
+        .get("format")
+        .or_else(|| payload.get("type"))
+        .and_then(Value::as_str)
+        .map(normalize_document_format)
+        .unwrap_or_else(|| "docx".into());
+    if !matches!(format.as_str(), "docx" | "xlsx" | "html" | "md" | "txt" | "csv") {
+        return Err(AppError::BadRequest(format!(
+            "document format is not supported: {format}. Use docx, xlsx, html, md, txt, or csv."
+        )));
+    }
+    let title = payload
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Document");
+    let content = payload
+        .get("content")
+        .or_else(|| payload.get("text"))
+        .or_else(|| payload.get("body"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if content.is_empty() {
+        return Err(AppError::BadRequest("document requires payload.content".into()));
+    }
+    let name = payload
+        .get("name")
+        .or_else(|| payload.get("fileName"))
+        .or_else(|| payload.get("file_name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(title);
+    let file_name = ensure_extension(&safe_document_name(name), &format);
+    let bytes = match format.as_str() {
+        "docx" => build_docx_document(title, content)?,
+        "xlsx" => build_xlsx_document(title, content)?,
+        "html" => build_html_document(title, content).into_bytes(),
+        "md" => format!("# {title}\n\n{content}\n").into_bytes(),
+        "txt" => format!("{title}\n\n{content}\n").into_bytes(),
+        "csv" => normalize_csv_content(content).into_bytes(),
+        _ => unreachable!(),
+    };
+    let artifact_path = store.save_tool_named_binary_artifact(run_id, &file_name, &bytes)?;
+    let mime_type = mime_from_path(&artifact_path);
+    let path_text = artifact_path.to_string_lossy().to_string();
+    let media_tag = format!(r#"MEDIA:"{}""#, path_text);
+    Ok(serde_json::to_string_pretty(&json!({
+        "runId": run_id,
+        "title": title,
+        "format": format,
+        "path": path_text,
+        "mimeType": mime_type,
+        "sizeBytes": bytes.len(),
+        "mediaTag": media_tag,
+        "wechatMarker": media_tag,
+        "wechatSendHint": "To send this document to the linked WeChat mobile user, include mediaTag as its own line in the final assistant reply. The bridge hides this internal MEDIA directive from visible text and uploads the file."
+    }))?)
+}
+
 fn mime_from_path(path: &Path) -> &'static str {
     match path
         .extension()
@@ -600,6 +676,8 @@ fn mime_from_path(path: &Path) -> &'static str {
         "txt" | "log" => "text/plain",
         "csv" => "text/csv",
         "html" | "htm" => "text/html",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "mp3" => "audio/mpeg",
         "wav" => "audio/wav",
         "webm" => "video/webm",
@@ -608,6 +686,222 @@ fn mime_from_path(path: &Path) -> &'static str {
         "zip" => "application/zip",
         _ => "application/octet-stream",
     }
+}
+
+fn normalize_document_format(value: &str) -> String {
+    let lowered = value.trim().trim_start_matches('.').to_ascii_lowercase();
+    match lowered.as_str() {
+        "markdown" => "md".into(),
+        "text" => "txt".into(),
+        "htm" => "html".into(),
+        "xls" => "xlsx".into(),
+        other => other.into(),
+    }
+}
+
+fn safe_document_name(value: &str) -> String {
+    let mut output = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ' ') || !ch.is_control() {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .trim_matches('.')
+        .to_string();
+    if output.is_empty() {
+        output = "document".into();
+    }
+    output.chars().take(80).collect()
+}
+
+fn ensure_extension(name: &str, extension: &str) -> String {
+    let clean_ext = extension.trim_start_matches('.').to_ascii_lowercase();
+    if clean_ext.is_empty() {
+        return name.to_string();
+    }
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(&format!(".{clean_ext}")) {
+        name.to_string()
+    } else {
+        format!("{name}.{clean_ext}")
+    }
+}
+
+fn build_docx_document(title: &str, content: &str) -> AppResult<Vec<u8>> {
+    let writer = Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(writer);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    zip_start_file(&mut zip, "[Content_Types].xml", options)?;
+    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/></Types>"#)?;
+    zip_start_file(&mut zip, "_rels/.rels", options)?;
+    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/></Relationships>"#)?;
+    zip_start_file(&mut zip, "docProps/core.xml", options)?;
+    zip.write_all(format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{}</dc:title></cp:coreProperties>"#, xml_escape(title)).as_bytes())?;
+    zip_start_file(&mut zip, "word/document.xml", options)?;
+    zip.write_all(docx_document_xml(title, content).as_bytes())?;
+    let writer = zip
+        .finish()
+        .map_err(|error| AppError::BadRequest(format!("failed to finish docx: {error}")))?;
+    Ok(writer.into_inner())
+}
+
+fn docx_document_xml(title: &str, content: &str) -> String {
+    let mut body = String::new();
+    body.push_str(&docx_paragraph(title, true));
+    for paragraph in content.split("\n\n") {
+        let paragraph = paragraph.trim();
+        if paragraph.is_empty() {
+            continue;
+        }
+        body.push_str(&docx_paragraph(paragraph, false));
+    }
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr></w:body></w:document>"#,
+        body
+    )
+}
+
+fn docx_paragraph(text: &str, heading: bool) -> String {
+    let mut runs = String::new();
+    for (index, line) in text.lines().enumerate() {
+        if index > 0 {
+            runs.push_str("<w:br/>");
+        }
+        runs.push_str(&format!("<w:t>{}</w:t>", xml_escape(line)));
+    }
+    let style = if heading {
+        r#"<w:pPr><w:spacing w:after="240"/><w:rPr><w:b/><w:sz w:val="32"/></w:rPr></w:pPr>"#
+    } else {
+        r#"<w:pPr><w:spacing w:after="160"/></w:pPr>"#
+    };
+    format!(r#"<w:p>{style}<w:r>{runs}</w:r></w:p>"#)
+}
+
+fn build_xlsx_document(title: &str, content: &str) -> AppResult<Vec<u8>> {
+    let rows = spreadsheet_rows(content);
+    let writer = Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(writer);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    zip_start_file(&mut zip, "[Content_Types].xml", options)?;
+    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#)?;
+    zip_start_file(&mut zip, "_rels/.rels", options)?;
+    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#)?;
+    zip_start_file(&mut zip, "xl/_rels/workbook.xml.rels", options)?;
+    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#)?;
+    zip_start_file(&mut zip, "xl/workbook.xml", options)?;
+    zip.write_all(format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="{}" sheetId="1" r:id="rId1"/></sheets></workbook>"#, xml_escape(&safe_sheet_name(title))).as_bytes())?;
+    zip_start_file(&mut zip, "xl/worksheets/sheet1.xml", options)?;
+    zip.write_all(xlsx_sheet_xml(&rows).as_bytes())?;
+    let writer = zip
+        .finish()
+        .map_err(|error| AppError::BadRequest(format!("failed to finish xlsx: {error}")))?;
+    Ok(writer.into_inner())
+}
+
+fn zip_start_file<W: Write + std::io::Seek>(
+    zip: &mut zip::ZipWriter<W>,
+    name: &str,
+    options: zip::write::SimpleFileOptions,
+) -> AppResult<()> {
+    zip.start_file(name, options)
+        .map_err(|error| AppError::BadRequest(format!("failed to write document zip entry {name}: {error}")))
+}
+
+fn spreadsheet_rows(content: &str) -> Vec<Vec<String>> {
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            if line.contains('\t') {
+                line.split('\t').map(|cell| cell.trim().to_string()).collect()
+            } else {
+                line.split(',').map(|cell| cell.trim().to_string()).collect()
+            }
+        })
+        .collect()
+}
+
+fn xlsx_sheet_xml(rows: &[Vec<String>]) -> String {
+    let mut sheet = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>"#);
+    for (row_index, row) in rows.iter().enumerate() {
+        let number = row_index + 1;
+        sheet.push_str(&format!(r#"<row r="{number}">"#));
+        for (col_index, cell) in row.iter().enumerate() {
+            sheet.push_str(&format!(
+                r#"<c r="{}{}" t="inlineStr"><is><t>{}</t></is></c>"#,
+                spreadsheet_column_name(col_index),
+                number,
+                xml_escape(cell)
+            ));
+        }
+        sheet.push_str("</row>");
+    }
+    sheet.push_str("</sheetData></worksheet>");
+    sheet
+}
+
+fn spreadsheet_column_name(mut index: usize) -> String {
+    let mut chars = Vec::new();
+    loop {
+        let rem = index % 26;
+        chars.push((b'A' + rem as u8) as char);
+        if index < 26 {
+            break;
+        }
+        index = index / 26 - 1;
+    }
+    chars.iter().rev().collect()
+}
+
+fn safe_sheet_name(title: &str) -> String {
+    let name = title
+        .chars()
+        .filter(|ch| !matches!(ch, ':' | '\\' | '/' | '?' | '*' | '[' | ']'))
+        .take(31)
+        .collect::<String>();
+    if name.trim().is_empty() {
+        "Sheet1".into()
+    } else {
+        name
+    }
+}
+
+fn build_html_document(title: &str, content: &str) -> String {
+    let body = content
+        .split("\n\n")
+        .map(|paragraph| format!("<p>{}</p>", xml_escape(paragraph.trim())))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title></head><body><h1>{}</h1>{}</body></html>",
+        xml_escape(title),
+        xml_escape(title),
+        body
+    )
+}
+
+fn normalize_csv_content(content: &str) -> String {
+    let mut output = content.trim().to_string();
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn payload_string_array(payload: &Value, camel_key: &str, snake_key: &str) -> Vec<String> {

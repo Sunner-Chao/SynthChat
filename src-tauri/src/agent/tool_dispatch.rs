@@ -1435,6 +1435,9 @@ pub(super) async fn execute_recovery_internal_tool(
     ensure_internal_tool_allowed(agent, tool_name, tool_context)?;
     let availability = internal_tool_availability(store);
     if !internal_tool_available(tool_name, &availability) {
+        if tool_name == "send_message" {
+            return skipped_disabled_send_message_event(store, run_id, &replay_payload);
+        }
         return Err(AppError::BadRequest(format!(
             "internal tool is not available with the current configuration: {tool_name}"
         )));
@@ -1722,6 +1725,7 @@ pub(super) async fn execute_recovery_internal_tool(
         "todo" | "update_todo" => todo_tool(store, run_id, conversation_id, &payload),
         "checkpoint" => checkpoint_tool(store, run_id, &payload),
         "artifact" => artifact_tool(store, agent, run_id, &payload),
+        "document" => document_tool(store, run_id, &payload),
         "list_artifacts" => list_artifacts_tool(store, run_id),
         "browser_navigate" => browser_navigate_tool(store, agent, run_id, &payload).await,
         "browser_snapshot" => browser_snapshot_tool(store, agent, run_id, &payload).await,
@@ -1834,6 +1838,49 @@ pub(super) async fn execute_recovery_internal_tool(
     } else {
         Ok((text, event))
     }
+}
+
+fn skipped_disabled_send_message_event(
+    store: &AppStore,
+    run_id: &str,
+    replay_payload: &Value,
+) -> AppResult<(String, ToolEvent)> {
+    let text = "send_message is disabled in settings; skipped without sending.".to_string();
+    let event = ToolEvent {
+        status: Some("completed".into()),
+        reference_id: None,
+        call_id: Some(provider_tool_call_id(replay_payload).unwrap_or_else(|| new_id("call"))),
+        run_id: Some(run_id.to_string()),
+        checkpoint_id: None,
+        event_type: "internal_tool".into(),
+        server_id: "__internal".into(),
+        tool_name: "send_message".into(),
+        ok: true,
+        timed_out: false,
+        elapsed_ms: 0,
+        kind: tool_event_kind("__internal", "send_message", None),
+        title: "internal · send_message".into(),
+        summary: text.clone(),
+        path: None,
+        exists: None,
+        mime_type: Some("text/plain".into()),
+        text: Some(text.clone()),
+        error: None,
+        raw: Some(redact_json_value(json!({"payload": replay_payload.clone(), "skipped": true}))),
+    };
+    store.append_tool_trace(ToolTraceEntry {
+        id: new_id("trace"),
+        created_at: now_iso(),
+        server_id: "__internal".into(),
+        tool_name: "send_message".into(),
+        ok: true,
+        timed_out: false,
+        elapsed_ms: 0,
+        payload: redact_json_value(replay_payload.clone()),
+        event: event.clone(),
+        error: None,
+    })?;
+    Ok((text, event))
 }
 
 fn strip_provider_tool_call_metadata(mut payload: Value) -> Value {

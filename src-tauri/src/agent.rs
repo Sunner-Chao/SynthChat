@@ -394,7 +394,7 @@ use skills::{skill_manage_tool, skill_view_tool, skills_list_tool};
 use spotify_status::spotify_status_tool;
 use state_tools::{
     artifact_tool, automatic_mutation_checkpoint, checkpoint_tool, file_state_tool,
-    list_artifacts_tool, todo_tool,
+    list_artifacts_tool, document_tool, todo_tool,
 };
 use teams_pipeline::teams_pipeline_tool;
 use tool_dispatch::*;
@@ -423,6 +423,43 @@ use workspace::{
 
 pub fn recovery_agent_error() -> AppError {
     AppError::BadRequest("agent runtime recovery baseline is active".into())
+}
+
+fn sanitize_visible_assistant_reply(text: &str) -> String {
+    let mut output = text.to_string();
+    for needle in [
+        "<tool_call>",
+        "<tool_call ",
+        "<tool_calls>",
+        "<tool_calls ",
+        "<function=",
+        "<function_call>",
+        "<function_call ",
+        "<function_calls>",
+        "<function_calls ",
+        "<tool_result>",
+        "<tool_result ",
+    ] {
+        if let Some(index) = find_ascii_case_insensitive(&output, needle, 0) {
+            output.truncate(index);
+        }
+    }
+    output
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str, start: usize) -> Option<usize> {
+    if start >= haystack.len() {
+        return None;
+    }
+    let haystack_lower = haystack[start..].to_ascii_lowercase();
+    let needle_lower = needle.to_ascii_lowercase();
+    haystack_lower.find(&needle_lower).map(|idx| start + idx)
 }
 
 pub async fn browser_runtime_status(store: &AppStore) -> AppResult<Value> {

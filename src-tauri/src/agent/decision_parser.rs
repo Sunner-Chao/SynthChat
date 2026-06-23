@@ -238,6 +238,9 @@ fn normalize_tool_payload_value(value: &Value) -> Value {
 }
 
 fn parse_hermes_tool_markup(text: &str) -> Option<Value> {
+    if let Some(value) = parse_function_equals_tool_markup(text) {
+        return Some(value);
+    }
     let tool_name = extract_xml_tag(text, "tool_name")
         .or_else(|| extract_xml_tag(text, "tool"))
         .map(|value| decode_basic_xml_entities(value.trim()))
@@ -256,6 +259,66 @@ fn parse_hermes_tool_markup(text: &str) -> Option<Value> {
         "tool": tool_name,
         "payload": payload,
     }))
+}
+
+fn parse_function_equals_tool_markup(text: &str) -> Option<Value> {
+    let open_idx = find_ascii_case_insensitive(text, "<function=", 0)?;
+    let name_start = open_idx + "<function=".len();
+    let name_end = text[name_start..].find('>').map(|offset| name_start + offset)?;
+    let tool_name = decode_basic_xml_entities(
+        text[name_start..name_end]
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\''),
+    );
+    if tool_name.trim().is_empty() {
+        return None;
+    }
+    let body_start = name_end + 1;
+    let body_end = find_ascii_case_insensitive(text, "</function>", body_start)
+        .or_else(|| find_ascii_case_insensitive(text, "</tool_call>", body_start))
+        .unwrap_or(text.len());
+    let body = &text[body_start..body_end];
+    let mut object = serde_json::Map::new();
+    for (name, value) in extract_parameter_tags(body) {
+        object.insert(name, Value::String(value));
+    }
+    Some(json!({
+        "action": "tool",
+        "tool": tool_name,
+        "payload": Value::Object(object),
+    }))
+}
+
+fn extract_parameter_tags(text: &str) -> Vec<(String, String)> {
+    let mut params = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(open_idx) = find_ascii_case_insensitive(text, "<parameter=", cursor) {
+        let name_start = open_idx + "<parameter=".len();
+        let Some(name_end) = text[name_start..].find('>').map(|offset| name_start + offset) else {
+            break;
+        };
+        let name = decode_basic_xml_entities(
+            text[name_start..name_end]
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\''),
+        );
+        let value_start = name_end + 1;
+        let Some(value_end) =
+            find_ascii_case_insensitive(text, "</parameter>", value_start)
+        else {
+            break;
+        };
+        if !name.trim().is_empty() {
+            params.push((
+                name,
+                decode_basic_xml_entities(text[value_start..value_end].trim()),
+            ));
+        }
+        cursor = value_end + "</parameter>".len();
+    }
+    params
 }
 
 pub(super) fn parse_tool_arguments_json(raw: &str, tool_name: &str) -> Value {
@@ -515,6 +578,15 @@ fn extract_xml_tag<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     let start = lower.find(&open)? + open.len();
     let end = lower[start..].find(&close)? + start;
     Some(&text[start..end])
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str, start: usize) -> Option<usize> {
+    if start >= haystack.len() {
+        return None;
+    }
+    let haystack_lower = haystack[start..].to_ascii_lowercase();
+    let needle_lower = needle.to_ascii_lowercase();
+    haystack_lower.find(&needle_lower).map(|idx| start + idx)
 }
 
 fn decode_basic_xml_entities(value: &str) -> String {

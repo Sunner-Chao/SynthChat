@@ -932,6 +932,7 @@ async fn continue_agent_run_after_approval(
     }
     normalize_guardrail_halt_reply(&mut assistant_text, &observations);
     append_file_mutation_footer(&mut assistant_text, &failed_file_mutations);
+    assistant_text = sanitize_visible_assistant_reply(&assistant_text);
     assistant_text = run_transform_llm_output_hooks(
         store,
         &run.run_id,

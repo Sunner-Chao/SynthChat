@@ -103,6 +103,29 @@ fn dispatch_tool_progress_to_wechat(store: &AppStore, conversation_id: &str, eve
     if event.status.as_deref() == Some("running") {
         return;
     }
+    if event.status.as_deref() == Some("failed")
+        || !event.ok
+        || event
+            .error
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return;
+    }
+    let detail = event
+        .summary
+        .trim()
+        .to_string()
+        + "\n"
+        + event.text.as_deref().unwrap_or("").trim();
+    let detail_lower = detail.to_ascii_lowercase();
+    if detail_lower.contains("error:")
+        || detail_lower.contains("\"ok\": false")
+        || detail_lower.contains("bad request")
+        || detail_lower.contains("failed")
+    {
+        return;
+    }
     let Ok(conversation) = store.conversation(conversation_id) else {
         return;
     };

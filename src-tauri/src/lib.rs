@@ -38,6 +38,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 const REMOTE_SKILL_FETCH_TIMEOUT_SECS: u64 = 20;
 const MAX_CHAT_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 const MAX_AVATAR_BYTES: usize = 10 * 1024 * 1024;
+const SYNTHCHAT_TOKIO_WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcpCliAction {
@@ -190,7 +191,7 @@ pub fn run_acp_setup_browser() -> AppResult<()> {
 pub fn run_acp_stdio() -> AppResult<()> {
     let store = AppStore::new(state_path())?;
     sync_runtime_env_from_store(&store);
-    let runtime = tokio::runtime::Runtime::new()?;
+    let runtime = synthchat_multi_thread_runtime("synthchat-acp-worker")?;
     let stdin = io::stdin();
     let stdout = Arc::new(Mutex::new(io::stdout()));
     let mut handles = Vec::new();
@@ -256,7 +257,7 @@ pub fn run_acp_stdio() -> AppResult<()> {
 pub fn run_mcp_stdio() -> AppResult<()> {
     let store = AppStore::new(state_path())?;
     sync_runtime_env_from_store(&store);
-    let runtime = tokio::runtime::Runtime::new()?;
+    let runtime = synthchat_multi_thread_runtime("synthchat-mcp-worker")?;
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     for line in stdin.lock().lines() {
@@ -283,6 +284,15 @@ pub fn run_mcp_stdio() -> AppResult<()> {
         }
     }
     Ok(())
+}
+
+fn synthchat_multi_thread_runtime(thread_name: &str) -> AppResult<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name(thread_name)
+        .thread_stack_size(SYNTHCHAT_TOKIO_WORKER_STACK_SIZE)
+        .build()
+        .map_err(AppError::Io)
 }
 
 async fn handle_mcp_stdio_json_rpc(store: &AppStore, request: &Value) -> Option<Value> {

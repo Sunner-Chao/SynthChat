@@ -206,6 +206,7 @@ export function App() {
     let unlisten: (() => void) | null = null;
     void listen<{
       type: string;
+      source?: string;
       personaId?: string;
       conversationId?: string;
       message?: ChatMessage;
@@ -214,6 +215,12 @@ export function App() {
       const payload = event.payload;
       if (payload.type === "processing" && payload.conversationId) {
         setConversationProcessing(payload.conversationId, true);
+        if (payload.source === "wechat") {
+          void (async () => {
+            await refreshChatData(payload.conversationId ?? null, payload.personaId ?? null);
+            setConversationProcessing(payload.conversationId ?? "", true);
+          })();
+        }
       }
       if ((payload.type === "assistant_message" || payload.type === "conversation_updated") && payload.conversationId) {
         setConversationProcessing(payload.conversationId, false);

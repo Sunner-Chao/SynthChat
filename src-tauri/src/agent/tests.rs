@@ -4767,6 +4767,18 @@ fn planner_decision_parses_hermes_xml_tool_markup() {
 }
 
 #[test]
+fn planner_decision_parses_function_equals_parameter_tool_markup() {
+    let decision = parse_agent_decision(
+        "<tool_call>\n<function=execute_code>\n<parameter=language>python</parameter>\n<parameter=code>print('ok')</parameter>\n</function>\n</tool_call>",
+    );
+
+    assert_eq!(decision["action"], "tool");
+    assert_eq!(decision["tool"], "execute_code");
+    assert_eq!(decision["payload"]["language"], "python");
+    assert_eq!(decision["payload"]["code"], "print('ok')");
+}
+
+#[test]
 fn planner_decision_normalizes_tool_aliases() {
     let decision = parse_agent_decision(
         r#"{"action":"use_tool","tool_name":"terminal","parameters":{"command":"pwd"}}"#,

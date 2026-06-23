@@ -72,6 +72,7 @@ export interface ChatConfig {
   toolRouterLlmPrompt?: string;
   toolParallelEnabled?: boolean;
   toolParallelLimit?: number;
+  sendMessageToolEnabled?: boolean;
   toolApprovalMode?: "risky" | "smart" | "always" | "never" | string;
   cronApprovalMode?: "deny" | "approve" | string;
   trustedToolPatterns?: string[];

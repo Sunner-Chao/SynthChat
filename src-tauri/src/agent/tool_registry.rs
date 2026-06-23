@@ -79,6 +79,7 @@ pub(super) struct InternalToolAvailability {
     yuanbao_stickers: bool,
     spotify: bool,
     discord: bool,
+    send_message: bool,
 }
 
 const TOOL_AVAILABILITY_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -109,6 +110,7 @@ impl InternalToolAvailability {
             yuanbao_stickers: true,
             spotify: true,
             discord: true,
+            send_message: true,
         }
     }
 }
@@ -130,6 +132,7 @@ impl Clone for InternalToolAvailability {
             yuanbao_stickers: self.yuanbao_stickers,
             spotify: self.spotify,
             discord: self.discord,
+            send_message: self.send_message,
         }
     }
 }
@@ -209,6 +212,10 @@ fn compute_internal_tool_availability(store: &AppStore) -> InternalToolAvailabil
         discord: config
             .as_ref()
             .map(|config| discord_settings(&config.discord).is_ok())
+            .unwrap_or(false),
+        send_message: config
+            .as_ref()
+            .map(|config| config.chat.send_message_tool_enabled)
             .unwrap_or(false),
     }
 }
@@ -370,6 +377,7 @@ pub(super) fn internal_tool_available(
         "spotify_playback" | "spotify_devices" | "spotify_queue" | "spotify_search"
         | "spotify_playlists" | "spotify_albums" | "spotify_library" => availability.spotify,
         "discord" | "discord_admin" => availability.discord,
+        "send_message" => availability.send_message,
         _ => true,
     }
 }
@@ -926,7 +934,11 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
         ),
         (
             "artifact",
-            r#"- artifact: payload {"name":"notes","content":"text to save"} or {"action":"publish_file","path":"workspace file","name":"optional"} publishes an existing workspace file as a clickable artifact."#,
+            r#"- artifact: payload {"name":"notes","content":"text to save"} or {"action":"publish_file","path":"workspace file","name":"optional"} publishes an existing workspace file as a clickable artifact. publish_file returns mediaTag as MEDIA:<path>; include it as its own line in the final reply to send the file through the linked WeChat bridge. The bridge hides this internal directive from visible text."#,
+        ),
+        (
+            "document",
+            r#"- document: payload {"title":"report title","format":"docx|xlsx|html|md|txt|csv","content":"document body","name":"optional file base name"}. Generates a common document artifact; docx/xlsx are real Office OpenXML files. Returns path, mimeType, and mediaTag as MEDIA:<path>. To send the file to a linked WeChat mobile user, include the returned mediaTag line in the final assistant reply. The bridge hides this internal directive from visible text."#,
         ),
         ("list_artifacts", r#"- list_artifacts: payload {}"#),
         (
@@ -2227,6 +2239,7 @@ fn internal_tool_unavailable_reason(tool_name: &str) -> &'static str {
             "Spotify settings are incomplete"
         }
         "discord" | "discord_admin" => "Discord settings are incomplete",
+        "send_message" => "send_message is disabled in settings",
         _ => "tool availability check failed",
     }
 }

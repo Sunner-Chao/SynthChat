@@ -480,11 +480,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     const state = get();
     const currentActive = state.activeConversationId;
     const activeConversationId =
-      (currentActive && conversations.some((item) => item.id === currentActive)
-        ? currentActive
-        : null)
-      ?? (preferredConversationId && conversations.some((item) => item.id === preferredConversationId)
+      (preferredConversationId && conversations.some((item) => item.id === preferredConversationId)
         ? preferredConversationId
+        : null)
+      ?? (currentActive && conversations.some((item) => item.id === currentActive)
+        ? currentActive
         : null)
       ?? (preferredPersonaId
         ? conversations.find((item) => item.personaId === preferredPersonaId)?.id ?? null
@@ -512,6 +512,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       messages,
       conversationUnreadCounts: unreadCounts,
       processingConversationIds: messages.at(-1)?.role === "assistant"
+        && activeConversationId !== preferredConversationId
         ? current.processingConversationIds.filter((id) => id !== activeConversationId)
         : current.processingConversationIds
     }));

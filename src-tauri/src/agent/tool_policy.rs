@@ -509,6 +509,7 @@ pub(super) fn is_internal_tool(tool_name: &str) -> bool {
             | "update_todo"
             | "checkpoint"
             | "artifact"
+            | "document"
             | "list_artifacts"
             | "browser_navigate"
             | "browser_snapshot"
@@ -779,7 +780,7 @@ pub(super) fn semantic_toolsets_for_tool(tool: &ToolDefinition) -> Vec<&'static 
             "spotify_status" => vec!["spotify", "config"],
             "discord" | "discord_admin" => vec!["discord"],
             "send_message" => vec!["messaging"],
-            "artifact" | "list_artifacts" => vec!["artifact"],
+            "artifact" | "document" | "list_artifacts" => vec!["artifact"],
             "tool_search" | "tool_describe" | "tool_call" => vec!["tools"],
             _ => vec!["internal"],
         };
