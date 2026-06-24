@@ -280,7 +280,7 @@ export interface ChatAttachment {
 }
 
 export interface ToolEvent {
-  status?: "running" | "completed";
+  status?: "running" | "completed" | "failed" | "canceled" | string;
   referenceId?: string;
   callId?: string;
   runId?: string;
@@ -1059,6 +1059,8 @@ export interface ProactiveStatus {
   conversationId?: string | null;
   lastUserAt: number;
   secondsSinceLastUser: number;
+  lastReplyAt: number;
+  secondsSinceLastReply: number;
   waitSeconds: number;
   readyInSeconds: number;
   consecutiveCount: number;

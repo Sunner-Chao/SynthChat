@@ -472,6 +472,8 @@ pub struct ProactiveStatus {
     pub conversation_id: Option<String>,
     pub last_user_at: i64,
     pub seconds_since_last_user: i64,
+    pub last_reply_at: i64,
+    pub seconds_since_last_reply: i64,
     pub wait_seconds: u64,
     pub ready_in_seconds: i64,
     pub consecutive_count: u32,

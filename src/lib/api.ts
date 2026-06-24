@@ -737,6 +737,8 @@ export const api: Record<string, any> = {
       conversationId: null,
       lastUserAt: 0,
       secondsSinceLastUser: 0,
+      lastReplyAt: 0,
+      secondsSinceLastReply: 0,
       waitSeconds: 0,
       readyInSeconds: 0,
       consecutiveCount: 0,

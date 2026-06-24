@@ -5580,7 +5580,7 @@ async fn wait_for_shell_output_interruptible(
             _ = tokio::time::sleep(Duration::from_millis(250)) => {
                 if agent_run_wait_was_interrupted(store, run_id)? {
                     return Err(AppError::BadRequest(
-                        "command interrupted because the agent run is no longer active".into(),
+                        "tool canceled because the agent run ended".into(),
                     ));
                 }
             }

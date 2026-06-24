@@ -223,13 +223,40 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     .await;
 
     let mut history = store.messages(&conversation.id, Some(30))?;
-    let effective_persona = effective_llm_persona(&persona, &agent);
+    let mut effective_persona = effective_llm_persona(&persona, &agent);
     let mut providers = store.provider_candidates(selected_provider_id(&persona, &agent))?;
+    if let Some(correction) =
+        reconcile_model_family_provider(&mut effective_persona, &mut providers)
+    {
+        let detail = json!({
+            "providerHint": correction.provider_hint,
+            "fromProviderId": correction.from_provider_id,
+            "toProviderId": correction.to_provider_id,
+            "requestedModel": correction.requested_model,
+            "effectiveModel": correction.effective_model,
+        });
+        run.phase_events.push(AgentRunPhaseRecord {
+            phase: "llm_route_corrected".into(),
+            detail: detail.clone(),
+            updated_at: now_iso(),
+        });
+        run.updated_at = now_iso();
+        append_parent_phase_event(
+            store,
+            &saved_run.run_id,
+            "llm_route_corrected",
+            detail,
+        )?;
+    }
     if let Some(base_url) = base_url_override
         .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty())
     {
-        let selected = selected_provider_id(&persona, &agent).map(str::to_string);
+        let selected = if effective_persona.llm_provider.trim().is_empty() {
+            None
+        } else {
+            Some(effective_persona.llm_provider.trim().to_string())
+        };
         let provider_index = selected
             .as_deref()
             .and_then(|id| providers.iter().position(|provider| provider.id == id))
@@ -428,7 +455,10 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                 let assistant = store.append_message(ChatMessage::new(
                     conversation.id.clone(),
                     "assistant",
-                    format!("本轮对话没有返回，是因为模型请求失败：{error}"),
+                    format!(
+                        "本轮对话没有返回：模型请求失败。\n{}",
+                        llm_route_summary(&providers, &effective_persona, &error.to_string())
+                    ),
                     "desktop-agent-error",
                 ))?;
                 if let Ok(saved_failed_run) = store.agent_run(&saved_run.run_id) {
@@ -2727,4 +2757,34 @@ pub(super) fn recovery_reply(user_content: &str) -> String {
             "Agent runtime recovery baseline is active. I received: {trimmed}\n\nAdvanced Hermes-style tool orchestration is temporarily unavailable until the full agent module is restored."
         )
     }
+}
+
+fn llm_route_summary(
+    providers: &[crate::models::LlmProvider],
+    persona: &Persona,
+    error: &str,
+) -> String {
+    let provider = providers.first();
+    let provider_id = provider
+        .map(|provider| provider.id.as_str())
+        .unwrap_or("-");
+    let provider_type = provider
+        .map(|provider| provider.provider_type.as_str())
+        .unwrap_or("-");
+    let model = if !persona.llm_model.trim().is_empty() {
+        persona.llm_model.trim()
+    } else {
+        provider
+            .map(|provider| provider.model.trim())
+            .filter(|model| !model.is_empty())
+            .unwrap_or("-")
+    };
+    let base_url = provider
+        .map(|provider| provider.base_url.trim())
+        .filter(|base_url| !base_url.is_empty())
+        .unwrap_or("-");
+    format!(
+        "路由：provider={provider_id} ({provider_type})，model={model}，baseUrl={base_url}。\n错误：{}",
+        truncate_for_prompt(error, 500)
+    )
 }

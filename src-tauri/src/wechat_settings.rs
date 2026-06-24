@@ -2590,6 +2590,7 @@ pub async fn wechat_inbound_text(
     let conversation_id =
         find_or_create_wechat_conversation(store, &account.linked_persona, &account.id)?;
     emit_wechat_processing(app, &conversation_id, &persona.id, true);
+    let turn_started_at = now_iso();
     let messages_result = run_wechat_chat_turn(
         store,
         SendChatRequest {
@@ -2609,12 +2610,40 @@ pub async fn wechat_inbound_text(
     )
     .await;
     emit_wechat_processing(app, &conversation_id, &persona.id, false);
-    let messages = messages_result?;
-    let reply_message = messages
+    let mut messages = match messages_result {
+        Ok(messages) => messages,
+        Err(error) => return Err(error),
+    };
+    let mut reply_message = messages
         .iter()
         .rev()
-        .find(|message| message.role == "assistant")
+        .find(|message| message.role == "assistant" && message.source != "desktop-agent-error")
         .cloned();
+    if let Some(message) = reply_message.as_ref() {
+        if let Some(attached) = attach_wechat_deliverable_to_reply(
+            store,
+            app,
+            &conversation_id,
+            &persona.id,
+            &turn_started_at,
+            message,
+        )? {
+            let attached_id = attached.id.clone();
+            reply_message = Some(attached.clone());
+            for item in &mut messages {
+                if item.id == attached_id {
+                    *item = attached.clone();
+                }
+            }
+        }
+    }
+    if reply_message.is_none() {
+        reply_message = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "assistant")
+            .cloned();
+    }
     if let Some(message) = reply_message.as_ref() {
         persist_wechat_assistant_message_if_missing(store, message)?;
         emit_wechat_assistant_message(app, &conversation_id, &persona.id, message);
@@ -2633,6 +2662,34 @@ pub async fn wechat_inbound_text(
         delivered,
         delivery_error,
     })
+}
+
+fn attach_wechat_deliverable_to_reply(
+    store: &AppStore,
+    app: Option<&AppHandle>,
+    conversation_id: &str,
+    persona_id: &str,
+    turn_started_at: &str,
+    message: &ChatMessage,
+) -> AppResult<Option<ChatMessage>> {
+    if message.content.contains("[media attached:")
+        || message
+            .content
+            .lines()
+            .any(|line| line.trim().get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("MEDIA:")))
+    {
+        return Ok(None);
+    }
+    let message = store.attach_wechat_deliverable_to_message_after(
+        conversation_id,
+        &message.id,
+        turn_started_at,
+        Some("附件已补到回复。"),
+    )?;
+    if let Some(message) = message.as_ref() {
+        emit_wechat_assistant_message(app, conversation_id, persona_id, message);
+    }
+    Ok(message)
 }
 
 fn persist_wechat_assistant_message_if_missing(

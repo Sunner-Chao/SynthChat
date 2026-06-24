@@ -1403,7 +1403,7 @@ pub(super) async fn wait_browser_run_interruptible(
     loop {
         if browser_run_interrupted(store, run_id)? {
             return Err(AppError::BadRequest(
-                "browser wait interrupted because the agent run is no longer active".into(),
+                "tool canceled because the agent run ended".into(),
             ));
         }
         let now = tokio::time::Instant::now();
@@ -1435,7 +1435,7 @@ where
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                 if browser_run_interrupted(store, run_id)? {
                     return Err(AppError::BadRequest(
-                        "browser operation interrupted because the agent run is no longer active".into(),
+                        "tool canceled because the agent run ended".into(),
                     ));
                 }
             }

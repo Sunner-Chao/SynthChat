@@ -3448,6 +3448,25 @@ pub(super) fn handle_model_control_command(
                 agent.llm_model = alias.model;
                 resolved_alias = Some(alias.alias);
             }
+        } else if let Some(route) =
+            resolve_model_family_route(model.trim(), active_provider, &providers)
+        {
+            let route_matches_explicit_provider = provider_selector.is_none()
+                || route
+                    .provider_id
+                    .as_deref()
+                    .map(|provider_id| provider_id == active_provider.id)
+                    .unwrap_or(true);
+            if !route_matches_explicit_provider {
+                agent.llm_model = model.trim().to_string();
+            } else {
+                if provider_selector.is_none() {
+                    if let Some(provider_id) = route.provider_id.as_deref() {
+                        agent.llm_provider = provider_id.to_string();
+                    }
+                }
+                agent.llm_model = route.model;
+            }
         } else {
             agent.llm_model = model.trim().to_string();
         }
@@ -3464,7 +3483,9 @@ pub(super) fn selected_provider_id<'a>(
     persona: &'a Persona,
     agent: &'a AgentDefinition,
 ) -> Option<&'a str> {
-    if !persona.llm_provider.trim().is_empty() {
+    if agent_llm_pair_should_win(persona, agent) {
+        Some(agent.llm_provider.as_str())
+    } else if !persona.llm_provider.trim().is_empty() {
         Some(persona.llm_provider.as_str())
     } else if !agent.llm_provider.trim().is_empty() {
         Some(agent.llm_provider.as_str())
@@ -3475,6 +3496,11 @@ pub(super) fn selected_provider_id<'a>(
 
 pub(super) fn effective_llm_persona(persona: &Persona, agent: &AgentDefinition) -> Persona {
     let mut effective = persona.clone();
+    if agent_llm_pair_should_win(persona, agent) {
+        effective.llm_provider = agent.llm_provider.clone();
+        effective.llm_model = agent.llm_model.clone();
+        return effective;
+    }
     if effective.llm_provider.trim().is_empty() && !agent.llm_provider.trim().is_empty() {
         effective.llm_provider = agent.llm_provider.clone();
     }
@@ -3482,6 +3508,12 @@ pub(super) fn effective_llm_persona(persona: &Persona, agent: &AgentDefinition) 
         effective.llm_model = agent.llm_model.clone();
     }
     effective
+}
+
+fn agent_llm_pair_should_win(persona: &Persona, agent: &AgentDefinition) -> bool {
+    !agent.llm_provider.trim().is_empty()
+        && !agent.llm_model.trim().is_empty()
+        && persona.llm_model.trim().is_empty()
 }
 
 pub(super) fn select_llm_provider<'a>(
@@ -3514,7 +3546,7 @@ pub(super) fn select_llm_provider<'a>(
 }
 
 #[derive(Debug, Clone)]
-struct ModelAliasResolution {
+pub(super) struct ModelAliasResolution {
     alias: String,
     model: String,
     provider_id: Option<String>,
@@ -3559,6 +3591,181 @@ pub(super) fn resolve_model_alias(
     })
 }
 
+pub(super) fn resolve_model_family_route(
+    raw_model: &str,
+    current_provider: &LlmProvider,
+    providers: &[LlmProvider],
+) -> Option<ModelAliasResolution> {
+    let provider_hint = model_family_provider_hint(raw_model)?;
+    let model = normalize_model_for_provider_hint(raw_model, provider_hint);
+    let provider_id = if provider_matches_alias_hint(current_provider, provider_hint) {
+        Some(current_provider.id.clone())
+    } else if provider_catalog_contains_model(current_provider, &model) {
+        Some(current_provider.id.clone())
+    } else {
+        providers
+            .iter()
+            .find(|provider| provider.enabled && provider_catalog_contains_model(provider, &model))
+            .or_else(|| {
+                providers.iter().find(|provider| {
+                    provider.enabled && provider_matches_alias_hint(provider, provider_hint)
+                })
+            })
+            .map(|provider| provider.id.clone())
+    }?;
+    Some(ModelAliasResolution {
+        alias: raw_model.trim().to_string(),
+        model,
+        provider_id: Some(provider_id),
+    })
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct LlmRouteCorrection {
+    pub provider_hint: String,
+    pub from_provider_id: Option<String>,
+    pub to_provider_id: String,
+    pub requested_model: String,
+    pub effective_model: String,
+}
+
+pub(super) fn reconcile_model_family_provider(
+    persona: &mut Persona,
+    providers: &mut Vec<LlmProvider>,
+) -> Option<LlmRouteCorrection> {
+    let requested_model = persona.llm_model.trim().to_string();
+    if requested_model.is_empty() || providers.is_empty() {
+        return None;
+    }
+    let provider_hint = model_family_provider_hint(&requested_model)?;
+    let effective_model = normalize_model_for_provider_hint(&requested_model, provider_hint);
+    let from_provider_id = providers.first().map(|provider| provider.id.clone());
+    if let Some(target_index) = providers
+        .iter()
+        .position(|provider| provider_catalog_contains_model(provider, &effective_model))
+    {
+        if target_index == 0 {
+            if effective_model != requested_model {
+                persona.llm_model = effective_model.clone();
+                return Some(LlmRouteCorrection {
+                    provider_hint: provider_hint.to_string(),
+                    from_provider_id: from_provider_id.clone(),
+                    to_provider_id: from_provider_id.unwrap_or_default(),
+                    requested_model,
+                    effective_model,
+                });
+            }
+            return None;
+        }
+        let target = providers.remove(target_index);
+        let to_provider_id = target.id.clone();
+        providers.insert(0, target);
+        persona.llm_provider = to_provider_id.clone();
+        persona.llm_model = effective_model.clone();
+        return Some(LlmRouteCorrection {
+            provider_hint: provider_hint.to_string(),
+            from_provider_id,
+            to_provider_id,
+            requested_model,
+            effective_model,
+        });
+    }
+    if providers
+        .first()
+        .is_some_and(|provider| provider_matches_alias_hint(provider, provider_hint))
+    {
+        if effective_model != requested_model {
+            persona.llm_model = effective_model.clone();
+            return Some(LlmRouteCorrection {
+                provider_hint: provider_hint.to_string(),
+                from_provider_id: from_provider_id.clone(),
+                to_provider_id: from_provider_id.unwrap_or_default(),
+                requested_model,
+                effective_model,
+            });
+        }
+        return None;
+    }
+    let target_index = providers
+        .iter()
+        .position(|provider| provider_matches_alias_hint(provider, provider_hint))?;
+    let target = providers.remove(target_index);
+    let to_provider_id = target.id.clone();
+    providers.insert(0, target);
+    persona.llm_provider = to_provider_id.clone();
+    persona.llm_model = effective_model.clone();
+    Some(LlmRouteCorrection {
+        provider_hint: provider_hint.to_string(),
+        from_provider_id,
+        to_provider_id,
+        requested_model,
+        effective_model,
+    })
+}
+
+fn provider_catalog_contains_model(provider: &LlmProvider, model: &str) -> bool {
+    let needle = model.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    if provider.model.trim().eq_ignore_ascii_case(&needle) {
+        return true;
+    }
+    provider
+        .models
+        .as_object()
+        .is_some_and(|models| models.keys().any(|id| id.eq_ignore_ascii_case(&needle)))
+}
+
+pub(super) fn model_family_provider_hint(raw_model: &str) -> Option<&'static str> {
+    let lower = raw_model.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    let bare = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    if lower.starts_with("xiaomi/") || bare.starts_with("mimo-") || bare.starts_with("mino-") {
+        return Some("xiaomi");
+    }
+    if lower.starts_with("minimax/")
+        || lower.starts_with("minimaxai/")
+        || bare.starts_with("minimax-")
+        || bare.starts_with("minimaxm")
+    {
+        return Some("minimax");
+    }
+    None
+}
+
+fn normalize_model_for_provider_hint(raw_model: &str, provider_hint: &str) -> String {
+    let trimmed = raw_model.trim();
+    if provider_hint == "xiaomi" {
+        let bare = trimmed
+            .rsplit_once('/')
+            .map(|(_, model)| model)
+            .unwrap_or(trimmed);
+        let lower = bare.to_ascii_lowercase();
+        if lower.starts_with("mino-") {
+            return format!("mimo-{}", &bare[5..]).to_ascii_lowercase();
+        }
+        return lower;
+    }
+    if provider_hint == "minimax" {
+        let bare = trimmed
+            .rsplit_once('/')
+            .map(|(_, model)| model)
+            .unwrap_or(trimmed);
+        let lower = bare.to_ascii_lowercase();
+        if lower.starts_with("minimax-m") {
+            return format!("MiniMax-M{}", &bare[9..]);
+        }
+        if lower.starts_with("minimaxm") {
+            return format!("MiniMax-M{}", &bare[8..]);
+        }
+        return bare.to_string();
+    }
+    trimmed.to_string()
+}
+
 pub(super) fn normalize_model_alias_key(value: &str) -> String {
     value
         .trim()
@@ -3579,7 +3786,11 @@ pub(super) fn provider_matches_alias_hint(provider: &LlmProvider, hint: &str) ->
     ];
     fields
         .iter()
-        .any(|field| field.to_ascii_lowercase().contains(&hint))
+        .any(|field| {
+            let field = field.to_ascii_lowercase();
+            field.contains(&hint)
+                || (hint == "xiaomi" && (field.contains("mimo") || field.contains("xiaomimimo")))
+        })
 }
 
 pub(super) fn format_model_control_reply(
@@ -3603,12 +3814,13 @@ pub(super) fn format_model_control_reply(
     } else {
         provider.model.trim()
     };
-    let persona_note =
-        if !persona.llm_provider.trim().is_empty() || !persona.llm_model.trim().is_empty() {
-            "\n- note: 当前 persona 有 LLM 覆盖，优先级高于 agent。"
-        } else {
-            ""
-        };
+    let persona_note = if agent_llm_pair_should_win(persona, agent) {
+        "\n- note: agent provider/model 成对优先，避免路由错配。"
+    } else if !persona.llm_provider.trim().is_empty() || !persona.llm_model.trim().is_empty() {
+        "\n- note: 当前 persona 有 LLM 覆盖，优先级高于 agent。"
+    } else {
+        ""
+    };
     let provider_rows = providers
         .iter()
         .take(10)

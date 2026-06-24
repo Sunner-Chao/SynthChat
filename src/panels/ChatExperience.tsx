@@ -291,8 +291,8 @@ function runPhaseLabel(phase: string) {
   return labels[phase] ?? phase;
 }
 
-function isTerminalRunState(state: string) {
-  return ["completed", "failed", "aborted"].includes(state);
+function isTerminalRunState(state?: string | null) {
+  return state === "completed" || state === "failed" || state === "aborted";
 }
 
 function compactRunText(value?: string | null, limit = 120) {
@@ -492,9 +492,37 @@ function acpUpdateLinesFromDetail(detail: unknown) {
 
 function eventStatusLabel(event: ToolEvent) {
   if (event.status === "running") return "调用中";
+  if (event.status === "canceled" || event.status === "cancelled") return "已取消";
   if (event.ok) return "成功";
   if (event.timedOut) return "超时";
   return "失败";
+}
+
+function isCanceledToolEvent(event: ToolEvent) {
+  return event.status === "canceled" || event.status === "cancelled";
+}
+
+function materializeToolEvent(event: ToolEvent, terminalRunState?: string | null): ToolEvent {
+  if (event.status !== "running" || !isTerminalRunState(terminalRunState)) return event;
+  const summary = terminalRunState === "completed"
+    ? "运行已完成"
+    : terminalRunState === "aborted"
+      ? "运行已取消"
+      : "运行已结束";
+  return {
+    ...event,
+    status: "canceled",
+    ok: false,
+    summary,
+    error: summary
+  };
+}
+
+function toolEventRank(event: ToolEvent) {
+  if (event.status === "running") return 0;
+  if (isCanceledToolEvent(event)) return 1;
+  if (!event.ok || event.status === "failed") return 2;
+  return 3;
 }
 
 function eventKey(event: ToolEvent, index: number) {
@@ -569,7 +597,8 @@ const MessageList = memo(function MessageList({
   animatedMessageIds,
   streamCharsPerSecond,
   onMessageAnimationDone,
-  memoryStats
+  memoryStats,
+  runStates
 }: {
   messages: ChatMessage[];
   profileName: string;
@@ -585,27 +614,46 @@ const MessageList = memo(function MessageList({
   streamCharsPerSecond: number;
   onMessageAnimationDone: (messageId: string) => void;
   memoryStats: Map<string, ShortMemoryMessageStat>;
+  runStates: Map<string, string>;
 }) {
   const visibleMessages = useMemo(() => {
     const sliced = messages.slice(-renderLimit);
-    // Deduplicate tool messages by provider call id when available; fall back to legacy tool name.
-    const seen = new Set<string>();
+    const selectedToolMessages = new Map<string, { index: number; event: ToolEvent; message: ChatMessage }>();
+    const toolKeys = new Map<string, string>();
+    for (let i = 0; i < sliced.length; i++) {
+      const msg = sliced[i];
+      if (msg.role !== "tool") continue;
+      const evt = parseToolEvent(msg.content);
+      if (!evt) continue;
+      const materialized = materializeToolEvent(evt, evt.runId ? runStates.get(evt.runId) : null);
+      const key = toolEventMessageKey(materialized);
+      toolKeys.set(msg.id, key);
+      const previous = selectedToolMessages.get(key);
+      if (
+        !previous
+        || toolEventRank(materialized) > toolEventRank(previous.event)
+        || (
+          toolEventRank(materialized) === toolEventRank(previous.event)
+          && i > previous.index
+        )
+      ) {
+        selectedToolMessages.set(key, { index: i, event: materialized, message: msg });
+      }
+    }
     const deduped: typeof sliced = [];
-    for (let i = sliced.length - 1; i >= 0; i--) {
+    for (let i = 0; i < sliced.length; i++) {
       const msg = sliced[i];
       if (msg.role === "tool") {
-        const evt = parseToolEvent(msg.content);
-        if (evt) {
-          const key = toolEventMessageKey(evt);
-          if (seen.has(key)) continue;
-          seen.add(key);
+        const key = toolKeys.get(msg.id);
+        if (key) {
+          const selected = selectedToolMessages.get(key);
+          if (!selected || selected.message.id !== msg.id) continue;
         }
       }
       deduped.push(msg);
     }
-    deduped.reverse();
     return deduped;
-  }, [messages, renderLimit]);
+  }, [messages, renderLimit, runStates]);
   const hiddenCount = messages.length - visibleMessages.length;
   return (
     <>
@@ -630,6 +678,7 @@ const MessageList = memo(function MessageList({
           streamCharsPerSecond={streamCharsPerSecond}
           onAnimationDone={() => onMessageAnimationDone(message.id)}
           memoryStat={memoryStats.get(message.id) ?? null}
+          runStates={runStates}
         />
       ))}
     </>
@@ -904,6 +953,12 @@ export const ChatExperience = memo(function ChatExperience() {
     () => agentRuns.find((run) => run.conversationId === activeConversationId && !run.parentRunId),
     [activeConversationId, agentRuns]
   );
+  const runStates = useMemo(() => {
+    const states = new Map<string, string>();
+    for (const run of agentRuns) states.set(run.runId, run.state);
+    for (const run of Object.values(activeAgentRuns)) states.set(run.runId, run.state);
+    return states;
+  }, [activeAgentRuns, agentRuns]);
   const runByQueueItemId = useMemo(() => {
     const entries = new Map<string, { runId: string; state: string }>();
     for (const run of agentRuns) {
@@ -933,11 +988,12 @@ export const ChatExperience = memo(function ChatExperience() {
   const activeRunActivityAt = activeRun?.lastActivityAt ?? storedRun?.lastActivityAt ?? activeRun?.updatedAt ?? storedRun?.updatedAt ?? null;
   const activeRunActivityDesc = activeRun?.lastActivityDesc ?? storedRun?.lastActivityDesc ?? null;
   const stoppableRun = activeRun ?? (storedRun && !["completed", "failed", "aborted"].includes(storedRun.state) ? storedRun : null);
-  const activeToolEvents: ToolEvent[] = activeRun?.accumulatedToolEvents?.length
+  const activeToolEvents: ToolEvent[] = (activeRun?.accumulatedToolEvents?.length
     ? activeRun.accumulatedToolEvents
     : activeRun?.toolEvent
       ? [activeRun.toolEvent]
-      : [];
+      : []
+  ).map((event) => materializeToolEvent(event, event.runId ? runStates.get(event.runId) : null));
   const activeRunPhases = activeRun?.accumulatedPhases
     ?? (activeRun?.phase ? [{ phase: activeRun.phase, detail: activeRun.detail, updatedAt: activeRun.updatedAt }] : storedRun?.phaseEvents ?? []);
   const activeProcessEvents = useMemo(
@@ -949,8 +1005,11 @@ export const ChatExperience = memo(function ChatExperience() {
   const recentMessages = useMemo(() => messages.slice(-renderLimit), [messages, renderLimit]);
   const artifactMessages = useMemo(() => recentMessages.slice(-artifactScanLimit), [artifactScanLimit, recentMessages]);
   const messageToolEvents = useMemo(() => recentMessages
-    .map((message) => (message.role === "tool" ? parseToolEvent(message.content) : null))
-    .filter((event): event is ToolEvent => Boolean(event)), [recentMessages]);
+    .map((message) => {
+      const event = message.role === "tool" ? parseToolEvent(message.content) : null;
+      return event ? materializeToolEvent(event, event.runId ? runStates.get(event.runId) : null) : null;
+    })
+    .filter((event): event is ToolEvent => Boolean(event)), [recentMessages, runStates]);
   const graphEvents = activeToolEvents.length > 0 ? activeToolEvents : messageToolEvents;
   const currentProvider = useMemo(() => {
     const providerId = selectedPersona?.llmProvider || activeAgent?.llmProvider || "";
@@ -1673,6 +1732,7 @@ export const ChatExperience = memo(function ChatExperience() {
                   streamCharsPerSecond={streamCharsPerSecond}
                   onMessageAnimationDone={handleMessageAnimationDone}
                   memoryStats={shortMemoryStats}
+                  runStates={runStates}
                 />
               )}
               {showThinking ? (
@@ -2181,7 +2241,8 @@ const MessageRow = memo(function MessageRow({
   animateText,
   streamCharsPerSecond,
   onAnimationDone,
-  memoryStat
+  memoryStat,
+  runStates
 }: {
   message: ChatMessage;
   profileName: string;
@@ -2196,9 +2257,13 @@ const MessageRow = memo(function MessageRow({
   streamCharsPerSecond: number;
   onAnimationDone: () => void;
   memoryStat: ShortMemoryMessageStat | null;
+  runStates: Map<string, string>;
 }) {
   const [previewSrc, setPreviewSrc] = useState<string | null>(null);
-  const toolEvent = message.role === "tool" ? parseToolEvent(message.content) : null;
+  const parsedToolEvent = message.role === "tool" ? parseToolEvent(message.content) : null;
+  const toolEvent = parsedToolEvent
+    ? materializeToolEvent(parsedToolEvent, parsedToolEvent.runId ? runStates.get(parsedToolEvent.runId) : null)
+    : null;
   const processEvent = message.role === "tool" ? parseManagedProcessEvent(message.content) : null;
   const isUser = message.role === "user";
   const text = previewText(renderTextForMessage(plainText(message.content)), previewCharLimit);
@@ -2383,9 +2448,11 @@ const ImagePreviewModal = memo(function ImagePreviewModal({ src, onClose }: { sr
 
 const ToolStep = memo(function ToolStep({ event }: { event: ToolEvent }) {
   const status = eventStatusLabel(event);
+  const isRunning = event.status === "running";
+  const isCanceled = isCanceledToolEvent(event);
   return (
-    <div className={event.status === "running" ? "claw-step active" : event.ok ? "claw-step done" : "claw-step failed"}>
-      {event.status === "running" ? <Loader2 size={15} /> : event.ok ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
+    <div className={isRunning ? "claw-step active" : event.ok || isCanceled ? "claw-step done" : "claw-step failed"}>
+      {isRunning ? <Loader2 size={15} /> : event.ok || isCanceled ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
       <span>{event.title || `${event.serverId}.${event.toolName}`}</span>
       <small>{status} · {event.elapsedMs}ms</small>
     </div>
@@ -2411,7 +2478,7 @@ function compactSteps(events: ToolEvent[]): CompactStep[] {
     if (prev && prev.title === title && !prev.anyRunning && !event.status) {
       prev.count++;
       prev.allOk = prev.allOk && event.ok;
-      prev.anyFailed = prev.anyFailed || (!event.ok && event.status !== "running");
+      prev.anyFailed = prev.anyFailed || (!event.ok && event.status !== "running" && !isCanceledToolEvent(event));
       prev.totalMs += event.elapsedMs;
       prev.lastEvent = event;
     } else {
@@ -2421,7 +2488,7 @@ function compactSteps(events: ToolEvent[]): CompactStep[] {
         count: 1,
         allOk: event.ok,
         anyRunning: event.status === "running",
-        anyFailed: !event.ok && event.status !== "running",
+        anyFailed: !event.ok && event.status !== "running" && !isCanceledToolEvent(event),
         totalMs: event.elapsedMs,
         lastEvent: event
       });
@@ -2490,7 +2557,8 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
   const canOpen = Boolean(event.path && event.exists);
   const isToolImage = canOpen && (event.eventType === "screenshot" || event.eventType === "image" || Boolean(event.mimeType?.startsWith("image/")));
   const isRunning = event.status === "running";
-  const isFailed = !isRunning && (!event.ok || Boolean(event.error));
+  const isCanceled = isCanceledToolEvent(event);
+  const isFailed = !isRunning && !isCanceled && (!event.ok || Boolean(event.error));
   const reauthInfo = toolEventReauthInfo(event);
   const summaryText = event.summary?.trim() ?? "";
   const bodyText = event.text?.trim() ?? "";
@@ -2539,7 +2607,7 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
               </div>
             ) : null}
             {bodyText && !duplicateBody ? <pre>{previewText(bodyText, DEFAULT_MESSAGE_PREVIEW_CHARS)}</pre> : null}
-            {errorText && !duplicateError ? <p className="claw-error-text">{errorText}</p> : null}
+            {errorText && !duplicateError && !isCanceled ? <p className="claw-error-text">{errorText}</p> : null}
             {reauthInfo ? (
               <div className="claw-tool-path">
                 <AlertCircle size={14} />

@@ -1247,13 +1247,25 @@ fn proactive_status_for_persona(store: &AppStore, persona: &Persona) -> AppResul
     let last_user_at = messages
         .iter()
         .rev()
-        .find(|message| message.role == "user")
+        .find(|message| proactive_message_counts_as_user_activity(message))
+        .and_then(|message| epoch_seconds_from_iso(&message.created_at))
+        .unwrap_or(0);
+    let last_user_index = messages
+        .iter()
+        .rposition(proactive_message_counts_as_user_activity);
+    let last_reply_at = last_user_index
+        .and_then(|index| {
+            messages[index + 1..]
+                .iter()
+                .rev()
+                .find(|message| proactive_message_counts_as_reply_anchor(message))
+        })
         .and_then(|message| epoch_seconds_from_iso(&message.created_at))
         .unwrap_or(0);
     let consecutive_count = messages
         .iter()
         .rev()
-        .take_while(|message| message.role != "user")
+        .take_while(|message| !proactive_message_counts_as_user_activity(message))
         .filter(|message| message.role == "assistant" && message.source == "proactive")
         .count() as u32;
     let wait_seconds = proactive_wait_seconds(&persona.id, &persona.proactive);
@@ -1263,8 +1275,13 @@ fn proactive_status_for_persona(store: &AppStore, persona: &Persona) -> AppResul
     } else {
         0
     };
+    let seconds_since_last_reply = if last_reply_at > 0 {
+        now.saturating_sub(last_reply_at)
+    } else {
+        0
+    };
     let in_quiet_hours = proactive_in_quiet_hours(&persona.proactive);
-    let ready_in_seconds = wait_seconds as i64 - seconds_since_last_user;
+    let ready_in_seconds = wait_seconds as i64 - seconds_since_last_reply;
     let enabled = persona
         .proactive
         .get("enabled")
@@ -1283,6 +1300,8 @@ fn proactive_status_for_persona(store: &AppStore, persona: &Persona) -> AppResul
         blocked_reason = "没有该角色的会话".into();
     } else if last_user_at <= 0 {
         blocked_reason = "没有历史用户消息，无法锚定空闲时间".into();
+    } else if last_reply_at <= 0 {
+        blocked_reason = "等待助手回复完成".into();
     } else if in_quiet_hours {
         blocked_reason = "当前处于静默时段".into();
     } else if consecutive_count >= max_consecutive {
@@ -1301,6 +1320,8 @@ fn proactive_status_for_persona(store: &AppStore, persona: &Persona) -> AppResul
         conversation_id: conversation.map(|conversation| conversation.id),
         last_user_at,
         seconds_since_last_user,
+        last_reply_at,
+        seconds_since_last_reply,
         wait_seconds,
         ready_in_seconds: ready_in_seconds.max(0),
         consecutive_count,
@@ -1309,6 +1330,16 @@ fn proactive_status_for_persona(store: &AppStore, persona: &Persona) -> AppResul
         can_fire: blocked_reason.is_empty(),
         blocked_reason,
     })
+}
+
+fn proactive_message_counts_as_user_activity(message: &models::ChatMessage) -> bool {
+    message.role == "user" && message.source != "proactive-internal"
+}
+
+fn proactive_message_counts_as_reply_anchor(message: &models::ChatMessage) -> bool {
+    message.role == "assistant"
+        && message.source != "desktop-agent-error"
+        && message.source != "proactive-internal"
 }
 
 fn proactive_wait_seconds(persona_id: &str, config: &Value) -> u64 {

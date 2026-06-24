@@ -466,6 +466,8 @@ export function PetWindow() {
         if (payload.toolEvent.status === "running") {
           appendBubbleEntry(createPetBubbleEntry("status", `正在调用工具: ${payload.toolEvent.title || payload.toolEvent.toolName}`));
           if (modelLoadedRef.current) postToPet({ type: "expression", id: "思考" });
+        } else if (payload.toolEvent.status === "canceled" || payload.toolEvent.status === "cancelled") {
+          appendBubbleEntry(createPetBubbleEntry("status", `工具已取消: ${payload.toolEvent.title || payload.toolEvent.toolName}`));
         } else if (!payload.toolEvent.ok) {
           appendBubbleEntry(createPetBubbleEntry("status", `工具调用失败: ${payload.toolEvent.title || payload.toolEvent.toolName}`));
         } else {

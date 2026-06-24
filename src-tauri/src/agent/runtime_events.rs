@@ -14,7 +14,6 @@ use crate::{
         ChatMessage, PlannerTraceRecord, ToolDefinition, ToolEvent,
     },
     store::AppStore,
-    wechat_settings,
 };
 
 use super::{
@@ -64,17 +63,27 @@ pub(super) fn record_tool_event_for_run(
     app: Option<&AppHandle>,
     conversation_id: &str,
     run_id: &str,
-    event: ToolEvent,
+    mut event: ToolEvent,
 ) -> AppResult<()> {
-    let tool_message = store.append_message(ChatMessage::new(
-        conversation_id.to_string(),
-        "tool",
-        json!({"type": "toolEvent", "event": event.clone()}).to_string(),
-        "desktop-agent-tool",
-    ))?;
+    normalize_tool_event_for_display(&mut event);
     if let Ok(mut run) = store.agent_run(run_id) {
-        run.state = "running".into();
-        run.completed_at = None;
+        let run_is_terminal = matches!(run.state.as_str(), "completed" | "failed" | "aborted");
+        if run_is_terminal && event.status.as_deref() == Some("running") {
+            event = tool_canceled_event_from_running(
+                &event,
+                terminal_tool_event_summary_for_run_state(&run.state),
+            );
+        }
+        let tool_message = store.append_message(ChatMessage::new(
+            conversation_id.to_string(),
+            "tool",
+            json!({"type": "toolEvent", "event": event.clone()}).to_string(),
+            "desktop-agent-tool",
+        ))?;
+        if !run_is_terminal {
+            run.state = "running".into();
+            run.completed_at = None;
+        }
         run.touch_activity(format!(
             "tool {}: {}",
             event.status.as_deref().unwrap_or("event"),
@@ -94,71 +103,18 @@ pub(super) fn record_tool_event_for_run(
         });
         let saved_run = store.save_agent_run(run)?;
         emit_agent_run_record(app, &saved_run, Some(&tool_message));
-    }
-    dispatch_tool_progress_to_wechat(store, conversation_id, &event);
-    Ok(())
-}
-
-fn dispatch_tool_progress_to_wechat(store: &AppStore, conversation_id: &str, event: &ToolEvent) {
-    if event.status.as_deref() == Some("running") {
-        return;
-    }
-    if event.status.as_deref() == Some("failed")
-        || !event.ok
-        || event
-            .error
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-    {
-        return;
-    }
-    let detail = event
-        .summary
-        .trim()
-        .to_string()
-        + "\n"
-        + event.text.as_deref().unwrap_or("").trim();
-    let detail_lower = detail.to_ascii_lowercase();
-    if detail_lower.contains("error:")
-        || detail_lower.contains("\"ok\": false")
-        || detail_lower.contains("bad request")
-        || detail_lower.contains("failed")
-    {
-        return;
-    }
-    let Ok(conversation) = store.conversation(conversation_id) else {
-        return;
-    };
-    if conversation.wechat_account_id.is_none()
-        && conversation
-            .metadata
-            .get("wechatAccountId")
-            .and_then(Value::as_str)
-            .is_none()
-    {
-        return;
-    }
-    let title = if event.title.trim().is_empty() {
-        format!("{}.{}", event.server_id, event.tool_name)
     } else {
-        event.title.trim().to_string()
-    };
-    let detail = event
-        .error
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            (!event.summary.trim().is_empty()).then_some(event.summary.as_str())
-        })
-        .or_else(|| event.text.as_deref().filter(|value| !value.trim().is_empty()))
-        .unwrap_or("");
-    let status = if event.ok { "完成" } else { "失败" };
-    let mut message = format!("工具调用{status}: {title}");
-    if !detail.trim().is_empty() {
-        message.push('\n');
-        message.push_str(&truncate_for_prompt(detail.trim(), 300));
+        if event.status.as_deref() == Some("running") {
+            event = tool_canceled_event_from_running(&event, "运行已结束");
+        }
+        let _ = store.append_message(ChatMessage::new(
+            conversation_id.to_string(),
+            "tool",
+            json!({"type": "toolEvent", "event": event.clone()}).to_string(),
+            "desktop-agent-tool",
+        ))?;
     }
-    wechat_settings::dispatch_desktop_reply_to_wechat(&conversation, &message);
+    Ok(())
 }
 
 pub(super) fn record_tool_failed_for_run(
@@ -174,7 +130,9 @@ pub(super) fn record_tool_failed_for_run(
     let (server_id, tool_name) = tool_event_target_for_request(requested_tool_name, mcp_tools);
     let (started, event) =
         tool_failed_transition_events(run_id, &server_id, &tool_name, payload, &error.to_string());
-    record_tool_event_for_run(store, app, conversation_id, run_id, started)?;
+    if !tool_error_is_run_inactive(&error.to_string()) {
+        record_tool_event_for_run(store, app, conversation_id, run_id, started)?;
+    }
     record_tool_event_for_run(store, app, conversation_id, run_id, event)
 }
 
@@ -487,8 +445,14 @@ pub(super) fn tool_failed_event(
     } else {
         json!({"payload": payload, "error": error})
     };
+    let canceled = tool_error_is_run_inactive(&error);
+    let display_error = if canceled {
+        "运行已结束，工具已取消".to_string()
+    } else {
+        error.clone()
+    };
     ToolEvent {
-        status: Some("failed".into()),
+        status: Some(if canceled { "canceled" } else { "failed" }.into()),
         reference_id: None,
         call_id: Some(provider_tool_call_id(payload).unwrap_or_else(|| new_id("call"))),
         run_id: Some(run_id.to_string()),
@@ -512,7 +476,7 @@ pub(super) fn tool_failed_event(
                 server_id
             }
         ),
-        summary: error.clone(),
+        summary: display_error.clone(),
         path: payload
             .get("path")
             .and_then(Value::as_str)
@@ -520,9 +484,49 @@ pub(super) fn tool_failed_event(
         exists: None,
         mime_type: Some("text/plain".into()),
         text: None,
-        error: Some(error.clone()),
+        error: Some(display_error),
         raw: Some(redact_json_value(raw)),
     }
+}
+
+fn normalize_tool_event_for_display(event: &mut ToolEvent) {
+    if event.status.as_deref() == Some("failed")
+        && event
+            .error
+            .as_deref()
+            .is_some_and(tool_error_is_run_inactive)
+    {
+        event.status = Some("canceled".into());
+        event.summary = "运行已结束，工具已取消".into();
+        event.error = Some(event.summary.clone());
+        event.ok = false;
+    }
+}
+
+fn tool_error_is_run_inactive(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("agent run is no longer active")
+        || lower.contains("agent run was stopped")
+        || lower.contains("is already terminal")
+        || lower.contains("agent run ended")
+        || lower.contains("run ended")
+}
+
+fn terminal_tool_event_summary_for_run_state(state: &str) -> &'static str {
+    match state {
+        "completed" => "运行已完成",
+        "aborted" => "运行已取消",
+        _ => "运行已结束",
+    }
+}
+
+fn tool_canceled_event_from_running(event: &ToolEvent, summary: &str) -> ToolEvent {
+    let mut event = event.clone();
+    event.status = Some("canceled".into());
+    event.ok = false;
+    event.summary = summary.into();
+    event.error = Some(summary.into());
+    event
 }
 
 pub(super) fn append_planner_trace(

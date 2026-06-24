@@ -1951,6 +1951,96 @@ mod tests {
     }
 
     #[test]
+    fn startup_interrupted_wechat_run_with_artifact_does_not_recover_delivery() {
+        let dir = std::env::temp_dir().join(format!(
+            "synthchat-recover-delivery-test-{}",
+            new_id("state")
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("report.pdf");
+        fs::write(&output, b"pdf").unwrap();
+
+        let mut state = PersistedState::default();
+        let mut conversation = Conversation::new(
+            "wechat delivery".into(),
+            "default".into(),
+            "default".into(),
+        );
+        conversation.wechat_account_id = Some("wechat-account".into());
+        let conversation_id = conversation.id.clone();
+        let mut run =
+            AgentRunRecord::new(conversation.id.clone(), "default".into(), "default".into());
+        run.state = "running".into();
+        run.tool_events.push(json!({
+            "status": "completed",
+            "runId": &run.run_id,
+            "serverId": "__internal",
+            "toolName": "artifact",
+            "ok": true,
+            "title": "internal · artifact",
+            "path": output.to_string_lossy(),
+            "raw": {
+                "payload": {
+                    "action": "publish_file",
+                    "name": "report",
+                    "path": output.to_string_lossy(),
+                }
+            },
+            "text": serde_json::to_string(&json!({
+                "name": "report",
+                "path": output.to_string_lossy(),
+                "mimeType": "application/pdf",
+                "mediaTag": format!("MEDIA:\"{}\"", output.to_string_lossy()),
+            })).unwrap(),
+        }));
+        let run_id = run.run_id.clone();
+        let mut error = ChatMessage::new(
+            conversation_id.clone(),
+            "assistant",
+            "本轮对话没有返回".into(),
+            "desktop-agent-error",
+        );
+        error.created_at = run.started_at.clone();
+        error.provider_data = Some(json!({
+            "failureSummaryForRun": &run_id,
+        }));
+        state.conversations.push(conversation);
+        state.messages.insert(conversation_id.clone(), vec![error]);
+        state.agent_runs.push(run);
+
+        normalize_interrupted_runs(&mut state);
+
+        let run = state
+            .agent_runs
+            .iter()
+            .find(|run| run.run_id == run_id)
+            .unwrap();
+        assert_eq!(run.state, "failed");
+        assert_eq!(
+            run.error.as_deref(),
+            Some("Agent run was interrupted before the application restarted.")
+        );
+        let messages = state.messages.get(&conversation_id).unwrap();
+        assert!(!messages
+            .iter()
+            .any(|message| message.source == "desktop-agent-recovered"));
+        assert!(messages
+            .iter()
+            .any(|message| message.source == "desktop-agent-error"));
+        let conversation = state
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+            .unwrap();
+        assert_eq!(
+            conversation.metadata["hermesSessionLifecycle"]["resumePending"],
+            true
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn active_run_timeout_uses_post_tool_quiet_timeout() {
         let dir = std::env::temp_dir().join(format!(
             "synthchat-run-post-tool-timeout-test-{}",
@@ -4907,12 +4997,34 @@ fn legacy_v0_config_path() -> Option<PathBuf> {
     .find(|candidate| candidate.is_file())
 }
 
+#[derive(Debug, Clone)]
+struct RecoveredRunDeliverable {
+    event: Value,
+    media_path: String,
+    media_tag: String,
+    visible_path: String,
+    name: String,
+    mime_type: Option<String>,
+}
+
 fn normalize_interrupted_runs(state: &mut PersistedState) {
     let now = now_iso();
     let mut interrupted_conversations = HashSet::new();
-    for run in &mut state.agent_runs {
-        if matches!(run.state.as_str(), "started" | "running") {
-            let summary = "Agent run was interrupted before the application restarted.";
+    let summary = "Agent run was interrupted before the application restarted.";
+    for run_index in 0..state.agent_runs.len() {
+        let should_normalize = {
+            let run = &state.agent_runs[run_index];
+            matches!(run.state.as_str(), "started" | "running")
+                || (run.state == "failed" && run.error.as_deref() == Some(summary))
+        };
+        if !should_normalize {
+            continue;
+        }
+        if matches!(
+            state.agent_runs[run_index].state.as_str(),
+            "started" | "running"
+        ) {
+            let run = &mut state.agent_runs[run_index];
             interrupted_conversations.insert(run.conversation_id.clone());
             run.checkpoints.push(AgentCheckpointRecord {
                 checkpoint_id: new_id("ckpt"),
@@ -4922,12 +5034,17 @@ fn normalize_interrupted_runs(state: &mut PersistedState) {
                 state: "interrupted_on_startup".into(),
                 completed_call_ids: Vec::new(),
                 event_refs: Vec::new(),
-                summary: summary.into(),
+                summary: summary.to_string(),
             });
             run.state = "failed".into();
-            run.error = Some(summary.into());
+            run.error = Some(summary.to_string());
             run.updated_at = now.clone();
             run.completed_at = Some(now.clone());
+        } else if state.agent_runs[run_index].state == "failed"
+            && state.agent_runs[run_index].error.as_deref() == Some(summary)
+        {
+            interrupted_conversations
+                .insert(state.agent_runs[run_index].conversation_id.clone());
         }
     }
     for conversation_id in interrupted_conversations {
@@ -4947,6 +5064,316 @@ fn normalize_interrupted_runs(state: &mut PersistedState) {
             item.started_at = None;
             item.completed_at = None;
         }
+    }
+}
+
+fn conversation_accepts_wechat_delivery(state: &PersistedState, conversation_id: &str) -> bool {
+    state
+        .conversations
+        .iter()
+        .find(|conversation| conversation.id == conversation_id)
+        .is_some_and(|conversation| {
+            conversation
+                .wechat_account_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                || conversation
+                    .metadata
+                    .get("wechatAccountId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+        })
+        || state
+            .messages
+            .get(conversation_id)
+            .is_some_and(|messages| messages.iter().any(|message| message.source == "wechat"))
+}
+
+fn run_delivery_recovery_was_user_stopped(run: &AgentRunRecord) -> bool {
+    if run.state != "aborted" {
+        return false;
+    }
+    let error = run.error.as_deref().unwrap_or("").to_ascii_lowercase();
+    error.contains("stopped by control command")
+        || error.contains("manual stop")
+        || error.contains("client stop")
+        || error.contains("api operator stop")
+        || error.contains("/stop")
+        || error.contains("用户")
+}
+
+fn recoverable_deliverable_from_run(
+    state: &PersistedState,
+    run: &AgentRunRecord,
+) -> Option<RecoveredRunDeliverable> {
+    run.tool_events
+        .iter()
+        .rev()
+        .find_map(recoverable_deliverable_from_tool_event)
+        .or_else(|| recoverable_deliverable_from_tool_messages(state, run))
+}
+
+fn recoverable_deliverable_from_tool_messages(
+    state: &PersistedState,
+    run: &AgentRunRecord,
+) -> Option<RecoveredRunDeliverable> {
+    state
+        .messages
+        .get(&run.conversation_id)?
+        .iter()
+        .rev()
+        .filter(|message| message_at_or_after(&message.created_at, &run.started_at))
+        .filter_map(message_tool_event)
+        .filter(|event| {
+            event
+                .get("runId")
+                .or_else(|| event.get("run_id"))
+                .and_then(Value::as_str)
+                == Some(run.run_id.as_str())
+        })
+        .find_map(|event| recoverable_deliverable_from_tool_event(&event))
+}
+
+fn recoverable_deliverable_from_tool_event(event: &Value) -> Option<RecoveredRunDeliverable> {
+    let status = event.get("status").and_then(Value::as_str).unwrap_or("");
+    if status != "completed" || event.get("ok").and_then(Value::as_bool) == Some(false) {
+        return None;
+    }
+    let tool_name = event
+        .get("toolName")
+        .or_else(|| event.get("tool_name"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(tool_name.as_str(), "artifact" | "document") {
+        return None;
+    }
+    let text = event.get("text").and_then(Value::as_str).unwrap_or("");
+    let payload = serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
+    let media_tag = payload
+        .get("mediaTag")
+        .or_else(|| payload.get("wechatMarker"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let media_path = media_tag
+        .as_deref()
+        .and_then(media_tag_path)
+        .or_else(|| string_path_if_file(payload.get("path").and_then(Value::as_str)))
+        .or_else(|| string_path_if_file(event.get("path").and_then(Value::as_str)))?;
+    let media_tag = media_tag.unwrap_or_else(|| format!(r#"MEDIA:"{}""#, media_path));
+    let visible_path = string_path_if_file(
+        event
+            .pointer("/raw/payload/path")
+            .and_then(Value::as_str),
+    )
+    .or_else(|| string_path_if_file(payload.get("sourcePath").and_then(Value::as_str)))
+    .or_else(|| string_path_if_file(event.get("path").and_then(Value::as_str)))
+    .unwrap_or_else(|| media_path.clone());
+    let name = payload
+        .get("name")
+        .or_else(|| payload.get("title"))
+        .or_else(|| event.pointer("/raw/payload/name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            Path::new(&visible_path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "文件".into());
+    let mime_type = payload
+        .get("mimeType")
+        .or_else(|| payload.get("mime_type"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(RecoveredRunDeliverable {
+        event: event.clone(),
+        media_path,
+        media_tag,
+        visible_path,
+        name,
+        mime_type,
+    })
+}
+
+fn media_tag_path(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_matches('`');
+    let prefix = trimmed.get(..6)?;
+    if !prefix.eq_ignore_ascii_case("MEDIA:") {
+        return None;
+    }
+    let path = trimmed[6..]
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_end_matches(['，', '。', ',', '.', ';', '；'])
+        .to_string();
+    string_path_if_file(Some(&path))
+}
+
+fn string_path_if_file(value: Option<&str>) -> Option<String> {
+    let path = value?.trim().trim_start_matches(r"\\?\").to_string();
+    if path.is_empty() || !PathBuf::from(&path).is_file() {
+        return None;
+    }
+    Some(path)
+}
+
+fn recovered_delivery_attachment_marker(deliverable: &RecoveredRunDeliverable) -> String {
+    let mime_type = deliverable
+        .mime_type
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("application/octet-stream");
+    let marker_path = deliverable.visible_path.replace('"', "'");
+    format!("[media attached: \"{}\" ({})]", marker_path, mime_type)
+}
+
+fn content_has_media_attachment(content: &str) -> bool {
+    content.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.contains("[media attached:")
+            || trimmed
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("MEDIA:"))
+    })
+}
+
+fn recovered_message_visible_preview(content: &str) -> String {
+    content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.contains("[media attached:")
+                || trimmed
+                    .get(..6)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("MEDIA:")))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn attach_deliverable_to_existing_message_in_state(
+    state: &mut PersistedState,
+    conversation_id: &str,
+    message_id: &str,
+    deliverable: &RecoveredRunDeliverable,
+    run_id: &str,
+    run_started_at: &str,
+    warning: &str,
+    now: &str,
+) -> Option<ChatMessage> {
+    let marker = recovered_delivery_attachment_marker(deliverable);
+    let messages = state.messages.get_mut(conversation_id)?;
+    let message = messages.iter_mut().rev().find(|message| {
+        message.id == message_id
+            && message.role == "assistant"
+            && message.source != "desktop-agent-error"
+            && message_at_or_after(&message.created_at, run_started_at)
+    })?;
+    if content_has_media_attachment(&message.content) {
+        return None;
+    }
+    let base = message.content.trim_end();
+    message.content = if base.trim().is_empty() {
+        marker
+    } else {
+        format!("{base}\n{marker}")
+    };
+    let mut provider_data = message
+        .provider_data
+        .take()
+        .unwrap_or_else(|| json!({}));
+    if !provider_data.is_object() {
+        provider_data = json!({ "originalProviderData": provider_data });
+    }
+    if let Some(object) = provider_data.as_object_mut() {
+        object.insert("deliverableAttachedFromRunId".into(), json!(run_id));
+        object.insert("deliverableAttachedFrom".into(), json!("wechat_turn_deliverable"));
+        object.insert("warning".into(), json!(warning));
+        object.insert("mediaPath".into(), json!(&deliverable.media_path));
+        object.insert("mediaTag".into(), json!(&deliverable.media_tag));
+        object.insert("visiblePath".into(), json!(&deliverable.visible_path));
+        object.insert("name".into(), json!(&deliverable.name));
+        object.insert("mimeType".into(), json!(deliverable.mime_type.as_deref()));
+        object.insert("runStartedAt".into(), json!(run_started_at));
+        object.insert("attachedAt".into(), json!(now));
+    }
+    message.provider_data = Some(provider_data);
+    let saved = message.clone();
+    if let Some(conversation) = state
+        .conversations
+        .iter_mut()
+        .find(|conversation| conversation.id == conversation_id)
+    {
+        conversation.updated_at = now.to_string();
+        if conversation_preview_message(&saved) {
+            let preview = recovered_message_visible_preview(&saved.content);
+            conversation.last_message = preview.chars().take(120).collect();
+        }
+    }
+    Some(saved)
+}
+
+fn remove_recoverable_error_messages_for_run(
+    state: &mut PersistedState,
+    conversation_id: &str,
+    run_id: &str,
+    timestamp: &str,
+) -> usize {
+    let Some(messages) = state.messages.get_mut(conversation_id) else {
+        return 0;
+    };
+    let before = messages.len();
+    messages.retain(|message| {
+        if message.role != "assistant"
+            || message.source != "desktop-agent-error"
+            || !message_at_or_after(&message.created_at, timestamp)
+        {
+            return true;
+        }
+        let provider_run = message
+            .provider_data
+            .as_ref()
+            .and_then(|data| {
+                data.get("failureSummaryForRun")
+                    .or_else(|| data.get("runId"))
+                    .or_else(|| data.get("run_id"))
+            })
+            .and_then(Value::as_str);
+        !matches!(provider_run, Some(value) if value == run_id)
+    });
+    before.saturating_sub(messages.len())
+}
+
+fn replace_run_tool_event_with_completed(run: &mut AgentRunRecord, event: &Value) {
+    if let Some(call_id) = tool_event_provider_call_id(event) {
+        if let Some(index) = run
+            .tool_events
+            .iter()
+            .position(|candidate| tool_event_provider_call_id(candidate) == Some(call_id))
+        {
+            run.tool_events[index] = event.clone();
+            return;
+        }
+    }
+    run.tool_events.push(event.clone());
+}
+
+fn message_at_or_after(left: &str, right: &str) -> bool {
+    match (
+        DateTime::parse_from_rfc3339(left),
+        DateTime::parse_from_rfc3339(right),
+    ) {
+        (Ok(left), Ok(right)) => left.with_timezone(&Utc) >= right.with_timezone(&Utc),
+        _ => left >= right,
     }
 }
 
@@ -4982,6 +5409,47 @@ fn mark_hermes_session_resume_pending_in_state(
         "source": source,
         "desktopAdaptation": true,
         "note": "SynthChat marks Hermes SessionEntry.resume_pending semantics in conversation metadata when an agent turn is interrupted and can be resumed or diagnosed by the desktop runtime.",
+    });
+    if let Some(object) = conversation.metadata.as_object_mut() {
+        object.insert("hermesSessionLifecycle".into(), snapshot);
+    }
+    conversation.updated_at = updated_at;
+    true
+}
+
+fn mark_hermes_session_resume_resolved_in_state(
+    state: &mut PersistedState,
+    conversation_id: &str,
+    reason: &str,
+    source: &str,
+) -> bool {
+    let Some(conversation) = state
+        .conversations
+        .iter_mut()
+        .find(|conversation| conversation.id == conversation_id)
+    else {
+        return false;
+    };
+    if !conversation.metadata.is_object() {
+        conversation.metadata = json!({});
+    }
+    let updated_at = now_iso();
+    let snapshot = json!({
+        "schema": "hermes_gateway_session_lifecycle_desktop_v1",
+        "sessionKey": conversation.id,
+        "sessionId": conversation.id,
+        "suspended": false,
+        "resumePending": false,
+        "resumeReason": reason,
+        "isFreshReset": false,
+        "wasAutoReset": false,
+        "autoResetReason": Value::Null,
+        "reason": reason,
+        "updatedAt": updated_at,
+        "source": source,
+        "desktopAdaptation": true,
+        "recovered": true,
+        "note": "SynthChat recovered an interrupted agent turn because a deliverable file had already been generated.",
     });
     if let Some(object) = conversation.metadata.as_object_mut() {
         object.insert("hermesSessionLifecycle".into(), snapshot);
@@ -5386,6 +5854,38 @@ fn mark_agent_run_aborted(run: &mut AgentRunRecord, now: &str, summary: &str) {
     run.error = Some(summary.to_string());
     run.updated_at = now.to_string();
     run.completed_at = Some(now.to_string());
+    close_running_tool_events(run, "canceled", "运行已取消");
+}
+
+fn close_running_tool_events(run: &mut AgentRunRecord, status: &str, summary: &str) -> usize {
+    let mut closed = 0usize;
+    for event in &mut run.tool_events {
+        if event.get("status").and_then(Value::as_str) != Some("running") {
+            continue;
+        }
+        if let Some(object) = event.as_object_mut() {
+            object.insert("status".into(), Value::String(status.into()));
+            object.insert("ok".into(), Value::Bool(false));
+            object.insert("summary".into(), Value::String(summary.into()));
+            object.insert("error".into(), Value::String(summary.into()));
+            object.insert("closedByRunState".into(), Value::String(run.state.clone()));
+        }
+        closed += 1;
+    }
+    closed
+}
+
+fn close_terminal_tool_events(run: &mut AgentRunRecord) {
+    if !matches!(run.state.as_str(), "completed" | "failed" | "aborted") {
+        return;
+    }
+    let summary = match run.state.as_str() {
+        "completed" => "运行已完成",
+        "failed" => "运行已结束",
+        "aborted" => "运行已取消",
+        _ => "运行已结束",
+    };
+    close_running_tool_events(run, "canceled", summary);
 }
 
 impl AppStore {
@@ -7764,6 +8264,110 @@ impl AppStore {
         })
     }
 
+    pub fn attach_wechat_deliverable_to_message_after(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        started_after: &str,
+        warning: Option<&str>,
+    ) -> AppResult<Option<ChatMessage>> {
+        self.with_state(|s| {
+            if !s
+                .conversations
+                .iter()
+                .any(|conversation| conversation.id == conversation_id)
+            {
+                return Ok(None);
+            }
+            if !conversation_accepts_wechat_delivery(s, conversation_id) {
+                return Ok(None);
+            }
+
+            let mut selected: Option<(usize, RecoveredRunDeliverable)> = None;
+            for (index, run) in s.agent_runs.iter().enumerate() {
+                if run.conversation_id != conversation_id
+                    || run.parent_run_id.is_some()
+                    || !message_at_or_after(&run.started_at, started_after)
+                    || run_delivery_recovery_was_user_stopped(run)
+                {
+                    continue;
+                }
+                if let Some(deliverable) = recoverable_deliverable_from_run(s, run) {
+                    selected = Some((index, deliverable));
+                    break;
+                }
+            }
+
+            let Some((run_index, deliverable)) = selected else {
+                return Ok(None);
+            };
+            let now = now_iso();
+            let warning = warning
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("附件已补到回复。");
+            let (run_id, run_started_at) = {
+                let run = &s.agent_runs[run_index];
+                (run.run_id.clone(), run.started_at.clone())
+            };
+
+            remove_recoverable_error_messages_for_run(s, conversation_id, &run_id, &run_started_at);
+            let Some(message) = attach_deliverable_to_existing_message_in_state(
+                s,
+                conversation_id,
+                message_id,
+                &deliverable,
+                &run_id,
+                &run_started_at,
+                warning,
+                &now,
+            ) else {
+                return Ok(None);
+            };
+
+            if let Some(run) = s.agent_runs.get_mut(run_index) {
+                replace_run_tool_event_with_completed(run, &deliverable.event);
+                run.checkpoints.push(AgentCheckpointRecord {
+                    checkpoint_id: new_id("ckpt"),
+                    run_id: run.run_id.clone(),
+                    iteration: run.checkpoints.len() as u32 + 1,
+                    created_at: now.clone(),
+                    state: "attached_deliverable_to_reply".into(),
+                    completed_call_ids: Vec::new(),
+                    event_refs: Vec::new(),
+                    summary: warning.to_string(),
+                });
+                run.phase_events.push(crate::models::AgentRunPhaseRecord {
+                    phase: "wechat_deliverable_attached".into(),
+                    detail: json!({
+                        "warning": warning,
+                        "mediaPath": &deliverable.media_path,
+                        "visiblePath": &deliverable.visible_path,
+                        "name": &deliverable.name,
+                    }),
+                    updated_at: now.clone(),
+                });
+                if !matches!(run.state.as_str(), "completed" | "failed" | "aborted") {
+                    run.state = "completed".into();
+                    run.completed_at = Some(now.clone());
+                }
+                run.error = None;
+                run.updated_at = now.clone();
+                run.last_activity_at = Some(now.clone());
+                run.last_activity_desc = Some("附件已补到回复".into());
+                close_running_tool_events(run, "canceled", "运行已完成");
+            }
+            mark_hermes_session_resume_resolved_in_state(
+                s,
+                conversation_id,
+                "wechat_delivery_attached",
+                "wechat-turn-attachment",
+            );
+            self.persist(s)?;
+            Ok(Some(message))
+        })
+    }
+
     pub fn messages(
         &self,
         conversation_id: &str,
@@ -9277,6 +9881,7 @@ impl AppStore {
                     run.pending_steers = existing.pending_steers.clone();
                 }
             }
+            close_terminal_tool_events(&mut run);
             s.agent_runs.retain(|r| r.run_id != run.run_id);
             s.agent_runs.insert(0, run.clone());
             let max = s.config.chat.max_stored_agent_runs;

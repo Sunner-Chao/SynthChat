@@ -371,11 +371,11 @@ export function PersonaPanel() {
             </label>
             <div className="two-column">
               <label>
-                最小间隔（小时）
+                回复后最短（小时）
                 <input min={0} step={0.1} type="number" value={draft.proactive?.minIdleHours ?? 1} onChange={(event) => setDraft((current) => ({ ...current, proactive: { ...(current.proactive ?? defaultProactiveConfig()), minIdleHours: Number(event.target.value) } }))} />
               </label>
               <label>
-                最大间隔（小时）
+                回复后最长（小时）
                 <input min={0} step={0.1} type="number" value={draft.proactive?.maxIdleHours ?? 3} onChange={(event) => setDraft((current) => ({ ...current, proactive: { ...(current.proactive ?? defaultProactiveConfig()), maxIdleHours: Number(event.target.value) } }))} />
               </label>
             </div>
@@ -411,7 +411,7 @@ export function PersonaPanel() {
               <div className="memory-content">
                 <strong>{proactiveStatus?.canFire ? "主动消息已就绪" : proactiveStatus?.blockedReason || "主动消息状态未同步"}</strong>
                 <span className="memory-meta">
-                  间隔 {Math.ceil((proactiveStatus?.waitSeconds ?? 0) / 60)} 分钟 · 连续 {proactiveStatus?.consecutiveCount ?? 0}/{proactiveStatus?.maxConsecutive ?? 1}
+                  回复后 {Math.ceil((proactiveStatus?.secondsSinceLastReply ?? 0) / 60)} 分钟 · 间隔 {Math.ceil((proactiveStatus?.waitSeconds ?? 0) / 60)} 分钟 · 连续 {proactiveStatus?.consecutiveCount ?? 0}/{proactiveStatus?.maxConsecutive ?? 1}
                 </span>
               </div>
               <button
