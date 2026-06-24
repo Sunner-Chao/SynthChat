@@ -1188,8 +1188,12 @@ async fn send_chat_message(
                 let resolved =
                     apply_persona_emoji(&store, &persona, messages[index].content.clone());
                 if resolved != messages[index].content {
-                    messages[index].content = resolved;
-                    store.replace_conversation_messages(&conversation_id, messages.clone())?;
+                    let saved = store.update_message_content(
+                        &conversation_id,
+                        &messages[index].id,
+                        resolved,
+                    )?;
+                    messages[index] = saved;
                 }
             }
             let assistant = &messages[index];

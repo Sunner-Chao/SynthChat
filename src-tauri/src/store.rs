@@ -1863,6 +1863,55 @@ mod tests {
     }
 
     #[test]
+    fn update_message_content_preserves_conversation_history() {
+        let dir =
+            std::env::temp_dir().join(format!("synthchat-message-update-{}", new_id("state")));
+        let path = dir.join("state.json");
+        let store = AppStore::new(path).unwrap();
+        let conversation = store
+            .create_conversation(Some("message update".into()), Some("default".into()))
+            .unwrap();
+        store
+            .append_message(ChatMessage::new(
+                conversation.id.clone(),
+                "user",
+                "first".into(),
+                "test",
+            ))
+            .unwrap();
+        let assistant = store
+            .append_message(ChatMessage::new(
+                conversation.id.clone(),
+                "assistant",
+                "second".into(),
+                "test",
+            ))
+            .unwrap();
+        store
+            .append_message(ChatMessage::new(
+                conversation.id.clone(),
+                "user",
+                "third".into(),
+                "test",
+            ))
+            .unwrap();
+
+        let saved = store
+            .update_message_content(&conversation.id, &assistant.id, "second emoji".into())
+            .unwrap();
+        let messages = store.messages(&conversation.id, None).unwrap();
+
+        assert_eq!(saved.content, "second emoji");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content, "first");
+        assert_eq!(messages[1].content, "second emoji");
+        assert_eq!(messages[2].content, "third");
+        assert_eq!(store.conversation(&conversation.id).unwrap().last_message, "third");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn active_run_timeout_marks_hermes_resume_pending() {
         let dir = std::env::temp_dir().join(format!(
             "synthchat-run-resume-pending-timeout-test-{}",
@@ -8783,6 +8832,46 @@ impl AppStore {
                 }
             }
             self.persist(s)
+        })
+    }
+
+    pub fn update_message_content(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        content: String,
+    ) -> AppResult<ChatMessage> {
+        self.with_state(|s| {
+            let messages = s
+                .messages
+                .get_mut(conversation_id)
+                .ok_or_else(|| AppError::NotFound(format!("conversation messages {conversation_id}")))?;
+            let message = messages
+                .iter_mut()
+                .find(|message| message.id == message_id)
+                .ok_or_else(|| AppError::NotFound(format!("message {message_id}")))?;
+            message.content = content;
+            let saved = message.clone();
+            if conversation_preview_message(&saved) {
+                if let Some(last) = messages
+                    .iter()
+                    .rev()
+                    .find(|message| conversation_preview_message(message))
+                {
+                    if last.id == saved.id {
+                        if let Some(conv) = s
+                            .conversations
+                            .iter_mut()
+                            .find(|conversation| conversation.id == conversation_id)
+                        {
+                            conv.last_message = saved.content.chars().take(120).collect();
+                            conv.updated_at = saved.created_at.clone();
+                        }
+                    }
+                }
+            }
+            self.persist(s)?;
+            Ok(saved)
         })
     }
 

@@ -137,6 +137,7 @@ export function PetWindow() {
   const pendingModelLoadRef = useRef<{ model: PetModel; force: boolean } | null>(null);
   const modelBoundsRef = useRef<PetModelBounds | null>(null);
   const modelDragActiveRef = useRef(false);
+  const modelDragTokenRef = useRef(0);
   const modelDragStartReadyRef = useRef(false);
   const modelDragLatestPointRef = useRef<PetDragPoint | null>(null);
   const modelDragMoveFrameRef = useRef<number | null>(null);
@@ -766,11 +767,18 @@ export function PetWindow() {
   async function startModelDrag(screenX?: number, screenY?: number) {
     if (typeof screenX !== "number" || typeof screenY !== "number") return;
     if (modelDragActiveRef.current) return;
+    const dragToken = ++modelDragTokenRef.current;
     modelDragActiveRef.current = true;
     modelDragStartReadyRef.current = false;
     modelDragLatestPointRef.current = { screenX, screenY };
     try {
       await invoke("pet_window_drag", { action: "start", screenX, screenY });
+      if (dragToken !== modelDragTokenRef.current || !modelDragActiveRef.current) {
+        void invoke("pet_window_drag", { action: "end" }).catch((error) => {
+          console.error("pet drag stale end failed:", error);
+        });
+        return;
+      }
       modelDragStartReadyRef.current = true;
       const latest = modelDragLatestPointRef.current ?? { screenX, screenY };
       queueModelDragMove(latest.screenX, latest.screenY);
@@ -823,6 +831,7 @@ export function PetWindow() {
   }
 
   function resetModelDragState() {
+    modelDragTokenRef.current += 1;
     modelDragActiveRef.current = false;
     modelDragStartReadyRef.current = false;
     modelDragLatestPointRef.current = null;
