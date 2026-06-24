@@ -52,6 +52,15 @@ function formatTime(value: string) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
+function normalizeQrBaseUrl(value?: string | null) {
+  const text = value?.trim() ?? "";
+  if (!text) return "";
+  const trimmed = text.replace(/\/+$/, "");
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  if (trimmed.startsWith("//")) return `https:${trimmed}`;
+  return `https://${trimmed.replace(/^\/+/, "")}`;
+}
+
 function maskSecret(value?: string | null) {
   const text = value?.trim() ?? "";
   if (!text) return "未记录";
@@ -647,6 +656,7 @@ function AccountsSettings({
   const [detailId, setDetailId] = useState("");
   const [bindDraft, setBindDraft] = useState("");
   const [pollStatus, setPollStatus] = useState("");
+  const [qrStatusText, setQrStatusText] = useState("");
   const [checking, setChecking] = useState(false);
   const [scanSuccess, setScanSuccess] = useState(false);
   const qrPollingRef = useRef(false);
@@ -658,23 +668,55 @@ function AccountsSettings({
 
   const checkQrOnce = async () => {
     if (!qr?.qrcode || qrPollingRef.current || scanSuccess) return;
+    const activeBaseUrl = normalizeQrBaseUrl(qr.baseUrl);
     qrPollingRef.current = true;
     setChecking(true);
     try {
-      const status = await api.checkWechatQrStatus(qr.qrcode, qr.baseUrl);
+      const status = await api.checkWechatQrStatus(qr.qrcode, activeBaseUrl || qr.baseUrl);
+      const redirectedBaseUrl = normalizeQrBaseUrl(status.host);
+      if (redirectedBaseUrl && redirectedBaseUrl !== activeBaseUrl) {
+        setQr((current) => (
+          current?.qrcode === qr.qrcode
+            ? { ...current, baseUrl: redirectedBaseUrl }
+            : current
+        ));
+      }
+      const normalizedStatus = (status.status || "").trim().toLowerCase();
       if (status.account) {
+        const account = status.account;
+        setQrError("");
+        setQrStatusText("登录成功");
         setScanSuccess(true);
         await refreshAccounts();
         setTimeout(() => {
           setShowQrSheet(false);
           setScanSuccess(false);
-          setDetailId(status.account!.id);
-          setBindDraft(status.account!.linkedPersona || "");
-          setPollStatus("扫码成功。请选择并保存链接角色，保存后后台会自动同步手机消息。");
+          setDetailId(account.id);
+          setBindDraft(account.linkedPersona || "");
+          setPollStatus("已登录，请绑定角色");
         }, 1200);
+      } else if (normalizedStatus === "wait") {
+        setQrError("");
+        setQrStatusText("等待扫码");
+      } else if (normalizedStatus === "scaned") {
+        setQrError("");
+        setQrStatusText("已扫码，待确认");
+      } else if (normalizedStatus === "scaned_but_redirect") {
+        setQrError("");
+        setQrStatusText("已扫码，正在确认");
+      } else if (normalizedStatus === "expired") {
+        setQrError("二维码已过期");
+        setQrStatusText("二维码已过期");
+      } else if (status.message?.trim()) {
+        setQrError(status.message.trim());
+        setQrStatusText("状态异常");
       }
-    } catch {
-      // 轮询失败静默处理，不显示调试错误
+    } catch (error) {
+      const message = String(error);
+      if (!message.includes("failed to request wechat QR status") && !message.includes("error sending request for url")) {
+        setQrError(message);
+        setQrStatusText("状态异常");
+      }
     } finally {
       qrPollingRef.current = false;
       setChecking(false);
@@ -688,7 +730,7 @@ function AccountsSettings({
       void checkQrOnce();
     }, 2500);
     return () => window.clearInterval(timer);
-  }, [showQrSheet, qr?.qrcode, scanSuccess]);
+  }, [showQrSheet, qr?.qrcode, qr?.baseUrl, scanSuccess]);
 
   const saveWechat = async (patch: Partial<WechatConfig>) => {
     const saved = await api.saveWechatConfig({ ...wechatConfig, ...patch });
@@ -699,13 +741,16 @@ function AccountsSettings({
     setBusy(true);
     setQrError("");
     setQr(null);
+    setQrStatusText("正在获取二维码");
     setScanSuccess(false);
     setShowQrSheet(true);
     try {
       const saved = await api.saveWechatConfig(wechatConfig);
       setWechatConfig(saved);
       setQr(await api.startWechatQr(saved.baseUrl));
+      setQrStatusText("等待扫码");
     } catch (error) {
+      setQrStatusText("");
       setQrError(String(error));
     } finally {
       setBusy(false);
@@ -731,7 +776,8 @@ function AccountsSettings({
   };
   const savePendingNote = async () => {
     if (!pendingNoteId) return;
-    await saveAccounts(accounts.map((account) => (
+    const latestAccounts = await api.listAccounts();
+    await saveAccounts(latestAccounts.map((account) => (
       account.id === pendingNoteId ? { ...account, note: noteDraft.trim() || account.note } : account
     )));
     setPendingNoteId("");
@@ -741,7 +787,8 @@ function AccountsSettings({
     if (!detail) return;
     const input = document.getElementById("acct-note") as HTMLInputElement | null;
     const note = input?.value.trim() ?? "";
-    await saveAccounts(accounts.map((account) => {
+    const latestAccounts = await api.listAccounts();
+    await saveAccounts(latestAccounts.map((account) => {
       if (account.id === detail.id) return { ...account, note, linkedPersona: bindDraft };
       if (bindDraft && account.linkedPersona === bindDraft) return { ...account, linkedPersona: "" };
       return account;
@@ -884,7 +931,7 @@ function AccountsSettings({
                     <code>{qr.qrcode}</code>
                   </div>
                 ) : null}
-                <div className="qr-status">{qrError ? "二维码获取失败" : qr?.qrImage ? "等待扫码确认..." : "正在等待二维码..."}</div>
+                <div className="qr-status">{qrError ? "二维码状态异常" : qrStatusText || (qr?.qrImage ? "等待扫码" : "正在获取二维码")}</div>
                 {!busy && !qr?.qrImage ? <button className="qr-check-btn" onClick={() => void startQr()} type="button">重新获取二维码</button> : null}
               </>
             )}

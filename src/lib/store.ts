@@ -42,6 +42,7 @@ const DEFAULT_UI_MESSAGE_LIMIT = 180;
 const MIN_UI_MESSAGE_LIMIT = 40;
 const MAX_UI_MESSAGE_LIMIT = 1000;
 const DEFAULT_UI_MESSAGE_PREVIEW_CHARS = 12_000;
+const BOOTSTRAP_CACHE_STORAGE_KEY = "synthchat.bootstrap.cache.v1";
 
 // Module-level ref for pending settings view (not in React state to avoid batching delays)
 let pendingSettingsViewRef: string | null = null;
@@ -49,6 +50,66 @@ export function consumePendingSettingsView(): string | null {
   const v = pendingSettingsViewRef;
   pendingSettingsViewRef = null;
   return v;
+}
+
+type BootstrapCacheSnapshot = {
+  config: AppConfig | null;
+  profile: ProfileConfig;
+  llmProviders: LlmProvider[];
+  imageProviders: ImageProvider[];
+  videoProviders: VideoProvider[];
+  searchProviders: SearchProvider[];
+  visionProviders: VisionProvider[];
+  browserProviders: BrowserProvider[];
+  themes: ThemeConfig[];
+  emojiGroups: EmojiGroup[];
+  accounts: AccountConfig[];
+  personas: Persona[];
+};
+
+function readBootstrapCache(): BootstrapCacheSnapshot | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(BOOTSTRAP_CACHE_STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as BootstrapCacheSnapshot;
+  } catch {
+    return null;
+  }
+}
+
+function writeBootstrapCache(snapshot: BootstrapCacheSnapshot) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(BOOTSTRAP_CACHE_STORAGE_KEY, JSON.stringify(snapshot));
+  } catch {
+    // ignore cache write failures
+  }
+}
+
+const bootstrapCache = readBootstrapCache();
+
+function withBootstrapTimeout<T>(promise: Promise<T>, fallback: T, label: string, timeoutMs = 5000): Promise<T> {
+  let timeoutId: number | null = null;
+  const timeoutPromise = new Promise<T>((resolve) => {
+    timeoutId = window.setTimeout(() => {
+      console.warn(`${label} timed out during bootstrap; using fallback`);
+      resolve(fallback);
+    }, timeoutMs);
+  });
+  return Promise.race([
+    promise
+      .then((value) => {
+        if (timeoutId !== null) window.clearTimeout(timeoutId);
+        return value;
+      })
+      .catch((error) => {
+        if (timeoutId !== null) window.clearTimeout(timeoutId);
+        console.warn(`${label} failed during bootstrap`, error);
+        return fallback;
+      }),
+    timeoutPromise
+  ]);
 }
 
 function uiMessageLimit(config: AppConfig | null) {
@@ -302,22 +363,22 @@ interface AppState {
 export const useAppStore = create<AppState>((set, get) => ({
   activeSection: "chat",
   previousSection: null,
-  config: null,
+  config: bootstrapCache?.config ?? null,
   conversations: [],
   activeConversationId: null,
   messages: [],
   processingConversationIds: [],
   conversationUnreadCounts: {},
-  llmProviders: [],
-  profile: { name: "我", avatarPath: null },
-  accounts: [],
-  imageProviders: [],
-  videoProviders: [],
-  searchProviders: [],
-  visionProviders: [],
-  browserProviders: [],
-  themes: [],
-  emojiGroups: [],
+  llmProviders: bootstrapCache?.llmProviders ?? [],
+  profile: bootstrapCache?.profile ?? { name: "我", avatarPath: null },
+  accounts: bootstrapCache?.accounts ?? [],
+  imageProviders: bootstrapCache?.imageProviders ?? [],
+  videoProviders: bootstrapCache?.videoProviders ?? [],
+  searchProviders: bootstrapCache?.searchProviders ?? [],
+  visionProviders: bootstrapCache?.visionProviders ?? [],
+  browserProviders: bootstrapCache?.browserProviders ?? [],
+  themes: bootstrapCache?.themes ?? [],
+  emojiGroups: bootstrapCache?.emojiGroups ?? [],
   memories: [],
   worldbooks: [],
   agents: [],
@@ -330,7 +391,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   marketplaceSkills: [],
   selectedAgentId: null,
   moments: [],
-  personas: [],
+  personas: bootstrapCache?.personas ?? [],
   mcpServers: [],
   capabilityAdapters: [],
   agentConfig: null,
@@ -354,70 +415,90 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   bootstrap: async () => {
     set({ loading: true });
-    const config = await api.getConfig();
+    const config = await withBootstrapTimeout(
+      api.getConfig(),
+      get().config ?? bootstrapCache?.config ?? null,
+      "config bootstrap",
+      3000
+    );
+    const profile = await withBootstrapTimeout(
+      api.getProfile(),
+      get().profile,
+      "profile bootstrap",
+      3000
+    );
+    set({ config, profile, loading: false });
     await api.cleanupHistoricalResources().catch((error) => {
       console.warn("historical resource cleanup failed", error);
     });
-    const [
-      conversations,
-      moments,
-      personas,
-      mcpServers,
-      capabilityAdapters,
-      agentConfig,
-      skills,
-      proactiveStatuses,
-      llmProviders,
-      profile,
-      accounts,
-      imageProviders,
-      videoProviders,
-      searchProviders,
-      visionProviders,
-      browserProviders,
-      themes,
-      emojiGroups,
-      memories,
-      worldbooks,
-      plugins,
-      agents,
-      agentRuns,
-      agentQueue,
-      skillBundles
-    ] = await Promise.all([
-      api.listConversations(),
-      api.listMoments(),
-      api.listPersonas(),
-      api.listMcpServers(),
-      api.listCapabilityAdapters(),
-      api.getAgentConfig(),
-      api.listSkills(),
-      api.listProactiveStatuses(),
-      api.listLlmProviders(),
-      api.getProfile(),
-      api.listAccounts(),
-      api.listImageProviders(),
-      api.listVideoProviders(),
-      api.listSearchProviders(),
-      api.listVisionProviders(),
-      api.listBrowserProviders(),
-      api.listThemes(),
-      api.listEmojiGroups(),
-      api.listMemories(),
-      api.listWorldbooks(),
-      api.listPlugins(),
-      api.listAgents(),
-      api.listAgentRuns(),
-      api.listAgentQueue(),
-      api.listSkillBundles()
+    const results = await Promise.allSettled([
+      withBootstrapTimeout(api.listConversations(), [] as Conversation[], "conversations bootstrap"),
+      withBootstrapTimeout(api.listMoments(), [] as MomentPost[], "moments bootstrap"),
+      withBootstrapTimeout(api.listPersonas(), get().personas, "personas bootstrap"),
+      withBootstrapTimeout(api.listMcpServers(), [] as McpServer[], "mcp servers bootstrap"),
+      withBootstrapTimeout(api.listCapabilityAdapters(), [] as CapabilityAdapter[], "capability adapters bootstrap"),
+      withBootstrapTimeout(api.getAgentConfig(), null as AgentConfig | null, "agent config bootstrap"),
+      withBootstrapTimeout(api.listSkills(), [] as EnhancedSkillSummary[], "skills bootstrap"),
+      withBootstrapTimeout(api.listProactiveStatuses(), [] as ProactiveStatus[], "proactive statuses bootstrap"),
+      withBootstrapTimeout(api.listLlmProviders(), get().llmProviders, "llm providers bootstrap"),
+      withBootstrapTimeout(api.listAccounts(), get().accounts, "accounts bootstrap"),
+      withBootstrapTimeout(api.listImageProviders(), get().imageProviders, "image providers bootstrap"),
+      withBootstrapTimeout(api.listVideoProviders(), get().videoProviders, "video providers bootstrap"),
+      withBootstrapTimeout(api.listSearchProviders(), get().searchProviders, "search providers bootstrap"),
+      withBootstrapTimeout(api.listVisionProviders(), get().visionProviders, "vision providers bootstrap"),
+      withBootstrapTimeout(api.listBrowserProviders(), get().browserProviders, "browser providers bootstrap"),
+      withBootstrapTimeout(api.listThemes(), get().themes, "themes bootstrap"),
+      withBootstrapTimeout(api.listEmojiGroups(), get().emojiGroups, "emoji groups bootstrap"),
+      withBootstrapTimeout(api.listMemories(), [] as MemoryEntry[], "memories bootstrap"),
+      withBootstrapTimeout(api.listWorldbooks(), [] as Worldbook[], "worldbooks bootstrap"),
+      withBootstrapTimeout(api.listPlugins(), [] as PluginSummary[], "plugins bootstrap"),
+      withBootstrapTimeout(api.listAgents(), [] as AgentDefinition[], "agents bootstrap"),
+      withBootstrapTimeout(api.listAgentRuns(), [] as AgentRunRecord[], "agent runs bootstrap"),
+      withBootstrapTimeout(api.listAgentQueue(), [] as AgentQueuedRequest[], "agent queue bootstrap"),
+      withBootstrapTimeout(api.listSkillBundles(), [] as SkillBundle[], "skill bundles bootstrap")
     ]);
+    const pick = <T,>(index: number, fallback: T): T => {
+      const result = results[index];
+      if (result.status === "fulfilled") return result.value as T;
+      console.warn(`bootstrap item ${index} failed`, result.reason);
+      return fallback;
+    };
+    const conversations = pick<Conversation[]>(0, []);
+    const moments = pick<MomentPost[]>(1, []);
+    const personas = pick<Persona[]>(2, []);
+    const mcpServers = pick<McpServer[]>(3, []);
+    const capabilityAdapters = pick<CapabilityAdapter[]>(4, []);
+    const agentConfig = pick<AgentConfig | null>(5, null);
+    const skills = pick<EnhancedSkillSummary[]>(6, []);
+    const proactiveStatuses = pick<ProactiveStatus[]>(7, []);
+    const llmProviders = pick<LlmProvider[]>(8, []);
+    const accounts = pick<AccountConfig[]>(9, []);
+    const imageProviders = pick<ImageProvider[]>(10, []);
+    const videoProviders = pick<VideoProvider[]>(11, []);
+    const searchProviders = pick<SearchProvider[]>(12, []);
+    const visionProviders = pick<VisionProvider[]>(13, []);
+    const browserProviders = pick<BrowserProvider[]>(14, []);
+    const themes = pick<ThemeConfig[]>(15, []);
+    const emojiGroups = pick<EmojiGroup[]>(16, []);
+    const memories = pick<MemoryEntry[]>(17, []);
+    const worldbooks = pick<Worldbook[]>(18, []);
+    const plugins = pick<PluginSummary[]>(19, []);
+    const agents = pick<AgentDefinition[]>(20, []);
+    const agentRuns = pick<AgentRunRecord[]>(21, []);
+    const agentQueue = pick<AgentQueuedRequest[]>(22, []);
+    const skillBundles = pick<SkillBundle[]>(23, []);
     const currentActive = get().activeConversationId;
     const activeConversationId = currentActive && conversations.some((item) => item.id === currentActive)
       ? currentActive
       : conversations[0]?.id ?? null;
     const messageLimit = uiMessageLimit(config);
     const previewChars = uiMessagePreviewChars(config);
-    const messages = activeConversationId ? visibleChatMessages(await api.listMessages(activeConversationId, messageLimit, previewChars)) : [];
+    const messages = activeConversationId
+      ? visibleChatMessages(await api.listMessages(activeConversationId, messageLimit, previewChars).catch((error) => {
+        console.warn("message bootstrap failed", error);
+        return [];
+      }))
+      : [];
     set({
       config,
       conversations,
@@ -451,6 +532,20 @@ export const useAppStore = create<AppState>((set, get) => ({
       managedProcessEvents: [],
       processingConversationIds: [],
       loading: false
+    });
+    writeBootstrapCache({
+      config,
+      profile,
+      llmProviders,
+      imageProviders,
+      videoProviders,
+      searchProviders,
+      visionProviders,
+      browserProviders,
+      themes,
+      emojiGroups,
+      accounts,
+      personas
     });
     void Promise.all([api.tickScheduledAgentJobs(), api.drainAgentQueue()]).then(async () => {
       const [nextRuns, nextQueue, nextConversations] = await Promise.all([

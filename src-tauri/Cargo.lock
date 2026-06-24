@@ -3946,6 +3946,7 @@ dependencies = [
  "cbc",
  "chrono",
  "ctr",
+ "dirs",
  "embed-resource",
  "futures",
  "hex",

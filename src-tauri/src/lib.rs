@@ -49,6 +49,11 @@ const MAX_SYNTHCHAT_TOKIO_WORKER_STACK_SIZE: usize = 256 * 1024 * 1024;
 const PET_WINDOW_LABEL: &str = "pet";
 const PET_WINDOW_WIDTH: f64 = 560.0;
 const PET_WINDOW_HEIGHT: f64 = 520.0;
+const PET_MODEL_WINDOW_WIDTH: f64 = 320.0;
+const PET_MODEL_WINDOW_HEIGHT: f64 = 420.0;
+const PET_DOCK_WINDOW_WIDTH: f64 = 48.0;
+const PET_DOCK_WINDOW_HEIGHT: f64 = 108.0;
+const PET_WINDOW_SAFE_MARGIN: i32 = 16;
 const TRAY_ID: &str = "synthchat-tray";
 const TRAY_OPEN_ID: &str = "open";
 const TRAY_PET_ID: &str = "pet";
@@ -64,6 +69,22 @@ struct PetDragState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PetDockEdge {
+    Left,
+    Right,
+}
+
+impl PetDockEdge {
+    fn from_option(value: Option<&str>) -> Option<Self> {
+        match value.map(str::trim) {
+            Some("left") => Some(Self::Left),
+            Some("right") => Some(Self::Right),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcpCliAction {
     Stdio,
     McpStdio,
@@ -73,13 +94,72 @@ pub enum AcpCliAction {
     SetupBrowser,
 }
 
-fn state_path() -> PathBuf {
-    let base = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("synthchat-data").join("state.json")
+pub(crate) fn state_path() -> PathBuf {
+    resolve_state_path(None)
+}
+
+fn legacy_state_path_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("synthchat-data").join("state.json"));
+            if let Some(grandparent) = parent.parent() {
+                candidates.push(grandparent.join("synthchat-data").join("state.json"));
+            }
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("synthchat-data").join("state.json"));
+        candidates.push(cwd.join("src-tauri").join("target").join("debug").join("synthchat-data").join("state.json"));
+        candidates.push(cwd.join("target").join("debug").join("synthchat-data").join("state.json"));
+    }
+    candidates
+}
+
+fn resolve_state_path(app: Option<&AppHandle>) -> PathBuf {
+    let app_data_dir = app
+        .and_then(|handle| handle.path().app_data_dir().ok())
+        .or_else(|| {
+            dirs::data_dir().map(|dir| dir.join("cc.synthchat.v1"))
+        })
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("synthchat-data")
+        });
+    let state_dir = app_data_dir.join("synthchat-data");
+    let state_path = state_dir.join("state.json");
+    if !state_path.exists() {
+        for candidate in legacy_state_path_candidates() {
+            if candidate == state_path || !candidate.exists() {
+                continue;
+            }
+            if let Some(parent) = state_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::copy(&candidate, &state_path);
+            let candidate_dir = candidate
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let target_dir = state_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            for name in ["accounts.json", "emoji_groups.json", "wechat.json", "processes.json"] {
+                let source = candidate_dir.join(name);
+                let target = target_dir.join(name);
+                if source.exists() && !target.exists() {
+                    let _ = fs::copy(source, target);
+                }
+            }
+            break;
+        }
+    }
+    state_path
 }
 
 fn sync_runtime_env_from_config(config: &AppConfig) {
@@ -3431,9 +3511,106 @@ fn asset_url(path: String) -> String {
     path
 }
 
+fn pet_window_target_size(mode: &str) -> PhysicalSize<u32> {
+    match mode {
+        "model" => PhysicalSize::new(PET_MODEL_WINDOW_WIDTH as u32, PET_MODEL_WINDOW_HEIGHT as u32),
+        "dock" => PhysicalSize::new(PET_DOCK_WINDOW_WIDTH as u32, PET_DOCK_WINDOW_HEIGHT as u32),
+        _ => PhysicalSize::new(PET_WINDOW_WIDTH as u32, PET_WINDOW_HEIGHT as u32),
+    }
+}
+
+fn clamp_pet_window_position(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    monitor_origin: &PhysicalPosition<i32>,
+    monitor_size: &PhysicalSize<u32>,
+) -> PhysicalPosition<i32> {
+    let min_x = monitor_origin.x;
+    let max_x = monitor_origin.x + monitor_size.width as i32 - width as i32;
+    let min_y = monitor_origin.y + PET_WINDOW_SAFE_MARGIN;
+    let max_y = monitor_origin.y + monitor_size.height as i32 - height as i32 - PET_WINDOW_SAFE_MARGIN;
+    PhysicalPosition::new(x.clamp(min_x, max_x.max(min_x)), y.clamp(min_y, max_y.max(min_y)))
+}
+
+fn place_pet_window_for_mode(
+    window: &tauri::WebviewWindow,
+    mode: &str,
+    dock_edge: Option<PetDockEdge>,
+) -> AppResult<()> {
+    let size = pet_window_target_size(mode);
+    let current_position = window
+        .outer_position()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let current_size = window
+        .outer_size()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let current_center_x = current_position.x + current_size.width as i32 / 2;
+    let current_center_y = current_position.y + current_size.height as i32 / 2;
+    window
+        .set_size(size)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    if let Some(monitor) = window
+        .current_monitor()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?
+    {
+        let origin = monitor.position();
+        let monitor_size = monitor.size();
+        let mut x = current_center_x - size.width as i32 / 2;
+        let y = current_center_y - size.height as i32 / 2;
+        if mode == "dock" {
+            x = match dock_edge.unwrap_or(PetDockEdge::Right) {
+                PetDockEdge::Left => origin.x,
+                PetDockEdge::Right => origin.x + monitor_size.width as i32 - size.width as i32,
+            };
+        }
+        let next = clamp_pet_window_position(x, y, size.width, size.height, origin, monitor_size);
+        let _ = window.set_position(next);
+    }
+    Ok(())
+}
+
+fn clamp_existing_pet_window(window: &tauri::WebviewWindow) -> AppResult<()> {
+    let Some(monitor) = window
+        .current_monitor()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?
+    else {
+        return Ok(());
+    };
+    let position = window
+        .outer_position()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let size = window
+        .outer_size()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let next = clamp_pet_window_position(
+        position.x,
+        position.y,
+        size.width,
+        size.height,
+        monitor.position(),
+        monitor.size(),
+    );
+    let _ = window.set_position(next);
+    Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn pet_window_set_ignore_cursor_events(app: AppHandle, ignore: bool) -> AppResult<()> {
+    let Some(window) = app.get_webview_window(PET_WINDOW_LABEL) else {
+        return Ok(());
+    };
+    window
+        .set_ignore_cursor_events(ignore)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(())
+}
+
 fn ensure_pet_window(app: &AppHandle, focus: bool) -> AppResult<()> {
     if let Some(window) = app.get_webview_window(PET_WINDOW_LABEL) {
         window.show().map_err(|error| AppError::BadRequest(error.to_string()))?;
+        let _ = clamp_existing_pet_window(&window);
         if focus {
             window
                 .set_focus()
@@ -3448,8 +3625,8 @@ fn ensure_pet_window(app: &AppHandle, focus: bool) -> AppResult<()> {
         WebviewUrl::App("index.html?window=pet".into()),
     )
     .title("SynthPet")
-    .inner_size(PET_WINDOW_WIDTH, PET_WINDOW_HEIGHT)
-    .min_inner_size(300.0, 300.0)
+    .inner_size(PET_MODEL_WINDOW_WIDTH, PET_MODEL_WINDOW_HEIGHT)
+    .min_inner_size(PET_DOCK_WINDOW_WIDTH, PET_DOCK_WINDOW_HEIGHT)
     .resizable(false)
     .decorations(false)
     .transparent(true)
@@ -3466,8 +3643,8 @@ fn ensure_pet_window(app: &AppHandle, focus: bool) -> AppResult<()> {
     {
         let origin = monitor.position();
         let size = monitor.size();
-        let x = origin.x + size.width.saturating_sub(PET_WINDOW_WIDTH as u32 + 24) as i32;
-        let y = origin.y + size.height.saturating_sub(PET_WINDOW_HEIGHT as u32 + 64) as i32;
+        let x = origin.x + size.width.saturating_sub(PET_MODEL_WINDOW_WIDTH as u32 + 24) as i32;
+        let y = origin.y + size.height.saturating_sub(PET_MODEL_WINDOW_HEIGHT as u32 + 64) as i32;
         let _ = window.set_position(PhysicalPosition::new(x, y));
     }
 
@@ -3597,7 +3774,7 @@ fn toggle_main_window(app: AppHandle) -> AppResult<()> {
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn pet_window_action(app: AppHandle, action: String) -> AppResult<()> {
+fn pet_window_action(app: AppHandle, action: String, edge: Option<String>) -> AppResult<()> {
     let Some(window) = app.get_webview_window(PET_WINDOW_LABEL) else {
         return Ok(());
     };
@@ -3606,19 +3783,19 @@ fn pet_window_action(app: AppHandle, action: String) -> AppResult<()> {
             .close()
             .map_err(|error| AppError::BadRequest(error.to_string()))?,
         "collapse" => {
-            window
-                .set_size(PhysicalSize::new(180, 56))
-                .map_err(|error| AppError::BadRequest(error.to_string()))?;
+            place_pet_window_for_mode(&window, "dock", PetDockEdge::from_option(edge.as_deref()))?;
         }
         "expand" => {
-            window
-                .set_size(PhysicalSize::new(PET_WINDOW_WIDTH as u32, PET_WINDOW_HEIGHT as u32))
-                .map_err(|error| AppError::BadRequest(error.to_string()))?;
+            place_pet_window_for_mode(&window, "full", None)?;
         }
         "model" => {
-            window
-                .set_size(PhysicalSize::new(PET_WINDOW_WIDTH as u32, PET_WINDOW_HEIGHT as u32))
-                .map_err(|error| AppError::BadRequest(error.to_string()))?;
+            place_pet_window_for_mode(&window, "model", None)?;
+        }
+        "dock" => {
+            place_pet_window_for_mode(&window, "dock", PetDockEdge::from_option(edge.as_deref()))?;
+        }
+        "undock" => {
+            place_pet_window_for_mode(&window, "model", None)?;
         }
         "drag" => window
             .start_dragging()
@@ -4032,6 +4209,7 @@ pub fn run() {
             toggle_main_window,
             pet_window_action,
             pet_window_drag,
+            pet_window_set_ignore_cursor_events,
             cursor_position,
             open_local_file,
             reveal_local_file,

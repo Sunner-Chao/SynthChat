@@ -40,7 +40,6 @@ let tapTimer = null;
 const MODEL_HIT_PADDING = 28;
 const MODEL_DRAG_DELAY_MS = 240;
 const MODEL_TAP_DELAY_MS = 220;
-const MODEL_VIEWPORT_WIDTH = 360;
 const DEFAULT_MODEL_URL = "/pet/model/Tororo/tororo.model3.json";
 
 let loadingModelKey = null;
@@ -96,7 +95,27 @@ function setModelHover(nextHovering) {
     if (nextHovering === hoveringModel) return;
     hoveringModel = nextHovering;
     document.body.classList.toggle("model-hover", hoveringModel);
-    postMessageToHost({ type: "model_hover", hovering: hoveringModel });
+    const bounds = model ? model.getBounds() : null;
+    postMessageToHost({
+        type: "model_hover",
+        hovering: hoveringModel,
+        x: bounds?.x,
+        y: bounds?.y,
+        width: bounds?.width,
+        height: bounds?.height
+    });
+}
+
+function reportModelBounds() {
+    if (!model) return;
+    const bounds = model.getBounds();
+    postMessageToHost({
+        type: "model_bounds",
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height
+    });
 }
 
 function focusScreenPoint(clientX, clientY, instant = false) {
@@ -106,10 +125,10 @@ function focusScreenPoint(clientX, clientY, instant = false) {
 
 function layoutModel() {
     if (!model || !modelNaturalSize || modelScale === null) return;
-    const modelAreaWidth = Math.min(window.innerWidth, MODEL_VIEWPORT_WIDTH);
     model.scale.set(modelScale);
     model.anchor.set(0.5, 0.5);
-    model.position.set(modelAreaWidth * 0.5, window.innerHeight * 0.57);
+    model.position.set(window.innerWidth * 0.5, window.innerHeight * 0.56);
+    reportModelBounds();
 }
 
 function finishModelDrag() {
@@ -195,7 +214,7 @@ async function loadModel(url = DEFAULT_MODEL_URL) {
                 };
                 modelScale = Math.min(
                     (window.innerHeight * 0.82) / modelNaturalSize.height,
-                    (MODEL_VIEWPORT_WIDTH * 0.86) / modelNaturalSize.width
+                    (window.innerWidth * 0.88) / modelNaturalSize.width
                 );
                 app.stage.addChild(model);
 
@@ -207,6 +226,7 @@ async function loadModel(url = DEFAULT_MODEL_URL) {
 
                 layoutModel();
                 model.interactive = true;
+                reportModelBounds();
 
                 setStatus("");
                 postMessageToHost({ type: "loaded", url: modelUrl });
@@ -271,6 +291,14 @@ listenHostMessages((msg) => {
 });
 
 const canvas = document.getElementById("canvas");
+
+canvas.addEventListener("contextmenu", (event) => {
+    if (!pointInModelBounds(event.clientX, event.clientY)) return;
+    event.preventDefault();
+    clearModelDragTimer();
+    finishModelDrag();
+    postMessageToHost({ type: "model_context_menu", areas: ["model"] });
+});
 
 canvas.addEventListener("dblclick", (event) => {
     clearModelDragTimer();

@@ -50,6 +50,7 @@ native-tls = "0.2"
 tokio-native-tls = "0.3"
 mailparse = "0.15"
 rsa = { version = "0.9", features = ["pem"] }
+dirs = "6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }

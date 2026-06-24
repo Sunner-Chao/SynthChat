@@ -38,6 +38,7 @@ const WECHAT_VOICE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_WECHAT_CHAT_THREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
 const MIN_WECHAT_CHAT_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 const MAX_WECHAT_CHAT_THREAD_STACK_SIZE: usize = 256 * 1024 * 1024;
+const WECHAT_QR_STATUS_TIMEOUT_SECONDS: u64 = 35;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -165,12 +166,63 @@ struct WechatInboundMedia {
 }
 
 pub fn data_path(name: &str) -> AppResult<PathBuf> {
-    let base = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|path| path.to_path_buf()))
-        .or_else(|| std::env::current_dir().ok())
+    let base = crate::state_path()
+        .parent()
+        .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    Ok(base.join("synthchat-data").join(name))
+    Ok(base.join(name))
+}
+
+fn legacy_data_path_candidates(name: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("synthchat-data").join(name));
+            if let Some(grandparent) = parent.parent() {
+                candidates.push(grandparent.join("synthchat-data").join(name));
+            }
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("synthchat-data").join(name));
+        candidates.push(
+            cwd.join("src-tauri")
+                .join("target")
+                .join("debug")
+                .join("synthchat-data")
+                .join(name),
+        );
+        candidates.push(
+            cwd.join("target")
+                .join("debug")
+                .join("synthchat-data")
+                .join(name),
+        );
+    }
+    candidates
+}
+
+fn file_has_non_whitespace_bytes(path: &Path) -> bool {
+    match fs::read(path) {
+        Ok(bytes) => bytes.iter().any(|byte| !byte.is_ascii_whitespace()),
+        Err(_) => false,
+    }
+}
+
+fn maybe_restore_legacy_data_file(name: &str, target: &Path) {
+    if file_has_non_whitespace_bytes(target) {
+        return;
+    }
+    for candidate in legacy_data_path_candidates(name) {
+        if candidate == target || !candidate.exists() || !file_has_non_whitespace_bytes(&candidate) {
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::copy(&candidate, target);
+        break;
+    }
 }
 
 fn read_json<T>(name: &str, fallback: T) -> AppResult<T>
@@ -178,11 +230,25 @@ where
     T: for<'de> Deserialize<'de>,
 {
     let path = data_path(name)?;
+    maybe_restore_legacy_data_file(name, &path);
     if !path.exists() {
         return Ok(fallback);
     }
     let bytes = fs::read(path)?;
-    Ok(serde_json::from_slice(&bytes)?)
+    if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(fallback);
+    }
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            eprintln!(
+                "SynthChat wechat settings ignored invalid JSON at {}: {}",
+                data_path(name)?.display(),
+                error
+            );
+            Ok(fallback)
+        }
+    }
 }
 
 fn write_json<T>(name: &str, value: &T) -> AppResult<()>
@@ -193,7 +259,9 @@ where
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_vec_pretty(value)?)?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
+    fs::rename(tmp, path)?;
     Ok(())
 }
 
@@ -1884,7 +1952,11 @@ pub async fn check_wechat_qr_status(
     }
     let config = get_wechat_config()?;
     let base_url = normalize_base_url(base_url.as_deref().unwrap_or(&config.base_url))?;
-    let timeout = Duration::from_secs(config.timeout_seconds.clamp(5, 8));
+    let timeout = Duration::from_secs(
+        config
+            .timeout_seconds
+            .clamp(WECHAT_QR_STATUS_TIMEOUT_SECONDS, 60),
+    );
     let client = reqwest::Client::builder()
         .timeout(timeout)
         .build()
@@ -1949,6 +2021,17 @@ pub async fn check_wechat_qr_status(
     .contains(&normalized.as_str());
     let account = if confirmed {
         let mut accounts = list_accounts()?;
+        let resolved_ilink_user_id = first_value_string(
+            &raw,
+            &[
+                &["ilink_user_id"],
+                &["data", "ilink_user_id"],
+                &["user_id"],
+                &["data", "user_id"],
+                &["data", "bot", "ilink_user_id"],
+            ],
+        )
+        .unwrap_or_default();
         let account_id = first_value_string(
             &raw,
             &[
@@ -1960,13 +2043,41 @@ pub async fn check_wechat_qr_status(
                 &["data", "botId"],
                 &["data", "bot", "bot_id"],
                 &["data", "bot", "botId"],
-                &["ilink_user_id"],
-                &["data", "ilink_user_id"],
             ],
         )
+        .or_else(|| {
+            if resolved_ilink_user_id.trim().is_empty() {
+                None
+            } else {
+                Some(resolved_ilink_user_id.clone())
+            }
+        })
         .unwrap_or_else(|| format!("wechat-{}", new_id("account")));
-        let existing = accounts.iter().find(|account| account.id == account_id);
+        let existing_index = accounts.iter().position(|account| {
+            account.id == account_id
+                || (!resolved_ilink_user_id.trim().is_empty()
+                    && account.ilink_user_id == resolved_ilink_user_id)
+        });
+        let existing = existing_index.and_then(|index| accounts.get(index));
         let now = now_iso();
+        let resolved_bot_token = first_value_string(
+            &raw,
+            &[
+                &["bot_token"],
+                &["data", "bot_token"],
+                &["ilink_bot_token"],
+                &["data", "ilink_bot_token"],
+                &["data", "bot", "bot_token"],
+            ],
+        )
+        .or_else(|| existing.map(|account| account.bot_token.clone()))
+        .unwrap_or_default();
+        if resolved_bot_token.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "wechat QR confirmed but credential payload was incomplete: missing bot token"
+                    .into(),
+            ));
+        }
         let saved = AccountConfig {
             id: account_id.clone(),
             note: first_value_string(
@@ -1988,30 +2099,14 @@ pub async fn check_wechat_qr_status(
             created_at: existing
                 .map(|account| account.created_at.clone())
                 .unwrap_or_else(|| now.clone()),
-            bot_token: first_value_string(
-                &raw,
-                &[
-                    &["bot_token"],
-                    &["data", "bot_token"],
-                    &["ilink_bot_token"],
-                    &["data", "ilink_bot_token"],
-                    &["data", "bot", "bot_token"],
-                ],
-            )
-            .or_else(|| existing.map(|account| account.bot_token.clone()))
-            .unwrap_or_default(),
-            ilink_user_id: first_value_string(
-                &raw,
-                &[
-                    &["ilink_user_id"],
-                    &["data", "ilink_user_id"],
-                    &["user_id"],
-                    &["data", "user_id"],
-                    &["data", "bot", "ilink_user_id"],
-                ],
-            )
-            .or_else(|| existing.map(|account| account.ilink_user_id.clone()))
-            .unwrap_or_default(),
+            bot_token: resolved_bot_token,
+            ilink_user_id: if resolved_ilink_user_id.trim().is_empty() {
+                existing
+                    .map(|account| account.ilink_user_id.clone())
+                    .unwrap_or_default()
+            } else {
+                resolved_ilink_user_id.clone()
+            },
             get_updates_buf: first_value_string(
                 &raw,
                 &[
@@ -2036,8 +2131,8 @@ pub async fn check_wechat_qr_status(
                 .unwrap_or_default(),
             raw_login_status: Some(raw.clone()),
         };
-        if let Some(existing) = accounts.iter_mut().find(|account| account.id == account_id) {
-            *existing = saved.clone();
+        if let Some(index) = existing_index {
+            accounts[index] = saved.clone();
         } else {
             accounts.push(saved.clone());
         }

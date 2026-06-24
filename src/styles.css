@@ -9862,8 +9862,9 @@ select:focus-visible {
   font-family: Inter, "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
 }
 
-.live2d-pet-shell.is-collapsed .live2d-pet-frame {
-  display: none;
+.live2d-pet-shell.is-docked .live2d-pet-frame {
+  opacity: 0;
+  pointer-events: none;
 }
 
 .live2d-pet-frame {
@@ -9875,19 +9876,92 @@ select:focus-visible {
   background: transparent;
 }
 
-.pet-collapsed-pill {
+.pet-edge-dock {
   position: absolute;
-  inset: 8px auto auto 8px;
   z-index: 5;
+  top: 10px;
+  width: 56px;
+  height: 104px;
+  pointer-events: auto;
+}
+
+.pet-edge-dock.is-left {
+  left: 0;
+}
+
+.pet-edge-dock.is-right {
+  right: 0;
+}
+
+.pet-edge-dock-button {
+  position: absolute;
+  top: 0;
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 6px;
-  padding: 6px;
-  border: 1px solid rgba(148, 163, 184, 0.24);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.86);
-  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.16);
+  justify-content: center;
+  gap: 4px;
+  width: 112px;
+  height: 104px;
+  padding: 0 8px;
+  border: 1px solid rgba(20, 184, 166, 0.28);
+  background:
+    radial-gradient(circle at 34% 22%, rgba(255, 255, 255, 0.98), rgba(255, 255, 255, 0) 36%),
+    linear-gradient(155deg, rgba(248, 250, 252, 0.96), rgba(220, 252, 231, 0.9));
+  color: #0f766e;
+  box-shadow:
+    0 16px 36px rgba(15, 23, 42, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.96);
+  cursor: pointer;
   backdrop-filter: blur(16px);
+  transition:
+    transform 160ms ease,
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    background 160ms ease;
+}
+
+.pet-edge-dock.is-left .pet-edge-dock-button {
+  left: -56px;
+  border-radius: 0 999px 999px 0;
+}
+
+.pet-edge-dock.is-right .pet-edge-dock-button {
+  right: -56px;
+  border-radius: 999px 0 0 999px;
+}
+
+.pet-edge-dock-button:hover {
+  border-color: rgba(16, 185, 129, 0.42);
+  background:
+    radial-gradient(circle at 34% 22%, rgba(255, 255, 255, 0.99), rgba(255, 255, 255, 0) 40%),
+    linear-gradient(155deg, rgba(236, 253, 245, 0.98), rgba(209, 250, 229, 0.92));
+  box-shadow:
+    0 20px 40px rgba(15, 23, 42, 0.18),
+    0 0 0 4px rgba(16, 185, 129, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.98);
+}
+
+.pet-edge-dock.is-left .pet-edge-dock-button:hover {
+  transform: translateX(8px);
+}
+
+.pet-edge-dock.is-right .pet-edge-dock-button:hover {
+  transform: translateX(-8px);
+}
+
+.pet-edge-dock-glow {
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: radial-gradient(circle, rgba(52, 211, 153, 0.36), rgba(52, 211, 153, 0));
+}
+
+.pet-edge-dock-label {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0;
+  line-height: 1;
 }
 
 .pet-panel {
@@ -9985,7 +10059,6 @@ select:focus-visible {
 }
 
 .pet-toolbar button,
-.pet-collapsed-pill button,
 .pet-mini-actions button,
 .pet-mini-input button,
 .pet-model-selector button {
@@ -10002,7 +10075,6 @@ select:focus-visible {
 }
 
 .pet-toolbar button:hover,
-.pet-collapsed-pill button:hover,
 .pet-mini-actions button:hover,
 .pet-mini-input button:hover,
 .pet-model-selector button:hover {
@@ -10012,12 +10084,9 @@ select:focus-visible {
 }
 
 .pet-toolbar button,
-.pet-collapsed-pill button {
+.pet-edge-dock button {
   display: grid;
   place-items: center;
-  width: 28px;
-  height: 28px;
-  padding: 0;
   font-size: 12px;
   font-weight: 700;
 }
@@ -10077,35 +10146,60 @@ select:focus-visible {
   position: absolute;
   z-index: 3;
   box-sizing: border-box;
-  min-height: 72px;
-  padding: 16px 22px 17px;
-  border: 2px solid rgba(203, 213, 225, 0.2);
-  border-radius: 34px 40px 36px 42px / 38px 34px 40px 34px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  overflow: visible;
+  min-height: 96px;
+  padding: 24px 80px 26px 38px;
+  border: 1px solid rgba(255, 255, 255, 0.8);
+  border-radius: 56px 64px 58px 66px / 54px 50px 62px 48px;
   background:
-    radial-gradient(circle at 22% 12%, rgba(255, 255, 255, 0.98), rgba(255, 255, 255, 0) 34%),
-    rgba(255, 255, 255, 0.93);
+    radial-gradient(circle at 14% 42%, rgba(255, 255, 255, 0.98) 0 25%, rgba(255, 255, 255, 0) 26%),
+    radial-gradient(circle at 30% 20%, rgba(255, 255, 255, 0.99) 0 31%, rgba(255, 255, 255, 0) 32%),
+    radial-gradient(circle at 54% 14%, rgba(255, 255, 255, 0.98) 0 28%, rgba(255, 255, 255, 0) 29%),
+    radial-gradient(circle at 76% 30%, rgba(255, 255, 255, 0.96) 0 30%, rgba(255, 255, 255, 0) 31%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(248, 250, 252, 0.9));
   box-shadow:
-    0 18px 38px rgba(30, 41, 59, 0.14),
-    inset 0 1px 0 rgba(255, 255, 255, 0.96);
+    0 18px 42px rgba(15, 23, 42, 0.15),
+    0 4px 12px rgba(14, 116, 144, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.98);
   color: #1f2937;
-  font-size: 13px;
-  font-weight: 650;
-  line-height: 1.45;
+  font-size: 14px;
+  font-weight: 750;
+  line-height: 1.38;
   animation: petCloudIn 180ms ease-out;
   backdrop-filter: blur(12px);
+  --pet-cloud-tail-start-x: 38px;
+  --pet-cloud-tail-start-y: calc(100% - 18px);
+  --pet-cloud-tail-x: 12px;
+  --pet-cloud-tail-y: calc(100% + 26px);
+  --pet-cloud-tail-length: 56px;
+  --pet-cloud-tail-angle: 118deg;
 }
 
 .pet-cloud-bubble span {
   position: relative;
   z-index: 1;
-  display: block;
-  padding-right: 54px;
+  display: -webkit-box;
+  width: 100%;
+  min-width: 0;
+  max-height: 3.95em;
+  overflow: hidden;
+  padding: 0 6px;
+  text-overflow: ellipsis;
+  white-space: normal;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  cursor: grab;
 }
 
 .pet-cloud-actions {
   position: absolute;
-  top: 10px;
-  right: 10px;
+  top: 14px;
+  right: 18px;
   z-index: 2;
   display: inline-flex;
   gap: 6px;
@@ -10116,38 +10210,55 @@ select:focus-visible {
   content: "";
   position: absolute;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.94);
+  background: rgba(255, 255, 255, 0.96);
   box-shadow:
-    0 10px 22px rgba(30, 41, 59, 0.1),
+    0 10px 22px rgba(30, 41, 59, 0.11),
     inset 0 1px 0 rgba(255, 255, 255, 0.95);
+  pointer-events: none;
 }
 
 .pet-cloud-bubble::before {
-  left: 18px;
-  bottom: -13px;
-  width: 28px;
-  height: 19px;
+  left: var(--pet-cloud-tail-start-x);
+  top: var(--pet-cloud-tail-start-y);
+  width: var(--pet-cloud-tail-length);
+  height: 22px;
+  transform: translateY(-50%) rotate(var(--pet-cloud-tail-angle));
+  transform-origin: 0 50%;
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  background:
+    linear-gradient(90deg, rgba(255, 255, 255, 0.95), rgba(255, 255, 255, 0.74));
+  box-shadow:
+    0 10px 20px rgba(15, 23, 42, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9);
 }
 
 .pet-cloud-bubble::after {
-  left: -2px;
-  bottom: -27px;
-  width: 14px;
-  height: 12px;
+  left: var(--pet-cloud-tail-x);
+  top: var(--pet-cloud-tail-y);
+  width: 18px;
+  height: 18px;
+  transform: translate(-50%, -50%);
+  border: 1px solid rgba(255, 255, 255, 0.76);
 }
 
 .pet-cloud-bubble.is-happy {
-  border-color: rgba(251, 191, 36, 0.3);
+  border-color: rgba(250, 204, 21, 0.36);
   background:
-    radial-gradient(circle at 22% 12%, rgba(255, 255, 255, 0.98), rgba(255, 255, 255, 0) 34%),
-    rgba(255, 251, 235, 0.94);
+    radial-gradient(circle at 14% 42%, rgba(255, 255, 255, 0.98) 0 25%, rgba(255, 255, 255, 0) 26%),
+    radial-gradient(circle at 30% 20%, rgba(255, 255, 255, 0.99) 0 31%, rgba(255, 255, 255, 0) 32%),
+    radial-gradient(circle at 54% 14%, rgba(255, 255, 255, 0.98) 0 28%, rgba(255, 255, 255, 0) 29%),
+    radial-gradient(circle at 76% 30%, rgba(255, 255, 255, 0.96) 0 30%, rgba(255, 255, 255, 0) 31%),
+    linear-gradient(180deg, rgba(255, 251, 235, 0.98), rgba(254, 243, 199, 0.88));
 }
 
 .pet-cloud-bubble.is-active {
-  border-color: rgba(45, 212, 191, 0.28);
+  border-color: rgba(45, 212, 191, 0.34);
   background:
-    radial-gradient(circle at 22% 12%, rgba(255, 255, 255, 0.98), rgba(255, 255, 255, 0) 34%),
-    rgba(240, 253, 250, 0.94);
+    radial-gradient(circle at 14% 42%, rgba(255, 255, 255, 0.98) 0 25%, rgba(255, 255, 255, 0) 26%),
+    radial-gradient(circle at 30% 20%, rgba(255, 255, 255, 0.99) 0 31%, rgba(255, 255, 255, 0) 32%),
+    radial-gradient(circle at 54% 14%, rgba(255, 255, 255, 0.98) 0 28%, rgba(255, 255, 255, 0) 29%),
+    radial-gradient(circle at 76% 30%, rgba(255, 255, 255, 0.96) 0 30%, rgba(255, 255, 255, 0) 31%),
+    linear-gradient(180deg, rgba(240, 253, 250, 0.98), rgba(204, 251, 241, 0.88));
 }
 
 .pet-chat-bubble {
