@@ -33,7 +33,12 @@ use models::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use store::AppStore;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{
+    menu::{MenuBuilder, MenuItemBuilder},
+    tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
+    App, AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl,
+    WebviewWindowBuilder, WindowEvent,
+};
 
 const REMOTE_SKILL_FETCH_TIMEOUT_SECS: u64 = 20;
 const MAX_CHAT_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
@@ -41,6 +46,22 @@ const MAX_AVATAR_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_SYNTHCHAT_TOKIO_WORKER_STACK_SIZE: usize = 64 * 1024 * 1024;
 const MIN_SYNTHCHAT_TOKIO_WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
 const MAX_SYNTHCHAT_TOKIO_WORKER_STACK_SIZE: usize = 256 * 1024 * 1024;
+const PET_WINDOW_LABEL: &str = "pet";
+const PET_WINDOW_WIDTH: f64 = 560.0;
+const PET_WINDOW_HEIGHT: f64 = 520.0;
+const TRAY_ID: &str = "synthchat-tray";
+const TRAY_OPEN_ID: &str = "open";
+const TRAY_PET_ID: &str = "pet";
+const TRAY_QUIT_ID: &str = "quit";
+
+#[derive(Debug, Default)]
+struct PetDragState {
+    active: bool,
+    window_x: i32,
+    window_y: i32,
+    pointer_x: i32,
+    pointer_y: i32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcpCliAction {
@@ -3410,6 +3431,279 @@ fn asset_url(path: String) -> String {
     path
 }
 
+fn ensure_pet_window(app: &AppHandle, focus: bool) -> AppResult<()> {
+    if let Some(window) = app.get_webview_window(PET_WINDOW_LABEL) {
+        window.show().map_err(|error| AppError::BadRequest(error.to_string()))?;
+        if focus {
+            window
+                .set_focus()
+                .map_err(|error| AppError::BadRequest(error.to_string()))?;
+        }
+        return Ok(());
+    }
+
+    let window = WebviewWindowBuilder::new(
+        app,
+        PET_WINDOW_LABEL,
+        WebviewUrl::App("index.html?window=pet".into()),
+    )
+    .title("SynthPet")
+    .inner_size(PET_WINDOW_WIDTH, PET_WINDOW_HEIGHT)
+    .min_inner_size(300.0, 300.0)
+    .resizable(false)
+    .decorations(false)
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .shadow(false)
+    .focused(false)
+    .build()
+    .map_err(|error| AppError::BadRequest(error.to_string()))?;
+
+    if let Some(monitor) = window
+        .current_monitor()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?
+    {
+        let origin = monitor.position();
+        let size = monitor.size();
+        let x = origin.x + size.width.saturating_sub(PET_WINDOW_WIDTH as u32 + 24) as i32;
+        let y = origin.y + size.height.saturating_sub(PET_WINDOW_HEIGHT as u32 + 64) as i32;
+        let _ = window.set_position(PhysicalPosition::new(x, y));
+    }
+
+    window.show().map_err(|error| AppError::BadRequest(error.to_string()))?;
+    if focus {
+        window
+            .set_focus()
+            .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    }
+
+    Ok(())
+}
+
+fn setup_tray(app: &App) -> AppResult<()> {
+    let open = MenuItemBuilder::with_id(TRAY_OPEN_ID, "打开")
+        .build(app)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let pet = MenuItemBuilder::with_id(TRAY_PET_ID, "桌宠")
+        .build(app)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let quit = MenuItemBuilder::with_id(TRAY_QUIT_ID, "退出")
+        .build(app)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let menu = MenuBuilder::new(app)
+        .item(&open)
+        .item(&pet)
+        .separator()
+        .item(&quit)
+        .build()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+
+    let mut tray_builder = TrayIconBuilder::with_id(TRAY_ID)
+        .tooltip("SynthChat")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } = event
+            {
+                let _ = show_main_window(tray.app_handle().clone());
+            }
+        })
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            TRAY_OPEN_ID => {
+                let _ = show_main_window(app.clone());
+            }
+            TRAY_PET_ID => {
+                let _ = ensure_pet_window(app, true);
+            }
+            TRAY_QUIT_ID => {
+                app.exit(0);
+            }
+            _ => {}
+        });
+
+    if let Some(icon) = app.default_window_icon() {
+        tray_builder = tray_builder.icon(icon.clone());
+    }
+
+    tray_builder
+        .build(app)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+
+    Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn open_pet_window(app: AppHandle) -> AppResult<()> {
+    ensure_pet_window(&app, true)
+}
+
+fn show_pet_first(app: &AppHandle) -> AppResult<()> {
+    ensure_pet_window(app, false)?;
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+    Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn show_main_window(app: AppHandle) -> AppResult<()> {
+    let Some(window) = app.get_webview_window("main") else {
+        return Ok(());
+    };
+    if window
+        .is_minimized()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?
+    {
+        window
+            .unminimize()
+            .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    }
+    window.show().map_err(|error| AppError::BadRequest(error.to_string()))?;
+    window
+        .set_focus()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn toggle_main_window(app: AppHandle) -> AppResult<()> {
+    let Some(window) = app.get_webview_window("main") else {
+        return Ok(());
+    };
+    let visible = window
+        .is_visible()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let minimized = window
+        .is_minimized()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    if visible && !minimized {
+        window.hide().map_err(|error| AppError::BadRequest(error.to_string()))?;
+        return Ok(());
+    }
+    if minimized {
+        window
+            .unminimize()
+            .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    }
+    window.show().map_err(|error| AppError::BadRequest(error.to_string()))?;
+    window
+        .set_focus()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn pet_window_action(app: AppHandle, action: String) -> AppResult<()> {
+    let Some(window) = app.get_webview_window(PET_WINDOW_LABEL) else {
+        return Ok(());
+    };
+    match action.as_str() {
+        "close" => window
+            .close()
+            .map_err(|error| AppError::BadRequest(error.to_string()))?,
+        "collapse" => {
+            window
+                .set_size(PhysicalSize::new(180, 56))
+                .map_err(|error| AppError::BadRequest(error.to_string()))?;
+        }
+        "expand" => {
+            window
+                .set_size(PhysicalSize::new(PET_WINDOW_WIDTH as u32, PET_WINDOW_HEIGHT as u32))
+                .map_err(|error| AppError::BadRequest(error.to_string()))?;
+        }
+        "model" => {
+            window
+                .set_size(PhysicalSize::new(PET_WINDOW_WIDTH as u32, PET_WINDOW_HEIGHT as u32))
+                .map_err(|error| AppError::BadRequest(error.to_string()))?;
+        }
+        "drag" => window
+            .start_dragging()
+            .map_err(|error| AppError::BadRequest(error.to_string()))?,
+        _ => {}
+    }
+    Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn cursor_position(app: AppHandle) -> AppResult<Value> {
+    let cursor = app
+        .cursor_position()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let window = app.get_webview_window(PET_WINDOW_LABEL);
+    let (window_x, window_y, window_width, window_height) = if let Some(window) = window {
+        let position = window
+            .outer_position()
+            .map_err(|error| AppError::BadRequest(error.to_string()))?;
+        let size = window
+            .inner_size()
+            .map_err(|error| AppError::BadRequest(error.to_string()))?;
+        (position.x, position.y, size.width, size.height)
+    } else {
+        (0, 0, 0, 0)
+    };
+    Ok(json!({
+        "x": cursor.x,
+        "y": cursor.y,
+        "screenX": cursor.x,
+        "screenY": cursor.y,
+        "screenWidth": 0,
+        "screenHeight": 0,
+        "clientX": cursor.x - window_x as f64,
+        "clientY": cursor.y - window_y as f64,
+        "windowWidth": window_width,
+        "windowHeight": window_height,
+        "windowScreenX": window_x,
+        "windowScreenY": window_y,
+    }))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn pet_window_drag(
+    app: AppHandle,
+    state: State<'_, Mutex<PetDragState>>,
+    action: String,
+    screen_x: Option<f64>,
+    screen_y: Option<f64>,
+) -> AppResult<()> {
+    let Some(window) = app.get_webview_window(PET_WINDOW_LABEL) else {
+        return Ok(());
+    };
+    let mut drag = state.lock().unwrap();
+    match action.as_str() {
+        "start" => {
+            let position = window
+                .outer_position()
+                .map_err(|error| AppError::BadRequest(error.to_string()))?;
+            drag.active = true;
+            drag.window_x = position.x;
+            drag.window_y = position.y;
+            drag.pointer_x = screen_x.unwrap_or(0.0).round() as i32;
+            drag.pointer_y = screen_y.unwrap_or(0.0).round() as i32;
+        }
+        "move" => {
+            if !drag.active {
+                return Ok(());
+            }
+            let x = screen_x.unwrap_or(drag.pointer_x as f64).round() as i32;
+            let y = screen_y.unwrap_or(drag.pointer_y as f64).round() as i32;
+            let next_x = drag.window_x + x - drag.pointer_x;
+            let next_y = drag.window_y + y - drag.pointer_y;
+            window
+                .set_position(PhysicalPosition::new(next_x, next_y))
+                .map_err(|error| AppError::BadRequest(error.to_string()))?;
+        }
+        "end" => {
+            *drag = PetDragState::default();
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 #[tauri::command(rename_all = "camelCase")]
 fn open_local_file(path: String) -> AppResult<()> {
     let path = PathBuf::from(path);
@@ -3463,7 +3757,18 @@ pub fn run() {
     sync_runtime_env_from_store(&store);
     tauri::Builder::default()
         .manage(store)
+        .manage(Mutex::new(PetDragState::default()))
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
+            setup_tray(app)?;
             let store = app.state::<AppStore>();
             mcp::start_mcp_keepalive_loop(store.inner().clone());
             let wechat_store = store.inner().clone();
@@ -3512,6 +3817,14 @@ pub fn run() {
                         }),
                     );
                 }
+            }
+            let app_handle = app.handle().clone();
+            if let Err(error) = show_pet_first(&app_handle) {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+                eprintln!("failed to show pet window: {error}");
             }
             Ok(())
         })
@@ -3714,6 +4027,12 @@ pub fn run() {
             noop,
             passthrough_value,
             asset_url,
+            open_pet_window,
+            show_main_window,
+            toggle_main_window,
+            pet_window_action,
+            pet_window_drag,
+            cursor_position,
             open_local_file,
             reveal_local_file,
         ])

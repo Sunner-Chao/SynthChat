@@ -597,7 +597,7 @@ fn wechat_outbound_image_payload(data: &[u8], path: &Path) -> AppResult<(Vec<u8>
             )
         })
         .unwrap_or(true);
-    if mime == "image/jpeg" || !normalize_non_jpeg {
+    if mime == "image/jpeg" || mime == "image/gif" || !normalize_non_jpeg {
         return Ok((data.to_vec(), mime));
     }
     let decoded = image::load_from_memory(data).map_err(|error| {
@@ -908,6 +908,7 @@ async fn upload_wechat_image(
     let aes_key_hex = bytes_to_lower_hex(&aes_key);
     let media_aes_key = wechat_media_aes_key(&aes_key);
     let encrypted = aes_128_ecb_pkcs7_encrypt(&plain, &aes_key);
+    let encrypted_len = encrypted.len();
     let filekey = wechat_upload_filekey();
     let base_url = normalize_base_url(if account.login_base_url.trim().is_empty() {
         DEFAULT_WECHAT_BASE_URL
@@ -924,7 +925,7 @@ async fn upload_wechat_image(
         "to_user_id": to_user_id,
         "rawsize": plain.len(),
         "rawfilemd5": raw_md5,
-        "filesize": encrypted.len(),
+        "filesize": encrypted_len,
         "aeskey": aes_key_hex,
         "no_need_thumb": true,
         "base_info": wechat_base_info()
@@ -985,7 +986,7 @@ async fn upload_wechat_image(
     Ok(WechatCdnImageInfo {
         encrypt_query_param: encrypted_param,
         aes_key: media_aes_key,
-        mid_size: plain.len() as u64,
+        mid_size: encrypted_len as u64,
     })
 }
 

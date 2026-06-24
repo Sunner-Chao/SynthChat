@@ -708,6 +708,7 @@ export const api: Record<string, any> = {
   convertFileSrc,
   openLocalFile: (path: string) => call("open_local_file", { path }, () => undefined),
   revealLocalFile: (path: string) => call("reveal_local_file", { path }, () => undefined),
+  openPetWindow: () => call("open_pet_window", {}, () => undefined),
   uploadChatAttachment: (fileName: string, mimeType: string, bytes: number[]): Promise<ChatAttachment> => call<ChatAttachment>("upload_chat_attachment", { fileName, mimeType, bytes }, () => ({
     id: `att-${Date.now()}`,
     fileName,

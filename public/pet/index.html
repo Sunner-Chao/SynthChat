@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SynthPet</title>
+    <style>
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: transparent;
+      }
+
+      body {
+        user-select: none;
+      }
+
+      #canvas {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+        background: transparent;
+      }
+
+      #thinking-indicator {
+        position: fixed;
+        left: 50%;
+        bottom: 18px;
+        width: 10px;
+        height: 10px;
+        border-radius: 999px;
+        background: #22c55e;
+        box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.5);
+        opacity: 0;
+        transform: translateX(-50%);
+        transition: opacity 160ms ease;
+      }
+
+      #thinking-indicator.show {
+        opacity: 1;
+        animation: thinkingPulse 1.2s ease-out infinite;
+      }
+
+      #pet-status {
+        position: fixed;
+        left: 50%;
+        bottom: 28px;
+        display: none;
+        padding: 5px 9px;
+        border: 1px solid rgba(148, 163, 184, 0.3);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.86);
+        color: #475569;
+        font-size: 12px;
+        font-weight: 600;
+        transform: translateX(-50%);
+      }
+
+      #pet-status.show {
+        display: block;
+      }
+
+      #bubble-container,
+      #chat-input,
+      #send-btn {
+        display: none;
+      }
+
+      @keyframes thinkingPulse {
+        0% {
+          box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.45);
+        }
+        100% {
+          box-shadow: 0 0 0 18px rgba(34, 197, 94, 0);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+    <div id="bubble-container"><div id="bubble"></div></div>
+    <div id="thinking-indicator"></div>
+    <div id="pet-status"></div>
+    <input id="chat-input" aria-hidden="true" />
+    <button id="send-btn" aria-hidden="true" type="button"></button>
+    <script src="./lib/pixi.min.js"></script>
+    <script src="./lib/live2d.min.js"></script>
+    <script src="./lib/live2dcubismcore.min.js"></script>
+    <script src="./lib/pixi-live2d-display.min.js"></script>
+    <script src="./pet.js"></script>
+  </body>
+</html>

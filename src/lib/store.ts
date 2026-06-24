@@ -224,6 +224,8 @@ interface AppState {
   bootstrap: () => Promise<void>;
   refreshChatData: (preferredConversationId?: string | null, preferredPersonaId?: string | null) => Promise<void>;
   setConversationProcessing: (conversationId: string, processing: boolean) => void;
+  incrementConversationUnread: (conversationId: string, amount?: number) => void;
+  markConversationRead: (conversationId: string) => void;
   upsertIncomingMessage: (message: ChatMessage) => void;
   createConversation: (personaId?: string) => Promise<void>;
   openPersonaConversation: (personaId: string) => Promise<void>;
@@ -502,15 +504,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ agentQueue });
       return;
     }
-    // Preserve existing unread counts, only clear for active conversation
-    const unreadCounts = { ...state.conversationUnreadCounts };
-    if (activeConversationId) delete unreadCounts[activeConversationId];
     set((current) => ({
       conversations,
       agentQueue,
       activeConversationId,
       messages,
-      conversationUnreadCounts: unreadCounts,
+      conversationUnreadCounts: current.conversationUnreadCounts,
       processingConversationIds: messages.at(-1)?.role === "assistant"
         && activeConversationId !== preferredConversationId
         ? current.processingConversationIds.filter((id) => id !== activeConversationId)
@@ -530,6 +529,24 @@ export const useAppStore = create<AppState>((set, get) => ({
         };
       }
       return state;
+    });
+  },
+  incrementConversationUnread: (conversationId, amount = 1) => {
+    if (!conversationId || amount <= 0) return;
+    set((state) => ({
+      conversationUnreadCounts: {
+        ...state.conversationUnreadCounts,
+        [conversationId]: (state.conversationUnreadCounts[conversationId] ?? 0) + amount
+      }
+    }));
+  },
+  markConversationRead: (conversationId) => {
+    if (!conversationId) return;
+    set((state) => {
+      if (!(conversationId in state.conversationUnreadCounts)) return state;
+      const unreadCounts = { ...state.conversationUnreadCounts };
+      delete unreadCounts[conversationId];
+      return { conversationUnreadCounts: unreadCounts };
     });
   },
   upsertIncomingMessage: (message) => {
@@ -585,13 +602,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ conversations, activeConversationId, messages, conversationUnreadCounts: unreadCounts });
   },
   selectConversation: async (conversationId) => {
-    set((state) => state.activeConversationId === conversationId
-      ? state
-      : {
-          activeConversationId: conversationId,
-          messages: [],
-          conversationUnreadCounts: { ...state.conversationUnreadCounts, [conversationId]: 0 }
-        });
+    set((state) => {
+      if (state.activeConversationId === conversationId) return state;
+      const unreadCounts = { ...state.conversationUnreadCounts };
+      delete unreadCounts[conversationId];
+      return {
+        activeConversationId: conversationId,
+        messages: [],
+        conversationUnreadCounts: unreadCounts
+      };
+    });
     const messageLimit = uiMessageLimit(get().config);
     const previewChars = uiMessagePreviewChars(get().config);
     const messages = visibleChatMessages(await api.listMessages(conversationId, messageLimit, previewChars));
@@ -631,11 +651,13 @@ export const useAppStore = create<AppState>((set, get) => ({
         const conversation = matches[0];
         const messageLimit = uiMessageLimit(state.config);
         const previewChars = uiMessagePreviewChars(state.config);
+        const unreadCounts = { ...state.conversationUnreadCounts };
+        delete unreadCounts[conversation.id];
         set({
           conversations,
           activeConversationId: conversation.id,
           messages: visibleChatMessages(await api.listMessages(conversation.id, messageLimit, previewChars)),
-          conversationUnreadCounts: { ...state.conversationUnreadCounts, [conversation.id]: 0 },
+          conversationUnreadCounts: unreadCounts,
           processingConversationIds: state.processingConversationIds.filter((id) => id !== state.activeConversationId)
         });
         return;

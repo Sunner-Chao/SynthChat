@@ -2,6 +2,7 @@ const ui = {
     bubble: document.getElementById("bubble"),
     bubbleContainer: document.getElementById("bubble-container"),
     thinkingIndicator: document.getElementById("thinking-indicator"),
+    status: document.getElementById("pet-status"),
     chatInput: document.getElementById("chat-input"),
     sendBtn: document.getElementById("send-btn")
 };
@@ -13,6 +14,12 @@ const app = new PIXI.Application({
     transparent: true,
     backgroundAlpha: 0,
 });
+
+try {
+    app.renderer.background.alpha = 0;
+} catch {
+    // Older Pixi builds may not expose renderer.background.
+}
 
 const HOST_MESSAGE_SOURCE = "synthchat-pet-host";
 const FRAME_MESSAGE_SOURCE = "synthchat-pet-frame";
@@ -34,6 +41,10 @@ const MODEL_HIT_PADDING = 28;
 const MODEL_DRAG_DELAY_MS = 240;
 const MODEL_TAP_DELAY_MS = 220;
 const MODEL_VIEWPORT_WIDTH = 360;
+const DEFAULT_MODEL_URL = "/pet/model/Tororo/tororo.model3.json";
+
+let loadingModelKey = null;
+let loadedModelUrl = null;
 
 function postMessageToHost(data) {
     const payload = { source: FRAME_MESSAGE_SOURCE, ...data };
@@ -53,6 +64,13 @@ function listenHostMessages(handler) {
 function showBubble(text) {
     ui.bubble.innerText = text;
     ui.bubbleContainer.classList.add("show");
+}
+
+function setStatus(text) {
+    if (!ui.status) return;
+    const nextText = typeof text === "string" ? text.trim() : "";
+    ui.status.innerText = nextText;
+    ui.status.classList.toggle("show", Boolean(nextText));
 }
 
 function clearModelDragTimer() {
@@ -104,44 +122,108 @@ function finishModelDrag() {
     }
 }
 
-async function loadModel(url) {
+function normalizeModelUrl(url) {
+    const rawUrl = typeof url === "string" && url.trim() ? url.trim() : DEFAULT_MODEL_URL;
+    return rawUrl;
+}
+
+function addModelUrlCandidate(candidates, url) {
+    if (url && !candidates.includes(url)) {
+        candidates.push(url);
+    }
+}
+
+function modelUrlCandidates(url) {
+    const rawUrl = normalizeModelUrl(url);
+    const candidates = [];
+    addModelUrlCandidate(candidates, rawUrl);
+    if (rawUrl.startsWith("/pet/model/")) {
+        addModelUrlCandidate(candidates, rawUrl.slice("/pet/".length));
+    } else if (rawUrl.startsWith("./model/")) {
+        addModelUrlCandidate(candidates, `/pet/${rawUrl.slice(2)}`);
+        addModelUrlCandidate(candidates, rawUrl.slice(2));
+    } else if (rawUrl.startsWith("model/")) {
+        addModelUrlCandidate(candidates, `./${rawUrl}`);
+        addModelUrlCandidate(candidates, `/pet/${rawUrl}`);
+    }
+    return candidates;
+}
+
+function errorMessage(error) {
+    if (error instanceof Error) return error.message;
+    return String(error);
+}
+
+async function loadModel(url = DEFAULT_MODEL_URL) {
+    const candidates = modelUrlCandidates(url);
+    const loadingKey = candidates.join("|");
+    if (model && loadedModelUrl && candidates.includes(loadedModelUrl)) {
+        postMessageToHost({ type: "loaded", url: loadedModelUrl });
+        return;
+    }
+    if (loadingModelKey === loadingKey) return;
     const currentToken = ++loadToken;
+    loadingModelKey = loadingKey;
+    setStatus("加载中");
     try {
+        if (!PIXI?.live2d?.Live2DModel) {
+            throw new Error("Live2D runtime is not ready");
+        }
         if (model) {
             app.stage.removeChild(model);
             model.destroy?.({ children: true });
             model = null;
             modelNaturalSize = null;
             modelScale = null;
-        }
-        const nextModel = await PIXI.live2d.Live2DModel.from(url, { autoInteract: false });
-        if (currentToken !== loadToken) {
-            nextModel.destroy?.({ children: true });
-            return;
-        }
-        model = nextModel;
-        modelNaturalSize = {
-            width: Math.max(1, nextModel.width),
-            height: Math.max(1, nextModel.height)
-        };
-        modelScale = Math.min(
-            (window.innerHeight * 0.82) / modelNaturalSize.height,
-            (MODEL_VIEWPORT_WIDTH * 0.86) / modelNaturalSize.width
-        );
-        app.stage.addChild(model);
-
-        const ctrl = model.internalModel.focusController;
-        if (ctrl) {
-            ctrl.acceleration = 0.04;
-            ctrl.deceleration = 0.08;
+            loadedModelUrl = null;
         }
 
-        layoutModel();
-        model.interactive = true;
+        let lastError = null;
+        for (const modelUrl of candidates) {
+            try {
+                const nextModel = await PIXI.live2d.Live2DModel.from(modelUrl, { autoInteract: false });
+                if (currentToken !== loadToken) {
+                    nextModel.destroy?.({ children: true });
+                    return;
+                }
+                loadingModelKey = null;
+                loadedModelUrl = modelUrl;
+                model = nextModel;
+                modelNaturalSize = {
+                    width: Math.max(1, nextModel.width),
+                    height: Math.max(1, nextModel.height)
+                };
+                modelScale = Math.min(
+                    (window.innerHeight * 0.82) / modelNaturalSize.height,
+                    (MODEL_VIEWPORT_WIDTH * 0.86) / modelNaturalSize.width
+                );
+                app.stage.addChild(model);
 
-        postMessageToHost({ type: "loaded" });
+                const ctrl = model.internalModel.focusController;
+                if (ctrl) {
+                    ctrl.acceleration = 0.04;
+                    ctrl.deceleration = 0.08;
+                }
+
+                layoutModel();
+                model.interactive = true;
+
+                setStatus("");
+                postMessageToHost({ type: "loaded", url: modelUrl });
+                return;
+            } catch (error) {
+                lastError = error;
+                console.warn("Live2D model candidate failed:", modelUrl, error);
+            }
+        }
+        throw lastError ?? new Error("Live2D model load failed");
     } catch (error) {
-        postMessageToHost({ type: "error", message: String(error) });
+        if (currentToken === loadToken) {
+            loadingModelKey = null;
+            loadedModelUrl = null;
+        }
+        setStatus("模型加载失败");
+        postMessageToHost({ type: "error", message: errorMessage(error) });
         console.error(error);
     }
 }

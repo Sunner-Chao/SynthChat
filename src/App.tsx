@@ -164,6 +164,7 @@ export function App() {
   const refreshAgentQueue = useAppStore((state) => state.refreshAgentQueue);
   const refreshAgentRuns = useAppStore((state) => state.refreshAgentRuns);
   const setConversationProcessing = useAppStore((state) => state.setConversationProcessing);
+  const incrementConversationUnread = useAppStore((state) => state.incrementConversationUnread);
   const handleAgentRunEvent = useAppStore((state) => state.handleAgentRunEvent);
   const handleManagedProcessEvent = useAppStore((state) => state.handleManagedProcessEvent);
   const upsertIncomingMessage = useAppStore((state) => state.upsertIncomingMessage);
@@ -172,6 +173,7 @@ export function App() {
     useAppStore.setState({ personas });
   }, []);
   const processingConversationCount = useAppStore((state) => state.processingConversationIds.length);
+  const hasChatUnread = useAppStore((state) => Object.values(state.conversationUnreadCounts).some((count) => count > 0));
   const themes = useAppStore((state) => state.themes);
   const lastCountedMessageRef = useRef<Map<string, string>>(new Map());
 
@@ -224,23 +226,23 @@ export function App() {
       }
       if ((payload.type === "assistant_message" || payload.type === "conversation_updated") && payload.conversationId) {
         setConversationProcessing(payload.conversationId, false);
-        // Increment unread count for non-active conversations (assistant reply only, deduplicated)
-        if (payload.type === "assistant_message" && payload.conversationId) {
-          const state = useAppStore.getState();
-          if (payload.conversationId !== state.activeConversationId) {
-            const conv = state.conversations.find((c) => c.id === payload.conversationId);
-            const updatedAt = conv?.updatedAt ?? "";
-            const prev = lastCountedMessageRef.current.get(payload.conversationId);
-            if (prev !== updatedAt) {
-              lastCountedMessageRef.current.set(payload.conversationId, updatedAt);
-              useAppStore.setState((s) => ({
-                conversationUnreadCounts: {
-                  ...s.conversationUnreadCounts,
-                  [payload.conversationId!]: (s.conversationUnreadCounts[payload.conversationId!] ?? 0) + 1
-                }
-              }));
-            }
-          }
+      }
+      if (
+        payload.conversationId
+        && payload.message
+        && payload.message.role === "assistant"
+        && (payload.type === "assistant_message" || payload.type === "new_message")
+        && isVisibleChatEventMessage(payload.message)
+      ) {
+        const state = useAppStore.getState();
+        const shouldMarkUnread =
+          payload.conversationId !== state.activeConversationId
+          || state.activeSection !== "chat";
+        const messageKey = payload.message.id.trim() || `${payload.message.createdAt}:${payload.message.content.length}`;
+        const previousKey = lastCountedMessageRef.current.get(payload.conversationId);
+        if (shouldMarkUnread && previousKey !== messageKey) {
+          lastCountedMessageRef.current.set(payload.conversationId, messageKey);
+          incrementConversationUnread(payload.conversationId);
         }
       }
       if ((payload.type === "assistant_stream" || payload.type === "new_message" || payload.type === "tool_message" || payload.type === "assistant_message") && payload.message && isVisibleChatEventMessage(payload.message)) {
@@ -261,7 +263,7 @@ export function App() {
     return () => {
       if (unlisten) unlisten();
     };
-  }, [refreshChatData, setConversationProcessing, upsertIncomingMessage]);
+  }, [incrementConversationUnread, refreshChatData, setConversationProcessing, upsertIncomingMessage]);
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;
@@ -440,6 +442,7 @@ export function App() {
               >
                 <Icon size={20} strokeWidth={activeSection === item.id ? 2.2 : 1.8} />
                 <span>{item.label}</span>
+                {item.id === "chat" && hasChatUnread ? <i aria-hidden="true" className="nav-item-dot" /> : null}
               </button>
             );
           })}

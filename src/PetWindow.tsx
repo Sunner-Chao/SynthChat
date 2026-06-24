@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
+import { Cat, Palette, X } from "lucide-react";
 import { api } from "./lib/api";
 import type { ChatMessage, Conversation, Persona, AgentRunEvent } from "./lib/types";
 import {
@@ -16,7 +17,7 @@ const HOST_MESSAGE_SOURCE = "synthchat-pet-host";
 const FRAME_MESSAGE_SOURCE = "synthchat-pet-frame";
 const PET_ACTIVE_CONTEXT_SOURCE = "pet";
 const PET_BUBBLE_MAX_CHARS = 1200;
-const PET_BUBBLE_HISTORY_LIMIT = 8;
+const PET_HISTORY_LIMIT = 8;
 const PET_PROACTIVE_IDLE_MS = 5 * 60 * 1000;
 
 type PetMessage =
@@ -32,13 +33,13 @@ type PetMessage =
     };
 
 const AVAILABLE_MODELS = [
-  { id: "mao", name: "猫咪", path: "/pet/model/Mao/Mao.model3.json", greeting: "桌宠已待机，输入框可以直接和我说话。" },
-  { id: "wanko", name: "Wanko (小狗)", path: "/pet/model/Wanko/Wanko.model3.json", greeting: "汪汪！我是 Wanko，很高兴见到你喵~" },
-  { id: "tororo", name: "Tororo (猫)", path: "/pet/model/Tororo/tororo.model3.json", greeting: "我是 Tororo，已经在桌面待机。" },
-  { id: "hijiki", name: "Hijiki (猫)", path: "/pet/model/Hijiki/hijiki.model3.json", greeting: "我是 Hijiki，最近的对话会显示在右侧气泡里。" },
-  { id: "hiyori", name: "Hiyori (可爱女孩)", path: "/pet/model/Hiyori/Hiyori.model3.json", greeting: "你好呀！我是 Hiyori~" },
-  { id: "natori", name: "Natori (夏鸟)", path: "/pet/model/Natori/Natori.model3.json", greeting: "你好！我是夏鸟，请多指教~" },
-  { id: "mark", name: "Mark (标记)", path: "/pet/model/Mark/Mark.model3.json", greeting: "Hi！我是 Mark！" },
+  { id: "tororo", name: "Tororo", path: "/pet/model/Tororo/tororo.model3.json", greeting: "我是 Tororo，已经在桌面待机。" },
+  { id: "hijiki", name: "Hijiki", path: "/pet/model/Hijiki/hijiki.model3.json", greeting: "我是 Hijiki，已经在桌面待机。" },
+  { id: "mao", name: "Mao", path: "/pet/model/Mao/Mao.model3.json", greeting: "我是 Mao，已经在桌面待机。" },
+  { id: "wanko", name: "Wanko", path: "/pet/model/Wanko/Wanko.model3.json", greeting: "汪汪！我是 Wanko。" },
+  { id: "hiyori", name: "Hiyori", path: "/pet/model/Hiyori/Hiyori.model3.json", greeting: "你好呀！我是 Hiyori。" },
+  { id: "natori", name: "Natori", path: "/pet/model/Natori/Natori.model3.json", greeting: "你好！我是夏鸟。" },
+  { id: "mark", name: "Mark", path: "/pet/model/Mark/Mark.model3.json", greeting: "Hi！我是 Mark。" },
 ];
 
 type PetModel = (typeof AVAILABLE_MODELS)[number];
@@ -50,11 +51,9 @@ type PetSendContext = {
   agentId: string | null;
 };
 
-type PetBubbleRole = "user" | "assistant" | "status";
-
 type PetBubbleEntry = {
   id: string;
-  role: PetBubbleRole;
+  role: "user" | "assistant";
   text: string;
   createdAt: string;
 };
@@ -79,15 +78,6 @@ function formatPetCloudText(text: string) {
   return `${normalized.slice(0, 110)}...`;
 }
 
-function createPetBubbleEntry(role: PetBubbleRole, text: string, createdAt = new Date().toISOString()): PetBubbleEntry {
-  return {
-    id: `${role}-${createdAt}-${Math.random().toString(36).slice(2)}`,
-    role,
-    text: formatPetBubble(text),
-    createdAt
-  };
-}
-
 function chatMessageToPetBubbleEntry(message: ChatMessage): PetBubbleEntry | null {
   if (message.role !== "user" && message.role !== "assistant") return null;
   if (message.role === "user" && (message.source === "proactive" || message.source === "proactive-internal")) return null;
@@ -100,166 +90,20 @@ function chatMessageToPetBubbleEntry(message: ChatMessage): PetBubbleEntry | nul
   };
 }
 
-function petBubbleRoleLabel(role: PetBubbleRole) {
-  if (role === "user") return "你";
-  if (role === "assistant") return "回复";
-  return "状态";
-}
-
-function formatPetBubbleTime(createdAt: string) {
-  const date = new Date(createdAt);
-  if (Number.isNaN(date.getTime())) return "";
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
-
 function textOnlyAssistantReply(messages: ChatMessage[]) {
   return [...messages]
     .reverse()
     .find((message) => message.role === "assistant" && message.content.trim());
 }
 
-type PetBubbleSegment =
-  | { kind: "text"; value: string }
-  | { kind: "image"; path: string; mimeType: string }
-  | { kind: "file"; path: string; mimeType: string };
-
-const MEDIA_MARKER = /\[media attached:\s*(?:"([^"]+)"|`([^`]+)`|([^\]\(]+?))\s*(?:\(([^)]+)\))?\]/gi;
-
-function fileNameFromPath(path: string) {
-  return path.split(/[\\/]/).pop() || path;
-}
-
-function isImagePath(path: string): boolean {
-  return /\.(png|jpe?g|webp|gif|bmp|svg)$/i.test(path);
-}
-
-function imageMimeType(path: string): string {
-  if (/\.gif$/i.test(path)) return "image/gif";
-  if (/\.webp$/i.test(path)) return "image/webp";
-  if (/\.jpe?g$/i.test(path)) return "image/jpeg";
-  if (/\.bmp$/i.test(path)) return "image/bmp";
-  if (/\.svg$/i.test(path)) return "image/svg+xml";
-  return "image/png";
-}
-
-function parsePetBubbleSegments(text: string): PetBubbleSegment[] {
-  const segments: PetBubbleSegment[] = [];
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-  MEDIA_MARKER.lastIndex = 0;
-  while ((match = MEDIA_MARKER.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      segments.push({ kind: "text", value: text.slice(lastIndex, match.index) });
-    }
-    const path = (match[1] || match[2] || match[3] || "").trim();
-    const mimeType = (match[4] || (isImagePath(path) ? imageMimeType(path) : "application/octet-stream")).trim();
-    if (path) {
-      segments.push({
-        kind: isImagePath(path) || mimeType.startsWith("image/") ? "image" : "file",
-        path,
-        mimeType
-      });
-    }
-    lastIndex = match.index + match[0].length;
-  }
-  if (lastIndex < text.length) {
-    segments.push({ kind: "text", value: text.slice(lastIndex) });
-  }
-  return segments;
-}
-
-function PetBubbleEntryContent({ text }: { text: string }) {
-  const segments = parsePetBubbleSegments(text);
-  return (
-    <>
-      {segments.map((segment, index) => {
-        if (segment.kind === "image") {
-          return (
-            <button
-              className="pet-bubble-image"
-              key={`${segment.path}-${index}`}
-              onClick={() => void api.openLocalFile(segment.path)}
-              title="打开图片"
-              type="button"
-            >
-              <img
-                alt={fileNameFromPath(segment.path)}
-                loading="lazy"
-                onLoad={() => window.dispatchEvent(new Event("synthchat-pet-bubble-resize"))}
-                src={api.assetUrl(segment.path)}
-              />
-            </button>
-          );
-        }
-        if (segment.kind === "file") {
-          return (
-            <button
-              className="pet-bubble-file"
-              key={`${segment.path}-${index}`}
-              onClick={() => void api.openLocalFile(segment.path)}
-              title="打开文件"
-              type="button"
-            >
-              <span>文件</span>
-              <strong>{fileNameFromPath(segment.path)}</strong>
-              <small>{segment.mimeType || "application/octet-stream"}</small>
-            </button>
-          );
-        }
-        return segment.value.split(/\n{2,}/).map((block, blockIndex) => {
-          const trimmed = block.trim();
-          if (!trimmed) return null;
-          return (
-            <p className="pet-bubble-text" key={`${index}-${blockIndex}`}>
-              {trimmed}
-            </p>
-          );
-        });
-      })}
-    </>
-  );
-}
-
-function PetBubbleContent({ entries }: { entries: PetBubbleEntry[] }) {
-  const scrollRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const scrollToBottom = () => {
-      window.requestAnimationFrame(() => {
-        const element = scrollRef.current;
-        if (!element) return;
-        element.scrollTop = element.scrollHeight;
-      });
-    };
-    scrollToBottom();
-    window.addEventListener("synthchat-pet-bubble-resize", scrollToBottom);
-    return () => window.removeEventListener("synthchat-pet-bubble-resize", scrollToBottom);
-  }, [entries]);
-
-  return (
-    <div className="pet-chat-bubble-content" ref={scrollRef}>
-      {entries.map((entry) => (
-        <article className={`pet-bubble-entry is-${entry.role}`} key={entry.id}>
-          <div className="pet-bubble-entry-meta">
-            <span>{petBubbleRoleLabel(entry.role)}</span>
-            <time>{formatPetBubbleTime(entry.createdAt)}</time>
-          </div>
-          <PetBubbleEntryContent text={entry.text} />
-        </article>
-      ))}
-    </div>
-  );
-}
-
 export function PetWindow() {
   const frameRef = useRef<HTMLIFrameElement>(null);
   const [input, setInput] = useState("");
   const [status, setStatus] = useState("启动中");
-  const [bubbleEntries, setBubbleEntries] = useState<PetBubbleEntry[]>(() => [
-    createPetBubbleEntry("status", AVAILABLE_MODELS[0].greeting)
-  ]);
-  const bubbleEntriesRef = useRef<PetBubbleEntry[]>(bubbleEntries);
+  const [historyEntries, setHistoryEntries] = useState<PetBubbleEntry[]>([]);
+  const historyEntriesRef = useRef<PetBubbleEntry[]>([]);
   const clearedConversationIdsRef = useRef<Set<string>>(new Set());
+  const lastEntryIdRef = useRef<string | null>(null);
   const [frameLoaded, setFrameLoaded] = useState(false);
   const [modelLoaded, setModelLoaded] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
@@ -286,7 +130,8 @@ export function PetWindow() {
   const controlsLockedRef = useRef(false);
   const proactiveRunningRef = useRef(false);
   const controlsVisible = uiVisible || showModelSelector || miniFocused || sending;
-  const shouldRenderPetControls = !collapsed && (controlsVisible || Boolean(cloudBubble));
+  const historyVisible = controlsVisible && historyEntries.length > 0;
+  const shouldRenderPetLayer = !collapsed && (controlsVisible || Boolean(cloudBubble));
 
   // Keep ref in sync so the message listener always calls the latest version
   useEffect(() => {
@@ -319,12 +164,12 @@ export function PetWindow() {
   }, [showModelSelector, miniFocused, sending]);
 
   useEffect(() => {
-    bubbleEntriesRef.current = bubbleEntries;
-  }, [bubbleEntries]);
-
-  useEffect(() => {
     activeContextRef.current = activeContext;
   }, [activeContext]);
+
+  useEffect(() => {
+    historyEntriesRef.current = historyEntries;
+  }, [historyEntries]);
 
   useEffect(() => {
     modelLoadedRef.current = modelLoaded;
@@ -407,8 +252,13 @@ export function PetWindow() {
       if (context?.conversationId && payload.conversationId && context.conversationId !== payload.conversationId) return;
       const entry = chatMessageToPetBubbleEntry(payload.message);
       if (!entry) return;
-      appendBubbleEntry(entry);
-      showCloudBubble(entry.text, "active", 5600);
+      upsertHistoryEntry(entry);
+      if (entry.role === "assistant") {
+        showCloudBubble(entry.text, "active", 5600);
+        showTransientUi();
+        scheduleHideUi(3600);
+      }
+      lastEntryIdRef.current = entry.id;
     }).then((handler) => {
       unlisten = handler;
     });
@@ -439,9 +289,11 @@ export function PetWindow() {
       if (!payload.message) return;
       const entry = chatMessageToPetBubbleEntry(payload.message);
       if (!entry) return;
-      appendBubbleEntry(entry);
+      upsertHistoryEntry(entry);
+      showTransientUi();
       if (payload.type === "assistant_message") {
         showCloudBubble(entry.text, "active", 5200);
+        lastEntryIdRef.current = entry.id;
         if (modelLoadedRef.current) {
           postToPet({ type: "expression", id: "开心" });
         }
@@ -464,14 +316,16 @@ export function PetWindow() {
       
       if (payload.toolEvent) {
         if (payload.toolEvent.status === "running") {
-          appendBubbleEntry(createPetBubbleEntry("status", `正在调用工具: ${payload.toolEvent.title || payload.toolEvent.toolName}`));
+          setStatus("调用中");
           if (modelLoadedRef.current) postToPet({ type: "expression", id: "思考" });
         } else if (payload.toolEvent.status === "canceled" || payload.toolEvent.status === "cancelled") {
-          appendBubbleEntry(createPetBubbleEntry("status", `工具已取消: ${payload.toolEvent.title || payload.toolEvent.toolName}`));
+          // Hidden in the pet UI; canceled tool events often represent run cleanup noise.
         } else if (!payload.toolEvent.ok) {
-          appendBubbleEntry(createPetBubbleEntry("status", `工具调用失败: ${payload.toolEvent.title || payload.toolEvent.toolName}`));
+          setStatus("失败");
+          window.setTimeout(() => setStatus("在线"), 2200);
         } else {
-          appendBubbleEntry(createPetBubbleEntry("status", `工具调用完成: ${payload.toolEvent.title || payload.toolEvent.toolName}`));
+          setStatus("成功");
+          window.setTimeout(() => setStatus("在线"), 1600);
         }
       }
       
@@ -529,25 +383,18 @@ export function PetWindow() {
         const now = Date.now();
         pokeCountRef.current = now - lastPokeAtRef.current < 2500 ? pokeCountRef.current + 1 : 1;
         lastPokeAtRef.current = now;
-        const combo = pokeCountRef.current > 0 && pokeCountRef.current % 3 === 0;
-        if (combo) {
-          appendStatusBubble("连续触摸已记录。");
-          showCloudBubble("欸，连续点我三次了，是有什么悄悄话吗？", "happy", 3600);
-        } else {
-          showCloudBubble(touchCloudText(pokeCountRef.current), "soft", 2800);
-        }
         if (modelLoadedRef.current) {
           postToPet({ type: "motion", group: "Tap", index: 0 });
         }
         showTransientUi();
-        scheduleHideUi(combo ? 2800 : 1800);
+        scheduleHideUi(1800);
       }
       if (message.type === "poke") {
         markInteraction();
         showTransientUi();
-        void invoke("show_main_window");
-        appendStatusBubble("已打开主窗口。");
-        showCloudBubble("主窗口打开啦，我会在旁边继续陪着。", "active", 3000);
+        void invoke("toggle_main_window");
+        setStatus("已切换");
+        window.setTimeout(() => setStatus("在线"), 1600);
         scheduleHideUi(1200);
       }
       if (message.type === "model_hover") {
@@ -559,7 +406,7 @@ export function PetWindow() {
       }
 
       if (message.type === "model_drag_start") {
-        showCloudBubble("带我换个位置吗？我会跟上。", "active", 2400);
+        setStatus("移动中");
         void startModelDrag(message.screenX, message.screenY);
       }
       if (message.type === "model_drag_move") {
@@ -570,7 +417,7 @@ export function PetWindow() {
       }
       if (message.type === "model_drag_end") {
         stopModelDrag();
-        showCloudBubble("我先停在这里。", "soft", 2200);
+        setStatus("在线");
       }
       if (message.type === "error") {
         setStatus("模型加载失败");
@@ -594,37 +441,6 @@ export function PetWindow() {
     );
   }
 
-  function appendBubbleEntry(entry: PetBubbleEntry) {
-    setBubbleEntries((items) => {
-      // Dedup by id so the synchronous send-return and the event-bridge path
-      // cannot show the same message twice.
-      if (items.some((item) => item.id === entry.id)) {
-        return items.map((item) => (item.id === entry.id ? entry : item));
-      }
-      // Reconcile an optimistic user echo (local-user- prefix) with the real
-      // backend message: when a backend user message arrives with the same
-      // text, replace the local echo in place instead of appending a duplicate.
-      if (entry.role === "user" && !entry.id.startsWith("local-user-")) {
-        const echoIndex = items.findIndex(
-          (item) =>
-            item.role === "user"
-            && item.id.startsWith("local-user-")
-            && item.text.trim() === entry.text.trim()
-        );
-        if (echoIndex >= 0) {
-          const next = items.slice();
-          next[echoIndex] = entry;
-          return next;
-        }
-      }
-      return [...items, entry].slice(-PET_BUBBLE_HISTORY_LIMIT);
-    });
-  }
-
-  function appendStatusBubble(text: string) {
-    appendBubbleEntry(createPetBubbleEntry("status", text));
-  }
-
   function clearPetMessages() {
     const conversationId = activeContextRef.current?.conversationId;
     if (conversationId) {
@@ -638,8 +454,11 @@ export function PetWindow() {
     }
     clearCloudTimer();
     setCloudBubble(null);
-    setBubbleEntries([createPetBubbleEntry("status", "桌宠消息已清空。")]);
-    showCloudBubble("消息记录清空啦。", "soft", 2200);
+    setHistoryEntries([]);
+    historyEntriesRef.current = [];
+    lastEntryIdRef.current = null;
+    setStatus("已清空");
+    window.setTimeout(() => setStatus("在线"), 1600);
   }
 
   async function loadConversationHistory(conversationId: string): Promise<PetBubbleEntry | null> {
@@ -647,16 +466,17 @@ export function PetWindow() {
       return null;
     }
     try {
-      const messages = await api.listMessages(conversationId, PET_BUBBLE_HISTORY_LIMIT * 2, PET_BUBBLE_MAX_CHARS);
+      const messages = await api.listMessages(conversationId, 12, PET_BUBBLE_MAX_CHARS);
       const entries = (messages as ChatMessage[])
         .map(chatMessageToPetBubbleEntry)
         .filter((entry): entry is PetBubbleEntry => Boolean(entry))
-        .slice(-PET_BUBBLE_HISTORY_LIMIT);
+        .slice(-PET_HISTORY_LIMIT);
       if (entries.length > 0) {
-        const previousLastId = bubbleEntriesRef.current.at(-1)?.id ?? "";
         const nextLastId = entries.at(-1)?.id ?? "";
-        setBubbleEntries(entries);
-        return nextLastId !== previousLastId ? entries.at(-1) ?? null : null;
+        const changed = nextLastId !== (lastEntryIdRef.current ?? "");
+        replaceHistoryEntries(entries);
+        lastEntryIdRef.current = nextLastId;
+        return changed ? entries.at(-1) ?? null : null;
       }
     } catch (error) {
       console.error("桌宠历史加载失败:", error);
@@ -669,7 +489,7 @@ export function PetWindow() {
     const deadline = Date.now() + 120000;
     while (Date.now() < deadline) {
       try {
-        const messages = await api.listMessages(conversationId, PET_BUBBLE_HISTORY_LIMIT * 2, PET_BUBBLE_MAX_CHARS);
+        const messages = await api.listMessages(conversationId, 12, PET_BUBBLE_MAX_CHARS);
         const assistant = [...messages]
           .reverse()
           .find((message) =>
@@ -748,13 +568,47 @@ export function PetWindow() {
     }, durationMs);
   }
 
-  function touchCloudText(count: number) {
-    const variants = [
-      "我在哦。轻轻碰一下就能叫醒我。",
-      "刚刚碰到我啦，我会把最近对话记在右边。",
-      "如果想打开主窗口，双击我就可以。"
-    ];
-    return variants[Math.max(0, count - 1) % variants.length];
+  function normalizeHistoryEntries(entries: PetBubbleEntry[]) {
+    const next: PetBubbleEntry[] = [];
+    for (const entry of entries) {
+      const sameIdIndex = next.findIndex((item) => item.id === entry.id);
+      if (sameIdIndex >= 0) {
+        next[sameIdIndex] = entry;
+        continue;
+      }
+      if (entry.role === "user" && !entry.id.startsWith("local-user-")) {
+        const echoIndex = next.findIndex(
+          (item) =>
+            item.role === "user"
+            && item.id.startsWith("local-user-")
+            && item.text.trim() === entry.text.trim()
+        );
+        if (echoIndex >= 0) {
+          next[echoIndex] = entry;
+          continue;
+        }
+      }
+      next.push(entry);
+    }
+    return next.slice(-PET_HISTORY_LIMIT);
+  }
+
+  function replaceHistoryEntries(entries: PetBubbleEntry[]) {
+    const next = normalizeHistoryEntries(entries);
+    historyEntriesRef.current = next;
+    setHistoryEntries(next);
+  }
+
+  function mergeHistoryEntries(entries: PetBubbleEntry[]) {
+    setHistoryEntries((items) => {
+      const next = normalizeHistoryEntries([...items, ...entries]);
+      historyEntriesRef.current = next;
+      return next;
+    });
+  }
+
+  function upsertHistoryEntry(entry: PetBubbleEntry) {
+    mergeHistoryEntries([entry]);
   }
 
   async function updateGlobalLook() {
@@ -931,10 +785,7 @@ export function PetWindow() {
     markInteraction();
     sendingRef.current = true;
     setSending(true);
-    // Optimistic user echo with a local- prefix so the real backend user
-    // message (arriving via the synthchat-chat-event bridge) reconciles in
-    // place instead of duplicating.
-    appendBubbleEntry({
+    upsertHistoryEntry({
       id: `local-user-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       role: "user",
       text: formatPetBubble(text.trim()),
@@ -949,8 +800,9 @@ export function PetWindow() {
     }
     try {
       const context = await resolvePetSendContext();
+      const wasCleared = clearedConversationIdsRef.current.delete(context.conversationId);
       updatePetActiveContext(context);
-      const previousLastId = bubbleEntriesRef.current.at(-1)?.id ?? null;
+      const previousLastId = lastEntryIdRef.current;
       const messages = await invoke<ChatMessage[]>("send_chat_message", {
         request: {
           conversationId: context.conversationId,
@@ -959,6 +811,13 @@ export function PetWindow() {
           content: text.trim()
         }
       });
+      const returnedEntries = (messages ?? [])
+        .map(chatMessageToPetBubbleEntry)
+        .filter((entry): entry is PetBubbleEntry => Boolean(entry))
+        .slice(-PET_HISTORY_LIMIT);
+      if (!wasCleared) {
+        mergeHistoryEntries(returnedEntries);
+      }
       const assistantMessage = textOnlyAssistantReply(messages ?? []);
       const assistantEntry = assistantMessage
         ? {
@@ -969,23 +828,24 @@ export function PetWindow() {
           }
         : await waitForAssistantBubbleReply(context.conversationId, previousLastId);
       if (assistantEntry) {
-        appendBubbleEntry(assistantEntry);
+        lastEntryIdRef.current = assistantEntry.id;
+        upsertHistoryEntry(assistantEntry);
+        showCloudBubble(assistantEntry.text, "active", 5600);
         if (modelLoadedRef.current) {
           postToPet({ type: "expression", id: "开心" });
         }
       } else {
-        appendStatusBubble("我还在处理这条消息，请稍等一下。");
+        setStatus("处理中");
       }
       setStatus("在线");
     } catch (error) {
       console.error("桌宠消息发送或任务执行失败:", error);
       const errStr = String(error);
       if (errStr.includes("active agent run") || errStr.includes("仍在执行")) {
-        appendStatusBubble("代理仍在执行上一个任务，请在主窗口查看或将其终止。");
+        setStatus("忙碌");
       } else {
-        appendStatusBubble(`任务异常中断 (${errStr})，完整信息请在主窗口查看。`);
+        setStatus("错误");
       }
-      setStatus("normal");
       window.setTimeout(() => setStatus("在线"), 3000);
     } finally {
       sendingRef.current = false;
@@ -1007,8 +867,6 @@ export function PetWindow() {
     setSelectedModel(model);
     setModelLoaded(false);
     setStatus("切换模型中");
-    appendStatusBubble(model.greeting);
-    showCloudBubble(model.greeting, "happy", 3200);
     setShowModelSelector(false);
     window.setTimeout(() => {
       setStatus("加载模型中");
@@ -1017,7 +875,7 @@ export function PetWindow() {
   };
 
   return (
-    <main className={`live2d-pet-shell${collapsed ? " is-collapsed" : ""}${controlsVisible ? " is-ui-visible" : ""}`}>
+    <main className={`live2d-pet-shell${collapsed ? " is-collapsed" : ""}${controlsVisible ? " is-ui-visible" : ""}${historyVisible ? " is-history-visible" : ""}`}>
       {collapsed ? (
         <section className="pet-collapsed-pill">
           <button
@@ -1052,21 +910,28 @@ export function PetWindow() {
         title="SynthPet Live2D"
       />
 
-      {shouldRenderPetControls ? (
+      {shouldRenderPetLayer ? (
         <>
-          <div
-            className="pet-toolbar"
-            onPointerEnter={showTransientUi}
-            onPointerLeave={() => scheduleHideUi()}
-          >
-            <span className="pet-toolbar-title">
-              SynthPet - {selectedModel.name}
-            </span>
-            <button className="pet-toolbar-main" onClick={hideControls} title="最小化隐藏控件" type="button">隐藏</button>
-            <button className="pet-toolbar-main" onClick={clearPetMessages} title="清空桌宠消息" type="button">清空</button>
-            <button onClick={() => setShowModelSelector(!showModelSelector)} title="切换模型" type="button">🎭</button>
-            <button className="pet-close-btn" onClick={() => void petWindowAction("close")} title="关闭" type="button">x</button>
-          </div>
+          {(controlsVisible || showModelSelector) ? (
+            <div
+              className="pet-toolbar"
+              onPointerEnter={showTransientUi}
+              onPointerLeave={() => scheduleHideUi()}
+            >
+              <span className="pet-toolbar-title">
+                <Cat size={14} strokeWidth={2.3} aria-hidden="true" />
+                SynthPet - {selectedModel.name}
+              </span>
+              <button className="pet-toolbar-main" onClick={hideControls} title="隐藏控件" type="button">隐藏</button>
+              <button className="pet-toolbar-main" onClick={clearPetMessages} title="清空消息" type="button">清空</button>
+              <button onClick={() => setShowModelSelector(!showModelSelector)} title="切换形象" type="button" aria-label="切换形象">
+                <Palette size={14} strokeWidth={2.3} aria-hidden="true" />
+              </button>
+              <button className="pet-close-btn" onClick={() => void petWindowAction("close")} title="关闭" type="button" aria-label="关闭">
+                <X size={14} strokeWidth={2.5} aria-hidden="true" />
+              </button>
+            </div>
+          ) : null}
 
           {showModelSelector ? (
             <div className="pet-model-selector">
@@ -1084,6 +949,28 @@ export function PetWindow() {
             </div>
           ) : null}
 
+          {historyVisible ? (
+            <section
+              className="pet-chat-bubble"
+              aria-live="polite"
+              onPointerEnter={showTransientUi}
+              onPointerLeave={() => scheduleHideUi()}
+            >
+              <div className="pet-chat-bubble-head">
+                <span>消息</span>
+                <strong>{historyEntries.length} 条</strong>
+              </div>
+              <div className="pet-chat-bubble-content">
+                {historyEntries.map((entry) => (
+                  <article className={`pet-bubble-entry is-${entry.role}`} key={entry.id}>
+                    <span>{entry.role === "user" ? "我" : "对方"}</span>
+                    <p>{entry.text}</p>
+                  </article>
+                ))}
+              </div>
+            </section>
+          ) : null}
+
           {cloudBubble ? (
             <section className={`pet-cloud-bubble is-${cloudBubble.tone}`} key={cloudBubble.id} aria-live="polite">
               <span>{cloudBubble.text}</span>
@@ -1091,44 +978,35 @@ export function PetWindow() {
           ) : null}
 
           {controlsVisible ? (
-            <>
-              <section
-                className="pet-chat-bubble"
-                aria-live="polite"
-                onPointerEnter={showTransientUi}
-                onPointerLeave={() => scheduleHideUi()}
-              >
-                <PetBubbleContent entries={bubbleEntries} />
-              </section>
-
-              <section
-                className="pet-mini-panel"
-                onPointerEnter={showTransientUi}
-                onPointerLeave={() => scheduleHideUi()}
-              >
-                <div className="pet-mini-status">
-                  <strong>桌宠</strong>
-                  <div className="pet-mini-actions">
-                    <button onClick={clearPetMessages} type="button">清空</button>
-                    <button onClick={hideControls} type="button">隐藏</button>
-                    <span>{status}</span>
-                  </div>
+            <section
+              className="pet-mini-panel"
+              onPointerEnter={showTransientUi}
+              onPointerLeave={() => scheduleHideUi()}
+            >
+              <div className="pet-mini-status">
+                <div className="pet-mini-status-copy">
+                  <strong>{selectedModel.name}</strong>
+                  <span>{status}</span>
                 </div>
-                <div className="pet-mini-input">
-                  <input
-                    onBlur={() => setMiniFocused(false)}
-                    onChange={(event) => setInput(event.target.value)}
-                    onFocus={() => setMiniFocused(true)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") send();
-                    }}
-                    placeholder="说点什么..."
-                    value={input}
-                  />
-                  <button onClick={send} type="button">发送</button>
+                <div className="pet-mini-actions">
+                  <button onClick={clearPetMessages} type="button">清空</button>
+                  <button onClick={hideControls} type="button">隐藏</button>
                 </div>
-              </section>
-            </>
+              </div>
+              <div className="pet-mini-input">
+                <input
+                  onBlur={() => setMiniFocused(false)}
+                  onChange={(event) => setInput(event.target.value)}
+                  onFocus={() => setMiniFocused(true)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") send();
+                  }}
+                  placeholder="说点什么..."
+                  value={input}
+                />
+                <button onClick={send} type="button">发送</button>
+              </div>
+            </section>
           ) : null}
         </>
       ) : null}
