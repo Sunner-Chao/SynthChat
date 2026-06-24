@@ -637,6 +637,7 @@ export interface SendChatRequest {
   personaId?: string | null;
   agentId?: string | null;
   content: string;
+  providerData?: unknown | null;
 }
 
 export interface LlmProvider {

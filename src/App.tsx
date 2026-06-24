@@ -40,6 +40,7 @@ import {
 import { useAppStore } from "./lib/store";
 import { api } from "./lib/api";
 import { listen } from "@tauri-apps/api/event";
+import { emit } from "@tauri-apps/api/event";
 import { Avatar, MenuRow } from "./components/common";
 import { SettingsPanel } from "./panels/SettingsPanel";
 import { AgentsPanel, MemoryPanel, SkillsPanel, WorldbooksPanel, PluginsPanel, McpPanel } from "./panels/ToolPanels";
@@ -47,6 +48,7 @@ import { MomentsPanel } from "./panels/MomentsPanel";
 import { PersonaPanel } from "./panels/PersonaPanel";
 import { ChatExperience } from "./panels/ChatExperience";
 import { EnvironmentCheck } from "./panels/EnvironmentCheck";
+import { PET_ACTIVE_CONTEXT_EVENT, writeStoredPetActiveContext, type PetActiveContext } from "./lib/petContext";
 import type {
   AccountConfig,
   AgentConfig,
@@ -174,12 +176,35 @@ export function App() {
   }, []);
   const processingConversationCount = useAppStore((state) => state.processingConversationIds.length);
   const hasChatUnread = useAppStore((state) => Object.values(state.conversationUnreadCounts).some((count) => count > 0));
+  const conversations = useAppStore((state) => state.conversations);
+  const personas = useAppStore((state) => state.personas);
+  const activeConversationId = useAppStore((state) => state.activeConversationId);
   const themes = useAppStore((state) => state.themes);
   const lastCountedMessageRef = useRef<Map<string, string>>(new Map());
 
   useEffect(() => {
     void bootstrap();
   }, [bootstrap]);
+
+  useEffect(() => {
+    if (!activeConversationId) return;
+    const conversation = conversations.find((item) => item.id === activeConversationId);
+    if (!conversation) return;
+    const persona = conversation.personaId
+      ? personas.find((item) => item.id === conversation.personaId) ?? null
+      : null;
+    const context: PetActiveContext = {
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      personaId: conversation.personaId ?? persona?.id ?? null,
+      personaName: persona?.name ?? null,
+      agentId: conversation.agentId ?? persona?.agentId ?? null,
+      updatedAt: new Date().toISOString(),
+      source: "main"
+    };
+    writeStoredPetActiveContext(context);
+    void emit(PET_ACTIVE_CONTEXT_EVENT, context);
+  }, [activeConversationId, conversations, personas]);
 
   useEffect(() => {
     const tick = async () => {

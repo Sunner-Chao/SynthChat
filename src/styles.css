@@ -9890,6 +9890,58 @@ select:focus-visible {
   backdrop-filter: blur(16px);
 }
 
+.pet-panel {
+  box-sizing: border-box;
+  user-select: none;
+}
+
+.pet-panel-drag {
+  cursor: grab;
+  touch-action: none;
+}
+
+.pet-panel.is-locked .pet-panel-drag {
+  cursor: default;
+}
+
+.pet-panel-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pet-panel-icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.78);
+  color: #475569;
+}
+
+.pet-panel-icon-btn:hover {
+  border-color: rgba(13, 148, 136, 0.34);
+  background: rgba(240, 253, 250, 0.9);
+  color: #0f766e;
+}
+
+.pet-panel-resize {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  width: 16px;
+  height: 16px;
+  border-radius: 5px;
+  background:
+    linear-gradient(135deg, transparent 0 42%, rgba(100, 116, 139, 0.22) 42% 54%, transparent 54%),
+    linear-gradient(135deg, transparent 0 62%, rgba(100, 116, 139, 0.42) 62% 74%, transparent 74%);
+  cursor: nwse-resize;
+  touch-action: none;
+}
+
 .pet-toolbar {
   position: absolute;
   z-index: 5;
@@ -9982,11 +10034,8 @@ select:focus-visible {
 .pet-model-selector {
   position: absolute;
   z-index: 5;
-  top: 66px;
-  left: 14px;
   display: grid;
   gap: 6px;
-  width: min(210px, calc(100vw - 28px));
   padding: 9px;
   border: 1px solid rgba(255, 255, 255, 0.7);
   border-radius: 16px;
@@ -9998,6 +10047,10 @@ select:focus-visible {
 }
 
 .pet-model-selector-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   color: #475569;
   font-size: 12px;
   font-weight: 800;
@@ -10023,12 +10076,8 @@ select:focus-visible {
 .pet-cloud-bubble {
   position: absolute;
   z-index: 3;
-  top: clamp(74px, 15vh, 110px);
-  left: clamp(170px, 38vw, 420px);
   box-sizing: border-box;
-  width: clamp(250px, 34vw, 420px);
-  max-width: calc(100vw - 28px);
-  min-height: 64px;
+  min-height: 72px;
   padding: 16px 22px 17px;
   border: 2px solid rgba(203, 213, 225, 0.2);
   border-radius: 34px 40px 36px 42px / 38px 34px 40px 34px;
@@ -10049,6 +10098,17 @@ select:focus-visible {
 .pet-cloud-bubble span {
   position: relative;
   z-index: 1;
+  display: block;
+  padding-right: 54px;
+}
+
+.pet-cloud-actions {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 2;
+  display: inline-flex;
+  gap: 6px;
 }
 
 .pet-cloud-bubble::before,
@@ -10093,14 +10153,9 @@ select:focus-visible {
 .pet-chat-bubble {
   position: absolute;
   z-index: 4;
-  top: 78px;
-  right: 14px;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 8px;
-  width: min(280px, calc(100vw - 28px));
-  max-height: min(342px, calc(100vh - 168px));
-  min-height: 204px;
   padding: 12px;
   border: 1px solid rgba(255, 255, 255, 0.72);
   border-radius: 18px;
@@ -10140,64 +10195,111 @@ select:focus-visible {
 }
 
 .pet-chat-bubble-content {
-  display: grid;
-  align-content: start;
-  gap: 7px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
   min-height: 0;
   overflow: hidden auto;
-  padding-right: 2px;
+  padding: 2px 2px 4px;
   scrollbar-width: thin;
   scrollbar-color: rgba(148, 163, 184, 0.42) transparent;
 }
 
 .pet-bubble-entry {
   display: grid;
-  gap: 4px;
+  gap: 6px;
   min-width: 0;
-  padding: 8px 9px;
+  width: 100%;
+  padding: 9px 11px 9px 12px;
   border: 1px solid rgba(203, 213, 225, 0.42);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.72);
+  border-left: 4px solid rgba(45, 212, 191, 0.64);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.76);
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.06);
 }
 
 .pet-bubble-entry.is-assistant {
   border-color: rgba(45, 212, 191, 0.26);
-  background: rgba(240, 253, 250, 0.78);
+  border-left-color: #14b8a6;
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.96), rgba(240, 253, 250, 0.9));
 }
 
 .pet-bubble-entry.is-user {
-  border-color: rgba(125, 211, 252, 0.24);
-  background: rgba(240, 249, 255, 0.72);
+  border-color: rgba(8, 145, 178, 0.22);
+  border-left-color: #0891b2;
+  background: linear-gradient(145deg, rgba(236, 254, 255, 0.96), rgba(207, 250, 254, 0.82));
 }
 
-.pet-bubble-entry span {
+.pet-bubble-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.pet-bubble-role {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  padding: 0 7px;
+  border-radius: 999px;
+  color: #0f766e;
+  background: rgba(20, 184, 166, 0.12);
+  font-size: 10px;
+  font-weight: 900;
+}
+
+.pet-bubble-entry.is-user .pet-bubble-role {
+  color: #0e7490;
+  background: rgba(8, 145, 178, 0.14);
+}
+
+.pet-bubble-context {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  min-width: 0;
+}
+
+.pet-bubble-context em,
+.pet-bubble-meta time {
   color: #64748b;
+  font-style: normal;
   font-size: 10px;
   font-weight: 850;
 }
 
-.pet-bubble-entry p {
-  display: -webkit-box;
-  max-height: 54px;
-  margin: 0;
+.pet-bubble-context em {
+  max-width: 36px;
   overflow: hidden;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.14);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pet-bubble-text {
+  margin: 0;
   color: #1f2937;
   font-size: 12px;
   font-weight: 620;
   line-height: 1.5;
   overflow-wrap: anywhere;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
+  white-space: pre-wrap;
+}
+
+.pet-bubble-entry.is-user .pet-bubble-text {
+  color: #164e63;
 }
 
 .pet-mini-panel {
   position: absolute;
   z-index: 5;
-  left: 50%;
-  bottom: 14px;
   display: grid;
   gap: 8px;
-  width: min(360px, calc(100vw - 28px));
   padding: 12px;
   border: 1px solid rgba(255, 255, 255, 0.72);
   border-radius: 18px;
@@ -10207,7 +10309,6 @@ select:focus-visible {
     0 18px 36px rgba(30, 41, 59, 0.16),
     0 1px 2px rgba(15, 23, 42, 0.05),
     inset 0 1px 0 rgba(255, 255, 255, 0.92);
-  transform: translateX(-50%);
   backdrop-filter: blur(20px);
 }
 
