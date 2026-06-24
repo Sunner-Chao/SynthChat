@@ -41,6 +41,7 @@ const WORKSPACE_SNAPSHOT_MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 const TOOL_ARTIFACT_PREVIEW_BYTES: u64 = 8 * 1024;
 const MANAGED_PROCESS_FINISHED_TTL_SECONDS: u64 = 1800;
 const MAX_MANAGED_PROCESSES: usize = 64;
+const RUNTIME_RELOAD_RECENT_RUN_GRACE_SECONDS: i64 = 600;
 const DIALOG_BRIDGE_HOST: &str = "hermes-dialog-bridge.invalid";
 const DIALOG_BRIDGE_URL_PATTERN: &str = "http://hermes-dialog-bridge.invalid/*";
 const DIALOG_BRIDGE_SCRIPT: &str = r#"
@@ -2222,6 +2223,53 @@ mod tests {
             "queued from acp"
         );
         assert_eq!(desktop_store.agent_queue().unwrap()[0].id, queued.id);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reload_from_disk_preserves_in_memory_active_run() {
+        let dir = std::env::temp_dir().join(format!(
+            "synthchat-active-run-reload-{}",
+            new_id("state")
+        ));
+        let path = dir.join("state.json");
+        let store = AppStore::new(path.clone()).unwrap();
+        let conversation = store
+            .create_conversation(Some("active reload".into()), Some("default".into()))
+            .unwrap();
+        let message = store
+            .append_message(ChatMessage::new(
+                conversation.id.clone(),
+                "user",
+                "keep this live run".into(),
+                "test",
+            ))
+            .unwrap();
+        let mut run =
+            AgentRunRecord::new(conversation.id.clone(), "default".into(), "default".into());
+        run.state = "running".into();
+        run.user_request = message.content.clone();
+        run.pending_steers.push("continue".into());
+        let run_id = run.run_id.clone();
+        store.save_agent_run(run).unwrap();
+
+        let stale_disk_state = PersistedState::default();
+        fs::write(&path, serde_json::to_vec_pretty(&stale_disk_state).unwrap()).unwrap();
+
+        store.reload_from_disk().unwrap();
+
+        let preserved = store.agent_run(&run_id).unwrap();
+        assert_eq!(preserved.state, "running");
+        assert_eq!(preserved.pending_steers, vec!["continue".to_string()]);
+        assert_eq!(
+            store.conversation(&conversation.id).unwrap().id,
+            conversation.id
+        );
+        assert_eq!(
+            store.messages(&conversation.id, None).unwrap()[0].content,
+            "keep this live run"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -5078,6 +5126,269 @@ fn normalize_interrupted_runs(state: &mut PersistedState) {
     }
 }
 
+fn active_agent_run_state(state: &str) -> bool {
+    matches!(
+        state,
+        "started" | "running" | "pendingApproval" | "needsClarification"
+    )
+}
+
+fn terminal_agent_run_state(state: &str) -> bool {
+    matches!(state, "completed" | "failed" | "aborted")
+}
+
+fn timestamp_is_after(left: &str, right: &str) -> bool {
+    match (
+        DateTime::parse_from_rfc3339(left).map(|value| value.with_timezone(&Utc)),
+        DateTime::parse_from_rfc3339(right).map(|value| value.with_timezone(&Utc)),
+    ) {
+        (Ok(left), Ok(right)) => left > right,
+        _ => left > right,
+    }
+}
+
+fn timestamp_age_seconds(value: &str, now: &DateTime<Utc>) -> Option<i64> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| now.signed_duration_since(value.with_timezone(&Utc)).num_seconds())
+}
+
+fn recently_updated_agent_run(run: &AgentRunRecord, now: &DateTime<Utc>) -> bool {
+    timestamp_age_seconds(&run.updated_at, now)
+        .map(|age| (0..=RUNTIME_RELOAD_RECENT_RUN_GRACE_SECONDS).contains(&age))
+        .unwrap_or(false)
+}
+
+fn upsert_agent_run(items: &mut Vec<AgentRunRecord>, item: AgentRunRecord) {
+    if let Some(index) = items.iter().position(|existing| existing.run_id == item.run_id) {
+        items[index] = item;
+    } else {
+        items.insert(0, item);
+    }
+}
+
+fn upsert_conversation(items: &mut Vec<Conversation>, item: Conversation) {
+    if let Some(index) = items
+        .iter()
+        .position(|existing| existing.id == item.id)
+    {
+        if timestamp_is_after(&item.updated_at, &items[index].updated_at) {
+            items[index] = item;
+        }
+    } else {
+        items.push(item);
+    }
+}
+
+fn upsert_agent_queue_item(items: &mut Vec<AgentQueuedRequest>, item: AgentQueuedRequest) {
+    if let Some(index) = items.iter().position(|existing| existing.id == item.id) {
+        items[index] = item;
+    } else {
+        items.insert(0, item);
+    }
+}
+
+fn upsert_agent_todo(items: &mut Vec<AgentTodoItem>, item: AgentTodoItem) {
+    if let Some(index) = items.iter().position(|existing| existing.id == item.id) {
+        items[index] = item;
+    } else {
+        items.push(item);
+    }
+}
+
+fn upsert_tool_approval(items: &mut Vec<ToolApprovalRequest>, item: ToolApprovalRequest) {
+    if let Some(index) = items.iter().position(|existing| existing.id == item.id) {
+        items[index] = item;
+    } else {
+        items.insert(0, item);
+    }
+}
+
+fn upsert_tool_trace(items: &mut Vec<ToolTraceEntry>, item: ToolTraceEntry) {
+    if let Some(index) = items.iter().position(|existing| existing.id == item.id) {
+        items[index] = item;
+    } else {
+        items.push(item);
+    }
+}
+
+fn upsert_planner_trace(items: &mut Vec<PlannerTraceRecord>, item: PlannerTraceRecord) {
+    if let Some(index) = items.iter().position(|existing| existing.id == item.id) {
+        items[index] = item;
+    } else {
+        items.push(item);
+    }
+}
+
+fn upsert_tool_router_trace(items: &mut Vec<ToolRouterTraceRecord>, item: ToolRouterTraceRecord) {
+    if let Some(index) = items.iter().position(|existing| existing.id == item.id) {
+        items[index] = item;
+    } else {
+        items.push(item);
+    }
+}
+
+fn merge_messages_by_id(target: &mut Vec<ChatMessage>, source: &[ChatMessage]) {
+    let mut positions = target
+        .iter()
+        .enumerate()
+        .map(|(index, message)| (message.id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    for message in source {
+        if let Some(index) = positions.get(&message.id).copied() {
+            target[index] = message.clone();
+        } else {
+            positions.insert(message.id.clone(), target.len());
+            target.push(message.clone());
+        }
+    }
+    target.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+fn merge_runtime_state_for_reload(state: &mut PersistedState, current: &PersistedState) {
+    let mut protected_run_ids = HashSet::new();
+    let mut protected_conversation_ids = HashSet::new();
+    let mut protected_queue_item_ids = HashSet::new();
+    let now = Utc::now();
+
+    for run in &current.agent_runs {
+        let disk_run = state
+            .agent_runs
+            .iter()
+            .find(|candidate| candidate.run_id == run.run_id);
+        let disk_has_newer_terminal = disk_run
+            .map(|candidate| {
+                terminal_agent_run_state(&candidate.state)
+                    && timestamp_is_after(&candidate.updated_at, &run.updated_at)
+            })
+            .unwrap_or(false);
+        if disk_has_newer_terminal {
+            continue;
+        }
+        let should_preserve = active_agent_run_state(&run.state)
+            || disk_run
+                .map(|candidate| timestamp_is_after(&run.updated_at, &candidate.updated_at))
+                .unwrap_or_else(|| recently_updated_agent_run(run, &now));
+        if !should_preserve {
+            continue;
+        }
+        upsert_agent_run(&mut state.agent_runs, run.clone());
+        protected_run_ids.insert(run.run_id.clone());
+        protected_conversation_ids.insert(run.conversation_id.clone());
+        if let Some(queue_item_id) = &run.queue_item_id {
+            protected_queue_item_ids.insert(queue_item_id.clone());
+        }
+    }
+
+    for item in &current.agent_queue {
+        let active_queue_item = matches!(item.status.as_str(), "pending" | "running")
+            || protected_queue_item_ids.contains(&item.id);
+        if !active_queue_item {
+            continue;
+        }
+        let disk_has_newer_terminal = state
+            .agent_queue
+            .iter()
+            .find(|candidate| candidate.id == item.id)
+            .map(|candidate| {
+                !matches!(candidate.status.as_str(), "pending" | "running")
+                    && timestamp_is_after(&candidate.updated_at, &item.updated_at)
+            })
+            .unwrap_or(false);
+        if disk_has_newer_terminal {
+            continue;
+        }
+        upsert_agent_queue_item(&mut state.agent_queue, item.clone());
+        protected_queue_item_ids.insert(item.id.clone());
+        protected_conversation_ids.insert(item.conversation_id.clone());
+    }
+
+    for approval in &current.tool_approvals {
+        let active_approval = approval.status == "pending"
+            || approval
+                .run_id
+                .as_ref()
+                .map(|run_id| protected_run_ids.contains(run_id))
+                .unwrap_or(false);
+        if !active_approval {
+            continue;
+        }
+        let disk_has_newer_terminal = state
+            .tool_approvals
+            .iter()
+            .find(|candidate| candidate.id == approval.id)
+            .map(|candidate| {
+                candidate.status != "pending"
+                    && timestamp_is_after(&candidate.updated_at, &approval.updated_at)
+            })
+            .unwrap_or(false);
+        if disk_has_newer_terminal {
+            continue;
+        }
+        upsert_tool_approval(&mut state.tool_approvals, approval.clone());
+        if let Some(conversation_id) = &approval.conversation_id {
+            protected_conversation_ids.insert(conversation_id.clone());
+        }
+    }
+
+    for todo in &current.agent_todos {
+        if protected_run_ids.contains(&todo.run_id) {
+            upsert_agent_todo(&mut state.agent_todos, todo.clone());
+            protected_conversation_ids.insert(todo.conversation_id.clone());
+        }
+    }
+
+    for trace in &current.tool_traces {
+        let protected = trace
+            .event
+            .run_id
+            .as_ref()
+            .map(|run_id| protected_run_ids.contains(run_id))
+            .unwrap_or(false);
+        if protected {
+            upsert_tool_trace(&mut state.tool_traces, trace.clone());
+        }
+    }
+
+    for trace in &current.planner_traces {
+        if protected_run_ids.contains(&trace.run_id) {
+            upsert_planner_trace(&mut state.planner_traces, trace.clone());
+            protected_conversation_ids.insert(trace.conversation_id.clone());
+        }
+    }
+
+    for trace in &current.tool_router_traces {
+        if protected_conversation_ids.contains(&trace.conversation_id) {
+            upsert_tool_router_trace(&mut state.tool_router_traces, trace.clone());
+        }
+    }
+
+    for conversation_id in protected_conversation_ids {
+        if let Some(conversation) = current
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+        {
+            upsert_conversation(&mut state.conversations, conversation.clone());
+        }
+        if let Some(messages) = current.messages.get(&conversation_id) {
+            merge_messages_by_id(
+                state.messages.entry(conversation_id.clone()).or_default(),
+                messages,
+            );
+        }
+        if let Some(short_context) = current.short_context.get(&conversation_id) {
+            state
+                .short_context
+                .insert(conversation_id.clone(), short_context.clone());
+        }
+    }
+}
+
 fn conversation_accepts_wechat_delivery(state: &PersistedState, conversation_id: &str) -> bool {
     state
         .conversations
@@ -7139,11 +7450,11 @@ impl AppStore {
             }
         };
         normalize_persisted_config(&mut state);
-        normalize_interrupted_runs(&mut state);
         let mut current = self
             .state
             .lock()
             .map_err(|_| AppError::BadRequest("state lock poisoned".into()))?;
+        merge_runtime_state_for_reload(&mut state, &current);
         *current = state;
         Ok(())
     }
@@ -9905,7 +10216,7 @@ impl AppStore {
             close_terminal_tool_events(&mut run);
             s.agent_runs.retain(|r| r.run_id != run.run_id);
             s.agent_runs.insert(0, run.clone());
-            let max = s.config.chat.max_stored_agent_runs;
+            let max = s.config.chat.max_stored_agent_runs.max(50);
             let removed_run_ids = if s.agent_runs.len() > max {
                 s.agent_runs[max..]
                     .iter()

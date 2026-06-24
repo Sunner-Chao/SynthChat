@@ -1,14 +1,7 @@
-const ui = {
-    bubble: document.getElementById("bubble"),
-    bubbleContainer: document.getElementById("bubble-container"),
-    thinkingIndicator: document.getElementById("thinking-indicator"),
-    status: document.getElementById("pet-status"),
-    chatInput: document.getElementById("chat-input"),
-    sendBtn: document.getElementById("send-btn")
-};
+const canvas = document.getElementById("canvas");
 
 const app = new PIXI.Application({
-    view: document.getElementById("canvas"),
+    view: canvas,
     autoStart: true,
     resizeTo: window,
     transparent: true,
@@ -36,6 +29,8 @@ let draggingModel = false;
 let dragStartScreenX = 0;
 let dragStartScreenY = 0;
 let tapTimer = null;
+let pendingDragMove = null;
+let dragMoveFrame = null;
 
 const MODEL_HIT_PADDING = 28;
 const MODEL_DRAG_DELAY_MS = 240;
@@ -58,18 +53,6 @@ function listenHostMessages(handler) {
         window.chrome.webview.addEventListener("message", (event) => handler(event.data));
     }
     window.addEventListener("message", (event) => handler(event.data));
-}
-
-function showBubble(text) {
-    ui.bubble.innerText = text;
-    ui.bubbleContainer.classList.add("show");
-}
-
-function setStatus(text) {
-    if (!ui.status) return;
-    const nextText = typeof text === "string" ? text.trim() : "";
-    ui.status.innerText = nextText;
-    ui.status.classList.toggle("show", Boolean(nextText));
 }
 
 function clearModelDragTimer() {
@@ -135,10 +118,35 @@ function finishModelDrag() {
     const wasDragging = draggingModel;
     activePointerId = null;
     draggingModel = false;
+    clearPendingDragMove();
     clearModelDragTimer();
     if (wasDragging) {
         postMessageToHost({ type: "model_drag_end" });
     }
+}
+
+function clearPendingDragMove() {
+    pendingDragMove = null;
+    if (dragMoveFrame !== null) {
+        window.cancelAnimationFrame(dragMoveFrame);
+        dragMoveFrame = null;
+    }
+}
+
+function queueModelDragMove(screenX, screenY) {
+    pendingDragMove = { screenX, screenY };
+    if (dragMoveFrame !== null) return;
+    dragMoveFrame = window.requestAnimationFrame(() => {
+        dragMoveFrame = null;
+        const point = pendingDragMove;
+        pendingDragMove = null;
+        if (!point || !draggingModel) return;
+        postMessageToHost({
+            type: "model_drag_move",
+            screenX: point.screenX,
+            screenY: point.screenY
+        });
+    });
 }
 
 function normalizeModelUrl(url) {
@@ -173,17 +181,17 @@ function errorMessage(error) {
     return String(error);
 }
 
-async function loadModel(url = DEFAULT_MODEL_URL) {
+async function loadModel(url = DEFAULT_MODEL_URL, options = {}) {
+    const force = Boolean(options.force);
     const candidates = modelUrlCandidates(url);
     const loadingKey = candidates.join("|");
-    if (model && loadedModelUrl && candidates.includes(loadedModelUrl)) {
+    if (!force && model && loadedModelUrl && candidates.includes(loadedModelUrl)) {
         postMessageToHost({ type: "loaded", url: loadedModelUrl });
         return;
     }
-    if (loadingModelKey === loadingKey) return;
+    if (!force && loadingModelKey === loadingKey) return;
     const currentToken = ++loadToken;
     loadingModelKey = loadingKey;
-    setStatus("加载中");
     try {
         if (!PIXI?.live2d?.Live2DModel) {
             throw new Error("Live2D runtime is not ready");
@@ -228,7 +236,6 @@ async function loadModel(url = DEFAULT_MODEL_URL) {
                 model.interactive = true;
                 reportModelBounds();
 
-                setStatus("");
                 postMessageToHost({ type: "loaded", url: modelUrl });
                 return;
             } catch (error) {
@@ -242,7 +249,6 @@ async function loadModel(url = DEFAULT_MODEL_URL) {
             loadingModelKey = null;
             loadedModelUrl = null;
         }
-        setStatus("模型加载失败");
         postMessageToHost({ type: "error", message: errorMessage(error) });
         console.error(error);
     }
@@ -253,7 +259,7 @@ listenHostMessages((msg) => {
     if (msg.source !== HOST_MESSAGE_SOURCE) return;
     switch (msg.type) {
         case "load":
-            void loadModel(msg.url);
+            void loadModel(msg.url, { force: Boolean(msg.force) });
             break;
         case "expression":
             try {
@@ -269,12 +275,6 @@ listenHostMessages((msg) => {
                 console.error(error);
             }
             break;
-        case "bubble":
-            showBubble(msg.text);
-            break;
-        case "hide-bubble":
-            ui.bubbleContainer.classList.remove("show");
-            break;
         case "look":
             if (typeof msg.x === "number" && typeof msg.y === "number") {
                 if (typeof msg.clientX === "number" && typeof msg.clientY === "number") {
@@ -284,20 +284,14 @@ listenHostMessages((msg) => {
                 }
             }
             break;
-        case "status":
-            ui.thinkingIndicator.classList.toggle("show", Boolean(msg.working));
-            break;
     }
 });
-
-const canvas = document.getElementById("canvas");
 
 canvas.addEventListener("contextmenu", (event) => {
     if (!pointInModelBounds(event.clientX, event.clientY)) return;
     event.preventDefault();
     clearModelDragTimer();
     finishModelDrag();
-    postMessageToHost({ type: "model_context_menu", areas: ["model"] });
 });
 
 canvas.addEventListener("dblclick", (event) => {
@@ -314,11 +308,7 @@ canvas.addEventListener("pointermove", (event) => {
     const overModel = pointInModelBounds(event.clientX, event.clientY);
     setModelHover(overModel);
     if (draggingModel && activePointerId === event.pointerId) {
-        postMessageToHost({
-            type: "model_drag_move",
-            screenX: event.screenX,
-            screenY: event.screenY
-        });
+        queueModelDragMove(event.screenX, event.screenY);
     }
 });
 
@@ -366,18 +356,5 @@ canvas.addEventListener("pointercancel", finishModelDrag);
 canvas.addEventListener("lostpointercapture", finishModelDrag);
 window.addEventListener("blur", finishModelDrag);
 window.addEventListener("resize", layoutModel);
-
-const onSend = () => {
-    const text = ui.chatInput.value.trim();
-    if (text) {
-        postMessageToHost({ type: "input", text });
-        ui.chatInput.value = "";
-    }
-};
-
-ui.sendBtn.onclick = onSend;
-ui.chatInput.onkeydown = (event) => {
-    if (event.key === "Enter") onSend();
-};
 
 postMessageToHost({ type: "ready" });

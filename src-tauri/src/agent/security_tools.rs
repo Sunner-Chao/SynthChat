@@ -136,10 +136,10 @@ fn run_tirith_scan_if_enabled(command: &str, config: &TirithConfig) -> Value {
     }
 }
 
-fn run_tirith_scan(command: &str, config: &TirithConfig) -> AppResult<Value> {
-    let mut command = Command::new(&config.path);
-    command.hide_window();
-    let mut child = command
+fn run_tirith_scan(command_text: &str, config: &TirithConfig) -> AppResult<Value> {
+    let mut tirith_command = Command::new(&config.path);
+    tirith_command.hide_window();
+    let mut child = tirith_command
         .args([
             "check",
             "--json",
@@ -147,7 +147,7 @@ fn run_tirith_scan(command: &str, config: &TirithConfig) -> AppResult<Value> {
             "--shell",
             "posix",
             "--",
-            command,
+            command_text,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

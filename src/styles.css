@@ -10171,56 +10171,69 @@ select:focus-visible {
 
 .pet-cloud-bubble {
   position: absolute;
-  z-index: 3;
+  z-index: 7;
   box-sizing: border-box;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   align-items: center;
   overflow: visible;
-  min-height: 96px;
-  padding: 24px 80px 26px 38px;
-  border: 1px solid rgba(255, 255, 255, 0.8);
-  border-radius: 56px 64px 58px 66px / 54px 50px 62px 48px;
+  min-height: 82px;
+  padding: 22px 34px 22px 32px;
+  border: 1px solid rgba(255, 255, 255, 0.9);
+  border-radius: 40px 46px 42px 50px / 42px 38px 46px 36px;
   background:
-    radial-gradient(circle at 14% 42%, rgba(255, 255, 255, 0.98) 0 25%, rgba(255, 255, 255, 0) 26%),
-    radial-gradient(circle at 30% 20%, rgba(255, 255, 255, 0.99) 0 31%, rgba(255, 255, 255, 0) 32%),
-    radial-gradient(circle at 54% 14%, rgba(255, 255, 255, 0.98) 0 28%, rgba(255, 255, 255, 0) 29%),
-    radial-gradient(circle at 76% 30%, rgba(255, 255, 255, 0.96) 0 30%, rgba(255, 255, 255, 0) 31%),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(248, 250, 252, 0.9));
+    radial-gradient(circle at 18% 14%, rgba(255, 255, 255, 1) 0 18%, rgba(255, 255, 255, 0) 19%),
+    radial-gradient(circle at 39% 4%, rgba(255, 255, 255, 0.98) 0 26%, rgba(255, 255, 255, 0) 27%),
+    radial-gradient(circle at 67% 12%, rgba(255, 255, 255, 0.98) 0 24%, rgba(255, 255, 255, 0) 25%),
+    radial-gradient(circle at 87% 38%, rgba(255, 255, 255, 0.94) 0 20%, rgba(255, 255, 255, 0) 21%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(238, 253, 249, 0.92));
   box-shadow:
-    0 18px 42px rgba(15, 23, 42, 0.15),
+    0 18px 36px rgba(15, 23, 42, 0.14),
     0 4px 12px rgba(14, 116, 144, 0.08),
     inset 0 1px 0 rgba(255, 255, 255, 0.98);
   color: #1f2937;
-  font-size: 14px;
-  font-weight: 750;
-  line-height: 1.38;
-  animation: petCloudIn 180ms ease-out;
-  backdrop-filter: blur(12px);
+  font-size: 13px;
+  font-weight: 680;
+  line-height: 1.45;
+  animation: petCloudIn 280ms cubic-bezier(0.2, 0.9, 0.22, 1.18);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  max-width: min(400px, calc(100vw - 28px));
+  pointer-events: none;
+  transform-origin: var(--pet-cloud-tail-x) var(--pet-cloud-tail-y);
+  transition: opacity 400ms cubic-bezier(0.4, 0, 0.2, 1),
+              transform 400ms cubic-bezier(0.4, 0, 0.2, 1);
   --pet-cloud-tail-start-x: 38px;
   --pet-cloud-tail-start-y: calc(100% - 18px);
   --pet-cloud-tail-x: 12px;
   --pet-cloud-tail-y: calc(100% + 26px);
   --pet-cloud-tail-length: 56px;
   --pet-cloud-tail-angle: 118deg;
+  --pet-cloud-dot-1-x: 34px;
+  --pet-cloud-dot-1-y: calc(100% - 10px);
+  --pet-cloud-dot-2-x: 22px;
+  --pet-cloud-dot-2-y: calc(100% + 12px);
+  --pet-cloud-dot-3-x: 12px;
+  --pet-cloud-dot-3-y: calc(100% + 28px);
 }
 
-.pet-cloud-bubble span {
+.pet-cloud-text {
   position: relative;
-  z-index: 1;
+  z-index: 2;
   display: -webkit-box;
   width: 100%;
   min-width: 0;
-  max-height: 3.95em;
+  max-height: 4.3em;
   overflow: hidden;
-  padding: 0 6px;
+  padding: 0 4px;
   text-overflow: ellipsis;
   white-space: normal;
   overflow-wrap: break-word;
   word-break: break-word;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 3;
-  cursor: grab;
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.72);
+  cursor: default;
 }
 
 .pet-cloud-actions {
@@ -10232,60 +10245,326 @@ select:focus-visible {
   gap: 6px;
 }
 
-.pet-cloud-bubble::before,
-.pet-cloud-bubble::after {
+.pet-cloud-bubble::before {
   content: "";
   position: absolute;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.96);
-  box-shadow:
-    0 10px 22px rgba(30, 41, 59, 0.11),
-    inset 0 1px 0 rgba(255, 255, 255, 0.95);
+  inset: 8px 10px 10px;
+  border-radius: inherit;
+  background:
+    radial-gradient(circle at 18% 22%, rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0) 28%),
+    radial-gradient(circle at 72% 24%, rgba(255, 255, 255, 0.48), rgba(255, 255, 255, 0) 30%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0));
   pointer-events: none;
 }
 
-.pet-cloud-bubble::before {
-  left: var(--pet-cloud-tail-start-x);
-  top: var(--pet-cloud-tail-start-y);
-  width: var(--pet-cloud-tail-length);
-  height: 22px;
-  transform: translateY(-50%) rotate(var(--pet-cloud-tail-angle));
-  transform-origin: 0 50%;
-  border: 1px solid rgba(255, 255, 255, 0.72);
-  background:
-    linear-gradient(90deg, rgba(255, 255, 255, 0.95), rgba(255, 255, 255, 0.74));
+.pet-cloud-bubble::after {
+  content: "";
+  position: absolute;
+  right: 24px;
+  bottom: 13px;
+  width: 26px;
+  height: 7px;
+  border-radius: 999px;
+  background: rgba(20, 184, 166, 0.12);
   box-shadow:
-    0 10px 20px rgba(15, 23, 42, 0.08),
-    inset 0 1px 0 rgba(255, 255, 255, 0.9);
+    -34px -2px 0 rgba(20, 184, 166, 0.08),
+    -17px -2px 0 rgba(20, 184, 166, 0.1);
+  pointer-events: none;
 }
 
-.pet-cloud-bubble::after {
-  left: var(--pet-cloud-tail-x);
-  top: var(--pet-cloud-tail-y);
+.pet-cloud-tail,
+.pet-cloud-tail span {
+  position: absolute;
+  display: block;
+  pointer-events: none;
+}
+
+.pet-cloud-tail {
+  inset: 0;
+  z-index: 1;
+}
+
+.pet-cloud-tail span {
+  border: 1px solid rgba(255, 255, 255, 0.78);
+  border-radius: 999px;
+  background:
+    radial-gradient(circle at 35% 28%, rgba(255, 255, 255, 0.98), rgba(255, 255, 255, 0.7) 62%, rgba(232, 250, 246, 0.72));
+  box-shadow:
+    0 8px 18px rgba(15, 23, 42, 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95);
+  transform: translate(-50%, -50%);
+}
+
+.pet-cloud-tail span:nth-child(1) {
+  left: var(--pet-cloud-dot-1-x);
+  top: var(--pet-cloud-dot-1-y);
   width: 18px;
   height: 18px;
-  transform: translate(-50%, -50%);
-  border: 1px solid rgba(255, 255, 255, 0.76);
+}
+
+.pet-cloud-tail span:nth-child(2) {
+  left: var(--pet-cloud-dot-2-x);
+  top: var(--pet-cloud-dot-2-y);
+  width: 13px;
+  height: 13px;
+  opacity: 0.92;
+}
+
+.pet-cloud-tail span:nth-child(3) {
+  left: var(--pet-cloud-dot-3-x);
+  top: var(--pet-cloud-dot-3-y);
+  width: 8px;
+  height: 8px;
+  opacity: 0.84;
+}
+
+.pet-cloud-bubble.is-hidden {
+  opacity: 0;
+  transform: scale(0.95);
+  pointer-events: none;
 }
 
 .pet-cloud-bubble.is-happy {
   border-color: rgba(250, 204, 21, 0.36);
   background:
-    radial-gradient(circle at 14% 42%, rgba(255, 255, 255, 0.98) 0 25%, rgba(255, 255, 255, 0) 26%),
-    radial-gradient(circle at 30% 20%, rgba(255, 255, 255, 0.99) 0 31%, rgba(255, 255, 255, 0) 32%),
-    radial-gradient(circle at 54% 14%, rgba(255, 255, 255, 0.98) 0 28%, rgba(255, 255, 255, 0) 29%),
-    radial-gradient(circle at 76% 30%, rgba(255, 255, 255, 0.96) 0 30%, rgba(255, 255, 255, 0) 31%),
+    radial-gradient(circle at 18% 14%, rgba(255, 255, 255, 1) 0 18%, rgba(255, 255, 255, 0) 19%),
+    radial-gradient(circle at 39% 4%, rgba(255, 255, 255, 0.98) 0 26%, rgba(255, 255, 255, 0) 27%),
+    radial-gradient(circle at 67% 12%, rgba(255, 255, 255, 0.98) 0 24%, rgba(255, 255, 255, 0) 25%),
+    radial-gradient(circle at 87% 38%, rgba(255, 255, 255, 0.94) 0 20%, rgba(255, 255, 255, 0) 21%),
     linear-gradient(180deg, rgba(255, 251, 235, 0.98), rgba(254, 243, 199, 0.88));
 }
 
 .pet-cloud-bubble.is-active {
   border-color: rgba(45, 212, 191, 0.34);
   background:
-    radial-gradient(circle at 14% 42%, rgba(255, 255, 255, 0.98) 0 25%, rgba(255, 255, 255, 0) 26%),
-    radial-gradient(circle at 30% 20%, rgba(255, 255, 255, 0.99) 0 31%, rgba(255, 255, 255, 0) 32%),
-    radial-gradient(circle at 54% 14%, rgba(255, 255, 255, 0.98) 0 28%, rgba(255, 255, 255, 0) 29%),
-    radial-gradient(circle at 76% 30%, rgba(255, 255, 255, 0.96) 0 30%, rgba(255, 255, 255, 0) 31%),
+    radial-gradient(circle at 18% 14%, rgba(255, 255, 255, 1) 0 18%, rgba(255, 255, 255, 0) 19%),
+    radial-gradient(circle at 39% 4%, rgba(255, 255, 255, 0.98) 0 26%, rgba(255, 255, 255, 0) 27%),
+    radial-gradient(circle at 67% 12%, rgba(255, 255, 255, 0.98) 0 24%, rgba(255, 255, 255, 0) 25%),
+    radial-gradient(circle at 87% 38%, rgba(255, 255, 255, 0.94) 0 20%, rgba(255, 255, 255, 0) 21%),
     linear-gradient(180deg, rgba(240, 253, 250, 0.98), rgba(204, 251, 241, 0.88));
+}
+
+.pet-cloud-bubble.is-error {
+  border-color: rgba(248, 113, 113, 0.38);
+  background:
+    radial-gradient(circle at 18% 14%, rgba(255, 255, 255, 1) 0 18%, rgba(255, 255, 255, 0) 19%),
+    radial-gradient(circle at 39% 4%, rgba(255, 255, 255, 0.98) 0 26%, rgba(255, 255, 255, 0) 27%),
+    radial-gradient(circle at 67% 12%, rgba(255, 255, 255, 0.98) 0 24%, rgba(255, 255, 255, 0) 25%),
+    radial-gradient(circle at 87% 38%, rgba(255, 255, 255, 0.94) 0 20%, rgba(255, 255, 255, 0) 21%),
+    linear-gradient(180deg, rgba(254, 242, 242, 0.98), rgba(254, 226, 226, 0.9));
+  color: #7f1d1d;
+}
+
+.pet-input-shell {
+  position: absolute;
+  z-index: 8;
+  left: 12px;
+  right: 12px;
+  bottom: 10px;
+  display: grid;
+  gap: 8px;
+  pointer-events: auto;
+  opacity: 1;
+  overflow: visible;
+  transition: opacity 400ms cubic-bezier(0.4, 0, 0.2, 1),
+              transform 400ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.pet-input-shell.is-hidden {
+  opacity: 0;
+  transform: translateY(12px) scale(0.98);
+  pointer-events: auto;
+}
+
+.pet-input-shell.is-menu-open {
+  opacity: 1;
+  transform: none;
+}
+
+.pet-input-wrap {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  height: 52px;
+  padding: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.86);
+  border-radius: 18px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(241, 250, 248, 0.9));
+  box-shadow:
+    0 18px 34px rgba(15, 23, 42, 0.16),
+    0 2px 6px rgba(15, 23, 42, 0.04),
+    inset 0 1px 0 rgba(255, 255, 255, 0.96);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+}
+
+.pet-input-wrap:focus-within {
+  border-color: rgba(20, 184, 166, 0.48);
+  box-shadow:
+    0 18px 34px rgba(15, 23, 42, 0.16),
+    0 0 0 4px rgba(45, 212, 191, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.98);
+}
+
+.pet-input-wrap input {
+  min-width: 0;
+  width: 100%;
+  height: 38px;
+  padding: 0 12px;
+  border: 1px solid rgba(203, 213, 225, 0.42);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.72);
+  color: #0f172a;
+  font-size: 14px;
+  font-weight: 560;
+  outline: none;
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.04);
+  transition:
+    border-color 140ms ease,
+    background 140ms ease,
+    box-shadow 140ms ease;
+}
+
+.pet-input-wrap input:focus {
+  border-color: rgba(20, 184, 166, 0.36);
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow:
+    inset 0 1px 2px rgba(15, 23, 42, 0.04),
+    0 0 0 3px rgba(20, 184, 166, 0.1);
+}
+
+.pet-input-wrap input::placeholder {
+  color: #64748b;
+  font-weight: 600;
+}
+
+.pet-input-model-button,
+.pet-input-send-button,
+.pet-input-model-menu button {
+  min-width: 0;
+  border: 1px solid rgba(148, 163, 184, 0.26);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.84);
+  color: #334155;
+  box-shadow: 0 1px 1px rgba(15, 23, 42, 0.04);
+  transition:
+    border-color 140ms ease,
+    background 140ms ease,
+    transform 140ms ease;
+}
+
+.pet-input-model-button:hover,
+.pet-input-send-button:hover,
+.pet-input-model-menu button:hover {
+  border-color: rgba(13, 148, 136, 0.34);
+  background: rgba(240, 253, 250, 0.92);
+  transform: translateY(-1px);
+}
+
+.pet-input-model-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  max-width: 118px;
+  height: 38px;
+  padding: 0 11px;
+  border-color: rgba(20, 184, 166, 0.24);
+  background: rgba(240, 253, 250, 0.86);
+  color: #0f766e;
+  font-size: 12.5px;
+  font-weight: 780;
+}
+
+.pet-input-model-button[aria-expanded="true"] {
+  border-color: rgba(13, 148, 136, 0.46);
+  background: rgba(204, 251, 241, 0.92);
+  box-shadow:
+    0 6px 18px rgba(13, 148, 136, 0.14),
+    inset 0 1px 0 rgba(255, 255, 255, 0.86);
+}
+
+.pet-input-model-button span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pet-input-send-button {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border-color: rgba(15, 118, 110, 0.18);
+  background: linear-gradient(135deg, #0f766e, #06b6d4);
+  color: #fff;
+  border-radius: 13px;
+  box-shadow:
+    0 8px 18px rgba(8, 145, 178, 0.24),
+    inset 0 1px 0 rgba(255, 255, 255, 0.24);
+}
+
+.pet-input-send-button:disabled {
+  cursor: default;
+  opacity: 0.48;
+  transform: none;
+}
+
+.pet-input-model-menu {
+  position: absolute;
+  z-index: 9;
+  bottom: calc(100% + 8px);
+  left: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(86px, 1fr));
+  gap: 8px;
+  width: min(252px, calc(100vw - 24px));
+  padding: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.88);
+  border-radius: 16px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(241, 250, 248, 0.94));
+  box-shadow:
+    0 18px 36px rgba(15, 23, 42, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  animation: petMenuSlideUp 200ms cubic-bezier(0.2, 0.9, 0.22, 1.2);
+  transform-origin: bottom left;
+}
+
+@keyframes petMenuSlideUp {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.pet-input-model-menu button {
+  height: 32px;
+  padding: 0 10px;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 780;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pet-input-model-menu button.is-selected {
+  border-color: rgba(13, 148, 136, 0.38);
+  background: rgba(204, 251, 241, 0.88);
+  color: #0f766e;
 }
 
 .pet-chat-bubble {

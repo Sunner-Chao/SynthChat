@@ -1,52 +1,33 @@
-import { useEffect, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
-import { Cat, Lock, Palette, RotateCcw, Unlock, X } from "lucide-react";
+import { Palette, SendHorizontal } from "lucide-react";
 import { api } from "./lib/api";
-import type { ChatMessage, Conversation, Persona, AgentRunEvent } from "./lib/types";
+import type { AgentRunEvent, ChatMessage, Conversation, Persona } from "./lib/types";
 import {
   PET_ACTIVE_CONTEXT_EVENT,
   PET_ACTIVE_CONTEXT_STORAGE_KEY,
-  type PetActiveContext,
   parsePetActiveContext,
   readStoredPetActiveContext,
-  writeStoredPetActiveContext
+  writeStoredPetActiveContext,
+  type PetActiveContext
 } from "./lib/petContext";
 
 const HOST_MESSAGE_SOURCE = "synthchat-pet-host";
 const FRAME_MESSAGE_SOURCE = "synthchat-pet-frame";
 const PET_ACTIVE_CONTEXT_SOURCE = "pet";
-const PET_BUBBLE_MAX_CHARS = 1200;
 const PET_HISTORY_LIMIT = 40;
-const PET_PROACTIVE_IDLE_MS = 5 * 60 * 1000;
-const PET_PANEL_LAYOUT_STORAGE_KEY = "synthchat.pet.panelLayouts.v1";
+const PET_PREVIEW_CHARS = 1200;
 const PET_MESSAGE_MIRROR_INTERVAL_MS = 3200;
-const PET_CLEAR_MARKER_EMPTY = "__synthchat_pet_clear_empty__";
-
-type PetMessage =
-  | {
-      source?: string;
-      type?: string;
-      text?: string;
-      areas?: string[];
-      message?: string;
-      hovering?: boolean;
-      screenX?: number;
-      screenY?: number;
-      x?: number;
-      y?: number;
-      width?: number;
-      height?: number;
-    };
 
 const AVAILABLE_MODELS = [
-  { id: "tororo", name: "Tororo", path: "/pet/model/Tororo/tororo.model3.json", greeting: "我是 Tororo，已经在桌面待机。" },
-  { id: "hijiki", name: "Hijiki", path: "/pet/model/Hijiki/hijiki.model3.json", greeting: "我是 Hijiki，已经在桌面待机。" },
-  { id: "mao", name: "Mao", path: "/pet/model/Mao/Mao.model3.json", greeting: "我是 Mao，已经在桌面待机。" },
-  { id: "wanko", name: "Wanko", path: "/pet/model/Wanko/Wanko.model3.json", greeting: "汪汪！我是 Wanko。" },
-  { id: "hiyori", name: "Hiyori", path: "/pet/model/Hiyori/Hiyori.model3.json", greeting: "你好呀！我是 Hiyori。" },
-  { id: "natori", name: "Natori", path: "/pet/model/Natori/Natori.model3.json", greeting: "你好！我是夏鸟。" },
-  { id: "mark", name: "Mark", path: "/pet/model/Mark/Mark.model3.json", greeting: "Hi！我是 Mark。" },
+  { id: "tororo", name: "Tororo", path: "/pet/model/Tororo/tororo.model3.json", greeting: "Tororo 到啦。" },
+  { id: "hijiki", name: "Hijiki", path: "/pet/model/Hijiki/hijiki.model3.json", greeting: "Hijiki 换好了。" },
+  { id: "mao", name: "Mao", path: "/pet/model/Mao/Mao.model3.json", greeting: "Mao 在这里。" },
+  { id: "wanko", name: "Wanko", path: "/pet/model/Wanko/Wanko.model3.json", greeting: "汪，我换好啦。" },
+  { id: "hiyori", name: "Hiyori", path: "/pet/model/Hiyori/Hiyori.model3.json", greeting: "Hiyori 来了。" },
+  { id: "natori", name: "Natori", path: "/pet/model/Natori/Natori.model3.json", greeting: "夏鸟已经就位。" },
+  { id: "mark", name: "Mark", path: "/pet/model/Mark/Mark.model3.json", greeting: "Mark is ready." }
 ];
 
 type PetModel = (typeof AVAILABLE_MODELS)[number];
@@ -58,18 +39,18 @@ type PetSendContext = {
   agentId: string | null;
 };
 
-type PetBubbleEntry = {
-  id: string;
-  role: "user" | "assistant";
-  text: string;
-  createdAt: string;
+type PetMessage = {
   source?: string;
-};
-
-type PetCloudBubble = {
-  id: string;
-  text: string;
-  tone: "soft" | "happy" | "active";
+  type?: string;
+  text?: string;
+  message?: string;
+  url?: string;
+  screenX?: number;
+  screenY?: number;
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
 };
 
 type PetModelBounds = {
@@ -79,15 +60,10 @@ type PetModelBounds = {
   height: number;
 };
 
-type PetPanelId = "toolbar" | "models" | "chat" | "composer" | "cloud";
-type PetDockEdge = "left" | "right";
-
-type PetPanelLayout = {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  locked: boolean;
+type PetCloudBubble = {
+  id: string;
+  text: string;
+  tone: "soft" | "happy" | "active" | "error";
 };
 
 type PetCloudStyle = CSSProperties & {
@@ -97,189 +73,27 @@ type PetCloudStyle = CSSProperties & {
   "--pet-cloud-tail-y"?: string;
   "--pet-cloud-tail-length"?: string;
   "--pet-cloud-tail-angle"?: string;
+  "--pet-cloud-dot-1-x"?: string;
+  "--pet-cloud-dot-1-y"?: string;
+  "--pet-cloud-dot-2-x"?: string;
+  "--pet-cloud-dot-2-y"?: string;
+  "--pet-cloud-dot-3-x"?: string;
+  "--pet-cloud-dot-3-y"?: string;
 };
 
-const PET_PANEL_IDS: PetPanelId[] = ["toolbar", "models", "chat", "composer", "cloud"];
-
-const PET_MODEL_CLEARANCE = 28;
-
-const PET_PANEL_LIMITS: Record<PetPanelId, { minWidth: number; minHeight: number }> = {
-  toolbar: { minWidth: 260, minHeight: 46 },
-  models: { minWidth: 176, minHeight: 150 },
-  chat: { minWidth: 220, minHeight: 180 },
-  composer: { minWidth: 260, minHeight: 96 },
-  cloud: { minWidth: 420, minHeight: 96 }
+type PetCursorPosition = {
+  clientX?: number;
+  clientY?: number;
+  windowWidth?: number;
+  windowHeight?: number;
 };
 
-function viewportSize() {
-  return {
-    width: typeof window === "undefined" ? 960 : window.innerWidth,
-    height: typeof window === "undefined" ? 620 : window.innerHeight
-  };
-}
+type PetDragPoint = {
+  screenX: number;
+  screenY: number;
+};
 
-function clampNumber(value: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, value));
-}
-
-function defaultPetPanelLayouts(): Record<PetPanelId, PetPanelLayout> {
-  const viewport = viewportSize();
-  const safeWidth = Math.max(320, viewport.width);
-  const safeHeight = Math.max(320, viewport.height);
-  const composerWidth = Math.min(360, safeWidth - 28);
-  const chatWidth = Math.min(280, safeWidth - 28);
-  const modelLeft = Math.max(0, Math.round((safeWidth - 280) / 2));
-  const modelRight = Math.min(safeWidth, Math.round((safeWidth + 280) / 2));
-  const chatRightX = safeWidth - chatWidth - 14;
-  const chatX = chatRightX > modelRight + PET_MODEL_CLEARANCE
-    ? chatRightX
-    : 14;
-  const cloudWidth = Math.min(680, Math.max(460, Math.round(safeWidth * 0.54)));
-  return {
-    toolbar: {
-      x: 14,
-      y: 14,
-      width: Math.min(410, safeWidth - 28),
-      height: 48,
-      locked: false
-    },
-    models: {
-      x: 14,
-      y: 66,
-      width: Math.min(210, safeWidth - 28),
-      height: 250,
-      locked: false
-    },
-    chat: {
-      x: chatX,
-      y: 78,
-      width: chatWidth,
-      height: Math.min(342, safeHeight - 168),
-      locked: false
-    },
-    composer: {
-      x: Math.max(14, Math.round(modelLeft - composerWidth - PET_MODEL_CLEARANCE)),
-      y: Math.max(14, safeHeight - 118),
-      width: composerWidth,
-      height: 138,
-      locked: false
-    },
-    cloud: {
-      x: clampNumber(Math.round(safeWidth * 0.54), 14, Math.max(14, safeWidth - cloudWidth - 14)),
-      y: clampNumber(Math.round(safeHeight * 0.18), 48, Math.max(48, safeHeight - 126)),
-      width: cloudWidth,
-      height: 104,
-      locked: false
-    }
-  };
-}
-
-function clampPetPanelLayout(id: PetPanelId, layout: PetPanelLayout): PetPanelLayout {
-  const viewport = viewportSize();
-  const limits = PET_PANEL_LIMITS[id];
-  const maxWidth = Math.max(limits.minWidth, viewport.width - 28);
-  const maxHeight = Math.max(limits.minHeight, viewport.height - 28);
-  const width = clampNumber(Math.round(layout.width), limits.minWidth, maxWidth);
-  const height = clampNumber(Math.round(layout.height), limits.minHeight, maxHeight);
-  return {
-    x: clampNumber(Math.round(layout.x), 0, Math.max(0, viewport.width - width)),
-    y: clampNumber(Math.round(layout.y), 0, Math.max(0, viewport.height - height)),
-    width,
-    height,
-    locked: Boolean(layout.locked)
-  };
-}
-
-function readStoredPetPanelLayouts() {
-  const defaults = defaultPetPanelLayouts();
-  if (typeof window === "undefined") return defaults;
-  try {
-    const raw = window.localStorage.getItem(PET_PANEL_LAYOUT_STORAGE_KEY);
-    if (!raw) return defaults;
-    const parsed = JSON.parse(raw) as Partial<Record<PetPanelId, Partial<PetPanelLayout>>>;
-    const next = { ...defaults };
-    for (const id of PET_PANEL_IDS) {
-      const stored = parsed[id];
-      if (!stored) continue;
-      next[id] = clampPetPanelLayout(id, {
-        ...defaults[id],
-        ...stored,
-        x: Number.isFinite(stored.x) ? Number(stored.x) : defaults[id].x,
-        y: Number.isFinite(stored.y) ? Number(stored.y) : defaults[id].y,
-        width: Number.isFinite(stored.width) ? Number(stored.width) : defaults[id].width,
-        height: Number.isFinite(stored.height) ? Number(stored.height) : defaults[id].height,
-        locked: Boolean(stored.locked)
-      });
-    }
-    return next;
-  } catch {
-    return defaults;
-  }
-}
-
-function estimateCloudPanelSize(text: string) {
-  const viewport = viewportSize();
-  const normalized = text.trim().replace(/\s+/g, " ");
-  const textWidth = normalized.length * 9.2 + 132;
-  const preferredWidth = Math.max(
-    PET_PANEL_LIMITS.cloud.minWidth,
-    Math.min(720, Math.max(460, textWidth, Math.round(viewport.width * 0.48)))
-  );
-  const width = clampNumber(
-    Math.round(preferredWidth),
-    PET_PANEL_LIMITS.cloud.minWidth,
-    Math.max(PET_PANEL_LIMITS.cloud.minWidth, viewport.width - 28)
-  );
-  const preferredHeight = 104;
-  const height = clampNumber(
-    Math.round(preferredHeight),
-    PET_PANEL_LIMITS.cloud.minHeight,
-    Math.max(PET_PANEL_LIMITS.cloud.minHeight, Math.min(140, viewport.height - 28))
-  );
-  return { width, height };
-}
-
-function preferredCloudPanelLayout(
-  current: PetPanelLayout,
-  _refs: Record<PetPanelId, PetPanelLayout>,
-  text: string,
-  modelBounds?: PetModelBounds | null
-): PetPanelLayout {
-  const viewport = viewportSize();
-  const estimated = estimateCloudPanelSize(text);
-  const width = estimated.width;
-  const height = estimated.height;
-  const anchorX = modelBounds
-    ? modelBounds.x + modelBounds.width * 0.68
-    : viewport.width * 0.54;
-  const anchorY = modelBounds
-    ? modelBounds.y + modelBounds.height * 0.32
-    : viewport.height * 0.4;
-  const gap = modelBounds ? PET_MODEL_CLEARANCE : 28;
-  const preferredX = anchorX + gap;
-  const preferredY = anchorY - height - 18;
-  const fallbackX = modelBounds ? anchorX - width - gap : viewport.width * 0.16;
-  const targetX = preferredX + width + 14 <= viewport.width
-    ? preferredX
-    : fallbackX;
-  const targetY = preferredY >= 12 ? preferredY : anchorY + 18;
-  return clampPetPanelLayout("cloud", {
-    ...current,
-    width,
-    height,
-    x: targetX,
-    y: targetY
-  });
-}
-
-function formatPetBubble(text: string) {
-  const normalized = text.trim();
-  if (!normalized) return "主窗口已经处理完成，完整内容请在主窗口查看。";
-  if (normalized.length <= PET_BUBBLE_MAX_CHARS) return normalized;
-  return `${normalized.slice(0, PET_BUBBLE_MAX_CHARS)}...\n（回复较长，完整内容请在主窗口查看）`;
-}
-
-function formatPetCloudText(text: string) {
+function formatCloudText(text: string) {
   const normalized = text
     .split(/\r?\n/)
     .map((line) => line.trim().replace(/[ \t]+/g, " "))
@@ -287,186 +101,80 @@ function formatPetCloudText(text: string) {
     .join(" ")
     .trim();
   if (!normalized) return "";
-  if (normalized.length <= 220) return normalized;
-  return `${normalized.slice(0, 220)}...`;
+  return normalized.length > 220 ? `${normalized.slice(0, 220)}...` : normalized;
 }
 
-function chatMessageToPetBubbleEntry(message: ChatMessage): PetBubbleEntry | null {
-  if (message.role !== "user" && message.role !== "assistant") return null;
-  if (message.role === "user" && (message.source === "proactive" || message.source === "proactive-internal")) return null;
-  if (!message.content.trim()) return null;
-  return {
-    id: message.id,
-    role: message.role,
-    text: formatPetBubble(message.content),
-    createdAt: message.createdAt,
-    source: message.source
-  };
-}
-
-function textOnlyAssistantReply(messages: ChatMessage[]) {
+function latestAssistantMessage(messages: ChatMessage[]) {
   return [...messages]
     .reverse()
     .find((message) => message.role === "assistant" && message.content.trim());
 }
 
-function formatPetMessageTime(createdAt: string) {
-  const date = new Date(createdAt);
-  if (Number.isNaN(date.getTime())) return "";
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+function messageToCloudText(message: ChatMessage | null | undefined) {
+  if (!message || message.role !== "assistant") return "";
+  return formatCloudText(message.content);
 }
 
-function petEntrySourceLabel(source?: string) {
-  if (source === "wechat") return "微信";
-  if (source === "pet") return "桌宠";
-  if (source?.startsWith("desktop")) return "桌面";
-  return "";
+function touchCloudText(count: number) {
+  const variants = [
+    "我在哦。",
+    "有什么想问的，直接在下面说就好。",
+    "我会在这里看着当前对话。"
+  ];
+  return variants[Math.max(0, count - 1) % variants.length];
 }
 
 export function PetWindow() {
   const frameRef = useRef<HTMLIFrameElement>(null);
-  const [input, setInput] = useState("");
-  const [status, setStatus] = useState("启动中");
-  const [historyEntries, setHistoryEntries] = useState<PetBubbleEntry[]>([]);
-  const historyEntriesRef = useRef<PetBubbleEntry[]>([]);
-  const clearedConversationMarkersRef = useRef<Map<string, string>>(new Map());
-  const lastEntryIdRef = useRef<string | null>(null);
-  const [frameLoaded, setFrameLoaded] = useState(false);
-  const [modelLoaded, setModelLoaded] = useState(false);
-  const [dockedEdge, setDockedEdge] = useState<PetDockEdge | null>(null);
-  const dockedEdgeRef = useRef<PetDockEdge | null>(null);
-  const [activeContext, setActiveContext] = useState<PetActiveContext | null>(() => readStoredPetActiveContext());
-  const activeContextRef = useRef<PetActiveContext | null>(activeContext);
-  const [sending, setSending] = useState(false);
-  const [selectedModel, setSelectedModel] = useState(
+  const inputShellRef = useRef<HTMLElement>(null);
+  const modelMenuRef = useRef<HTMLDivElement>(null);
+  const cloudBubbleRef = useRef<HTMLElement>(null);
+  const activeContextRef = useRef<PetActiveContext | null>(readStoredPetActiveContext());
+  const frameReadyRef = useRef(false);
+  const selectedModelRef = useRef<PetModel>(
     AVAILABLE_MODELS.find((model) => model.id === "mao") ?? AVAILABLE_MODELS[0]
   );
-  const [showModelSelector, setShowModelSelector] = useState(false);
-  const [uiVisible, setUiVisible] = useState(false);
-  const [miniFocused, setMiniFocused] = useState(false);
-  const [petHovered, setPetHovered] = useState(false);
-  const [cloudBubble, setCloudBubble] = useState<PetCloudBubble | null>(null);
-  const [panelLayouts, setPanelLayouts] = useState<Record<PetPanelId, PetPanelLayout>>(() => readStoredPetPanelLayouts());
+  const pendingModelLoadRef = useRef<{ model: PetModel; force: boolean } | null>(null);
   const modelBoundsRef = useRef<PetModelBounds | null>(null);
-  const ignoreCursorEventsRef = useRef(false);
-  const suppressPanelLayoutClampRef = useRef(false);
-  const handlePetInputRef = useRef<(text: string) => void>(() => {});
-  const hideUiTimerRef = useRef<number | null>(null);
-  const cloudTimerRef = useRef<number | null>(null);
-  const chatScrollRef = useRef<HTMLDivElement>(null);
-  const panelInteractionRef = useRef<{
-    id: PetPanelId;
-    mode: "move" | "resize";
-    startX: number;
-    startY: number;
-    startLayout: PetPanelLayout;
-  } | null>(null);
-  const globalLookTimerRef = useRef<number | null>(null);
-  const lastLookMoveAtRef = useRef(Date.now());
-  const lastLookPointRef = useRef<{ x: number; y: number } | null>(null);
   const modelDragActiveRef = useRef(false);
+  const modelDragStartReadyRef = useRef(false);
+  const modelDragLatestPointRef = useRef<PetDragPoint | null>(null);
+  const modelDragMoveFrameRef = useRef<number | null>(null);
+  const modelDragMoveInFlightRef = useRef(false);
   const modelLoadedRef = useRef(false);
-  const petHoveredRef = useRef(false);
-  const mirrorInitializedRef = useRef(false);
+  const ignoreCursorEventsRef = useRef(false);
   const sendingRef = useRef(false);
-  const lastInteractionAtRef = useRef(Date.now());
+  const mirrorInitializedRef = useRef(false);
+  const cloudTimerRef = useRef<number | null>(null);
+  const lastAssistantIdRef = useRef<string | null>(null);
   const pokeCountRef = useRef(0);
   const lastPokeAtRef = useRef(0);
-  const controlsLockedRef = useRef(false);
-  const proactiveRunningRef = useRef(false);
-  const controlsVisible = uiVisible || showModelSelector || miniFocused || sending;
-  const toolbarVisible = controlsVisible || panelLayouts.toolbar.locked;
-  const modelSelectorVisible = showModelSelector || panelLayouts.models.locked;
-  const historyVisible = (controlsVisible || panelLayouts.chat.locked) && historyEntries.length > 0;
-  const composerVisible = controlsVisible || panelLayouts.composer.locked;
-  const auxiliaryPanelsVisible = toolbarVisible || modelSelectorVisible || historyVisible || composerVisible;
-  const cloudVisible = Boolean(cloudBubble) && !auxiliaryPanelsVisible;
-  const visibleCloudBubble = cloudVisible ? cloudBubble : null;
-  const isDocked = dockedEdge !== null;
-  const shouldRenderPetLayer = !isDocked && (auxiliaryPanelsVisible || cloudVisible);
-  const shouldPersistPanelLayoutsRef = useRef(shouldRenderPetLayer);
+  const initialGreetingShownRef = useRef(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const hideTimeoutRef = useRef<number | null>(null);
+  const isNearModelRef = useRef(false);
+  const modelMenuOpenRef = useRef(false);
 
-  // Keep ref in sync so the message listener always calls the latest version
-  useEffect(() => {
-    handlePetInputRef.current = handlePetInput;
-  });
+  const [input, setInput] = useState("");
+  const [activeContext, setActiveContext] = useState<PetActiveContext | null>(activeContextRef.current);
+  const [selectedModel, setSelectedModel] = useState<PetModel>(selectedModelRef.current);
+  const [modelLoaded, setModelLoaded] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [cloudBubble, setCloudBubble] = useState<PetCloudBubble | null>(null);
+  const [showInput, setShowInput] = useState(true);
 
   useEffect(() => {
+    document.body.classList.add("pet-window-body");
+    document.documentElement.classList.add("pet-window-html");
+    void petWindowAction("expand");
     return () => {
-      clearHideUiTimer();
+      document.body.classList.remove("pet-window-body");
+      document.documentElement.classList.remove("pet-window-html");
       clearCloudTimer();
-      if (globalLookTimerRef.current !== null) {
-        window.clearInterval(globalLookTimerRef.current);
-        globalLookTimerRef.current = null;
-      }
+      void syncPetPointerPassthrough(false);
       stopModelDrag();
     };
-  }, []);
-
-  useEffect(() => {
-    if (showModelSelector || miniFocused || sending) {
-      showTransientUi();
-    } else if (uiVisible) {
-      scheduleHideUi();
-    }
-  }, [showModelSelector, miniFocused, sending]);
-
-  useEffect(() => {
-    controlsLockedRef.current = showModelSelector || miniFocused || sending || petHovered;
-    sendingRef.current = sending;
-  }, [showModelSelector, miniFocused, sending, petHovered]);
-
-  useEffect(() => {
-    shouldPersistPanelLayoutsRef.current = shouldRenderPetLayer;
-  }, [shouldRenderPetLayer]);
-
-  useEffect(() => {
-    if (dockedEdgeRef.current || !shouldRenderPetLayer) return;
-    window.localStorage.setItem(PET_PANEL_LAYOUT_STORAGE_KEY, JSON.stringify(panelLayouts));
-  }, [panelLayouts, shouldRenderPetLayer]);
-
-  useEffect(() => {
-    const onPointerMove = (event: PointerEvent) => {
-      const interaction = panelInteractionRef.current;
-      if (!interaction) return;
-      event.preventDefault();
-      const dx = event.clientX - interaction.startX;
-      const dy = event.clientY - interaction.startY;
-      setPanelLayouts((current) => {
-        const base = interaction.startLayout;
-        const nextLayout = interaction.mode === "move"
-          ? { ...base, x: base.x + dx, y: base.y + dy }
-          : { ...base, width: base.width + dx, height: base.height + dy };
-        return {
-          ...current,
-          [interaction.id]: clampPetPanelLayout(interaction.id, nextLayout)
-        };
-      });
-    };
-    const onPointerUp = () => {
-      panelInteractionRef.current = null;
-    };
-    window.addEventListener("pointermove", onPointerMove);
-    window.addEventListener("pointerup", onPointerUp);
-    window.addEventListener("pointercancel", onPointerUp);
-    return () => {
-      window.removeEventListener("pointermove", onPointerMove);
-      window.removeEventListener("pointerup", onPointerUp);
-      window.removeEventListener("pointercancel", onPointerUp);
-    };
-  }, []);
-
-  useEffect(() => {
-    const onResize = () => {
-      if (dockedEdgeRef.current || suppressPanelLayoutClampRef.current || !shouldPersistPanelLayoutsRef.current) return;
-      setPanelLayouts((current) => {
-        const next = { ...current };
-        for (const id of PET_PANEL_IDS) next[id] = clampPetPanelLayout(id, current[id]);
-        return next;
-      });
-    };
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
   }, []);
 
   useEffect(() => {
@@ -474,127 +182,44 @@ export function PetWindow() {
   }, [activeContext]);
 
   useEffect(() => {
-    dockedEdgeRef.current = dockedEdge;
-  }, [dockedEdge]);
-
-  useEffect(() => {
-    historyEntriesRef.current = historyEntries;
-  }, [historyEntries]);
-
-  useEffect(() => {
-    if (!historyVisible) return;
-    window.requestAnimationFrame(() => {
-      const element = chatScrollRef.current;
-      if (!element) return;
-      element.scrollTop = element.scrollHeight;
-    });
-  }, [historyEntries, historyVisible]);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      if (isDocked || shouldRenderPetLayer || !modelLoadedRef.current) {
-        void syncPetPointerPassthrough(false);
-        return;
-      }
-      void invoke<{
-        clientX?: number;
-        clientY?: number;
-      }>("cursor_position").then((position) => {
-        const clientX = typeof position.clientX === "number" ? position.clientX : Number.NaN;
-        const clientY = typeof position.clientY === "number" ? position.clientY : Number.NaN;
-        if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return;
-        void syncPetPointerPassthrough(!pointNearModel(clientX, clientY));
-      }).catch((error) => {
-        console.error("桌宠鼠标位置读取失败:", error);
-      });
-    }, 180);
-    return () => window.clearInterval(timer);
-  }, [isDocked, shouldRenderPetLayer]);
-
-  useEffect(() => {
-    if (!cloudBubble) return;
-    setPanelLayouts((current) => {
-      if (current.cloud.locked) return current;
-      const nextCloud = preferredCloudPanelLayout(current.cloud, current, cloudBubble.text, modelBoundsRef.current);
-      if (
-        nextCloud.x === current.cloud.x
-        && nextCloud.y === current.cloud.y
-        && nextCloud.width === current.cloud.width
-        && nextCloud.height === current.cloud.height
-      ) {
-        return current;
-      }
-      return {
-        ...current,
-        cloud: nextCloud
-      };
-    });
-  }, [cloudBubble?.id, cloudBubble?.text]);
-
-  useEffect(() => {
-    const refreshMirror = async () => {
-      const conversationId = activeContextRef.current?.conversationId;
-      if (!conversationId) return;
-      const latestEntry = await loadConversationHistory(conversationId);
-      if (mirrorInitializedRef.current && latestEntry?.role === "assistant") {
-        showCloudBubble(latestEntry.text, "active", 5200);
-      }
-      mirrorInitializedRef.current = true;
-    };
-    void refreshMirror();
-    const timer = window.setInterval(refreshMirror, PET_MESSAGE_MIRROR_INTERVAL_MS);
-    return () => window.clearInterval(timer);
-  }, []);
+    selectedModelRef.current = selectedModel;
+  }, [selectedModel]);
 
   useEffect(() => {
     modelLoadedRef.current = modelLoaded;
   }, [modelLoaded]);
 
   useEffect(() => {
-    if (!activeContext?.conversationId) return;
-    void loadConversationHistory(activeContext.conversationId);
-  }, [activeContext?.conversationId]);
+    sendingRef.current = sending;
+  }, [sending]);
 
   useEffect(() => {
-    if (!modelLoaded || isDocked) {
-      if (globalLookTimerRef.current !== null) {
-        window.clearInterval(globalLookTimerRef.current);
-        globalLookTimerRef.current = null;
-      }
-      return;
-    }
-    globalLookTimerRef.current = window.setInterval(() => {
-      void updateGlobalLook();
-    }, 32);
-    return () => {
-      if (globalLookTimerRef.current !== null) {
-        window.clearInterval(globalLookTimerRef.current);
-        globalLookTimerRef.current = null;
+    modelMenuOpenRef.current = modelMenuOpen;
+  }, [modelMenuOpen]);
+
+  useEffect(() => {
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!target?.closest(".pet-input-shell")) {
+        modelMenuOpenRef.current = false;
+        setModelMenuOpen(false);
       }
     };
-  }, [modelLoaded, isDocked]);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      if (isDocked || sending || miniFocused || showModelSelector) return;
-      if (Date.now() - lastInteractionAtRef.current < PET_PROACTIVE_IDLE_MS) return;
-      void triggerProactiveFromPet();
-    }, 30000);
-    return () => window.clearInterval(timer);
-  }, [isDocked, sending, miniFocused, showModelSelector]);
+    window.addEventListener("pointerdown", onPointerDown);
+    return () => window.removeEventListener("pointerdown", onPointerDown);
+  }, []);
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     void listen<PetActiveContext>(PET_ACTIVE_CONTEXT_EVENT, (event) => {
       const context = parsePetActiveContext(event.payload);
       if (!context) return;
-      activeContextRef.current = context;
-      setActiveContext(context);
-      writeStoredPetActiveContext(context);
-      void loadConversationHistory(context.conversationId);
+      setPetContext(context);
+      void refreshLatestAssistant(context.conversationId, false);
     }).then((handler) => {
       unlisten = handler;
     });
+
     const onStorage = (event: StorageEvent) => {
       if (event.key !== PET_ACTIVE_CONTEXT_STORAGE_KEY || !event.newValue) return;
       let parsed: unknown;
@@ -605,15 +230,26 @@ export function PetWindow() {
       }
       const context = parsePetActiveContext(parsed);
       if (!context) return;
-      activeContextRef.current = context;
-      setActiveContext(context);
-      void loadConversationHistory(context.conversationId);
+      setPetContext(context, false);
+      void refreshLatestAssistant(context.conversationId, false);
     };
     window.addEventListener("storage", onStorage);
     return () => {
       if (unlisten) unlisten();
       window.removeEventListener("storage", onStorage);
     };
+  }, []);
+
+  useEffect(() => {
+    const refreshMirror = async () => {
+      const conversationId = activeContextRef.current?.conversationId;
+      if (!conversationId) return;
+      await refreshLatestAssistant(conversationId, mirrorInitializedRef.current);
+      mirrorInitializedRef.current = true;
+    };
+    void refreshMirror();
+    const timer = window.setInterval(refreshMirror, PET_MESSAGE_MIRROR_INTERVAL_MS);
+    return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -627,13 +263,7 @@ export function PetWindow() {
       if (payload.type !== "proactive_message" || !payload.message) return;
       const context = activeContextRef.current ?? readStoredPetActiveContext();
       if (context?.conversationId && payload.conversationId && context.conversationId !== payload.conversationId) return;
-      const entry = chatMessageToPetBubbleEntry(payload.message);
-      if (!entry) return;
-      upsertHistoryEntry(entry);
-      if (entry.role === "assistant") {
-        showCloudBubble(entry.text, "active", 5600);
-      }
-      lastEntryIdRef.current = entry.id;
+      showAssistantCloud(payload.message, 5600);
     }).then((handler) => {
       unlisten = handler;
     });
@@ -642,9 +272,6 @@ export function PetWindow() {
     };
   }, []);
 
-  // Keep the pet message panel as a compact mirror of the active chat
-  // conversation. We refresh from the canonical message list so desktop and
-  // WeChat turns converge even when an event only says "conversation updated".
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     void listen<{
@@ -655,13 +282,14 @@ export function PetWindow() {
       message?: ChatMessage;
     }>("synthchat-chat-event", (event) => {
       const payload = event.payload;
-      const relevantTypes = ["processing", "new_message", "assistant_message", "conversation_updated"];
-      if (!relevantTypes.includes(payload.type)) return;
-      if (!payload.conversationId) return;
+      const relevantTypes = ["new_message", "assistant_message", "conversation_updated"];
+      if (!relevantTypes.includes(payload.type) || !payload.conversationId) return;
+
       const context = activeContextRef.current ?? readStoredPetActiveContext();
       const isCurrentConversation = context?.conversationId === payload.conversationId;
       const shouldFollowIncomingWechat = payload.source === "wechat" && (!context?.conversationId || !isCurrentConversation);
       if (!isCurrentConversation && !shouldFollowIncomingWechat) return;
+
       if (shouldFollowIncomingWechat) {
         const nextContext: PetActiveContext = {
           conversationId: payload.conversationId,
@@ -672,19 +300,14 @@ export function PetWindow() {
           updatedAt: new Date().toISOString(),
           source: "wechat"
         };
-        activeContextRef.current = nextContext;
-        setActiveContext(nextContext);
-        writeStoredPetActiveContext(nextContext);
+        setPetContext(nextContext);
       }
-      void loadConversationHistory(payload.conversationId).then((latestEntry) => {
-        if (!latestEntry) return;
-        if (latestEntry.role === "assistant") {
-          showCloudBubble(latestEntry.text, "active", 5200);
-          if (modelLoadedRef.current) {
-            postToPet({ type: "expression", id: "开心" });
-          }
-        }
-      });
+
+      if (payload.message?.role === "assistant") {
+        showAssistantCloud(payload.message, 5200);
+        return;
+      }
+      void refreshLatestAssistant(payload.conversationId, true);
     }).then((handler) => {
       unlisten = handler;
     });
@@ -698,31 +321,9 @@ export function PetWindow() {
     void listen<AgentRunEvent>("synthchat-agent-run-event", (event) => {
       const payload = event.payload;
       const context = activeContextRef.current ?? readStoredPetActiveContext();
-      if (!context?.conversationId || !payload.conversationId) return;
-      if (context.conversationId !== payload.conversationId) return;
-      
-      if (payload.toolEvent) {
-        if (payload.toolEvent.status === "running") {
-          setStatus("调用中");
-          if (modelLoadedRef.current) postToPet({ type: "expression", id: "思考" });
-        } else if (payload.toolEvent.status === "canceled" || payload.toolEvent.status === "cancelled") {
-          // Hidden in the pet UI; canceled tool events often represent run cleanup noise.
-        } else if (!payload.toolEvent.ok) {
-          setStatus("失败");
-          window.setTimeout(() => setStatus("在线"), 2200);
-        } else {
-          setStatus("成功");
-          window.setTimeout(() => setStatus("在线"), 1600);
-        }
-      }
-      
-      if (payload.state) {
-        if (payload.state === "completed") {
-          setStatus("在线");
-        } else if (payload.state === "failed" || payload.state === "aborted") {
-          setStatus("错误");
-          window.setTimeout(() => setStatus("在线"), 3000);
-        }
+      if (!context?.conversationId || context.conversationId !== payload.conversationId) return;
+      if (payload.state === "failed" || payload.state === "aborted") {
+        showCloud("任务没有完成。", "error", 3200);
       }
     }).then((handler) => {
       unlisten = handler;
@@ -733,58 +334,71 @@ export function PetWindow() {
   }, []);
 
   useEffect(() => {
-    document.body.classList.add("pet-window-body");
-    document.documentElement.classList.add("pet-window-html");
+    const timer = window.setInterval(() => {
+      if (!modelLoadedRef.current) return;
+      void invoke<PetCursorPosition>("cursor_position").then((position) => {
+        const point = normalizeCursorPosition(position);
+        if (!point) return;
+        const { clientX, clientY } = point;
+        const overModel = pointNearModel(clientX, clientY);
+        const inPetUi = isPointerInPetUi(clientX, clientY);
+        const inputFocused = document.activeElement === inputRef.current;
+        const isNear = overModel || inPetUi || modelMenuOpenRef.current || inputFocused;
+
+        void syncPetPointerPassthrough(!isNear);
+
+        if (isNear) {
+          clearInputHideTimer();
+          if (!isNearModelRef.current) {
+            isNearModelRef.current = true;
+            setShowInput(true);
+          }
+        } else {
+          if (isNearModelRef.current && !modelMenuOpenRef.current) {
+            isNearModelRef.current = false;
+            if (hideTimeoutRef.current !== null) {
+              window.clearTimeout(hideTimeoutRef.current);
+            }
+            hideTimeoutRef.current = window.setTimeout(() => {
+              if (!modelMenuOpenRef.current) {
+                setShowInput(false);
+              }
+              hideTimeoutRef.current = null;
+            }, 800);
+          }
+        }
+      }).catch(() => {
+        void syncPetPointerPassthrough(false);
+      });
+    }, 150);
     return () => {
-      document.body.classList.remove("pet-window-body");
-      document.documentElement.classList.remove("pet-window-html");
+      window.clearInterval(timer);
+      if (hideTimeoutRef.current !== null) {
+        window.clearTimeout(hideTimeoutRef.current);
+      }
     };
   }, []);
 
   useEffect(() => {
-    if (isDocked) {
-      void petWindowAction("dock", dockedEdge);
-    } else {
-      void petWindowAction(shouldRenderPetLayer ? "expand" : "model");
-    }
-  }, [isDocked, dockedEdge, shouldRenderPetLayer]);
-
-  useEffect(() => {
     const onMessage = (event: MessageEvent<PetMessage>) => {
       const message = event.data;
-      if (!message || typeof message !== "object" || !("type" in message)) return;
-      if (message.source !== FRAME_MESSAGE_SOURCE) return;
+      if (!message || typeof message !== "object" || message.source !== FRAME_MESSAGE_SOURCE) return;
       if (message.type === "ready") {
-        loadModel();
+        frameReadyRef.current = true;
+        flushPendingModelLoad();
+        loadModel(selectedModelRef.current);
+        return;
       }
       if (message.type === "loaded") {
         setModelLoaded(true);
-        setStatus("在线");
-        postToPet({ type: "hide-bubble" });
-      }
-      if (message.type === "input") {
-        void handlePetInputRef.current(message.text ?? "");
-      }
-      if (message.type === "tap") {
-        markInteraction();
-        const now = Date.now();
-        pokeCountRef.current = now - lastPokeAtRef.current < 2500 ? pokeCountRef.current + 1 : 1;
-        lastPokeAtRef.current = now;
-        if (modelLoadedRef.current) {
-          postToPet({ type: "motion", group: "Tap", index: 0 });
+        setModelMenuOpen(false);
+        if (!initialGreetingShownRef.current) {
+          initialGreetingShownRef.current = true;
+          window.setTimeout(() => showCloud(selectedModel.greeting, "happy", 2400), 120);
         }
-        showTransientUi();
+        return;
       }
-      if (message.type === "poke") {
-        markInteraction();
-        hideControls();
-        showTransientUi();
-        void invoke("toggle_main_window");
-        setStatus("已切换");
-        window.setTimeout(() => setStatus("在线"), 1600);
-        scheduleHideUi(1200);
-      }
-      if (message.type === "model_hover") {
+      if (message.type === "model_hover" || message.type === "model_bounds") {
         if (
           typeof message.x === "number"
           && typeof message.y === "number"
@@ -800,195 +414,61 @@ export function PetWindow() {
         }
         return;
       }
-      if (message.type === "model_bounds") {
-        if (
-          typeof message.x === "number"
-          && typeof message.y === "number"
-          && typeof message.width === "number"
-          && typeof message.height === "number"
-        ) {
-          modelBoundsRef.current = {
-            x: message.x,
-            y: message.y,
-            width: message.width,
-            height: message.height
-          };
-        }
-      }
-
       if (message.type === "model_drag_start") {
-        setStatus("移动中");
+        showCloud("带我换个位置吗？我会跟上。", "active", 2200);
         void startModelDrag(message.screenX, message.screenY);
+        return;
       }
       if (message.type === "model_drag_move") {
         void moveModelDrag(message.screenX, message.screenY);
-      }
-      if (message.type === "drag_start") {
-        void petWindowAction("drag");
-      }
-      if (message.type === "model_context_menu") {
-        hideControls();
-        clearCloudTimer();
-        setCloudBubble(null);
-        setStatus("已隐藏");
-        dockedEdgeRef.current = "right";
-        setDockedEdge("right");
-        void petWindowAction("dock", "right");
+        return;
       }
       if (message.type === "model_drag_end") {
         stopModelDrag();
-        setStatus("在线");
+        showCloud("我先停在这里。", "soft", 2000);
+        return;
+      }
+      if (message.type === "tap") {
+        const now = Date.now();
+        pokeCountRef.current = now - lastPokeAtRef.current < 2500 ? pokeCountRef.current + 1 : 1;
+        lastPokeAtRef.current = now;
+        showCloud(touchCloudText(pokeCountRef.current), "soft", 2600);
+        inputRef.current?.focus();
+        return;
+      }
+      if (message.type === "poke") {
+        showCloud("我在旁边，需要时叫我就好。", "active", 3000);
+        inputRef.current?.focus();
+        return;
       }
       if (message.type === "error") {
-        setStatus("模型加载失败");
-        console.error(message.message);
+        showCloud(message.message ?? "模型加载失败。", "error", 3600);
       }
     };
     window.addEventListener("message", onMessage as EventListener);
     return () => window.removeEventListener("message", onMessage as EventListener);
-  }, []);
-
-  useEffect(() => {
-    if (!frameLoaded) return;
-    const timer = window.setTimeout(loadModel, 100);
-    return () => window.clearTimeout(timer);
-  }, [frameLoaded]);
+  }, [selectedModel.greeting, selectedModel.path]);
 
   function postToPet(message: unknown) {
-    frameRef.current?.contentWindow?.postMessage(
+    const target = frameRef.current?.contentWindow;
+    if (!target) return false;
+    target.postMessage(
       { source: HOST_MESSAGE_SOURCE, ...(message as Record<string, unknown>) },
       "*"
     );
+    return true;
   }
 
-  function clearPetMessages() {
-    const conversationId = activeContextRef.current?.conversationId;
-    if (conversationId) {
-      const latestKnownId = lastEntryIdRef.current || historyEntriesRef.current.at(-1)?.id || PET_CLEAR_MARKER_EMPTY;
-      clearedConversationMarkersRef.current.set(conversationId, latestKnownId);
-      if (latestKnownId === PET_CLEAR_MARKER_EMPTY) {
-        void api.listMessages(conversationId, PET_HISTORY_LIMIT, PET_BUBBLE_MAX_CHARS)
-          .then((messages) => {
-            const latestVisible = (messages as ChatMessage[])
-              .map(chatMessageToPetBubbleEntry)
-              .filter((entry): entry is PetBubbleEntry => Boolean(entry))
-              .at(-1);
-            if (latestVisible && clearedConversationMarkersRef.current.get(conversationId) === PET_CLEAR_MARKER_EMPTY) {
-              clearedConversationMarkersRef.current.set(conversationId, latestVisible.id);
-            }
-          })
-          .catch((error) => console.error("桌宠清空锚点读取失败:", error));
-      }
-      api.listAgentRuns().then(runs => {
-        const activeRun = runs.find((r: any) => r.conversationId === conversationId && (r.state === "running" || r.state === "pending"));
-        if (activeRun) {
-          api.abortAgentRun(activeRun.runId, "用户在桌宠清空消息").catch(console.error);
-        }
-      }).catch(console.error);
-    }
-    clearCloudTimer();
-    setCloudBubble(null);
-    setHistoryEntries([]);
-    historyEntriesRef.current = [];
-    lastEntryIdRef.current = null;
-    setStatus("已清空");
-    window.setTimeout(() => setStatus("在线"), 1600);
+  function flushPendingModelLoad() {
+    if (!frameReadyRef.current || !pendingModelLoadRef.current) return;
+    const pending = pendingModelLoadRef.current;
+    pendingModelLoadRef.current = null;
+    postToPet({ type: "load", url: pending.model.path, force: pending.force });
   }
 
-  async function loadConversationHistory(conversationId: string): Promise<PetBubbleEntry | null> {
-    try {
-      const messages = await api.listMessages(conversationId, PET_HISTORY_LIMIT, PET_BUBBLE_MAX_CHARS);
-      const entries = (messages as ChatMessage[])
-        .map(chatMessageToPetBubbleEntry)
-        .filter((entry): entry is PetBubbleEntry => Boolean(entry))
-        .slice(-PET_HISTORY_LIMIT);
-      const clearMarker = clearedConversationMarkersRef.current.get(conversationId);
-      const markerIndex = clearMarker && clearMarker !== PET_CLEAR_MARKER_EMPTY
-        ? entries.findIndex((entry) => entry.id === clearMarker)
-        : -1;
-      const visibleEntries = clearMarker
-        ? markerIndex >= 0
-          ? entries.slice(markerIndex + 1)
-          : []
-        : entries;
-      if (clearMarker && visibleEntries.length > 0) {
-        clearedConversationMarkersRef.current.delete(conversationId);
-      }
-      if (visibleEntries.length > 0) {
-        const nextLastId = visibleEntries.at(-1)?.id ?? "";
-        const changed = nextLastId !== (lastEntryIdRef.current ?? "");
-        if (clearMarker) {
-          mergeHistoryEntries(visibleEntries);
-        } else {
-          replaceHistoryEntries(visibleEntries);
-        }
-        lastEntryIdRef.current = nextLastId;
-        return changed ? visibleEntries.at(-1) ?? null : null;
-      }
-    } catch (error) {
-      console.error("桌宠历史加载失败:", error);
-    }
-    return null;
-  }
-
-  async function waitForAssistantBubbleReply(conversationId: string, previousLastId: string | null) {
-    // Tool-using turns can run many iterations; give them room before giving up.
-    const deadline = Date.now() + 120000;
-    while (Date.now() < deadline) {
-      try {
-        const messages = await api.listMessages(conversationId, PET_HISTORY_LIMIT, PET_BUBBLE_MAX_CHARS);
-        const assistant = [...messages]
-          .reverse()
-          .find((message) =>
-            message.role === "assistant"
-            && message.id !== previousLastId
-            && message.content.trim()
-          );
-        if (assistant) {
-          return chatMessageToPetBubbleEntry(assistant);
-        }
-      } catch (error) {
-        console.error("桌宠等待回复失败:", error);
-        return null;
-      }
-      await new Promise((resolve) => window.setTimeout(resolve, 800));
-    }
-    return null;
-  }
-
-  function markInteraction() {
-    lastInteractionAtRef.current = Date.now();
-  }
-
-  async function triggerProactiveFromPet() {
-    if (proactiveRunningRef.current) return;
-    const context = activeContextRef.current ?? readStoredPetActiveContext();
-    if (!context?.personaId || !context.conversationId) {
-      lastInteractionAtRef.current = Date.now();
-      return;
-    }
-    proactiveRunningRef.current = true;
-    lastInteractionAtRef.current = Date.now();
-    try {
-      await api.triggerProactiveOnce(context.personaId);
-      const latestEntry = await loadConversationHistory(context.conversationId);
-      if (latestEntry) {
-        if (latestEntry.role === "assistant") {
-          showCloudBubble(latestEntry.text, "active", 5600);
-        }
-      }
-    } catch (error) {
-      console.error("桌宠主动消息触发失败:", error);
-    } finally {
-      proactiveRunningRef.current = false;
-    }
-  }
-
-  function clearHideUiTimer() {
-    if (hideUiTimerRef.current !== null) {
-      window.clearTimeout(hideUiTimerRef.current);
-      hideUiTimerRef.current = null;
-    }
+  function loadModel(model = selectedModelRef.current, force = false) {
+    pendingModelLoadRef.current = { model, force };
+    flushPendingModelLoad();
   }
 
   function clearCloudTimer() {
@@ -998,30 +478,43 @@ export function PetWindow() {
     }
   }
 
-  function pointNearModel(clientX: number, clientY: number) {
-    const bounds = modelBoundsRef.current;
-    if (!bounds) return false;
-    const padding = 28;
-    return (
-      clientX >= bounds.x - padding
-      && clientX <= bounds.x + bounds.width + padding
-      && clientY >= bounds.y - padding
-      && clientY <= bounds.y + bounds.height + padding
-    );
-  }
-
-  async function syncPetPointerPassthrough(ignore: boolean) {
-    if (ignoreCursorEventsRef.current === ignore) return;
-    ignoreCursorEventsRef.current = ignore;
-    try {
-      await invoke("pet_window_set_ignore_cursor_events", { ignore });
-    } catch (error) {
-      console.error("桌宠鼠标穿透切换失败:", error);
+  function clearInputHideTimer() {
+    if (hideTimeoutRef.current !== null) {
+      window.clearTimeout(hideTimeoutRef.current);
+      hideTimeoutRef.current = null;
     }
   }
 
-  function showCloudBubble(text: string, tone: PetCloudBubble["tone"] = "soft", durationMs = 4200) {
-    const formatted = formatPetCloudText(text);
+  function revealInput() {
+    clearInputHideTimer();
+    isNearModelRef.current = true;
+    setShowInput(true);
+  }
+
+  function scheduleInputHide() {
+    if (modelMenuOpenRef.current || document.activeElement === inputRef.current) return;
+    isNearModelRef.current = false;
+    clearInputHideTimer();
+    hideTimeoutRef.current = window.setTimeout(() => {
+      if (!modelMenuOpenRef.current && document.activeElement !== inputRef.current) {
+        setShowInput(false);
+      }
+      hideTimeoutRef.current = null;
+    }, 800);
+  }
+
+  function toggleModelMenu() {
+    revealInput();
+    void syncPetPointerPassthrough(false);
+    setModelMenuOpen((open) => {
+      const next = !open;
+      modelMenuOpenRef.current = next;
+      return next;
+    });
+  }
+
+  function showCloud(text: string, tone: PetCloudBubble["tone"] = "soft", durationMs = 4200) {
+    const formatted = formatCloudText(text);
     if (!formatted) return;
     clearCloudTimer();
     setCloudBubble({
@@ -1035,313 +528,51 @@ export function PetWindow() {
     }, durationMs);
   }
 
-  function normalizeHistoryEntries(entries: PetBubbleEntry[]) {
-    const next: PetBubbleEntry[] = [];
-    for (const entry of entries) {
-      const sameIdIndex = next.findIndex((item) => item.id === entry.id);
-      if (sameIdIndex >= 0) {
-        next[sameIdIndex] = entry;
-        continue;
-      }
-      if (entry.role === "user" && !entry.id.startsWith("local-user-")) {
-        const echoIndex = next.findIndex(
-          (item) =>
-            item.role === "user"
-            && item.id.startsWith("local-user-")
-            && item.text.trim() === entry.text.trim()
-        );
-        if (echoIndex >= 0) {
-          next[echoIndex] = entry;
-          continue;
-        }
-      }
-      next.push(entry);
-    }
-    return next.slice(-PET_HISTORY_LIMIT);
-  }
-
-  function replaceHistoryEntries(entries: PetBubbleEntry[]) {
-    const next = normalizeHistoryEntries(entries);
-    historyEntriesRef.current = next;
-    setHistoryEntries(next);
-  }
-
-  function mergeHistoryEntries(entries: PetBubbleEntry[]) {
-    setHistoryEntries((items) => {
-      const next = normalizeHistoryEntries([...items, ...entries]);
-      historyEntriesRef.current = next;
-      return next;
-    });
-  }
-
-  function upsertHistoryEntry(entry: PetBubbleEntry) {
-    mergeHistoryEntries([entry]);
-  }
-
-  function panelStyle(id: PetPanelId): CSSProperties {
-    const layout = panelLayouts[id];
-    return {
-      left: `${layout.x}px`,
-      top: `${layout.y}px`,
-      width: `${layout.width}px`,
-      height: `${layout.height}px`
-    };
-  }
-
-  function cloudPanelStyle(): PetCloudStyle {
-    const layout = panelLayouts.cloud;
-    const bounds = modelBoundsRef.current;
-    const base: PetCloudStyle = panelStyle("cloud");
-    if (!bounds) return base;
-    const anchorX = bounds.x + bounds.width * 0.68;
-    const anchorY = bounds.y + bounds.height * 0.32;
-    const tailX = clampNumber(anchorX - layout.x, 18, layout.width - 18);
-    const tailY = clampNumber(anchorY - layout.y, 18, layout.height + 56);
-    const startX = tailX < layout.width * 0.5 ? 38 : layout.width - 38;
-    const startY = layout.height - 18;
-    const dx = tailX - startX;
-    const dy = tailY - startY;
-    const angle = Math.atan2(dy, dx) * 180 / Math.PI;
-    const length = clampNumber(Math.hypot(dx, dy), 28, 92);
-    return {
-      ...base,
-      "--pet-cloud-tail-start-x": `${startX}px`,
-      "--pet-cloud-tail-start-y": `${startY}px`,
-      "--pet-cloud-tail-x": `${tailX}px`,
-      "--pet-cloud-tail-y": `${tailY}px`,
-      "--pet-cloud-tail-length": `${length}px`,
-      "--pet-cloud-tail-angle": `${angle}deg`
-    };
-  }
-
-  function beginPanelInteraction(
-    event: ReactPointerEvent<HTMLElement>,
-    id: PetPanelId,
-    mode: "move" | "resize"
-  ) {
-    const layout = panelLayouts[id];
-    if (layout.locked) return;
-    event.preventDefault();
-    event.stopPropagation();
-    markInteraction();
-    showTransientUi();
-    panelInteractionRef.current = {
-      id,
-      mode,
-      startX: event.clientX,
-      startY: event.clientY,
-      startLayout: layout
-    };
-  }
-
-  function togglePanelLock(id: PetPanelId) {
-    setPanelLayouts((current) => ({
-      ...current,
-      [id]: { ...current[id], locked: !current[id].locked }
-    }));
-  }
-
-  function resetPanelLayout(id: PetPanelId) {
-    setPanelLayouts((current) => ({
-      ...current,
-      [id]: defaultPetPanelLayouts()[id]
-    }));
-  }
-
-  function resetAllPanelLayouts() {
-    setPanelLayouts(defaultPetPanelLayouts());
-  }
-
-  function renderPanelChrome(id: PetPanelId) {
-    const locked = panelLayouts[id].locked;
-    return (
-      <>
-        <button
-          className="pet-panel-icon-btn"
-          onClick={() => togglePanelLock(id)}
-          title={locked ? "取消固定" : "固定位置"}
-          type="button"
-          aria-label={locked ? "取消固定" : "固定位置"}
-        >
-          {locked ? <Lock size={13} strokeWidth={2.4} /> : <Unlock size={13} strokeWidth={2.4} />}
-        </button>
-        <button
-          className="pet-panel-icon-btn"
-          onClick={() => resetPanelLayout(id)}
-          title="重置位置"
-          type="button"
-          aria-label="重置位置"
-        >
-          <RotateCcw size={13} strokeWidth={2.4} />
-        </button>
-      </>
-    );
-  }
-
-  function renderResizeHandle(id: PetPanelId) {
-    if (panelLayouts[id].locked) return null;
-    return (
-      <span
-        className="pet-panel-resize"
-        onPointerDown={(event) => beginPanelInteraction(event, id, "resize")}
-        role="presentation"
-      />
-    );
-  }
-
-  async function updateGlobalLook() {
-    if (!modelLoadedRef.current || isDocked) return;
-    try {
-      const position = await invoke<{
-        x: number;
-        y: number;
-        screenX: number;
-        screenY: number;
-        screenWidth: number;
-        screenHeight: number;
-        clientX?: number;
-        clientY?: number;
-        windowWidth?: number;
-        windowHeight?: number;
-        windowScreenX?: number;
-        windowScreenY?: number;
-        scaleFactor?: number;
-      }>("cursor_position");
-      const currentPoint = { x: position.x, y: position.y };
-      const previousPoint = lastLookPointRef.current;
-      if (
-        !previousPoint ||
-        Math.abs(previousPoint.x - currentPoint.x) > 1 ||
-        Math.abs(previousPoint.y - currentPoint.y) > 1
-      ) {
-        lastLookMoveAtRef.current = Date.now();
-        lastLookPointRef.current = currentPoint;
-        postToPet({ type: "look", ...position, instant: false });
-        return;
-      }
-
-      if (
-        Date.now() - lastLookMoveAtRef.current > 3000 &&
-        typeof position.windowWidth === "number" &&
-        typeof position.windowHeight === "number"
-      ) {
-        postToPet({
-          type: "look",
-          x: position.windowWidth / 2,
-          y: position.windowHeight / 2,
-          clientX: position.windowWidth / 2,
-          clientY: position.windowHeight / 2,
-          instant: false
-        });
-        lastLookMoveAtRef.current = Date.now();
-      }
-    } catch {
-      // If the platform cannot provide global cursor coordinates, pet.js still tracks in-window movement.
+  function showAssistantCloud(message: ChatMessage, durationMs = 5200) {
+    const text = messageToCloudText(message);
+    if (!text) return;
+    lastAssistantIdRef.current = message.id;
+    showCloud(text, "active", durationMs);
+    if (modelLoadedRef.current) {
+      postToPet({ type: "expression", id: "开心" });
     }
   }
 
-  function showTransientUi() {
-    clearHideUiTimer();
-    setUiVisible(true);
-  }
-
-  function scheduleHideUi(delayMs = 1600) {
-    if (controlsLockedRef.current || petHoveredRef.current) return;
-    clearHideUiTimer();
-    hideUiTimerRef.current = window.setTimeout(() => {
-      if (controlsLockedRef.current || petHoveredRef.current) {
-        hideUiTimerRef.current = null;
-        return;
-      }
-      setUiVisible(false);
-      hideUiTimerRef.current = null;
-    }, delayMs);
-  }
-
-  function handlePetPointerEnter() {
-    petHoveredRef.current = true;
-    controlsLockedRef.current = true;
-    setPetHovered(true);
-    clearHideUiTimer();
-  }
-
-  function handlePetPointerLeave() {
-    petHoveredRef.current = false;
-    controlsLockedRef.current = showModelSelector || miniFocused || sending;
-    setPetHovered(false);
-    scheduleHideUi();
-  }
-
-  function hideControls() {
-    clearHideUiTimer();
-    setShowModelSelector(false);
-    setMiniFocused(false);
-    setUiVisible(false);
-  }
-
-  async function startModelDrag(screenX?: number, screenY?: number) {
-    if (typeof screenX !== "number" || typeof screenY !== "number") return;
-    if (modelDragActiveRef.current) return;
+  async function refreshLatestAssistant(conversationId: string, showChanged: boolean) {
     try {
-      await invoke("pet_window_drag", { action: "start", screenX, screenY });
-      modelDragActiveRef.current = true;
+      const messages = await api.listMessages(conversationId, PET_HISTORY_LIMIT, PET_PREVIEW_CHARS);
+      const assistant = latestAssistantMessage(messages);
+      if (!assistant) return null;
+      const changed = assistant.id !== lastAssistantIdRef.current;
+      lastAssistantIdRef.current = assistant.id;
+      if (showChanged && changed) {
+        showAssistantCloud(assistant, 5200);
+      }
+      return assistant;
     } catch (error) {
-      console.error("桌宠拖动初始化失败:", error);
+      console.error("pet message mirror failed:", error);
+      return null;
     }
   }
 
-  async function moveModelDrag(screenX?: number, screenY?: number) {
-    if (typeof screenX !== "number" || typeof screenY !== "number") return;
-    if (!modelDragActiveRef.current) return;
-    try {
-      await invoke("pet_window_drag", { action: "move", screenX, screenY });
-    } catch (error) {
-      console.error("桌宠拖动失败:", error);
-      stopModelDrag();
-    }
+  function setPetContext(context: PetActiveContext, persist = true) {
+    activeContextRef.current = context;
+    setActiveContext(context);
+    if (persist) writeStoredPetActiveContext(context);
   }
 
-  function stopModelDrag() {
-    if (!modelDragActiveRef.current) return;
-    modelDragActiveRef.current = false;
-    void invoke("pet_window_drag", { action: "end" })
-      .catch((error) => {
-        console.error("桌宠拖动结束失败:", error);
-      });
-  }
-
-  function loadModel() {
-    if (isDocked) return;
-    setStatus("加载模型中");
-    postToPet({ type: "load", url: selectedModel.path });
-  }
-
-  async function petWindowAction(action: "close" | "drag" | "dock" | "undock" | "expand" | "model", edge?: PetDockEdge | null) {
-    try {
-      await invoke("pet_window_action", { action, edge: edge ?? null });
-    } catch (error) {
-      setStatus("窗口控制失败");
-      console.error(error);
-    }
-  }
-
-  function undockPet() {
-    suppressPanelLayoutClampRef.current = true;
-    dockedEdgeRef.current = null;
-    setDockedEdge(null);
-    clearHideUiTimer();
-    markInteraction();
-    void syncPetPointerPassthrough(false);
-    void petWindowAction("undock").finally(() => {
-      window.requestAnimationFrame(() => {
-        suppressPanelLayoutClampRef.current = false;
-      });
-    });
-  }
-
-  function handleDockContextMenu(event: ReactMouseEvent<HTMLButtonElement>) {
-    event.preventDefault();
-    undockPet();
+  function updatePetActiveContext(context: PetSendContext) {
+    const nextContext: PetActiveContext = {
+      conversationId: context.conversationId,
+      conversationTitle: activeContextRef.current?.conversationTitle ?? null,
+      personaId: context.personaId,
+      personaName: context.personaName,
+      agentId: context.agentId,
+      updatedAt: new Date().toISOString(),
+      source: PET_ACTIVE_CONTEXT_SOURCE
+    };
+    setPetContext(nextContext);
+    void emit(PET_ACTIVE_CONTEXT_EVENT, nextContext);
   }
 
   async function resolvePetSendContext(): Promise<PetSendContext> {
@@ -1384,295 +615,386 @@ export function PetWindow() {
     };
   }
 
-  function updatePetActiveContext(context: PetSendContext) {
-    const nextContext: PetActiveContext = {
-      conversationId: context.conversationId,
-      conversationTitle: activeContextRef.current?.conversationTitle ?? null,
-      personaId: context.personaId,
-      personaName: context.personaName,
-      agentId: context.agentId,
-      updatedAt: new Date().toISOString()
-    };
-    activeContextRef.current = nextContext;
-    setActiveContext(nextContext);
-    writeStoredPetActiveContext(nextContext);
-    void emit(PET_ACTIVE_CONTEXT_EVENT, { ...nextContext, source: PET_ACTIVE_CONTEXT_SOURCE });
+  async function waitForAssistantReply(conversationId: string, previousAssistantId: string | null) {
+    const deadline = Date.now() + 120000;
+    while (Date.now() < deadline) {
+      try {
+        const messages = await api.listMessages(conversationId, PET_HISTORY_LIMIT, PET_PREVIEW_CHARS);
+        const assistant = latestAssistantMessage(messages);
+        if (assistant && assistant.id !== previousAssistantId) return assistant;
+      } catch (error) {
+        console.error("pet wait reply failed:", error);
+        return null;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 800));
+    }
+    return null;
   }
 
-  const handlePetInput = async (text: string) => {
-    if (!text.trim() || sendingRef.current) return;
-    markInteraction();
+  async function handleSubmit() {
+    const text = input.trim();
+    if (!text || sendingRef.current) return;
+    setInput("");
+    setModelMenuOpen(false);
     sendingRef.current = true;
     setSending(true);
-    upsertHistoryEntry({
-      id: `local-user-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-      role: "user",
-      text: formatPetBubble(text.trim()),
-      createdAt: new Date().toISOString(),
-      source: "pet"
-    });
-    showTransientUi();
-    setStatus("思考中...");
-    postToPet({ type: "hide-bubble" });
-    postToPet({ type: "status", working: true });
     if (modelLoadedRef.current) {
       postToPet({ type: "expression", id: "闭眼" });
     }
+
     try {
       const context = await resolvePetSendContext();
-      clearedConversationMarkersRef.current.delete(context.conversationId);
       updatePetActiveContext(context);
-      const previousLastId = lastEntryIdRef.current;
-      const messages = await invoke<ChatMessage[]>("send_chat_message", {
-        request: {
-          conversationId: context.conversationId,
-          personaId: context.personaId,
-          agentId: context.agentId,
-          content: text.trim(),
-          providerData: {
-            source: "pet"
-          }
+      const previousAssistantId = lastAssistantIdRef.current;
+      const messages = await api.sendChatMessage({
+        conversationId: context.conversationId,
+        personaId: context.personaId,
+        agentId: context.agentId,
+        content: text,
+        providerData: {
+          source: "pet"
         }
       });
-      const returnedEntries = (messages ?? [])
-        .map(chatMessageToPetBubbleEntry)
-        .filter((entry): entry is PetBubbleEntry => Boolean(entry))
-        .slice(-PET_HISTORY_LIMIT);
-      mergeHistoryEntries(returnedEntries);
-      const assistantMessage = textOnlyAssistantReply(messages ?? []);
-      const assistantEntry = assistantMessage
-        ? chatMessageToPetBubbleEntry(assistantMessage)
-        : await waitForAssistantBubbleReply(context.conversationId, previousLastId);
-      if (assistantEntry) {
-        lastEntryIdRef.current = assistantEntry.id;
-        upsertHistoryEntry(assistantEntry);
-        showCloudBubble(assistantEntry.text, "active", 5600);
-        if (modelLoadedRef.current) {
-          postToPet({ type: "expression", id: "开心" });
-        }
+      const assistant = latestAssistantMessage(messages) ?? await waitForAssistantReply(context.conversationId, previousAssistantId);
+      if (assistant) {
+        showAssistantCloud(assistant, 5600);
       } else {
-        setStatus("处理中");
+        showCloud("处理中...", "soft", 2600);
       }
-      setStatus("在线");
     } catch (error) {
-      console.error("桌宠消息发送或任务执行失败:", error);
-      const errStr = String(error);
-      if (errStr.includes("active agent run") || errStr.includes("仍在执行")) {
-        setStatus("忙碌");
-      } else {
-        setStatus("错误");
-      }
-      window.setTimeout(() => setStatus("在线"), 3000);
+      console.error("pet send failed:", error);
+      showCloud("发送失败。", "error", 3600);
     } finally {
       sendingRef.current = false;
       setSending(false);
-      postToPet({ type: "status", working: false });
-      scheduleHideUi(2800);
     }
-  };
+  }
 
-  const send = () => {
-    const text = input.trim();
-    if (!text || sending) return;
-    setInput("");
-    void handlePetInput(text);
-  };
-
-  const switchModel = (model: PetModel) => {
-    markInteraction();
+  function switchModel(model: PetModel) {
+    void syncPetPointerPassthrough(false);
+    if (model.id === selectedModel.id) {
+      modelMenuOpenRef.current = false;
+      setModelMenuOpen(false);
+      showCloud(`${model.name} 已经在这里。`, "soft", 1800);
+      return;
+    }
+    selectedModelRef.current = model;
     setSelectedModel(model);
     setModelLoaded(false);
-    setStatus("切换模型中");
-    setShowModelSelector(false);
-    window.setTimeout(() => {
-      setStatus("加载模型中");
-      postToPet({ type: "load", url: model.path });
-    }, 100);
-  };
+    modelMenuOpenRef.current = false;
+    setModelMenuOpen(false);
+    modelBoundsRef.current = null;
+    showCloud(model.greeting, "happy", 2600);
+    loadModel(model, true);
+  }
+
+  async function petWindowAction(action: "expand" | "model" | "drag") {
+    try {
+      await invoke("pet_window_action", { action, edge: null });
+    } catch (error) {
+      console.error("pet window action failed:", error);
+    }
+  }
+
+  async function syncPetPointerPassthrough(ignore: boolean) {
+    if (ignoreCursorEventsRef.current === ignore) return;
+    ignoreCursorEventsRef.current = ignore;
+    try {
+      await invoke("pet_window_set_ignore_cursor_events", { ignore });
+    } catch (error) {
+      ignoreCursorEventsRef.current = !ignore;
+      console.error("pet pointer passthrough failed:", error);
+    }
+  }
+
+  function pointNearModel(clientX: number, clientY: number) {
+    const bounds = modelBoundsRef.current;
+    if (!bounds) return false;
+    const padding = 48;
+    return (
+      clientX >= bounds.x - padding
+      && clientX <= bounds.x + bounds.width + padding
+      && clientY >= bounds.y - padding
+      && clientY <= bounds.y + bounds.height + padding
+    );
+  }
+
+  function normalizeCursorPosition(position: PetCursorPosition) {
+    const rawClientX = typeof position.clientX === "number" ? position.clientX : Number.NaN;
+    const rawClientY = typeof position.clientY === "number" ? position.clientY : Number.NaN;
+    if (!Number.isFinite(rawClientX) || !Number.isFinite(rawClientY)) return null;
+
+    const cssWidth = Math.max(1, window.innerWidth);
+    const cssHeight = Math.max(1, window.innerHeight);
+    const scaleX = typeof position.windowWidth === "number" && position.windowWidth > 0
+      ? position.windowWidth / cssWidth
+      : window.devicePixelRatio;
+    const scaleY = typeof position.windowHeight === "number" && position.windowHeight > 0
+      ? position.windowHeight / cssHeight
+      : window.devicePixelRatio;
+
+    return {
+      clientX: scaleX > 1.01 ? rawClientX / scaleX : rawClientX,
+      clientY: scaleY > 1.01 ? rawClientY / scaleY : rawClientY
+    };
+  }
+
+  function rectContainsPoint(element: Element | null, clientX: number, clientY: number, padding = 0) {
+    if (!element) return false;
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    return (
+      clientX >= rect.left - padding
+      && clientX <= rect.right + padding
+      && clientY >= rect.top - padding
+      && clientY <= rect.bottom + padding
+    );
+  }
+
+  function isPointerInPetUi(clientX: number, clientY: number) {
+    if (
+      rectContainsPoint(inputShellRef.current, clientX, clientY, 8)
+      || rectContainsPoint(modelMenuRef.current, clientX, clientY, 8)
+      || rectContainsPoint(cloudBubbleRef.current, clientX, clientY, 4)
+    ) {
+      return true;
+    }
+    const element = document.elementFromPoint(clientX, clientY);
+    return Boolean(element?.closest(".pet-input-shell, .pet-cloud-bubble"));
+  }
+
+  async function startModelDrag(screenX?: number, screenY?: number) {
+    if (typeof screenX !== "number" || typeof screenY !== "number") return;
+    if (modelDragActiveRef.current) return;
+    modelDragActiveRef.current = true;
+    modelDragStartReadyRef.current = false;
+    modelDragLatestPointRef.current = { screenX, screenY };
+    try {
+      await invoke("pet_window_drag", { action: "start", screenX, screenY });
+      modelDragStartReadyRef.current = true;
+      const latest = modelDragLatestPointRef.current ?? { screenX, screenY };
+      queueModelDragMove(latest.screenX, latest.screenY);
+    } catch (error) {
+      resetModelDragState();
+      console.error("pet drag start failed:", error);
+    }
+  }
+
+  function moveModelDrag(screenX?: number, screenY?: number) {
+    if (typeof screenX !== "number" || typeof screenY !== "number") return;
+    if (!modelDragActiveRef.current) return;
+    queueModelDragMove(screenX, screenY);
+  }
+
+  function queueModelDragMove(screenX: number, screenY: number) {
+    modelDragLatestPointRef.current = { screenX, screenY };
+    if (!modelDragStartReadyRef.current || modelDragMoveInFlightRef.current || modelDragMoveFrameRef.current !== null) {
+      return;
+    }
+    modelDragMoveFrameRef.current = window.requestAnimationFrame(() => {
+      modelDragMoveFrameRef.current = null;
+      void flushModelDragMove();
+    });
+  }
+
+  async function flushModelDragMove() {
+    if (!modelDragActiveRef.current || !modelDragStartReadyRef.current || modelDragMoveInFlightRef.current) return;
+    const point = modelDragLatestPointRef.current;
+    if (!point) return;
+    modelDragMoveInFlightRef.current = true;
+    try {
+      await invoke("pet_window_drag", { action: "move", screenX: point.screenX, screenY: point.screenY });
+    } catch (error) {
+      console.error("pet drag move failed:", error);
+      stopModelDrag();
+      return;
+    } finally {
+      modelDragMoveInFlightRef.current = false;
+    }
+
+    const latest = modelDragLatestPointRef.current;
+    if (
+      modelDragActiveRef.current
+      && latest
+      && (latest.screenX !== point.screenX || latest.screenY !== point.screenY)
+    ) {
+      queueModelDragMove(latest.screenX, latest.screenY);
+    }
+  }
+
+  function resetModelDragState() {
+    modelDragActiveRef.current = false;
+    modelDragStartReadyRef.current = false;
+    modelDragLatestPointRef.current = null;
+    modelDragMoveInFlightRef.current = false;
+    if (modelDragMoveFrameRef.current !== null) {
+      window.cancelAnimationFrame(modelDragMoveFrameRef.current);
+      modelDragMoveFrameRef.current = null;
+    }
+  }
+
+  function stopModelDrag() {
+    if (!modelDragActiveRef.current) return;
+    resetModelDragState();
+    void invoke("pet_window_drag", { action: "end" }).catch((error) => {
+      console.error("pet drag end failed:", error);
+    });
+  }
+
+  function cloudStyle(): PetCloudStyle {
+    const bounds = modelBoundsRef.current;
+    const width = Math.min(400, Math.max(292, window.innerWidth - 28));
+    const height = 106;
+    const fallbackLeft = Math.max(14, Math.round((window.innerWidth - width) / 2));
+    const fallbackTop = Math.max(14, Math.round(window.innerHeight * 0.12));
+    if (!bounds) {
+      return {
+        left: `${fallbackLeft}px`,
+        top: `${fallbackTop}px`,
+        width: `${width}px`
+      };
+    }
+
+    const anchorX = bounds.x + bounds.width * 0.64;
+    const anchorY = bounds.y + bounds.height * 0.28;
+    const gap = 24;
+    const preferRight = anchorX + gap + width <= window.innerWidth - 14 || anchorX < window.innerWidth * 0.48;
+    const left = preferRight
+      ? Math.min(window.innerWidth - width - 14, anchorX + gap)
+      : Math.max(14, anchorX - width - gap);
+    const top = Math.min(
+      Math.max(14, anchorY - height * 0.66),
+      Math.max(14, window.innerHeight - height - 78)
+    );
+    const tailX = Math.min(width + 52, Math.max(-52, anchorX - left));
+    const tailY = Math.min(height + 58, Math.max(-18, anchorY - top));
+    const startX = preferRight ? 30 : width - 30;
+    const startY = Math.min(height - 22, Math.max(34, tailY < height * 0.45 ? height * 0.48 : height * 0.72));
+    const dx = tailX - startX;
+    const dy = tailY - startY;
+    const dot = (ratio: number) => ({
+      x: Math.round(startX + dx * ratio),
+      y: Math.round(startY + dy * ratio)
+    });
+    const dot1 = dot(0.24);
+    const dot2 = dot(0.54);
+    const dot3 = dot(0.82);
+
+    return {
+      left: `${Math.round(left)}px`,
+      top: `${Math.round(top)}px`,
+      width: `${Math.round(width)}px`,
+      "--pet-cloud-tail-start-x": `${Math.round(startX)}px`,
+      "--pet-cloud-tail-start-y": `${Math.round(startY)}px`,
+      "--pet-cloud-tail-x": `${Math.round(tailX)}px`,
+      "--pet-cloud-tail-y": `${Math.round(tailY)}px`,
+      "--pet-cloud-tail-length": `${Math.round(Math.min(86, Math.max(30, Math.hypot(dx, dy))))}px`,
+      "--pet-cloud-tail-angle": `${Math.round(Math.atan2(dy, dx) * 180 / Math.PI)}deg`,
+      "--pet-cloud-dot-1-x": `${dot1.x}px`,
+      "--pet-cloud-dot-1-y": `${dot1.y}px`,
+      "--pet-cloud-dot-2-x": `${dot2.x}px`,
+      "--pet-cloud-dot-2-y": `${dot2.y}px`,
+      "--pet-cloud-dot-3-x": `${dot3.x}px`,
+      "--pet-cloud-dot-3-y": `${dot3.y}px`
+    };
+  }
 
   return (
-    <main
-      className={`live2d-pet-shell${isDocked ? ` is-docked is-docked-${dockedEdge}` : ""}${controlsVisible ? " is-ui-visible" : ""}${historyVisible ? " is-history-visible" : ""}`}
-      onPointerEnter={handlePetPointerEnter}
-      onPointerLeave={handlePetPointerLeave}
-    >
+    <main className="live2d-pet-shell">
       <iframe
         className="live2d-pet-frame"
-        onLoad={() => setFrameLoaded(true)}
         ref={frameRef}
         src="/pet/index.html"
         title="SynthPet Live2D"
       />
 
-      {isDocked ? (
-        <section className={`pet-edge-dock is-${dockedEdge}`}>
-          <button
-            className="pet-edge-dock-button"
-            onClick={undockPet}
-            onContextMenu={handleDockContextMenu}
-            title="右键显示桌宠"
-            type="button"
-            aria-label="展开桌宠"
-          >
-            <span className="pet-edge-dock-glow" aria-hidden="true" />
-            <Cat size={20} strokeWidth={2.45} aria-hidden="true" />
-            <span className="pet-edge-dock-label">显示</span>
-          </button>
+      {cloudBubble ? (
+        <section
+          className={`pet-cloud-bubble is-${cloudBubble.tone}`}
+          key={cloudBubble.id}
+          ref={cloudBubbleRef}
+          style={cloudStyle()}
+          aria-live="polite"
+        >
+          <span className="pet-cloud-text" title={cloudBubble.text}>{cloudBubble.text}</span>
+          <span className="pet-cloud-tail" aria-hidden="true">
+            <span />
+            <span />
+            <span />
+          </span>
         </section>
       ) : null}
 
-      {shouldRenderPetLayer ? (
-        <>
-          {toolbarVisible ? (
-            <div
-              className={`pet-toolbar pet-panel${panelLayouts.toolbar.locked ? " is-locked" : ""}`}
-              onPointerEnter={showTransientUi}
-              onPointerLeave={() => scheduleHideUi()}
-              style={panelStyle("toolbar")}
-            >
-              <span
-                className="pet-toolbar-title pet-panel-drag"
-                onPointerDown={(event) => beginPanelInteraction(event, "toolbar", "move")}
+      <section
+        className={`pet-input-shell${showInput ? "" : " is-hidden"}${modelMenuOpen ? " is-menu-open" : ""}`}
+        ref={inputShellRef}
+        aria-label="桌宠输入"
+        onFocusCapture={revealInput}
+        onMouseEnter={revealInput}
+        onMouseLeave={scheduleInputHide}
+        onPointerDown={() => {
+          revealInput();
+          void syncPetPointerPassthrough(false);
+        }}
+      >
+        <div className="pet-input-wrap">
+          <button
+            className="pet-input-model-button"
+            onClick={toggleModelMenu}
+            title="切换模型"
+            type="button"
+            aria-expanded={modelMenuOpen}
+            aria-label="切换模型"
+          >
+            <Palette size={15} strokeWidth={2.4} aria-hidden="true" />
+            <span>{selectedModel.name}</span>
+          </button>
+          <input
+            ref={inputRef}
+            autoComplete="off"
+            onChange={(event) => setInput(event.target.value)}
+            onFocus={() => {
+              revealInput();
+              void syncPetPointerPassthrough(false);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                void handleSubmit();
+              }
+            }}
+            placeholder={activeContext?.personaName ? `和 ${activeContext.personaName} 说点什么...` : "说点什么..."}
+            spellCheck={false}
+            type="text"
+            value={input}
+          />
+          <button
+            className="pet-input-send-button"
+            disabled={!input.trim() || sending}
+            onClick={() => void handleSubmit()}
+            title="发送"
+            type="button"
+            aria-label="发送"
+          >
+            <SendHorizontal size={16} strokeWidth={2.5} aria-hidden="true" />
+          </button>
+        </div>
+        {modelMenuOpen ? (
+          <div className="pet-input-model-menu" ref={modelMenuRef} role="menu">
+            {AVAILABLE_MODELS.map((model) => (
+              <button
+                className={model.id === selectedModel.id ? "is-selected" : ""}
+                key={model.id}
+                onClick={() => switchModel(model)}
+                type="button"
+                role="menuitem"
               >
-                <Cat size={14} strokeWidth={2.3} aria-hidden="true" />
-                SynthPet - {selectedModel.name}
-              </span>
-              <button className="pet-toolbar-main" onClick={hideControls} title="隐藏控件" type="button">隐藏</button>
-              <button className="pet-toolbar-main" onClick={clearPetMessages} title="清空消息" type="button">清空</button>
-              <button className="pet-toolbar-main" onClick={resetAllPanelLayouts} title="重置布局" type="button">重置</button>
-              <button onClick={() => setShowModelSelector(!showModelSelector)} title="切换形象" type="button" aria-label="切换形象">
-                <Palette size={14} strokeWidth={2.3} aria-hidden="true" />
+                {model.name}
               </button>
-              {renderPanelChrome("toolbar")}
-              <button className="pet-close-btn" onClick={() => void petWindowAction("close")} title="关闭" type="button" aria-label="关闭">
-                <X size={14} strokeWidth={2.5} aria-hidden="true" />
-              </button>
-              {renderResizeHandle("toolbar")}
-            </div>
-          ) : null}
-
-          {modelSelectorVisible ? (
-            <div
-              className={`pet-model-selector pet-panel${panelLayouts.models.locked ? " is-locked" : ""}`}
-              style={panelStyle("models")}
-            >
-              <div
-                className="pet-model-selector-title pet-panel-drag"
-                onPointerDown={(event) => beginPanelInteraction(event, "models", "move")}
-              >
-                <span>选择形象</span>
-                <div className="pet-panel-head-actions">
-                  {renderPanelChrome("models")}
-                </div>
-              </div>
-              {AVAILABLE_MODELS.map(model => (
-                <button
-                  key={model.id}
-                  className={selectedModel.id === model.id ? "is-selected" : ""}
-                  onClick={() => switchModel(model)}
-                  type="button"
-                >
-                  {model.name}
-                </button>
-              ))}
-              {renderResizeHandle("models")}
-            </div>
-          ) : null}
-
-          {historyVisible ? (
-            <section
-              className={`pet-chat-bubble pet-panel${panelLayouts.chat.locked ? " is-locked" : ""}`}
-              aria-live="polite"
-              onPointerEnter={showTransientUi}
-              onPointerLeave={() => scheduleHideUi()}
-              style={panelStyle("chat")}
-            >
-              <div
-                className="pet-chat-bubble-head pet-panel-drag"
-                onPointerDown={(event) => beginPanelInteraction(event, "chat", "move")}
-              >
-                <span>消息</span>
-                <div className="pet-panel-head-actions">
-                  <strong>{historyEntries.length} 条</strong>
-                  {renderPanelChrome("chat")}
-                </div>
-              </div>
-              <div className="pet-chat-bubble-content" ref={chatScrollRef}>
-                {historyEntries.map((entry) => (
-                  <article className={`pet-bubble-entry is-${entry.role}`} key={entry.id}>
-                    <div className="pet-bubble-meta">
-                      <span className="pet-bubble-role">{entry.role === "user" ? "我" : "对方"}</span>
-                      <span className="pet-bubble-context">
-                        {petEntrySourceLabel(entry.source) ? <em>{petEntrySourceLabel(entry.source)}</em> : null}
-                        <time>{formatPetMessageTime(entry.createdAt)}</time>
-                      </span>
-                    </div>
-                    <div className="pet-bubble-text">{entry.text}</div>
-                  </article>
-                ))}
-              </div>
-              {renderResizeHandle("chat")}
-            </section>
-          ) : null}
-
-          {visibleCloudBubble ? (
-            <section
-              className={`pet-cloud-bubble pet-panel is-${visibleCloudBubble.tone}${panelLayouts.cloud.locked ? " is-locked" : ""}`}
-              key={visibleCloudBubble.id}
-              aria-live="polite"
-              style={cloudPanelStyle()}
-            >
-              <span
-                className="pet-cloud-drag"
-                title={visibleCloudBubble.text}
-                onPointerDown={(event) => beginPanelInteraction(event, "cloud", "move")}
-              >
-                {visibleCloudBubble.text}
-              </span>
-              <div className="pet-cloud-actions">{renderPanelChrome("cloud")}</div>
-              {renderResizeHandle("cloud")}
-            </section>
-          ) : null}
-
-          {composerVisible ? (
-            <section
-              className={`pet-mini-panel pet-panel${panelLayouts.composer.locked ? " is-locked" : ""}`}
-              onPointerEnter={showTransientUi}
-              onPointerLeave={() => scheduleHideUi()}
-              style={panelStyle("composer")}
-            >
-              <div
-                className="pet-mini-status pet-panel-drag"
-                onPointerDown={(event) => beginPanelInteraction(event, "composer", "move")}
-              >
-                <div className="pet-mini-status-copy">
-                  <strong>{selectedModel.name}</strong>
-                  <span>{status}</span>
-                </div>
-                <div className="pet-mini-actions">
-                  <button onClick={clearPetMessages} type="button">清空</button>
-                  <button onClick={hideControls} type="button">隐藏</button>
-                  {renderPanelChrome("composer")}
-                </div>
-              </div>
-              <div className="pet-mini-input">
-                <input
-                  onBlur={() => setMiniFocused(false)}
-                  onChange={(event) => setInput(event.target.value)}
-                  onFocus={() => setMiniFocused(true)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") send();
-                  }}
-                  placeholder="说点什么..."
-                  value={input}
-                />
-                <button onClick={send} type="button">发送</button>
-              </div>
-              {renderResizeHandle("composer")}
-            </section>
-          ) : null}
-        </>
-      ) : null}
+            ))}
+          </div>
+        ) : null}
+      </section>
     </main>
   );
 }

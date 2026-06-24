@@ -2718,9 +2718,7 @@ pub async fn wechat_inbound_text(
     if let Some(message) = reply_message.as_ref() {
         if let Some(attached) = attach_wechat_deliverable_to_reply(
             store,
-            app,
             &conversation_id,
-            &persona.id,
             &turn_started_at,
             message,
         )? {
@@ -2762,9 +2760,7 @@ pub async fn wechat_inbound_text(
 
 fn attach_wechat_deliverable_to_reply(
     store: &AppStore,
-    app: Option<&AppHandle>,
     conversation_id: &str,
-    persona_id: &str,
     turn_started_at: &str,
     message: &ChatMessage,
 ) -> AppResult<Option<ChatMessage>> {
@@ -2776,16 +2772,12 @@ fn attach_wechat_deliverable_to_reply(
     {
         return Ok(None);
     }
-    let message = store.attach_wechat_deliverable_to_message_after(
+    store.attach_wechat_deliverable_to_message_after(
         conversation_id,
         &message.id,
         turn_started_at,
         Some("附件已补到回复。"),
-    )?;
-    if let Some(message) = message.as_ref() {
-        emit_wechat_assistant_message(app, conversation_id, persona_id, message);
-    }
-    Ok(message)
+    )
 }
 
 fn persist_wechat_assistant_message_if_missing(
