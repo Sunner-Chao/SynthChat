@@ -7,7 +7,9 @@ use std::{
 
 use serde_json::Value;
 
-use crate::{error::AppResult, models::PluginSummary, store::AppStore};
+use crate::{
+    error::AppResult, models::PluginSummary, process_utils::CommandWindowExt, store::AppStore,
+};
 
 pub fn list_plugins(store: &AppStore) -> AppResult<Vec<PluginSummary>> {
     let discovered = discover_plugins();
@@ -269,7 +271,12 @@ try:
 except Exception:
     print("[]")
 "#;
-    let output = StdCommand::new(python).arg("-c").arg(script).output().ok();
+    let output = StdCommand::new(python)
+        .hide_window()
+        .arg("-c")
+        .arg(script)
+        .output()
+        .ok();
     let Some(output) = output.filter(|output| output.status.success()) else {
         return Vec::new();
     };
@@ -332,6 +339,7 @@ fn plugin_env_value_configured(name: &str) -> bool {
 fn find_python_command() -> Option<&'static str> {
     ["python", "py", "python3"].into_iter().find(|command| {
         StdCommand::new(command)
+            .hide_window()
             .arg("--version")
             .output()
             .map(|output| output.status.success())

@@ -16,6 +16,7 @@ use tokio::{
 use crate::{
     error::{AppError, AppResult},
     models::{new_id, now_iso, AgentDefinition},
+    process_utils::CommandWindowExt,
 };
 
 use super::{
@@ -606,6 +607,7 @@ fn run_path_syntax_command(
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
     let mut child = StdCommand::new(program)
+        .hide_window()
         .args(args)
         .arg(path)
         .stdin(Stdio::null())
@@ -1374,6 +1376,7 @@ async fn run_lsp_install_recipe(
     timeout_seconds: u64,
 ) -> AppResult<Value> {
     let mut command = lsp_install_command(recipe);
+    command.hide_window();
     command
         .args(recipe.args)
         .current_dir(root)
@@ -1448,6 +1451,7 @@ async fn lsp_start_client(root: &Path, server: &LspServerInfo) -> AppResult<Valu
     }
 
     let mut command = lsp_spawn_command(&binary_path);
+    command.hide_window();
     command
         .args(server.spawn_args)
         .current_dir(root)
@@ -3236,7 +3240,9 @@ async fn run_diagnostic_command(
     command: &DiagnosticCommand,
     timeout_seconds: u64,
 ) -> Result<std::process::Output, String> {
-    let child = Command::new(&command.program)
+    let mut child_command = Command::new(&command.program);
+    child_command.hide_window();
+    let child = child_command
         .args(&command.args)
         .current_dir(root)
         .stdin(Stdio::null())

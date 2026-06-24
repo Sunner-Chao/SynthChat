@@ -144,6 +144,7 @@ pub(super) fn recover_llm_failure_for_agent_run(
             recover_image_payloads_for_retry_persisted(store, conversation_id, history, kind)?
         }
         "thinking_signature" => recover_reasoning_replay_text_for_retry(history, kind)?,
+        "thinking_replay_missing" => recover_tool_replay_history_for_retry(history, kind)?,
         "invalid_encrypted_content" => recover_invalid_encrypted_content_for_retry(
             store,
             conversation_id,
@@ -215,6 +216,50 @@ fn combine_recovery_notes(left: Option<String>, right: Option<String>) -> Option
         (None, Some(right)) => Some(format!("Persisted cleanup: {right}")),
         (None, None) => None,
     }
+}
+
+fn recover_llm_failure_for_provider_retry(
+    store: &AppStore,
+    run_id: Option<&str>,
+    history: &mut [ChatMessage],
+    error: &AppError,
+    attempted: &mut HashSet<String>,
+) -> AppResult<Option<String>> {
+    let kind = classify_llm_failure(error);
+    if !matches!(
+        kind,
+        "thinking_replay_missing" | "thinking_signature" | "tool_replay_orphan"
+    ) {
+        return Ok(None);
+    }
+    if !attempted.insert(kind.to_string()) {
+        return Ok(None);
+    }
+
+    let recovery = match kind {
+        "thinking_signature" => recover_reasoning_replay_text_for_retry(history, kind)?,
+        "thinking_replay_missing" | "tool_replay_orphan" => {
+            recover_tool_replay_history_for_retry(history, kind)?
+        }
+        _ => None,
+    };
+
+    if let (Some(run_id), Some(note)) = (run_id, recovery.as_ref()) {
+        append_parent_phase_event(
+            store,
+            run_id,
+            "llm_recovery",
+            json!({
+                "kind": kind,
+                "message": error.to_string(),
+                "note": note,
+                "recoveryHints": llm_failure_recovery_hints(kind, &error.to_string()),
+                "classifiedError": llm_classified_error_detail(kind, &error.to_string(), None, None),
+            }),
+        )?;
+    }
+
+    Ok(recovery)
 }
 
 pub(super) fn preflight_compact_context_for_agent_run(
@@ -1615,7 +1660,7 @@ pub(super) async fn complete_chat_with_provider_failover(
     }
 
     let chat_config = store.config()?.chat;
-    let (history, repaired_history) = sanitize_history_for_llm_request(history);
+    let (mut request_history, repaired_history) = sanitize_history_for_llm_request(history);
     if repaired_history {
         if let Some(run_id) = run_id {
             append_parent_phase_event(
@@ -1633,6 +1678,7 @@ pub(super) async fn complete_chat_with_provider_failover(
     let retry_backoff_ms = chat_config.llm_retry_backoff_ms.min(60_000);
     let mut failed_providers = Vec::new();
     let mut attempts = Vec::new();
+    let mut recovery_attempted = HashSet::new();
     for (index, provider) in providers.iter().enumerate() {
         let credential_binding = crate::llm::bind_runtime_credential_for_attempt(provider);
         let attempt_provider = credential_binding.provider;
@@ -1648,7 +1694,7 @@ pub(super) async fn complete_chat_with_provider_failover(
                 provider,
                 attempt_number,
                 &system_prompt,
-                &history,
+                &request_history,
                 user_content,
                 native_tools,
             );
@@ -1663,7 +1709,7 @@ pub(super) async fn complete_chat_with_provider_failover(
                     &attempt_provider,
                     &attempt_persona,
                     system_prompt.clone(),
-                    history.clone(),
+                    request_history.clone(),
                     user_content,
                     native_tools,
                     &crate::llm::LlmCallOptions {
@@ -1741,6 +1787,36 @@ pub(super) async fn complete_chat_with_provider_failover(
                     });
                     let next_max_tokens_override =
                         next_max_tokens_override(max_tokens_override, persona.max_tokens, &message);
+                    if let Some(recovery_note) = recover_llm_failure_for_provider_retry(
+                        store,
+                        run_id,
+                        &mut request_history,
+                        &error,
+                        &mut recovery_attempted,
+                    )? {
+                        attempt_index += 1;
+                        max_tokens_override = next_max_tokens_override;
+                        if let Some(run_id) = run_id {
+                            append_parent_phase_event(
+                                store,
+                                run_id,
+                                "llm_retry",
+                                json!({
+                                    "providerId": provider.id.clone(),
+                                    "providerType": provider.provider_type.clone(),
+                                    "model": provider.model.clone(),
+                                    "kind": kind,
+                                    "attempt": attempt_index,
+                                    "maxRetries": retry_count,
+                                    "delayMs": 0,
+                                    "maxTokensOverride": max_tokens_override,
+                                    "message": message,
+                                    "recovery": recovery_note,
+                                }),
+                            )?;
+                        }
+                        continue;
+                    }
                     let rotate_local_credential =
                         llm_credential_variant_should_skip_retry(provider, kind);
                     let rotate_hermes_credential = if rotate_local_credential {

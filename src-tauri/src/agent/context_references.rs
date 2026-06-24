@@ -10,6 +10,7 @@ use tokio::process::Command;
 use crate::{
     error::{AppError, AppResult},
     models::AgentDefinition,
+    process_utils::CommandWindowExt,
 };
 
 use super::{
@@ -765,6 +766,7 @@ async fn expand_context_git_reference(
     label: &str,
 ) -> Result<String, String> {
     let mut command = Command::new("git");
+    command.hide_window();
     command.args(args).current_dir(root);
     let output = tokio::time::timeout(Duration::from_secs(30), command.output())
         .await

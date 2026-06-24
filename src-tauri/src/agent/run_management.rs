@@ -10,6 +10,7 @@ use crate::{
         AgentCheckpointRecord, AgentRunPhaseRecord, AgentRunRecord, ChatMessage, ScheduledAgentJob,
         SendChatRequest,
     },
+    process_utils::CommandWindowExt,
     store::{scan_scheduled_job_assembled_prompt, AppStore},
 };
 
@@ -389,6 +390,7 @@ fn scheduled_script_command(script_path: &std::path::Path) -> Command {
     match extension.as_str() {
         "ps1" => {
             let mut command = Command::new("powershell");
+            command.hide_window();
             command
                 .arg("-NoProfile")
                 .arg("-ExecutionPolicy")
@@ -399,15 +401,21 @@ fn scheduled_script_command(script_path: &std::path::Path) -> Command {
         }
         "cmd" | "bat" => {
             let mut command = Command::new("cmd");
+            command.hide_window();
             command.arg("/C").arg("call").arg(&command_path);
             command
         }
         "py" => {
             let mut command = Command::new("python");
+            command.hide_window();
             command.arg(&command_path);
             command
         }
-        _ => Command::new(command_path),
+        _ => {
+            let mut command = Command::new(command_path);
+            command.hide_window();
+            command
+        }
     }
 }
 

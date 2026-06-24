@@ -938,7 +938,7 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
         ),
         (
             "document",
-            r#"- document: payload {"title":"report title","format":"docx|xlsx|html|md|txt|csv","content":"document body","name":"optional file base name"}. Generates a common document artifact; docx/xlsx are real Office OpenXML files. Returns path, mimeType, and mediaTag as MEDIA:<path>. To send the file to a linked WeChat mobile user, include the returned mediaTag line in the final assistant reply. The bridge hides this internal directive from visible text."#,
+            r#"- document: payload {"title":"report title","format":"docx|xlsx|pptx|html|md|txt|csv","content":"document body","name":"optional file base name"}. Generates a common document artifact; docx/xlsx/pptx are real Office OpenXML files. Returns path, mimeType, and mediaTag as MEDIA:<path>. To send the file to a linked WeChat mobile user, include the returned mediaTag line in the final assistant reply. The bridge hides this internal directive from visible text."#,
         ),
         ("list_artifacts", r#"- list_artifacts: payload {}"#),
         (

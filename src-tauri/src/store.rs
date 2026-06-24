@@ -28,6 +28,7 @@ use crate::{
         ToolApprovalRequest, ToolDefinition, ToolEvent, ToolRouterTraceRecord, ToolTraceEntry,
         VideoProvider, VisionProvider,
     },
+    process_utils::CommandWindowExt,
     threat_patterns::{first_threat_message, ThreatScope},
 };
 
@@ -2567,6 +2568,7 @@ fn host_pid_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
         let Ok(output) = std::process::Command::new("tasklist")
+            .hide_window()
             .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
             .output()
         else {
@@ -2586,6 +2588,7 @@ fn host_pid_alive(pid: u32) -> bool {
     #[cfg(not(windows))]
     {
         std::process::Command::new("kill")
+            .hide_window()
             .args(["-0", &pid.to_string()])
             .status()
             .map(|status| status.success())
@@ -2596,10 +2599,12 @@ fn host_pid_alive(pid: u32) -> bool {
 fn terminate_host_pid(pid: u32) -> AppResult<()> {
     #[cfg(windows)]
     let status = std::process::Command::new("taskkill")
+        .hide_window()
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .status();
     #[cfg(not(windows))]
     let status = std::process::Command::new("kill")
+        .hide_window()
         .args(["-TERM", &pid.to_string()])
         .status();
     match status {
@@ -2618,6 +2623,7 @@ fn command_vec_success(command: &[String]) -> bool {
         return false;
     };
     std::process::Command::new(program)
+        .hide_window()
         .args(args)
         .status()
         .map(|status| status.success())
@@ -2630,7 +2636,11 @@ fn run_command_vec(command: &[String], description: &str) -> AppResult<()> {
             "{description} command is empty"
         )));
     };
-    match std::process::Command::new(program).args(args).status() {
+    match std::process::Command::new(program)
+        .hide_window()
+        .args(args)
+        .status()
+    {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(AppError::BadRequest(format!(
             "{description} failed with exit status {status}"
@@ -2644,6 +2654,7 @@ fn run_command_vec(command: &[String], description: &str) -> AppResult<()> {
 fn command_vec_output_lines(command: &[String]) -> Option<Vec<String>> {
     let (program, args) = command.split_first()?;
     let output = std::process::Command::new(program)
+        .hide_window()
         .args(args)
         .output()
         .ok()?;
@@ -9707,11 +9718,21 @@ impl AppStore {
     }
 
     pub fn agents(&self) -> AppResult<Vec<AgentDefinition>> {
-        self.with_state(|s| Ok(s.agents.clone()))
+        self.with_state(|s| {
+            if s.agents.is_empty() {
+                s.agents.push(AgentDefinition::default());
+                self.persist(s)?;
+            }
+            Ok(s.agents.clone())
+        })
     }
 
     pub fn agent(&self, agent_id: Option<&str>) -> AppResult<AgentDefinition> {
         self.with_state(|s| {
+            if s.agents.is_empty() {
+                s.agents.push(AgentDefinition::default());
+                self.persist(s)?;
+            }
             let wanted = agent_id.unwrap_or("default");
             s.agents
                 .iter()

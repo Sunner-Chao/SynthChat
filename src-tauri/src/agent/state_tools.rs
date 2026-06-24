@@ -600,9 +600,12 @@ pub(super) fn document_tool(store: &AppStore, run_id: &str, payload: &Value) -> 
         .and_then(Value::as_str)
         .map(normalize_document_format)
         .unwrap_or_else(|| "docx".into());
-    if !matches!(format.as_str(), "docx" | "xlsx" | "html" | "md" | "txt" | "csv") {
+    if !matches!(
+        format.as_str(),
+        "docx" | "xlsx" | "pptx" | "html" | "md" | "txt" | "csv"
+    ) {
         return Err(AppError::BadRequest(format!(
-            "document format is not supported: {format}. Use docx, xlsx, html, md, txt, or csv."
+            "document format is not supported: {format}. Use docx, xlsx, pptx, html, md, txt, or csv."
         )));
     }
     let title = payload
@@ -633,6 +636,7 @@ pub(super) fn document_tool(store: &AppStore, run_id: &str, payload: &Value) -> 
     let bytes = match format.as_str() {
         "docx" => build_docx_document(title, content)?,
         "xlsx" => build_xlsx_document(title, content)?,
+        "pptx" => build_pptx_document(title, content)?,
         "html" => build_html_document(title, content).into_bytes(),
         "md" => format!("# {title}\n\n{content}\n").into_bytes(),
         "txt" => format!("{title}\n\n{content}\n").into_bytes(),
@@ -678,6 +682,7 @@ fn mime_from_path(path: &Path) -> &'static str {
         "html" | "htm" => "text/html",
         "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "mp3" => "audio/mpeg",
         "wav" => "audio/wav",
         "webm" => "video/webm",
@@ -695,6 +700,7 @@ fn normalize_document_format(value: &str) -> String {
         "text" => "txt".into(),
         "htm" => "html".into(),
         "xls" => "xlsx".into(),
+        "ppt" => "pptx".into(),
         other => other.into(),
     }
 }
@@ -805,6 +811,71 @@ fn build_xlsx_document(title: &str, content: &str) -> AppResult<Vec<u8>> {
     Ok(writer.into_inner())
 }
 
+#[derive(Debug, Clone)]
+struct PptxSlide {
+    title: String,
+    lines: Vec<String>,
+    title_slide: bool,
+}
+
+fn build_pptx_document(title: &str, content: &str) -> AppResult<Vec<u8>> {
+    let slides = pptx_slides(title, content);
+    let writer = Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(writer);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    zip_start_file(&mut zip, "[Content_Types].xml", options)?;
+    zip.write_all(pptx_content_types_xml(slides.len()).as_bytes())?;
+    zip_start_file(&mut zip, "_rels/.rels", options)?;
+    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/></Relationships>"#)?;
+    zip_start_file(&mut zip, "docProps/core.xml", options)?;
+    zip.write_all(format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{}</dc:title></cp:coreProperties>"#, xml_escape(title)).as_bytes())?;
+    zip_start_file(&mut zip, "docProps/app.xml", options)?;
+    zip.write_all(pptx_app_xml(slides.len()).as_bytes())?;
+    zip_start_file(&mut zip, "ppt/presentation.xml", options)?;
+    zip.write_all(pptx_presentation_xml(slides.len()).as_bytes())?;
+    zip_start_file(&mut zip, "ppt/_rels/presentation.xml.rels", options)?;
+    zip.write_all(pptx_presentation_rels_xml(slides.len()).as_bytes())?;
+    zip_start_file(&mut zip, "ppt/slideMasters/slideMaster1.xml", options)?;
+    zip.write_all(pptx_slide_master_xml().as_bytes())?;
+    zip_start_file(
+        &mut zip,
+        "ppt/slideMasters/_rels/slideMaster1.xml.rels",
+        options,
+    )?;
+    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="../theme/theme1.xml"/></Relationships>"#)?;
+    zip_start_file(&mut zip, "ppt/slideLayouts/slideLayout1.xml", options)?;
+    zip.write_all(pptx_slide_layout_xml().as_bytes())?;
+    zip_start_file(
+        &mut zip,
+        "ppt/slideLayouts/_rels/slideLayout1.xml.rels",
+        options,
+    )?;
+    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/></Relationships>"#)?;
+    zip_start_file(&mut zip, "ppt/theme/theme1.xml", options)?;
+    zip.write_all(pptx_theme_xml().as_bytes())?;
+    for (index, slide) in slides.iter().enumerate() {
+        let slide_number = index + 1;
+        zip_start_file(
+            &mut zip,
+            &format!("ppt/slides/slide{slide_number}.xml"),
+            options,
+        )?;
+        zip.write_all(pptx_slide_xml(slide).as_bytes())?;
+        zip_start_file(
+            &mut zip,
+            &format!("ppt/slides/_rels/slide{slide_number}.xml.rels"),
+            options,
+        )?;
+        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/></Relationships>"#)?;
+    }
+    let writer = zip
+        .finish()
+        .map_err(|error| AppError::BadRequest(format!("failed to finish pptx: {error}")))?;
+    Ok(writer.into_inner())
+}
+
 fn zip_start_file<W: Write + std::io::Seek>(
     zip: &mut zip::ZipWriter<W>,
     name: &str,
@@ -812,6 +883,175 @@ fn zip_start_file<W: Write + std::io::Seek>(
 ) -> AppResult<()> {
     zip.start_file(name, options)
         .map_err(|error| AppError::BadRequest(format!("failed to write document zip entry {name}: {error}")))
+}
+
+fn pptx_slides(title: &str, content: &str) -> Vec<PptxSlide> {
+    let mut slides = Vec::new();
+    slides.push(PptxSlide {
+        title: title.to_string(),
+        lines: Vec::new(),
+        title_slide: true,
+    });
+    for section in content.split("\n\n") {
+        let section = section.trim();
+        if section.is_empty() {
+            continue;
+        }
+        let mut lines = section
+            .lines()
+            .map(|line| {
+                line.trim()
+                    .trim_start_matches(|ch: char| matches!(ch, '-' | '*' | ' ' | '\t'))
+                    .to_string()
+            })
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            continue;
+        }
+        let section_title = lines.remove(0);
+        if lines.is_empty() {
+            lines = wrap_pptx_lines(&section_title, 68);
+        }
+        for chunk in lines.chunks(6) {
+            slides.push(PptxSlide {
+                title: section_title.clone(),
+                lines: chunk.to_vec(),
+                title_slide: false,
+            });
+        }
+    }
+    if slides.len() == 1 {
+        slides.push(PptxSlide {
+            title: title.to_string(),
+            lines: content
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .take(6)
+                .map(str::to_string)
+                .collect(),
+            title_slide: false,
+        });
+    }
+    slides.into_iter().take(40).collect()
+}
+
+fn wrap_pptx_lines(text: &str, max_chars: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.len() + word.len() + 1 > max_chars {
+            lines.push(current);
+            current = String::new();
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        vec![text.to_string()]
+    } else {
+        lines
+    }
+}
+
+fn pptx_content_types_xml(slide_count: usize) -> String {
+    let mut overrides = String::new();
+    for index in 1..=slide_count {
+        overrides.push_str(&format!(r#"<Override PartName="/ppt/slides/slide{index}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>"#));
+    }
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/><Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/><Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>{overrides}</Types>"#
+    )
+}
+
+fn pptx_app_xml(slide_count: usize) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>SynthChat</Application><PresentationFormat>On-screen Show (16:9)</PresentationFormat><Slides>{slide_count}</Slides></Properties>"#
+    )
+}
+
+fn pptx_presentation_xml(slide_count: usize) -> String {
+    let mut slide_ids = String::new();
+    for index in 1..=slide_count {
+        let id = 255 + index;
+        let rid = index + 1;
+        slide_ids.push_str(&format!(r#"<p:sldId id="{id}" r:id="rId{rid}"/>"#));
+    }
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst><p:sldIdLst>{slide_ids}</p:sldIdLst><p:sldSz cx="12192000" cy="6858000" type="screen16x9"/><p:notesSz cx="6858000" cy="9144000"/></p:presentation>"#
+    )
+}
+
+fn pptx_presentation_rels_xml(slide_count: usize) -> String {
+    let mut rels = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="slideMasters/slideMaster1.xml"/>"#);
+    for index in 1..=slide_count {
+        let rid = index + 1;
+        rels.push_str(&format!(r#"<Relationship Id="rId{rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide{index}.xml"/>"#));
+    }
+    rels.push_str("</Relationships>");
+    rels
+}
+
+fn pptx_slide_xml(slide: &PptxSlide) -> String {
+    let body = if slide.title_slide {
+        format!(
+            "{}{}",
+            pptx_text_box(2, &slide.title, &[], 760_000, 1_890_000, 10_640_000, 1_300_000, 44, true),
+            pptx_text_box(3, "Generated document deck", &[], 1_250_000, 3_420_000, 9_600_000, 650_000, 18, false)
+        )
+    } else {
+        pptx_text_box(2, &slide.title, &slide.lines, 700_000, 520_000, 10_800_000, 5_700_000, 30, true)
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:bg><p:bgPr><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:effectLst/></p:bgPr></p:bg><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>{body}</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>"#
+    )
+}
+
+fn pptx_text_box(
+    shape_id: u32,
+    title: &str,
+    lines: &[String],
+    x: i64,
+    y: i64,
+    cx: i64,
+    cy: i64,
+    title_size: i32,
+    centered: bool,
+) -> String {
+    let align = if centered { r#" algn="ctr""# } else { "" };
+    let mut paragraphs = format!(
+        r#"<a:p><a:pPr{align}/><a:r><a:rPr lang="zh-CN" sz="{}" b="1"><a:solidFill><a:srgbClr val="1F2937"/></a:solidFill></a:rPr><a:t>{}</a:t></a:r><a:endParaRPr lang="zh-CN" sz="{}"/></a:p>"#,
+        title_size * 100,
+        xml_escape(title),
+        title_size * 100
+    );
+    for line in lines {
+        paragraphs.push_str(&format!(
+            r#"<a:p><a:pPr marL="342900" indent="-171450"><a:buChar char="&#8226;"/></a:pPr><a:r><a:rPr lang="zh-CN" sz="2000"><a:solidFill><a:srgbClr val="334155"/></a:solidFill></a:rPr><a:t>{}</a:t></a:r><a:endParaRPr lang="zh-CN" sz="2000"/></a:p>"#,
+            xml_escape(line)
+        ));
+    }
+    format!(
+        r#"<p:sp><p:nvSpPr><p:cNvPr id="{shape_id}" name="Text"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/></p:spPr><p:txBody><a:bodyPr wrap="square" rtlCol="0"><a:spAutoFit/></a:bodyPr><a:lstStyle/>{paragraphs}</p:txBody></p:sp>"#
+    )
+}
+
+fn pptx_slide_master_xml() -> String {
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sldMaster xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr></p:spTree></p:cSld><p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/><p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rId1"/></p:sldLayoutIdLst><p:txStyles><p:titleStyle/><p:bodyStyle/><p:otherStyle/></p:txStyles></p:sldMaster>"#.to_string()
+}
+
+fn pptx_slide_layout_xml() -> String {
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sldLayout xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" type="blank" preserve="1"><p:cSld name="Blank"><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr></p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sldLayout>"#.to_string()
+}
+
+fn pptx_theme_xml() -> String {
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="SynthChat"><a:themeElements><a:clrScheme name="SynthChat"><a:dk1><a:srgbClr val="111827"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1><a:dk2><a:srgbClr val="334155"/></a:dk2><a:lt2><a:srgbClr val="F8FAFC"/></a:lt2><a:accent1><a:srgbClr val="2563EB"/></a:accent1><a:accent2><a:srgbClr val="10B981"/></a:accent2><a:accent3><a:srgbClr val="F59E0B"/></a:accent3><a:accent4><a:srgbClr val="EF4444"/></a:accent4><a:accent5><a:srgbClr val="8B5CF6"/></a:accent5><a:accent6><a:srgbClr val="06B6D4"/></a:accent6><a:hlink><a:srgbClr val="2563EB"/></a:hlink><a:folHlink><a:srgbClr val="7C3AED"/></a:folHlink></a:clrScheme><a:fontScheme name="SynthChat"><a:majorFont><a:latin typeface="Aptos Display"/><a:ea typeface="Microsoft YaHei"/></a:majorFont><a:minorFont><a:latin typeface="Aptos"/><a:ea typeface="Microsoft YaHei"/></a:minorFont></a:fontScheme><a:fmtScheme name="SynthChat"><a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst><a:lnStyleLst><a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></a:lnStyleLst><a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst><a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:bgFillStyleLst></a:fmtScheme></a:themeElements></a:theme>"#.to_string()
 }
 
 fn spreadsheet_rows(content: &str) -> Vec<Vec<String>> {

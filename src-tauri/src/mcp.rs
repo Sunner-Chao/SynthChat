@@ -23,6 +23,7 @@ use crate::{
         new_id, now_iso, tool_event_kind, McpCallResult, McpListToolsResult, McpServer,
         McpToolInfo, Persona, ToolDefinition, ToolEvent, ToolTraceEntry,
     },
+    process_utils::CommandWindowExt,
     store::AppStore,
 };
 
@@ -4092,6 +4093,7 @@ fn command(server: &McpServer) -> Command {
     let mut env = build_safe_mcp_stdio_env(server.env.as_ref());
     let command = resolve_mcp_stdio_command(&server.command, &mut env);
     let mut cmd = Command::new(command);
+    cmd.hide_window();
     cmd.args(&server.args);
     cmd.env_clear();
     cmd.envs(env);
@@ -4257,6 +4259,7 @@ async fn kill_mcp_child_tree(child: &mut Child) {
         if let Some(pid) = child.id() {
             let pid_arg = pid.to_string();
             let _ = Command::new("taskkill")
+                .hide_window()
                 .args(["/PID", pid_arg.as_str(), "/T", "/F"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

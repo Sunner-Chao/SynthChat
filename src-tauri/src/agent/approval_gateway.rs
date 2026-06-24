@@ -543,13 +543,15 @@ async fn continue_agent_run_after_approval(
                                     &run.run_id,
                                     event.clone(),
                                 )?;
-                                let tool_message = store.append_message(ChatMessage::new(
+                                let mut tool_message = ChatMessage::new(
                                     run.conversation_id.clone(),
                                     "tool",
                                     json!({"type": "toolEvent", "event": event.clone()})
                                         .to_string(),
                                     "desktop-agent-tool",
-                                ))?;
+                                );
+                                tool_message.provider_data = reply.provider_data.clone();
+                                let tool_message = store.append_message(tool_message)?;
                                 history.push(tool_message);
                                 run = store.agent_run(&run.run_id)?;
                                 if pause_run_for_clarify_tool(
@@ -782,12 +784,14 @@ async fn continue_agent_run_after_approval(
                                     &run.run_id,
                                     event.clone(),
                                 )?;
-                                let tool_message = store.append_message(ChatMessage::new(
+                                let mut tool_message = ChatMessage::new(
                                     run.conversation_id.clone(),
                                     "tool",
                                     json!({"type": "toolEvent", "event": event}).to_string(),
                                     "desktop-agent-tool",
-                                ))?;
+                                );
+                                tool_message.provider_data = reply.provider_data.clone();
+                                let tool_message = store.append_message(tool_message)?;
                                 history.push(tool_message);
                                 run = store.agent_run(&run.run_id)?;
                             }

@@ -18,6 +18,7 @@ use crate::{
     models::{
         new_id, now_iso, AgentDefinition, AgentRunRecord, ChatMessage, PluginAuxiliaryTaskSummary,
     },
+    process_utils::CommandWindowExt,
     store::AppStore,
 };
 
@@ -3619,6 +3620,7 @@ fn run_python_plugin_hook_runner_blocking(request: &Value) -> AppResult<Value> {
         .or_else(|_| env::var("SYNTHCHAT_PYTHON"))
         .unwrap_or_else(|_| "python".into());
     let mut child = StdCommand::new(python)
+        .hide_window()
         .arg("-c")
         .arg(PYTHON_PLUGIN_HOOK_RUNNER)
         .stdin(Stdio::piped())
@@ -3666,6 +3668,7 @@ async fn run_python_plugin_hook_runner(request: &Value) -> AppResult<Value> {
         .or_else(|_| env::var("SYNTHCHAT_PYTHON"))
         .unwrap_or_else(|_| "python".into());
     let mut child = Command::new(python)
+        .hide_window()
         .arg("-c")
         .arg(PYTHON_PLUGIN_HOOK_RUNNER)
         .stdin(Stdio::piped())
@@ -3932,6 +3935,7 @@ async fn run_shell_hook(
     ))?;
 
     let mut child = Command::new(program);
+    child.hide_window();
     child
         .args(args)
         .stdin(std::process::Stdio::piped())
@@ -3993,7 +3997,9 @@ fn run_shell_hook_diagnostic(
         Err(error) => return ShellHookDiagnosticRun::error(error.to_string()),
     };
 
-    let mut child = match std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command.hide_window();
+    let mut child = match command
         .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

@@ -9,6 +9,7 @@ use crate::{
     models::{
         AgentDefinition, MemoryEntry, Persona, ShortContextState, SkillPromptBlock, ToolDefinition,
     },
+    process_utils::CommandWindowExt,
     store::AppStore,
 };
 
@@ -183,7 +184,7 @@ Before write_file, patch, delete_file, or move_file, inspect the target file unl
 Use terminal/process/execute_code only when command execution is necessary and the agent is configured to allow shell access.
 Use workspace_diagnostics after code changes or when build/type/test failures are relevant; it runs bounded read-only diagnostics.
 Direct file tools may access absolute local paths when permitted, as well as paths relative to the configured agent workspace. Do not claim that you can only access workspace files. If a file tool rejects a path, explain the concrete tool error and choose an appropriate available alternative only when needed.
-When you create or identify a file the user should open/download, use document for common documents (docx/xlsx/html/md/txt/csv) or artifact with action=publish_file for an existing workspace file, then mention the artifact path in the final answer. If the user asks to send a document to the linked WeChat mobile side, include the tool's returned mediaTag (MEDIA:<path>) as its own line in the final answer so the WeChat bridge silently uploads it as a file and hides the directive from visible text.
+When you create or identify a file the user should open/download, use document for common documents (docx/xlsx/pptx/html/md/txt/csv) or artifact with action=publish_file for an existing workspace file, then mention the artifact path in the final answer. If the user asks to send a document to the linked WeChat mobile side, include the tool's returned mediaTag (MEDIA:<path>) as its own line in the final answer so the WeChat bridge silently uploads it as a file and hides the directive from visible text.
 Use web_extract when the user gives specific HTTP(S) URLs or after web_search when page content, documentation, article text, or source evidence is needed.
 For web page tasks, prefer browser_snapshot/browser_navigate first for static pages and browser_cdp action=snapshot for dynamic pages; inspect forms, inputs, links, refs, and request clues before choosing click/type/fetch-style actions.
 When enough context is available, return {{"action":"final","content":"your answer"}}.
@@ -330,6 +331,7 @@ fn build_environment_probe_line() -> String {
 fn command_exists(command: &str) -> bool {
     if cfg!(windows) {
         StdCommand::new("where")
+            .hide_window()
             .arg(command)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -338,6 +340,7 @@ fn command_exists(command: &str) -> bool {
             .unwrap_or(false)
     } else {
         StdCommand::new("sh")
+            .hide_window()
             .arg("-c")
             .arg(format!("command -v {}", shell_escape_single(command)))
             .stdout(Stdio::null())
@@ -367,6 +370,7 @@ fn has_pip_module(binary: &str) -> bool {
         return false;
     }
     StdCommand::new(binary)
+        .hide_window()
         .args(["-m", "pip", "--version"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -404,6 +408,7 @@ fn pip_python_version() -> Option<String> {
 
 fn run_probe_command(command: &str, args: &[&str]) -> AppResult<String> {
     let output = StdCommand::new(command)
+        .hide_window()
         .args(args)
         .output()
         .map_err(|error| AppError::BadRequest(format!("probe command failed: {error}")))?;

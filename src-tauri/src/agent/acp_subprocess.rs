@@ -14,6 +14,7 @@ use tokio::{
 
 use crate::{
     error::{AppError, AppResult},
+    process_utils::CommandWindowExt,
     store::AppStore,
 };
 
@@ -311,6 +312,7 @@ pub(super) async fn run_acp_prompt(
         args.to_vec()
     };
     let mut child = Command::new(command)
+        .hide_window()
         .args(&args)
         .current_dir(cwd)
         .stdin(Stdio::piped())

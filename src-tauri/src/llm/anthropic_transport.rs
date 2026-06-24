@@ -153,6 +153,7 @@ async fn read_anthropic_sse_stream(
     let mut cache_write_tokens = 0usize;
     let mut stop_reason = None::<String>;
     let mut tool_calls = BTreeMap::<usize, AnthropicStreamToolCall>::new();
+    let mut replay_blocks = BTreeMap::<usize, Value>::new();
     let mut stream = response.bytes_stream();
 
     loop {
@@ -190,6 +191,7 @@ async fn read_anthropic_sse_stream(
                 &mut cache_write_tokens,
                 &mut stop_reason,
                 &mut tool_calls,
+                &mut replay_blocks,
             )?;
         }
     }
@@ -205,6 +207,7 @@ async fn read_anthropic_sse_stream(
             &mut cache_write_tokens,
             &mut stop_reason,
             &mut tool_calls,
+            &mut replay_blocks,
         )?;
     }
 
@@ -224,6 +227,8 @@ async fn read_anthropic_sse_stream(
             "anthropic stream produced no visible text".into(),
         ));
     }
+    let replay_content_blocks = replay_blocks.into_values().collect::<Vec<_>>();
+    let provider_data = anthropic_provider_data(&replay_content_blocks);
     Ok(LlmReply {
         prompt_tokens,
         completion_tokens: if completion_tokens == 0 {
@@ -249,7 +254,7 @@ async fn read_anthropic_sse_stream(
         } else {
             stop_reason.or_else(|| Some("stop".into()))
         },
-        provider_data: None,
+        provider_data,
         failover_attempts: Vec::new(),
     })
 }
@@ -264,6 +269,7 @@ fn handle_anthropic_sse_line(
     cache_write_tokens: &mut usize,
     stop_reason: &mut Option<String>,
     tool_calls: &mut BTreeMap<usize, AnthropicStreamToolCall>,
+    replay_blocks: &mut BTreeMap<usize, Value>,
 ) -> AppResult<()> {
     let Some(data) = line.trim().strip_prefix("data:") else {
         return Ok(());
@@ -284,6 +290,7 @@ fn handle_anthropic_sse_line(
         callback(delta)?;
     }
     track_anthropic_stream_tool_call(&payload, tool_calls);
+    track_anthropic_stream_replay_block(&payload, replay_blocks);
     let usage = payload
         .pointer("/message/usage")
         .or_else(|| payload.pointer("/usage"));
@@ -354,6 +361,75 @@ fn track_anthropic_stream_tool_call(
     }
 }
 
+fn track_anthropic_stream_replay_block(
+    payload: &Value,
+    replay_blocks: &mut BTreeMap<usize, Value>,
+) {
+    let index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+    if let Some(block) = payload.get("content_block") {
+        if anthropic_replay_block_is_required(block) {
+            replay_blocks.insert(index, block.clone());
+        }
+    }
+
+    let delta = payload.get("delta");
+    let delta_type = delta.and_then(|value| value.get("type")).and_then(Value::as_str);
+    if !replay_blocks.contains_key(&index)
+        && matches!(
+            delta_type,
+            Some("thinking_delta" | "signature_delta" | "redacted_thinking_delta")
+        )
+    {
+        let block_type = if delta_type == Some("redacted_thinking_delta") {
+            "redacted_thinking"
+        } else {
+            "thinking"
+        };
+        replay_blocks.insert(index, json!({ "type": block_type }));
+    }
+
+    let Some(block) = replay_blocks.get_mut(&index) else {
+        return;
+    };
+    let Some(delta) = delta else {
+        return;
+    };
+    let Some(object) = block.as_object_mut() else {
+        return;
+    };
+    if let Some(thinking) = delta
+        .get("thinking")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        let combined = object
+            .get("thinking")
+            .and_then(Value::as_str)
+            .map(|existing| format!("{existing}{thinking}"))
+            .unwrap_or_else(|| thinking.to_string());
+        object.insert("thinking".into(), json!(combined));
+    }
+    if let Some(signature) = delta
+        .get("signature")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        object.insert("signature".into(), json!(signature));
+    }
+    if let Some(data) = delta
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        let combined = object
+            .get("data")
+            .and_then(Value::as_str)
+            .map(|existing| format!("{existing}{data}"))
+            .unwrap_or_else(|| data.to_string());
+        object.insert("data".into(), json!(combined));
+    }
+}
+
 fn anthropic_stream_tool_calls(
     tool_calls: BTreeMap<usize, AnthropicStreamToolCall>,
 ) -> AppResult<Vec<Value>> {
@@ -388,14 +464,16 @@ pub(super) fn build_anthropic_messages(history: Vec<ChatMessage>) -> Vec<Value> 
     let mut messages = Vec::new();
     for item in history {
         if let Some(tool_replay) = tool_replay_message(&item) {
+            let mut content = anthropic_replay_blocks_from_provider_data(&item.provider_data);
+            content.push(json!({
+                "type": "tool_use",
+                "id": tool_replay.call_id,
+                "name": tool_replay.name,
+                "input": tool_replay.arguments,
+            }));
             messages.push(json!({
                 "role": "assistant",
-                "content": [{
-                    "type": "tool_use",
-                    "id": tool_replay.call_id,
-                    "name": tool_replay.name,
-                    "input": tool_replay.arguments,
-                }]
+                "content": content
             }));
             messages.push(json!({
                 "role": "user",
@@ -408,11 +486,35 @@ pub(super) fn build_anthropic_messages(history: Vec<ChatMessage>) -> Vec<Value> 
             }));
             continue;
         }
+        if item.role == "assistant" {
+            let content = sanitize_provider_text(&item.content);
+            let mut blocks = anthropic_replay_blocks_from_provider_data(&item.provider_data);
+            if !content.trim().is_empty() {
+                blocks.push(json!({
+                    "type": "text",
+                    "text": content,
+                }));
+            }
+            if !blocks.is_empty() {
+                push_anthropic_content_message(&mut messages, "assistant", blocks);
+            }
+            continue;
+        }
         if let Some(message) = sanitized_wire_message(item, true) {
             push_anthropic_text_message(&mut messages, &message.role, &message.content);
         }
     }
     messages
+}
+
+fn push_anthropic_content_message(messages: &mut Vec<Value>, role: &str, content: Vec<Value>) {
+    if content.is_empty() {
+        return;
+    }
+    messages.push(json!({
+        "role": role,
+        "content": content,
+    }));
 }
 
 fn push_anthropic_text_message(messages: &mut Vec<Value>, role: &str, content: &str) {
@@ -437,6 +539,31 @@ fn push_anthropic_text_message(messages: &mut Vec<Value>, role: &str, content: &
         "role": role,
         "content": content,
     }));
+}
+
+fn anthropic_replay_blocks_from_provider_data(provider_data: &Option<Value>) -> Vec<Value> {
+    let Some(provider_data) = provider_data.as_ref() else {
+        return Vec::new();
+    };
+    let anthropic = provider_data.get("anthropic").unwrap_or(provider_data);
+    let blocks = anthropic
+        .get("content")
+        .or_else(|| anthropic.get("contentBlocks"))
+        .or_else(|| anthropic.get("content_blocks"))
+        .and_then(Value::as_array);
+    blocks
+        .into_iter()
+        .flatten()
+        .filter(|block| anthropic_replay_block_is_required(block))
+        .cloned()
+        .collect()
+}
+
+fn anthropic_replay_block_is_required(block: &Value) -> bool {
+    matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("thinking" | "redacted_thinking")
+    )
 }
 
 pub(super) fn is_anthropic_compatible(provider: &LlmProvider) -> bool {
@@ -775,6 +902,7 @@ pub(super) fn parse_anthropic_compatible(payload: Value) -> AppResult<LlmReply> 
         .pointer("/usage/cache_creation_input_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0) as usize;
+    let provider_data = anthropic_provider_data(content_blocks);
 
     Ok(LlmReply {
         content,
@@ -797,9 +925,22 @@ pub(super) fn parse_anthropic_compatible(payload: Value) -> AppResult<LlmReply> 
         } else {
             "stop".into()
         }),
-        provider_data: None,
+        provider_data,
         failover_attempts: Vec::new(),
     })
+}
+
+fn anthropic_provider_data(content_blocks: &[Value]) -> Option<Value> {
+    let replay_blocks = content_blocks
+        .iter()
+        .filter(|block| anthropic_replay_block_is_required(block))
+        .cloned()
+        .collect::<Vec<_>>();
+    if replay_blocks.is_empty() {
+        None
+    } else {
+        Some(json!({ "anthropic": { "content": replay_blocks } }))
+    }
 }
 
 fn anthropic_tool_calls(content_blocks: &[Value]) -> Vec<Value> {
@@ -830,6 +971,128 @@ fn anthropic_tool_calls(content_blocks: &[Value]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anthropic_parser_preserves_thinking_provider_data() {
+        let reply = parse_anthropic_compatible(json!({
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "plan",
+                    "signature": "sig"
+                },
+                {
+                    "type": "text",
+                    "text": "done"
+                }
+            ],
+            "usage": {
+                "input_tokens": 4,
+                "output_tokens": 8
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(reply.content, "done");
+        let data = reply.provider_data.unwrap();
+        assert_eq!(data["anthropic"]["content"][0]["type"], "thinking");
+        assert_eq!(data["anthropic"]["content"][0]["thinking"], "plan");
+        assert_eq!(data["anthropic"]["content"][0]["signature"], "sig");
+    }
+
+    #[test]
+    fn anthropic_stream_preserves_thinking_provider_data() {
+        let mut replay_blocks = BTreeMap::<usize, Value>::new();
+        track_anthropic_stream_replay_block(
+            &json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "thinking",
+                    "thinking": "",
+                    "signature": ""
+                }
+            }),
+            &mut replay_blocks,
+        );
+        track_anthropic_stream_replay_block(
+            &json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "thinking_delta",
+                    "thinking": "step "
+                }
+            }),
+            &mut replay_blocks,
+        );
+        track_anthropic_stream_replay_block(
+            &json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "thinking_delta",
+                    "thinking": "two"
+                }
+            }),
+            &mut replay_blocks,
+        );
+        track_anthropic_stream_replay_block(
+            &json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": "sig"
+                }
+            }),
+            &mut replay_blocks,
+        );
+
+        let blocks = replay_blocks.into_values().collect::<Vec<_>>();
+        let data = anthropic_provider_data(&blocks).unwrap();
+        assert_eq!(data["anthropic"]["content"][0]["thinking"], "step two");
+        assert_eq!(data["anthropic"]["content"][0]["signature"], "sig");
+    }
+
+    #[test]
+    fn anthropic_tool_replay_includes_thinking_before_tool_use() {
+        let mut message = ChatMessage::new(
+            "conv".into(),
+            "tool",
+            json!({
+                "type": "toolEvent",
+                "event": {
+                    "toolName": "web_extract",
+                    "callId": "toolu_123",
+                    "ok": true,
+                    "text": "ok",
+                    "raw": {
+                        "payload": {
+                            "url": "https://example.com"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+            "test",
+        );
+        message.provider_data = Some(json!({
+            "anthropic": {
+                "content": [{
+                    "type": "thinking",
+                    "thinking": "plan",
+                    "signature": "sig"
+                }]
+            }
+        }));
+
+        let messages = build_anthropic_messages(vec![message]);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"][0]["type"], "thinking");
+        assert_eq!(messages[0]["content"][1]["type"], "tool_use");
+        assert_eq!(messages[1]["content"][0]["type"], "tool_result");
+    }
 
     #[test]
     fn anthropic_stream_tool_calls_reconstruct_partial_json() {

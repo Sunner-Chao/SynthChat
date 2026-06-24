@@ -15,6 +15,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use crate::{
     error::{AppError, AppResult},
     models::{new_id, AgentDefinition, BrowserProvider},
+    process_utils::CommandWindowExt,
     store::{summarize_browser_supervisor_state, AppStore},
 };
 
@@ -2482,7 +2483,9 @@ fn browser_record_export_webm(
     for (index, bytes) in frames.iter().enumerate() {
         fs::write(temp_dir.join(format!("frame-{index:06}.png")), bytes)?;
     }
-    let output = Command::new(&ffmpeg_path)
+    let mut command = Command::new(&ffmpeg_path);
+    command.hide_window();
+    let output = command
         .arg("-y")
         .arg("-hide_banner")
         .arg("-loglevel")

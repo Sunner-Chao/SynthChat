@@ -33,6 +33,7 @@ use crate::{
         new_id, now_iso, AgentDefinition, AgentRunRecord, BrowserProvider, ChatMessage,
         LlmProvider, ScheduledAgentJob, SearchProvider, SendChatRequest,
     },
+    process_utils::CommandWindowExt,
     store::AppStore,
 };
 
@@ -9245,7 +9246,9 @@ fn api_server_chat_tab_gateway_run_clipboard_binary(
     args: &[&str],
     timeout_seconds: u64,
 ) -> AppResult<Option<Vec<u8>>> {
-    let mut child = match std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command.hide_window();
+    let mut child = match command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -9279,7 +9282,9 @@ fn api_server_chat_tab_gateway_run_clipboard_status(
     args: &[&str],
     timeout_seconds: u64,
 ) -> AppResult<bool> {
-    let mut child = match std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command.hide_window();
+    let mut child = match command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -9309,7 +9314,9 @@ fn api_server_chat_tab_gateway_run_clipboard_powershell(
     script: &str,
     timeout_seconds: u64,
 ) -> AppResult<Option<String>> {
-    let mut child = match std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    command.hide_window();
+    let mut child = match command
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -20924,7 +20931,9 @@ async fn api_server_run_dashboard_plugin_api(
         new_id("runner")
     ));
     fs::write(&runner_path, DASHBOARD_PLUGIN_API_RUNNER)?;
-    let mut child = Command::new(python)
+    let mut command = Command::new(python);
+    command.hide_window();
+    let mut child = command
         .arg(&runner_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -31180,7 +31189,9 @@ pub(super) async fn webhook_deliver_github_comment(payload: &Value) -> AppResult
         }));
     }
 
-    let output = Command::new("gh")
+    let mut command = Command::new("gh");
+    command.hide_window();
+    let output = command
         .args(&args)
         .output()
         .await

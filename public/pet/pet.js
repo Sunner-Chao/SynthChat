@@ -39,8 +39,8 @@ let tapTimer = null;
 
 const MODEL_HIT_PADDING = 28;
 const MODEL_DRAG_DELAY_MS = 240;
-const MODEL_TAP_DELAY_MS = 220;
-const DEFAULT_MODEL_URL = "/pet/model/Tororo/tororo.model3.json";
+const MODEL_TAP_DELAY_MS = 340;
+const DEFAULT_MODEL_URL = "/pet/model/Mao/Mao.model3.json";
 
 let loadingModelKey = null;
 let loadedModelUrl = null;

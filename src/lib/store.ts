@@ -43,6 +43,8 @@ const MIN_UI_MESSAGE_LIMIT = 40;
 const MAX_UI_MESSAGE_LIMIT = 1000;
 const DEFAULT_UI_MESSAGE_PREVIEW_CHARS = 12_000;
 const BOOTSTRAP_CACHE_STORAGE_KEY = "synthchat.bootstrap.cache.v1";
+const TERMINAL_AGENT_STATES = new Set(["completed", "failed", "aborted"]);
+const ACTIVE_QUEUE_STATES = new Set(["pending", "running"]);
 
 // Module-level ref for pending settings view (not in React state to avoid batching delays)
 let pendingSettingsViewRef: string | null = null;
@@ -134,6 +136,106 @@ function isVisibleChatMessage(message: ChatMessage) {
 
 function visibleChatMessages(messages: ChatMessage[]) {
   return messages.filter(isVisibleChatMessage);
+}
+
+function isLocalUiMessage(message: ChatMessage) {
+  return message.id.startsWith("local-");
+}
+
+function isLocalStatusMessage(message: ChatMessage) {
+  return message.source?.startsWith("desktop-local-") ?? false;
+}
+
+function messageTime(message: ChatMessage) {
+  const timestamp = Date.parse(message.createdAt);
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function mergeLocalUiMessages(backendMessages: ChatMessage[], currentMessages: ChatMessage[], conversationId: string | null, limit: number) {
+  if (!conversationId) return limitMessages(backendMessages, limit);
+  const backendIds = new Set(backendMessages.map((message) => message.id));
+  const localMessages = currentMessages.filter((message) => {
+    if (message.conversationId !== conversationId || !isLocalUiMessage(message) || backendIds.has(message.id)) {
+      return false;
+    }
+    if (message.role === "user") {
+      const localContent = message.content.trim();
+      return !backendMessages.some((backend) => backend.role === "user" && backend.content.trim() === localContent);
+    }
+    if (isLocalStatusMessage(message)) {
+      const localCreatedAt = messageTime(message);
+      return !backendMessages.some((backend) => backend.role === "assistant" && messageTime(backend) >= localCreatedAt - 1000);
+    }
+    return false;
+  });
+  if (localMessages.length === 0) return limitMessages(backendMessages, limit);
+  return limitMessages([...backendMessages, ...localMessages].sort((left, right) => messageTime(left) - messageTime(right)), limit);
+}
+
+function hasPendingAgentWork(state: AppState, conversationId: string | null) {
+  if (!conversationId) return false;
+  return Object.values(state.activeAgentRuns).some((run) =>
+    run.conversationId === conversationId
+    && !run.parentRunId
+    && !TERMINAL_AGENT_STATES.has(run.state)
+  )
+    || state.agentQueue.some((item) =>
+      item.conversationId === conversationId
+      && ACTIVE_QUEUE_STATES.has(item.status)
+    )
+    || state.agentRuns.some((run) =>
+      run.conversationId === conversationId
+      && !run.parentRunId
+      && !TERMINAL_AGENT_STATES.has(run.state)
+    );
+}
+
+function appendLocalAssistantNotice(
+  setState: (updater: (current: AppState) => Partial<AppState> | AppState) => void,
+  conversationId: string | null,
+  content: string,
+  source = "desktop-local-status"
+) {
+  if (!conversationId || !content.trim()) return;
+  setState((current) => {
+    if (current.messages.some((message) =>
+      message.conversationId === conversationId
+      && message.role === "assistant"
+      && message.source === source
+      && message.content === content
+    )) {
+      return current;
+    }
+    const now = new Date().toISOString();
+    const message: ChatMessage = {
+      id: `local-status-${crypto.randomUUID()}`,
+      conversationId,
+      role: "assistant",
+      content,
+      createdAt: now,
+      source,
+      accountId: null
+    };
+    return {
+      messages: limitMessages([...current.messages, message], uiMessageLimit(current.config)),
+      conversations: current.conversations.map((conversation) =>
+        conversation.id === conversationId
+          ? { ...conversation, lastMessage: content, updatedAt: now }
+          : conversation
+      )
+    };
+  });
+}
+
+function compactErrorMessage(error: unknown) {
+  const raw = error instanceof Error
+    ? error.message
+    : typeof error === "string"
+      ? error
+      : String(error ?? "");
+  const text = raw.replace(/^bad request:\s*/i, "").trim();
+  if (!text) return "发送失败。";
+  return `发送失败：${text.length > 90 ? `${text.slice(0, 90)}...` : text}`;
 }
 
 function sameConversations(left: Conversation[], right: Conversation[]) {
@@ -590,13 +692,23 @@ export const useAppStore = create<AppState>((set, get) => ({
       ?? null;
     const messageLimit = uiMessageLimit(state.config);
     const previewChars = uiMessagePreviewChars(state.config);
-    const messages = activeConversationId ? visibleChatMessages(await api.listMessages(activeConversationId, messageLimit, previewChars)) : [];
+    const backendMessages = activeConversationId
+      ? visibleChatMessages(await api.listMessages(activeConversationId, messageLimit, previewChars))
+      : [];
+    const messages = mergeLocalUiMessages(backendMessages, state.messages, activeConversationId, messageLimit);
+    const latestMessage = messages.at(-1);
+    const shouldClearProcessing = Boolean(activeConversationId && latestMessage?.role === "assistant");
     if (
       state.activeConversationId === activeConversationId
       && sameConversations(state.conversations, conversations)
       && sameMessages(state.messages, messages)
     ) {
-      set({ agentQueue });
+      set((current) => ({
+        agentQueue,
+        processingConversationIds: shouldClearProcessing
+          ? current.processingConversationIds.filter((id) => id !== activeConversationId)
+          : current.processingConversationIds
+      }));
       return;
     }
     set((current) => ({
@@ -605,8 +717,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       activeConversationId,
       messages,
       conversationUnreadCounts: current.conversationUnreadCounts,
-      processingConversationIds: messages.at(-1)?.role === "assistant"
-        && activeConversationId !== preferredConversationId
+      processingConversationIds: shouldClearProcessing
         ? current.processingConversationIds.filter((id) => id !== activeConversationId)
         : current.processingConversationIds
     }));
@@ -789,46 +900,93 @@ export const useAppStore = create<AppState>((set, get) => ({
           : conversation
       )
     }));
+    const conversationIdForSend = activeConversationId;
+    const personaIdForSend = personaId ?? activeConversation?.personaId ?? null;
+    const requestedAgentId = agentId ?? activeConversation?.agentId ?? null;
+    const agentIdForSend = requestedAgentId && state.agents.some((item) => item.id === requestedAgentId)
+      ? requestedAgentId
+      : null;
     // 异步发送消息，不阻塞 UI
-    api.sendChatMessage({
-      conversationId: activeConversationId,
-      personaId: personaId ?? activeConversation?.personaId ?? null,
-      agentId: agentId ?? activeConversation?.agentId ?? null,
-      content: cleanContent
-    }).then((responseMessages) => {
-      void get().refreshAgentQueue();
-      if (!responseMessages || responseMessages.length === 0) {
-        // 后端未返回消息，清除处理状态
-        get().setConversationProcessing(activeConversationId ?? "", false);
-        return;
+    void (async () => {
+      try {
+        const responseMessages = await api.sendChatMessage({
+          conversationId: conversationIdForSend,
+          personaId: personaIdForSend,
+          agentId: agentIdForSend,
+          content: cleanContent
+        });
+        await Promise.allSettled([
+          get().refreshAgentQueue(),
+          get().refreshAgentRuns()
+        ]);
+        const visibleResponseMessages = visibleChatMessages(responseMessages ?? []);
+        const hasAssistantReply = visibleResponseMessages.some((m) => m.role === "assistant" && m.content.trim());
+        if (visibleResponseMessages.length > 0) {
+          const messageLimit = uiMessageLimit(get().config);
+          set((current) => {
+            const backendUserIds = new Set(
+              visibleResponseMessages.filter((m) => m.role === "user").map((m) => m.id)
+            );
+            const withoutTemp = current.messages.filter((m) => {
+              if (m.conversationId !== conversationIdForSend) return true;
+              if (m.role === "user" && isLocalUiMessage(m) && backendUserIds.size > 0) return false;
+              if (hasAssistantReply && isLocalStatusMessage(m)) return false;
+              return true;
+            });
+            const existingIds = new Set(withoutTemp.map((m) => m.id));
+            const newMessages = visibleResponseMessages.filter((m) => !existingIds.has(m.id));
+            const merged = [...withoutTemp, ...newMessages];
+            return { messages: limitMessages(merged, messageLimit) };
+          });
+        }
+        if (get().activeConversationId === conversationIdForSend) {
+          await get().refreshChatData(conversationIdForSend, personaIdForSend);
+        }
+        const current = get();
+        const hasNewerLocalUser = conversationIdForSend
+          ? current.messages.some((message) =>
+            message.conversationId === conversationIdForSend
+            && message.role === "user"
+            && isLocalUiMessage(message)
+            && messageTime(message) > messageTime(temporaryMessage)
+          )
+          : false;
+        const hasVisibleAssistant = conversationIdForSend
+          ? current.messages.some((message) =>
+            message.conversationId === conversationIdForSend
+            && message.role === "assistant"
+            && message.content.trim()
+            && messageTime(message) >= messageTime(temporaryMessage) - 1000
+          )
+          : false;
+        const pendingWork = hasPendingAgentWork(current, conversationIdForSend);
+        if (!hasNewerLocalUser && (hasAssistantReply || hasVisibleAssistant || !pendingWork)) {
+          current.setConversationProcessing(conversationIdForSend ?? "", false);
+        }
+        if (!hasNewerLocalUser && !hasAssistantReply && !hasVisibleAssistant && !pendingWork) {
+          appendLocalAssistantNotice(set, conversationIdForSend, "本轮对话没有返回。", "desktop-local-empty");
+        }
+      } catch (error) {
+        console.error("发送消息失败:", error);
+        await Promise.allSettled([
+          get().refreshAgentQueue(),
+          get().refreshAgentRuns()
+        ]);
+        const current = get();
+        const hasNewerLocalUser = conversationIdForSend
+          ? current.messages.some((message) =>
+            message.conversationId === conversationIdForSend
+            && message.role === "user"
+            && isLocalUiMessage(message)
+            && messageTime(message) > messageTime(temporaryMessage)
+          )
+          : false;
+        if (!hasNewerLocalUser) {
+          current.setConversationProcessing(conversationIdForSend ?? "", false);
+        }
+        appendLocalAssistantNotice(set, conversationIdForSend, compactErrorMessage(error), "desktop-local-error");
       }
-      const visibleResponseMessages = visibleChatMessages(responseMessages);
-      const hasAssistantReply = visibleResponseMessages.some((m) => m.role === "assistant" && m.content.trim());
-      const messageLimit = uiMessageLimit(get().config);
-      set((current) => {
-        // 去重：用后端返回的消息替换本地临时消息
-        const backendUserIds = new Set(
-          visibleResponseMessages.filter((m) => m.role === "user").map((m) => m.id)
-        );
-        // 移除本地临时 user 消息（id 以 "local-" 开头），保留后端返回的
-        const withoutTemp = current.messages.filter(
-          (m) => !(m.id.startsWith("local-") && m.role === "user" && backendUserIds.size > 0)
-        );
-        const existingIds = new Set(withoutTemp.map((m) => m.id));
-        const newMessages = visibleResponseMessages.filter((m) => !existingIds.has(m.id));
-        const merged = [...withoutTemp, ...newMessages];
-        return { messages: limitMessages(merged, messageLimit) };
-      });
-      // 仅当后端确认返回了助手回复时，立即清除处理状态
-      // 否则等待轮询（refreshChatData）检测到助手消息后自动清除
-      if (hasAssistantReply) {
-        get().setConversationProcessing(activeConversationId ?? "", false);
-      }
-    }).catch((error) => {
-      console.error("发送消息失败:", error);
-      void get().refreshAgentQueue();
-      get().setConversationProcessing(activeConversationId ?? "", false);
-    });
+    })();
   },
   deleteMessage: async (messageId) => {
     await api.deleteMessage(messageId);

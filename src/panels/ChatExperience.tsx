@@ -77,6 +77,17 @@ function previewText(text: string, limit: number) {
   return `${text.slice(0, limit)}\n\n[内容过长，界面仅预览前 ${limit} 个字符；复制按钮仍会复制完整消息。]`;
 }
 
+function composerErrorText(error: unknown) {
+  const raw = error instanceof Error
+    ? error.message
+    : typeof error === "string"
+      ? error
+      : String(error ?? "");
+  const text = raw.replace(/^bad request:\s*/i, "").trim();
+  if (!text) return "发送失败。";
+  return `发送失败：${text.length > 80 ? `${text.slice(0, 80)}...` : text}`;
+}
+
 function normalizeToolDetailText(text: string) {
   return text.trim().replace(/\s+/g, " ");
 }
@@ -769,6 +780,7 @@ export const ChatExperience = memo(function ChatExperience() {
   const savePersona = useAppStore((state) => state.savePersona);
   const saveAgent = useAppStore((state) => state.saveAgent);
   const [draft, setDraft] = useState("");
+  const [composerError, setComposerError] = useState<string | null>(null);
   const [controlCommands, setControlCommands] = useState<AgentControlCommand[]>([]);
   const [selectedSlashCommandIndex, setSelectedSlashCommandIndex] = useState(0);
   const [query, setQuery] = useState("");
@@ -1537,8 +1549,10 @@ export const ChatExperience = memo(function ChatExperience() {
     const content = draft.trim();
     const readyAttachments = attachments.filter((item) => item.status === "ready");
     if ((!content && readyAttachments.length === 0) || sendingRef.current) return;
+    const submittedAttachments = attachments;
     sendingRef.current = true;
     setDraft("");
+    setComposerError(null);
     setCompactionTipVisible(false);
     try {
       if (selectedPersona && activeAgent && selectedPersona.agentId !== activeAgent.id) {
@@ -1562,6 +1576,11 @@ export const ChatExperience = memo(function ChatExperience() {
       setAttachments([]);
       await sendMessage(outbound, selectedPersona?.id, activeAgent?.id);
       window.setTimeout(() => void refreshChatData(activeConversationId, selectedPersona?.id), 500);
+    } catch (error) {
+      console.error("submit message failed", error);
+      setDraft((current) => current.trim() ? current : content);
+      setAttachments((current) => current.length > 0 ? current : submittedAttachments);
+      setComposerError(composerErrorText(error));
     } finally {
       sendingRef.current = false;
       // Delay scroll to let React commit the new message to DOM first
@@ -2136,6 +2155,12 @@ export const ChatExperience = memo(function ChatExperience() {
                 <span>{shortContextNotice}</span>
               </div>
             ) : null}
+            {composerError ? (
+              <div className="claw-composer-error">
+                <AlertCircle size={14} />
+                <span>{composerError}</span>
+              </div>
+            ) : null}
             {slashCommandSuggestions.length > 0 ? (
               <div className="claw-command-suggestions">
                 {slashCommandSuggestions.map((command, index) => {
@@ -2173,7 +2198,10 @@ export const ChatExperience = memo(function ChatExperience() {
             ) : null}
           <textarea
             value={draft}
-            onChange={(event) => setDraft(event.target.value)}
+            onChange={(event) => {
+              setDraft(event.target.value);
+              if (composerError) setComposerError(null);
+            }}
             onPaste={(event) => {
               if (event.clipboardData.files.length > 0) void stageFiles(event.clipboardData.files);
             }}

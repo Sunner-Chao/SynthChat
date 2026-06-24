@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use crate::{
     error::{AppError, AppResult},
     models::{new_id, now_iso, MemoryEntry, Persona},
+    process_utils::CommandWindowExt,
     store::AppStore,
 };
 
@@ -4216,6 +4217,7 @@ fn byterover_run_brv(
     timeout_seconds: u64,
 ) -> AppResult<Value> {
     let mut command = Command::new(cli_path);
+    command.hide_window();
     let mut child = command
         .args(args)
         .current_dir(cwd)

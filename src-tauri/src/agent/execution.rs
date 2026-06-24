@@ -23,6 +23,7 @@ use tokio::{
 use crate::{
     error::{AppError, AppResult},
     models::{new_id, now_iso, AgentDefinition, ChatMessage},
+    process_utils::CommandWindowExt,
     store::{AppStore, ManagedProcess, ManagedProcessNotificationState},
 };
 
@@ -379,6 +380,7 @@ async fn execute_code_with_local_python_rpc(
     let allowed_env = tool_env_passthrough(store, Some(agent), &chat_config.tool_env_passthrough);
     let max_output_chars = positive_or_default(chat_config.tool_output_max_bytes, 50_000);
     let mut child = Command::new(&python);
+    child.hide_window();
     apply_command_env_guard(&mut child, &allowed_env);
     child
         .arg(&script_path)
@@ -2026,7 +2028,9 @@ for task_id in cfg.get("taskIds") or ["default"]:
     rows.append(row)
 print(json.dumps({"ok": True, "results": rows}, ensure_ascii=False))
 "#;
-    let mut child = match StdCommand::new(&python)
+    let mut cleanup_command = StdCommand::new(&python);
+    cleanup_command.hide_window();
+    let mut child = match cleanup_command
         .args(["-c", script])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -2371,6 +2375,7 @@ fn python_module_available(module: &str) -> bool {
         "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec({module:?}) else 1)"
     );
     StdCommand::new(python)
+        .hide_window()
         .args(["-c", &code])
         .output()
         .ok()
@@ -2379,7 +2384,9 @@ fn python_module_available(module: &str) -> bool {
 
 fn run_version_probe(executable: &str, args: &[&str], timeout_seconds: u64) -> Value {
     let started = std::time::Instant::now();
-    let mut child = match StdCommand::new(executable)
+    let mut command = StdCommand::new(executable);
+    command.hide_window();
+    let mut child = match command
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -2439,6 +2446,26 @@ fn run_version_probe(executable: &str, args: &[&str], timeout_seconds: u64) -> V
             }
         }
     }
+}
+
+fn hidden_std_command_output<P, I, S>(program: P, args: I) -> io::Result<std::process::Output>
+where
+    P: AsRef<std::ffi::OsStr>,
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let mut command = StdCommand::new(program);
+    command.hide_window();
+    command.args(args).output()
+}
+
+fn hidden_std_command_spawn<P>(program: P) -> StdCommand
+where
+    P: AsRef<std::ffi::OsStr>,
+{
+    let mut command = StdCommand::new(program);
+    command.hide_window();
+    command
 }
 
 fn find_executable(name: &str) -> Option<String> {
@@ -2754,6 +2781,7 @@ async fn start_ssh_managed_process(
     let mut args = ssh_base_args(&user, &host, port, key_path.as_deref())?;
     args.push(remote_spawn);
     let mut child = Command::new(&ssh);
+    child.hide_window();
     child
         .args(&args)
         .stdout(Stdio::piped())
@@ -2944,9 +2972,11 @@ async fn start_docker_managed_process(
         posix_shell_quote(&exit_path),
         posix_shell_quote(&pid_path),
     );
+    let mut docker_command = Command::new(&docker);
+    docker_command.hide_window();
     let output = tokio::time::timeout(
         Duration::from_secs(30),
-        Command::new(&docker)
+        docker_command
             .args([
                 "exec",
                 "--workdir",
@@ -3144,9 +3174,11 @@ async fn start_singularity_managed_process(
     push_singularity_remote_mounts(store, &mut instance_args, container_base)?;
     instance_args.push(image.clone());
     instance_args.push(instance_name.clone());
+    let mut instance_command = Command::new(&executable);
+    instance_command.hide_window();
     let instance_output = tokio::time::timeout(
         Duration::from_secs(120),
-        Command::new(&executable)
+        instance_command
             .args(&instance_args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -3170,9 +3202,11 @@ async fn start_singularity_managed_process(
         posix_shell_quote(&pid_path),
     );
     let instance_ref = format!("instance://{instance_name}");
+    let mut exec_command = Command::new(&executable);
+    exec_command.hide_window();
     let output = tokio::time::timeout(
         Duration::from_secs(30),
-        Command::new(&executable)
+        exec_command
             .args([
                 "exec",
                 "--pwd",
@@ -3190,6 +3224,7 @@ async fn start_singularity_managed_process(
     .map_err(|_| AppError::BadRequest("Singularity background process start timed out".into()))??;
     if !output.status.success() {
         let _ = StdCommand::new(&executable)
+            .hide_window()
             .args(["instance", "stop", &instance_name])
             .output();
         return Err(AppError::BadRequest(format!(
@@ -3546,6 +3581,7 @@ async def main():
 asyncio.run(main())
 "#;
     let mut child = Command::new(&python);
+    child.hide_window();
     child
         .args(["-c", script])
         .stdin(Stdio::piped())
@@ -4290,6 +4326,7 @@ else:
     }, ensure_ascii=False))
 "#;
     let mut child = Command::new(&python);
+    child.hide_window();
     child
         .args(["-c", script])
         .stdin(Stdio::piped())
@@ -5215,6 +5252,7 @@ fn command_vec_success_for_watcher(command: &[String]) -> bool {
         return false;
     };
     StdCommand::new(program)
+        .hide_window()
         .args(args)
         .status()
         .map(|status| status.success())
@@ -5223,7 +5261,11 @@ fn command_vec_success_for_watcher(command: &[String]) -> bool {
 
 fn command_vec_output_lines_for_watcher(command: &[String]) -> Option<Vec<String>> {
     let (program, args) = command.split_first()?;
-    let output = StdCommand::new(program).args(args).output().ok()?;
+    let output = StdCommand::new(program)
+        .hide_window()
+        .args(args)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -6160,6 +6202,7 @@ async fn run_ssh_terminal_command(
     args.push(remote_shell);
 
     let mut child = Command::new(&ssh);
+    child.hide_window();
     child
         .args(&args)
         .stdout(Stdio::piped())
@@ -6450,6 +6493,7 @@ finally:
             pass
 "#;
     let mut child = Command::new(&python);
+    child.hide_window();
     child
         .args(["-c", script])
         .stdin(Stdio::piped())
@@ -6792,6 +6836,7 @@ async def main():
 asyncio.run(main())
 "#;
     let mut child = Command::new(&python);
+    child.hide_window();
     child
         .args(["-c", script])
         .stdin(Stdio::piped())
@@ -7234,7 +7279,7 @@ fn sync_ssh_remote_files(
             "{user}@{host}:{}",
             scp_remote_target_path(&remote_path)
         ));
-        let output = StdCommand::new(&scp).args(&args).output()?;
+        let output = hidden_std_command_output(&scp, &args)?;
         if !output.status.success() {
             return Err(AppError::BadRequest(format!(
                 "ssh sync scp failed for {} -> {}: {}",
@@ -7329,7 +7374,7 @@ fn sync_ssh_remote_files_back(
                 scp_remote_target_path(&remote_path)
             ));
             args.push(temp_path.to_string_lossy().to_string());
-            let output = StdCommand::new(&scp).args(&args).output()?;
+            let output = hidden_std_command_output(&scp, &args)?;
             if !output.status.success() {
                 return Err(AppError::BadRequest(format!(
                     "ssh sync-back scp failed for {} -> {}: {}",
@@ -7391,7 +7436,7 @@ fn ssh_bulk_download_and_apply_sync_back(
         let mut ssh_args = ssh_base_args(user, host, port, key_path)?;
         ssh_args.push(format!("tar cf - -C {} .", posix_quote_cwd(remote_base)));
         let archive_file = fs::File::create(&archive)?;
-        let child = StdCommand::new(&ssh)
+        let child = hidden_std_command_spawn(&ssh)
             .args(&ssh_args)
             .stdout(archive_file)
             .stderr(std::process::Stdio::piped())
@@ -7403,7 +7448,7 @@ fn ssh_bulk_download_and_apply_sync_back(
                 String::from_utf8_lossy(&output.stderr)
             )));
         }
-        let output = StdCommand::new(&tar)
+        let output = hidden_std_command_spawn(&tar)
             .args(["-xf"])
             .arg(&archive)
             .args(["-C"])
@@ -7512,7 +7557,7 @@ fn ssh_remote_file_exists(
     let ssh = find_executable("ssh")
         .or_else(common_ssh_path)
         .ok_or_else(|| AppError::BadRequest("TERMINAL_ENV=ssh but ssh was not found".into()))?;
-    let output = StdCommand::new(&ssh).args(&args).output()?;
+    let output = hidden_std_command_output(&ssh, &args)?;
     Ok(output.status.success())
 }
 
@@ -7542,7 +7587,7 @@ fn ssh_mkdir_path(
     let ssh = find_executable("ssh")
         .or_else(common_ssh_path)
         .ok_or_else(|| AppError::BadRequest("TERMINAL_ENV=ssh but ssh was not found".into()))?;
-    let output = StdCommand::new(&ssh).args(&args).output()?;
+    let output = hidden_std_command_output(&ssh, &args)?;
     if !output.status.success() {
         return Err(AppError::BadRequest(format!(
             "ssh sync mkdir failed for {remote_path}: {}",
@@ -7584,7 +7629,7 @@ fn ssh_bulk_upload_tar(
         if staged == 0 {
             return Ok(0);
         }
-        let mut tar_child = StdCommand::new(&tar)
+        let mut tar_child = hidden_std_command_spawn(&tar)
             .args(["-cf", "-", "-C"])
             .arg(&staging)
             .arg(".")
@@ -7593,7 +7638,7 @@ fn ssh_bulk_upload_tar(
             .spawn()?;
         let mut ssh_args = ssh_base_args(user, host, port, key_path)?;
         ssh_args.push(format!("tar xf - -C {}", posix_quote_cwd(remote_base)));
-        let mut ssh_child = StdCommand::new(&ssh)
+        let mut ssh_child = hidden_std_command_spawn(&ssh)
             .args(&ssh_args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -7734,7 +7779,7 @@ fn ssh_delete_remote_paths(
     let ssh = find_executable("ssh")
         .or_else(common_ssh_path)
         .ok_or_else(|| AppError::BadRequest("TERMINAL_ENV=ssh but ssh was not found".into()))?;
-    let output = StdCommand::new(&ssh).args(&args).output()?;
+    let output = hidden_std_command_output(&ssh, &args)?;
     if !output.status.success() {
         return Err(AppError::BadRequest(format!(
             "ssh sync delete failed: {}",
@@ -8023,6 +8068,7 @@ async fn run_singularity_terminal_command(
     args.push(singularity_command);
 
     let mut child = Command::new(&executable);
+    child.hide_window();
     child
         .args(&args)
         .stdout(Stdio::piped())
@@ -8155,6 +8201,7 @@ async fn run_docker_terminal_command(
     };
 
     let mut child = Command::new(&docker);
+    child.hide_window();
     child
         .args(&docker_args)
         .stdout(Stdio::piped())
@@ -8365,8 +8412,8 @@ fn host_user_spec() -> Option<String> {
     }
     #[cfg(not(windows))]
     {
-        let uid = StdCommand::new("id").arg("-u").output().ok()?;
-        let gid = StdCommand::new("id").arg("-g").output().ok()?;
+        let uid = hidden_std_command_output("id", ["-u"]).ok()?;
+        let gid = hidden_std_command_output("id", ["-g"]).ok()?;
         if !uid.status.success() || !gid.status.success() {
             return None;
         }
@@ -8381,15 +8428,13 @@ fn host_user_spec() -> Option<String> {
 }
 
 fn docker_image_uses_init_entrypoint(docker: &str, image: &str) -> bool {
-    StdCommand::new(docker)
-        .args([
+    hidden_std_command_output(docker, [
             "image",
             "inspect",
             image,
             "--format",
             "{{json .Config.Entrypoint}}",
         ])
-        .output()
         .ok()
         .filter(|output| output.status.success())
         .map(|output| docker_entrypoint_uses_init(&String::from_utf8_lossy(&output.stdout)))
@@ -8447,9 +8492,7 @@ fn docker_storage_opt_supported(docker: &str) -> bool {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        StdCommand::new(docker)
-            .args(["info", "--format", "{{.Driver}}"])
-            .output()
+        hidden_std_command_output(docker, ["info", "--format", "{{.Driver}}"])
             .ok()
             .filter(|output| output.status.success())
             .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "overlay2")
@@ -8673,13 +8716,13 @@ fn ensure_docker_terminal_container(
         }
     }
     if let Some(stale_container_id) = find_docker_terminal_container(docker, key, false) {
-        let _ = StdCommand::new(docker)
+        let _ = hidden_std_command_spawn(docker)
             .args(["rm", "-f", &stale_container_id])
             .output();
     }
     let name = docker_container_name(key);
     if let Some(existing_id) = docker_container_id_by_name(docker, &name) {
-        let _ = StdCommand::new(docker)
+        let _ = hidden_std_command_spawn(docker)
             .args(["rm", "-f", &existing_id])
             .output();
     }
@@ -8699,7 +8742,7 @@ fn ensure_docker_terminal_container(
     args.push("sh".into());
     args.push("-lc".into());
     args.push("trap 'exit 0' TERM INT; while true; do sleep 3600; done".into());
-    let output = StdCommand::new(docker).args(&args).output()?;
+    let output = hidden_std_command_output(docker, &args)?;
     if !output.status.success() {
         return Err(AppError::BadRequest(format!(
             "failed to start docker terminal container: {}",
@@ -8736,9 +8779,7 @@ fn find_docker_terminal_container(docker: &str, key: &str, running_only: bool) -
     }
     args.push("--format".into());
     args.push("{{.ID}}".into());
-    StdCommand::new(docker)
-        .args(&args)
-        .output()
+    hidden_std_command_output(docker, &args)
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| {
@@ -8751,8 +8792,7 @@ fn find_docker_terminal_container(docker: &str, key: &str, running_only: bool) -
 }
 
 fn docker_container_id_by_name(docker: &str, name: &str) -> Option<String> {
-    StdCommand::new(docker)
-        .args([
+    hidden_std_command_output(docker, [
             "ps",
             "-a",
             "--filter",
@@ -8760,7 +8800,6 @@ fn docker_container_id_by_name(docker: &str, name: &str) -> Option<String> {
             "--format",
             "{{.ID}}",
         ])
-        .output()
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| {
@@ -8789,8 +8828,7 @@ fn maybe_reap_docker_orphans(docker: &str) -> usize {
     }
     let lifetime = env_u64("TERMINAL_LIFETIME_SECONDS", 300).max(60);
     let max_age_seconds = lifetime.saturating_mul(2);
-    let output = StdCommand::new(docker)
-        .args([
+    let output = hidden_std_command_output(docker, [
             "container",
             "prune",
             "-f",
@@ -8803,8 +8841,7 @@ fn maybe_reap_docker_orphans(docker: &str) -> usize {
             ),
             "--filter",
             &format!("until={max_age_seconds}s"),
-        ])
-        .output();
+        ]);
     let Ok(output) = output else {
         return 0;
     };
@@ -8892,9 +8929,7 @@ fn docker_container_snapshot() -> Value {
 }
 
 fn docker_container_running(docker: &str, container_id: &str) -> bool {
-    StdCommand::new(docker)
-        .args(["inspect", "-f", "{{.State.Running}}", container_id])
-        .output()
+    hidden_std_command_output(docker, ["inspect", "-f", "{{.State.Running}}", container_id])
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
@@ -8923,14 +8958,14 @@ fn cleanup_docker_terminal_containers(target_session: Option<&str>) -> usize {
         }
     }
     for container_id in &removed {
-        let _ = StdCommand::new(&docker)
+        let _ = hidden_std_command_spawn(&docker)
             .args(["rm", "-f", container_id])
             .output();
     }
     let mut removed_count = removed.len();
     if let Some(target_key) = target_key {
         if let Some(container_id) = find_docker_terminal_container(&docker, &target_key, false) {
-            let _ = StdCommand::new(&docker)
+            let _ = hidden_std_command_spawn(&docker)
                 .args(["rm", "-f", &container_id])
                 .output();
             removed_count += 1;
@@ -8942,8 +8977,7 @@ fn cleanup_docker_terminal_containers(target_session: Option<&str>) -> usize {
 }
 
 fn cleanup_all_labeled_docker_terminal_containers(docker: &str) -> usize {
-    let output = StdCommand::new(docker)
-        .args([
+    let output = hidden_std_command_output(docker, [
             "ps",
             "-a",
             "--filter",
@@ -8955,8 +8989,7 @@ fn cleanup_all_labeled_docker_terminal_containers(docker: &str) -> usize {
             ),
             "--format",
             "{{.ID}}",
-        ])
-        .output();
+        ]);
     let Ok(output) = output else {
         return 0;
     };
@@ -8970,7 +9003,7 @@ fn cleanup_all_labeled_docker_terminal_containers(docker: &str) -> usize {
         .map(str::to_string)
         .collect::<Vec<_>>();
     for container_id in &ids {
-        let _ = StdCommand::new(docker)
+        let _ = hidden_std_command_spawn(docker)
             .args(["rm", "-f", container_id])
             .output();
     }
@@ -9012,12 +9045,14 @@ fn shell_command(command: &str) -> Command {
     #[cfg(windows)]
     {
         let mut child = Command::new("powershell.exe");
+        child.hide_window();
         child.args(["-NoProfile", "-Command", command]);
         child
     }
     #[cfg(not(windows))]
     {
         let mut child = Command::new("sh");
+        child.hide_window();
         child.args(["-lc", command]);
         child
     }

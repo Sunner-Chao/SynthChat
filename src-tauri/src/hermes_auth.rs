@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{new_id, LlmProvider};
+use crate::process_utils::CommandWindowExt;
 
 #[cfg(test)]
 pub(crate) static HERMES_AUTH_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -4967,6 +4968,7 @@ fn run_bws_secret_list(
     config: &BitwardenConfig,
 ) -> AppResult<HashMap<String, String>> {
     let mut command = Command::new(binary);
+    command.hide_window();
     command
         .args(["secret", "list", &config.project_id, "--output", "json"])
         .env("BWS_ACCESS_TOKEN", &config.access_token)

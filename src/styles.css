@@ -1019,6 +1019,12 @@
   color: var(--primary);
 }
 
+[data-theme="dark"] .claw-composer-error {
+  border-color: rgba(248, 113, 113, 0.26);
+  background: rgba(127, 29, 29, 0.28);
+  color: #fecaca;
+}
+
 /* ── Dark Mode: chat toolbar ── */
 [data-theme="dark"] .claw-chat-toolbar {
   background: var(--bg);
@@ -6249,6 +6255,27 @@ button:disabled {
 }
 
 .claw-context-hint span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.claw-composer-error {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  width: fit-content;
+  max-width: 100%;
+  padding: 6px 10px;
+  border: 1px solid rgba(239, 68, 68, 0.22);
+  border-radius: var(--radius-pill);
+  background: rgba(254, 242, 242, 0.9);
+  color: #b91c1c;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.claw-composer-error span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

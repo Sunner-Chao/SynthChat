@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use crate::{
     error::{AppError, AppResult},
     models::AgentDefinition,
+    process_utils::CommandWindowExt,
 };
 
 use super::workspace_root;
@@ -143,6 +144,7 @@ fn python_pep668(binary: &str) -> bool {
 
 fn command_stdout(command: &str, args: &[&str]) -> Result<String, AppError> {
     let output = Command::new(command)
+        .hide_window()
         .args(args)
         .output()
         .map_err(AppError::Io)?;

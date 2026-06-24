@@ -8,6 +8,7 @@ use std::{
 use crate::{
     error::{AppError, AppResult},
     mcp::{infer_osv_ecosystem, parse_osv_package_from_args, query_osv_malware},
+    process_utils::CommandWindowExt,
     threat_patterns::{scan_for_threats, ThreatScope},
 };
 
@@ -136,7 +137,9 @@ fn run_tirith_scan_if_enabled(command: &str, config: &TirithConfig) -> Value {
 }
 
 fn run_tirith_scan(command: &str, config: &TirithConfig) -> AppResult<Value> {
-    let mut child = Command::new(&config.path)
+    let mut command = Command::new(&config.path);
+    command.hide_window();
+    let mut child = command
         .args([
             "check",
             "--json",

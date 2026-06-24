@@ -691,13 +691,15 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                         break;
                                     }
                                 }
-                                let _tool_message = store.append_message(ChatMessage::new(
+                                let mut tool_message = ChatMessage::new(
                                     conversation.id.clone(),
                                     "tool",
                                     json!({"type": "toolEvent", "event": event.clone()})
                                         .to_string(),
                                     "desktop-agent-tool",
-                                ))?;
+                                );
+                                tool_message.provider_data = reply.provider_data.clone();
+                                let _tool_message = store.append_message(tool_message)?;
                                 history.push(_tool_message);
                                 push_tool_event_record(&mut run, &event);
                                 if let Some(assistant) = pause_run_for_clarify_tool(
@@ -1031,13 +1033,15 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                         break;
                                     }
                                 }
-                                let _tool_message = store.append_message(ChatMessage::new(
+                                let mut tool_message = ChatMessage::new(
                                     conversation.id.clone(),
                                     "tool",
                                     json!({"type": "toolEvent", "event": event.clone()})
                                         .to_string(),
                                     "desktop-agent-tool",
-                                ))?;
+                                );
+                                tool_message.provider_data = reply.provider_data.clone();
+                                let _tool_message = store.append_message(tool_message)?;
                                 history.push(_tool_message);
                                 push_tool_event_record(&mut run, &event);
                                 emit_agent_run_record(app, &run, None);
@@ -1331,13 +1335,15 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                         break;
                                     }
                                 }
-                                let _tool_message = store.append_message(ChatMessage::new(
+                                let mut tool_message = ChatMessage::new(
                                     conversation.id.clone(),
                                     "tool",
                                     json!({"type": "toolEvent", "event": event.clone()})
                                         .to_string(),
                                     "desktop-agent-tool",
-                                ))?;
+                                );
+                                tool_message.provider_data = reply.provider_data.clone();
+                                let _tool_message = store.append_message(tool_message)?;
                                 history.push(_tool_message);
                                 push_tool_event_record(&mut run, &event);
                                 emit_agent_run_record(app, &run, None);

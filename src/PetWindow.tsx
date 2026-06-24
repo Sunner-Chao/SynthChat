@@ -101,6 +101,8 @@ type PetCloudStyle = CSSProperties & {
 
 const PET_PANEL_IDS: PetPanelId[] = ["toolbar", "models", "chat", "composer", "cloud"];
 
+const PET_MODEL_CLEARANCE = 28;
+
 const PET_PANEL_LIMITS: Record<PetPanelId, { minWidth: number; minHeight: number }> = {
   toolbar: { minWidth: 260, minHeight: 46 },
   models: { minWidth: 176, minHeight: 150 },
@@ -126,7 +128,12 @@ function defaultPetPanelLayouts(): Record<PetPanelId, PetPanelLayout> {
   const safeHeight = Math.max(320, viewport.height);
   const composerWidth = Math.min(360, safeWidth - 28);
   const chatWidth = Math.min(280, safeWidth - 28);
-  const chatX = Math.max(14, safeWidth - chatWidth - 14);
+  const modelLeft = Math.max(0, Math.round((safeWidth - 280) / 2));
+  const modelRight = Math.min(safeWidth, Math.round((safeWidth + 280) / 2));
+  const chatRightX = safeWidth - chatWidth - 14;
+  const chatX = chatRightX > modelRight + PET_MODEL_CLEARANCE
+    ? chatRightX
+    : 14;
   const cloudWidth = Math.min(680, Math.max(460, Math.round(safeWidth * 0.54)));
   return {
     toolbar: {
@@ -151,7 +158,7 @@ function defaultPetPanelLayouts(): Record<PetPanelId, PetPanelLayout> {
       locked: false
     },
     composer: {
-      x: Math.max(14, Math.round((safeWidth - composerWidth) / 2)),
+      x: Math.max(14, Math.round(modelLeft - composerWidth - PET_MODEL_CLEARANCE)),
       y: Math.max(14, safeHeight - 118),
       width: composerWidth,
       height: 138,
@@ -248,9 +255,10 @@ function preferredCloudPanelLayout(
   const anchorY = modelBounds
     ? modelBounds.y + modelBounds.height * 0.32
     : viewport.height * 0.4;
-  const preferredX = anchorX + 28;
+  const gap = modelBounds ? PET_MODEL_CLEARANCE : 28;
+  const preferredX = anchorX + gap;
   const preferredY = anchorY - height - 18;
-  const fallbackX = modelBounds ? anchorX - width - 28 : viewport.width * 0.16;
+  const fallbackX = modelBounds ? anchorX - width - gap : viewport.width * 0.16;
   const targetX = preferredX + width + 14 <= viewport.width
     ? preferredX
     : fallbackX;
@@ -330,7 +338,9 @@ export function PetWindow() {
   const [activeContext, setActiveContext] = useState<PetActiveContext | null>(() => readStoredPetActiveContext());
   const activeContextRef = useRef<PetActiveContext | null>(activeContext);
   const [sending, setSending] = useState(false);
-  const [selectedModel, setSelectedModel] = useState(AVAILABLE_MODELS[0]);
+  const [selectedModel, setSelectedModel] = useState(
+    AVAILABLE_MODELS.find((model) => model.id === "mao") ?? AVAILABLE_MODELS[0]
+  );
   const [showModelSelector, setShowModelSelector] = useState(false);
   const [uiVisible, setUiVisible] = useState(false);
   const [miniFocused, setMiniFocused] = useState(false);
@@ -767,6 +777,7 @@ export function PetWindow() {
       }
       if (message.type === "poke") {
         markInteraction();
+        hideControls();
         showTransientUi();
         void invoke("toggle_main_window");
         setStatus("已切换");
@@ -1337,6 +1348,7 @@ export function PetWindow() {
     const context = activeContextRef.current ?? readStoredPetActiveContext();
     const conversations = await invoke<Conversation[]>("list_conversations");
     const personas = await invoke<Persona[]>("list_personas");
+    const agents = await api.listAgents();
     const contextConversation = context?.conversationId
       ? conversations.find((conversation) => conversation.id === context.conversationId) ?? null
       : null;
@@ -1344,6 +1356,8 @@ export function PetWindow() {
       ? conversations.find((conversation) => conversation.personaId === context.personaId) ?? null
       : conversations[0] ?? null;
     const conversation = contextConversation ?? fallbackConversation;
+    const validAgentId = (value: string | null | undefined) =>
+      value && agents.some((agent) => agent.id === value) ? value : null;
     if (conversation) {
       const persona = conversation.personaId
         ? personas.find((item) => item.id === conversation.personaId) ?? null
@@ -1352,7 +1366,7 @@ export function PetWindow() {
         conversationId: conversation.id,
         personaId: conversation.personaId ?? persona?.id ?? context?.personaId ?? null,
         personaName: persona?.name ?? context?.personaName ?? null,
-        agentId: conversation.agentId ?? context?.agentId ?? null
+        agentId: validAgentId(conversation.agentId ?? context?.agentId ?? null)
       };
     }
     const persona = context?.personaId
@@ -1366,7 +1380,7 @@ export function PetWindow() {
       conversationId: created.id,
       personaId: created.personaId ?? persona?.id ?? null,
       personaName: persona?.name ?? context?.personaName ?? null,
-      agentId: created.agentId ?? context?.agentId ?? null
+      agentId: validAgentId(created.agentId ?? context?.agentId ?? null)
     };
   }
 

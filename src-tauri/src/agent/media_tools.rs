@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use crate::{
     error::{AppError, AppResult},
     models::{AgentDefinition, ImageProvider, LlmProvider, VideoProvider, VisionProvider},
+    process_utils::CommandWindowExt,
     store::AppStore,
 };
 
@@ -118,6 +119,7 @@ fn voice_recording_start(payload: &Value) -> AppResult<String> {
         .min(3600);
     let path = temp_voice_recording_path()?;
     let mut command = recording_command_for_path(&path, duration_seconds)?;
+    command.hide_window();
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -265,6 +267,7 @@ fn voice_playback_start(agent: &AgentDefinition, payload: &Value) -> AppResult<S
         )));
     }
     let mut command = playback_command_for_path(&path)?;
+    command.hide_window();
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -4439,6 +4442,7 @@ fn run_shell_command_with_timeout(command_text: &str, timeout_seconds: u64) -> A
         command.arg("-c").arg(command_text);
         command
     };
+    command.hide_window();
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

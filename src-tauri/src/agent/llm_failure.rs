@@ -42,6 +42,11 @@ pub(super) fn classify_llm_failure(error: &AppError) -> &'static str {
         ],
     ) {
         "invalid_encrypted_content"
+    } else if text.contains("content[].thinking")
+        || (text.contains("thinking")
+            && (text.contains("must be passed back") || text.contains("passed back to the api")))
+    {
+        "thinking_replay_missing"
     } else if text.contains("thinking") && text.contains("signature") {
         "thinking_signature"
     } else if text_contains_any(
@@ -314,6 +319,7 @@ pub(super) fn llm_failure_is_retryable(kind: &str, message: &str) -> bool {
             | "invalid_encrypted_content"
             | "multimodal_tool_content_unsupported"
             | "thinking_signature"
+            | "thinking_replay_missing"
             | "image_too_large"
             | "long_context_tier"
             | "oauth_long_context_beta_forbidden"
@@ -352,12 +358,14 @@ pub(super) fn llm_failure_recovery_hints(kind: &str, message: &str) -> Value {
         kind,
         "context_overflow" | "payload_too_large" | "long_context_tier"
     );
-    let should_strip_reasoning = matches!(kind, "invalid_encrypted_content" | "thinking_signature");
+    let should_strip_reasoning =
+        matches!(kind, "invalid_encrypted_content" | "thinking_signature");
     let should_strip_image_payloads = matches!(
         kind,
         "image_too_large" | "multimodal_tool_content_unsupported"
     );
-    let should_repair_tool_replay = kind == "tool_replay_orphan";
+    let should_repair_tool_replay =
+        matches!(kind, "tool_replay_orphan" | "thinking_replay_missing");
     let should_rotate_credential =
         matches!(kind, "rate_limit" | "quota" | "auth" | "terminal_auth");
     let should_fallback = matches!(
@@ -401,6 +409,9 @@ pub(super) fn llm_failure_recovery_hints(kind: &str, message: &str) -> Value {
         }
         "invalid_encrypted_content" | "thinking_signature" => {
             vec!["Remove stale reasoning replay/signature metadata and retry once."]
+        }
+        "thinking_replay_missing" => {
+            vec!["Downgrade historical tool replay that cannot be paired with signed thinking blocks, then retry once."]
         }
         "multimodal_tool_content_unsupported" => {
             vec!["Downgrade historical multimodal tool messages to plain text."]

@@ -15,6 +15,7 @@ use tokio::{
 use crate::{
     error::{AppError, AppResult},
     models::now_iso,
+    process_utils::CommandWindowExt,
     store::AppStore,
 };
 
@@ -482,6 +483,7 @@ async fn computer_use_cua_mcp_probe(payload: &Value) -> AppResult<Value> {
 async fn computer_use_cua_mcp_tools_list(command: &str) -> AppResult<Value> {
     computer_use_cua_mcp_record_start("tools/list", true);
     let mut child = Command::new(command)
+        .hide_window()
         .arg("mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -596,6 +598,7 @@ async fn computer_use_cua_mcp_start_persistent_session(
     command: &str,
 ) -> AppResult<CuaMcpPersistentSession> {
     let mut child = Command::new(command)
+        .hide_window()
         .arg("mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2036,6 +2039,7 @@ async fn computer_use_windows_action(
 #[cfg(windows)]
 async fn run_powershell_script(script: &str, timeout_seconds: u64) -> AppResult<String> {
     let mut child = Command::new("powershell.exe");
+    child.hide_window();
     child
         .args([
             "-NoProfile",
