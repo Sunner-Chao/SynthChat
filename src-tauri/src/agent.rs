@@ -316,6 +316,7 @@ use runtime_events::{
     tool_failed_event, tool_failed_transition_events, tool_started_event,
 };
 pub(crate) use runtime_events::{emit_agent_goal_event, emit_agent_queue_event};
+pub(crate) use runtime_events::emit_pet_assistant_event;
 
 pub(crate) fn agent_runtime_events(
     store: &AppStore,

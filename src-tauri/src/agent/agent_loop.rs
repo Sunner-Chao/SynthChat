@@ -1695,6 +1695,14 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     maybe_run_background_skill_curator(store, &chat_config)?;
     let saved_completed_run = store.agent_run(&saved_completed_run.run_id)?;
     if let Some(app) = app {
+        let pet_event_source = request
+            .provider_data
+            .as_ref()
+            .and_then(|data| data.get("source"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("desktop");
         let _ = app.emit(
             "synthchat-chat-event",
             json!({
@@ -1706,6 +1714,16 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                 "isLast": true,
             }),
         );
+        if pet_event_source != "wechat" {
+            emit_pet_assistant_event(
+                Some(app),
+                "assistant_final",
+                &assistant.source,
+                Some(&persona.id),
+                &conversation.id,
+                &assistant,
+            );
+        }
     }
     emit_agent_run_record(app, &saved_completed_run, Some(&assistant));
     Ok(vec![user, assistant])

@@ -180,6 +180,8 @@ function structuredMessageAttachments(message: ChatMessage | null | undefined): 
 function assistantMessageVisibleInCloud(message: ChatMessage | null | undefined) {
   if (!message || message.role !== "assistant") return false;
   if (message.source === "desktop-agent-error") return false;
+  if (message.source === "desktop-control") return false;
+  if (message.source === "desktop-diagnosis") return false;
   if (message.source?.startsWith("desktop-local-")) return false;
   return Boolean(assistantCloudPayload(message));
 }
@@ -461,9 +463,10 @@ export function PetWindow() {
       type: string;
       conversationId?: string;
       message?: ChatMessage;
+      source?: string;
     }>("synthchat-pet-event", (event) => {
       const payload = event.payload;
-      if (payload.type !== "proactive_message" || !payload.message) return;
+      if ((payload.type !== "assistant_final" && payload.type !== "proactive_message") || !payload.message) return;
       const context = activeContextRef.current ?? readStoredPetActiveContext();
       const isWechat = payload.message.source === "wechat" || (payload as { source?: string }).source === "wechat";
       if (isWechat && payload.conversationId && context?.conversationId !== payload.conversationId) {
@@ -495,8 +498,10 @@ export function PetWindow() {
       conversationId?: string;
       message?: ChatMessage;
     }>("synthchat-chat-event", (event) => {
+      // The chat stream only keeps the pet's send target/context in sync.
+      // Bubble display is driven by the dedicated synthchat-pet-event path.
       const payload = event.payload;
-      const relevantTypes = ["new_message", "assistant_message", "conversation_updated", "turn_finished"];
+      const relevantTypes = ["new_message", "assistant_message", "conversation_updated"];
       if (!relevantTypes.includes(payload.type) || !payload.conversationId) return;
 
       const context = activeContextRef.current ?? readStoredPetActiveContext();
@@ -505,8 +510,8 @@ export function PetWindow() {
       const hasContext = Boolean(context?.conversationId);
       // Follow rules:
       // - WeChat-originated messages always follow (locked or not).
-      // - When the pet has no locked context yet, follow whatever conversation
-      //   is active on the desktop so assistant replies still surface as a cloud.
+      // - When the pet has no locked context yet, follow the desktop-active
+      //   conversation so the input target stays intuitive.
       const shouldFollowIncomingWechat = eventSource === "wechat" && (!hasContext || !isCurrentConversation);
       const shouldFollowWhenUnbound = !hasContext;
       const shouldFollow = shouldFollowIncomingWechat || shouldFollowWhenUnbound;
@@ -523,31 +528,6 @@ export function PetWindow() {
         };
         setPetContext(nextContext);
       }
-
-      // Bubble display is no longer bound to the currently active conversation.
-      // We still keep the input context-following rules above so send targets do
-      // not jump around unexpectedly.
-      // turn_finished is the authoritative "reply is ready" signal from the hub
-      // for every source. Show the carried assistant message immediately; if it
-      // has no cloud-renderable text/attachments or was already shown, fall
-      // back to an immediate fetch of the latest assistant so the cloud never
-      // waits on the slow polling mirror.
-      if (payload.type === "turn_finished") {
-        if (assistantMessageVisibleInCloud(payload.message)) {
-          showAssistantCloud(payload.message);
-        } else {
-          void refreshLatestAssistant(payload.conversationId, true, true);
-        }
-        return;
-      }
-
-      if (assistantMessageVisibleInCloud(payload.message)) {
-        showAssistantCloud(payload.message);
-        return;
-      }
-      if (isCurrentConversation || shouldFollow) {
-        void refreshLatestAssistant(payload.conversationId, true);
-      }
     }).then((handler) => {
       unlisten = handler;
     });
@@ -561,10 +541,6 @@ export function PetWindow() {
     void listen<AgentRunEvent>("synthchat-agent-run-event", (event) => {
       const payload = event.payload;
       const context = activeContextRef.current ?? readStoredPetActiveContext();
-      if (assistantMessageVisibleInCloud(payload.message)) {
-        showAssistantCloud(payload.message);
-        return;
-      }
       if (
         context?.conversationId
         && context.conversationId === payload.conversationId

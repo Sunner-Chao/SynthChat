@@ -2842,7 +2842,7 @@ fn emit_wechat_assistant_message(
     let _ = app.emit(
         "synthchat-pet-event",
         json!({
-            "type": "proactive_message",
+            "type": "assistant_final",
             "source": "wechat",
             "personaId": persona_id,
             "conversationId": conversation_id,

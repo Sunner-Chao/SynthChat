@@ -200,6 +200,29 @@ pub(super) fn emit_agent_run_record(
     let _ = app.emit("synthchat-agent-run-event", payload);
 }
 
+pub(crate) fn emit_pet_assistant_event(
+    app: Option<&AppHandle>,
+    event_type: &str,
+    source: &str,
+    persona_id: Option<&str>,
+    conversation_id: &str,
+    message: &ChatMessage,
+) {
+    let Some(app) = app else {
+        return;
+    };
+    let _ = app.emit(
+        "synthchat-pet-event",
+        json!({
+            "type": event_type,
+            "source": source,
+            "personaId": persona_id,
+            "conversationId": conversation_id,
+            "message": message,
+        }),
+    );
+}
+
 pub(crate) fn emit_agent_queue_event(
     app: Option<&AppHandle>,
     event_type: &str,
