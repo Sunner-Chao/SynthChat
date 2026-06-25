@@ -1,4 +1,5 @@
 import { ChangeEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import {
   Bot,
   ChevronRight,
@@ -47,6 +48,25 @@ import type {
   TokenUsageStats
 } from "../lib/types";
 import { Avatar, MenuRow } from "../components/common";
+
+const UPDATE_MANIFEST_STORAGE_KEY = "synthchat.update.manifest.url.v1";
+
+type UpdateManifest = {
+  latestVersion: string;
+  downloadUrl?: string;
+  releaseUrl?: string;
+  notes?: string;
+  publishedAt?: string;
+};
+
+type GitHubRelease = {
+  tag_name?: string;
+  html_url?: string;
+  body?: string;
+  published_at?: string;
+  assets?: Array<{ browser_download_url?: string }>;
+};
+
 function formatTime(value: string) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
@@ -110,6 +130,78 @@ function imageProviderTypeLabel(id: string) {
   };
   return labels[id] ?? id;
 }
+
+function normalizeVersionText(value: string) {
+  return value.trim().replace(/^v/i, "");
+}
+
+function compareVersionStrings(left: string, right: string) {
+  const parse = (value: string) => normalizeVersionText(value).split(".").map((part) => {
+    const numeric = Number.parseInt(part.replace(/[^\d].*$/, ""), 10);
+    return Number.isFinite(numeric) ? numeric : 0;
+  });
+  const leftParts = parse(left);
+  const rightParts = parse(right);
+  const length = Math.max(leftParts.length, rightParts.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftPart = leftParts[index] ?? 0;
+    const rightPart = rightParts[index] ?? 0;
+    if (leftPart > rightPart) return 1;
+    if (leftPart < rightPart) return -1;
+  }
+  return 0;
+}
+
+function readUpdateManifestUrl() {
+  if (typeof window === "undefined") return "";
+  try {
+    return window.localStorage.getItem(UPDATE_MANIFEST_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeUpdateManifestUrl(value: string) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(UPDATE_MANIFEST_STORAGE_KEY, value.trim());
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function parseUpdateManifest(payload: unknown): UpdateManifest {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("更新源返回内容无效");
+  }
+  const candidate = payload as Record<string, unknown>;
+  if (typeof candidate.latestVersion === "string") {
+    return {
+      latestVersion: candidate.latestVersion,
+      downloadUrl: typeof candidate.downloadUrl === "string" ? candidate.downloadUrl : undefined,
+      releaseUrl: typeof candidate.releaseUrl === "string" ? candidate.releaseUrl : undefined,
+      notes: typeof candidate.notes === "string" ? candidate.notes : undefined,
+      publishedAt: typeof candidate.publishedAt === "string" ? candidate.publishedAt : undefined
+    };
+  }
+  if (typeof candidate.tag_name === "string") {
+    const release = candidate as GitHubRelease;
+    const tagName = candidate.tag_name;
+    const latestVersion = tagName.trim();
+    if (!latestVersion) {
+      throw new Error("GitHub Release 缺少 tag_name");
+    }
+    return {
+      latestVersion,
+      downloadUrl: release.assets?.find((asset) => asset.browser_download_url)?.browser_download_url,
+      releaseUrl: release.html_url,
+      notes: release.body,
+      publishedAt: release.published_at
+    };
+  }
+  throw new Error("不支持的更新源格式");
+}
+
 type SettingsView =
   | "menu"
   | "profile"
@@ -2169,6 +2261,8 @@ function ChatSettings({
   onSave: (patch: Partial<ChatConfig>) => Promise<void>;
 }) {
   const [wait, setWait] = useState(config.queueWaitSeconds);
+  const [dedupEnabled, setDedupEnabled] = useState(config.messageDedupEnabled !== false);
+  const [dedupWindow, setDedupWindow] = useState(config.messageDedupWindowSeconds ?? 30);
   const [runTimeout, setRunTimeout] = useState(config.agentRunTimeoutSeconds ?? 600);
   const [busyInputMode, setBusyInputMode] = useState(config.busyInputMode ?? "queue");
   const [delegationMaxConcurrentChildren, setDelegationMaxConcurrentChildren] = useState(config.delegationMaxConcurrentChildren ?? 3);
@@ -2242,6 +2336,8 @@ function ChatSettings({
 
   useEffect(() => {
     setWait(config.queueWaitSeconds);
+    setDedupEnabled(config.messageDedupEnabled !== false);
+    setDedupWindow(config.messageDedupWindowSeconds ?? 30);
     setRunTimeout(config.agentRunTimeoutSeconds ?? 600);
     setBusyInputMode(config.busyInputMode ?? "queue");
     setDelegationMaxConcurrentChildren(config.delegationMaxConcurrentChildren ?? 3);
@@ -2312,10 +2408,12 @@ function ChatSettings({
     setStoredMessages(config.maxStoredMessagesPerConversation ?? 300);
     setStoredRuns(config.maxStoredAgentRuns ?? 50);
     setStoredTraces(config.maxStoredToolTraces ?? 100);
-  }, [config.activePollIntervalMs, config.agentRunTimeoutSeconds, config.artifactScanLimit, config.autoTitleEnabled, config.backgroundMemoryReviewEnabled, config.backgroundMemoryReviewMinMessages, config.backgroundSkillCuratorEnabled, config.backgroundSkillCuratorIntervalHours, config.backgroundSkillReviewAutoCreateEnabled, config.backgroundSkillReviewEnabled, config.bottomFollowThresholdPx, config.busyInputMode, config.delegationInheritMcpToolsets, config.delegationMaxConcurrentChildren, config.delegationOrchestratorEnabled, config.delegationSubagentAutoApprove, config.delegationSubagentModel, config.delegationSubagentProviderId, config.historyCleanupEnabled, config.historyRetentionDays, config.idlePollIntervalMs, config.intentAnalyzerMode, config.intentAnalyzerModel, config.intentAnalyzerProviderId, config.intentEmbeddingMinConfidence, config.intentLlmMaxTokens, config.intentLlmMinConfidence, config.intentLlmPrompt, config.intentLlmTimeoutSeconds, config.llmCredentialPoolStrategy, config.llmRetryBackoffMs, config.llmRetryCount, config.maxStoredAgentRuns, config.maxStoredMessagesPerConversation, config.maxStoredToolTraces, config.queueWaitSeconds, config.responsesReasoningReplayEnabled, config.sendMessageToolEnabled, config.shortContextAbortOnSummaryFailure, config.shortContextSummaryModel, config.shortContextSummaryProviderId, config.skillHotReloadEnabled, config.skillHotReloadIntervalSeconds, config.thinkingMinVisibleMs, config.toolApprovalMode, config.toolCallRetryBackoffMs, config.toolCallRetryCount, config.toolEnvPassthrough, config.toolGuardrailExactFailureLimit, config.toolGuardrailExactFailureWarnAfter, config.toolGuardrailHardStopEnabled, config.toolGuardrailNoProgressLimit, config.toolGuardrailNoProgressWarnAfter, config.toolGuardrailSameToolFailureLimit, config.toolGuardrailSameToolFailureWarnAfter, config.toolGuardrailWarningsEnabled, config.toolParallelEnabled, config.toolParallelLimit, config.toolRouterLlmEnabled, config.toolRouterLlmMaxTokens, config.toolRouterLlmMinConfidence, config.toolRouterLlmPrompt, config.toolRouterLlmTimeoutSeconds, config.toolUseEnforcement, config.trustedCommandPatterns, config.trustedToolPatterns, config.uiMessageLimit, config.uiMessagePreviewChars, config.uiStreamCharsPerSecond]);
+  }, [config.activePollIntervalMs, config.agentRunTimeoutSeconds, config.artifactScanLimit, config.autoTitleEnabled, config.backgroundMemoryReviewEnabled, config.backgroundMemoryReviewMinMessages, config.backgroundSkillCuratorEnabled, config.backgroundSkillCuratorIntervalHours, config.backgroundSkillReviewAutoCreateEnabled, config.backgroundSkillReviewEnabled, config.bottomFollowThresholdPx, config.busyInputMode, config.delegationInheritMcpToolsets, config.delegationMaxConcurrentChildren, config.delegationOrchestratorEnabled, config.delegationSubagentAutoApprove, config.delegationSubagentModel, config.delegationSubagentProviderId, config.historyCleanupEnabled, config.historyRetentionDays, config.idlePollIntervalMs, config.intentAnalyzerMode, config.intentAnalyzerModel, config.intentAnalyzerProviderId, config.intentEmbeddingMinConfidence, config.intentLlmMaxTokens, config.intentLlmMinConfidence, config.intentLlmPrompt, config.intentLlmTimeoutSeconds, config.llmCredentialPoolStrategy, config.llmRetryBackoffMs, config.llmRetryCount, config.maxStoredAgentRuns, config.maxStoredMessagesPerConversation, config.maxStoredToolTraces, config.messageDedupEnabled, config.messageDedupWindowSeconds, config.queueWaitSeconds, config.responsesReasoningReplayEnabled, config.sendMessageToolEnabled, config.shortContextAbortOnSummaryFailure, config.shortContextSummaryModel, config.shortContextSummaryProviderId, config.skillHotReloadEnabled, config.skillHotReloadIntervalSeconds, config.thinkingMinVisibleMs, config.toolApprovalMode, config.toolCallRetryBackoffMs, config.toolCallRetryCount, config.toolEnvPassthrough, config.toolGuardrailExactFailureLimit, config.toolGuardrailExactFailureWarnAfter, config.toolGuardrailHardStopEnabled, config.toolGuardrailNoProgressLimit, config.toolGuardrailNoProgressWarnAfter, config.toolGuardrailSameToolFailureLimit, config.toolGuardrailSameToolFailureWarnAfter, config.toolGuardrailWarningsEnabled, config.toolParallelEnabled, config.toolParallelLimit, config.toolRouterLlmEnabled, config.toolRouterLlmMaxTokens, config.toolRouterLlmMinConfidence, config.toolRouterLlmPrompt, config.toolRouterLlmTimeoutSeconds, config.toolUseEnforcement, config.trustedCommandPatterns, config.trustedToolPatterns, config.uiMessageLimit, config.uiMessagePreviewChars, config.uiStreamCharsPerSecond]);
 
   const save = () => void onSave({
     busyInputMode: busyInputMode,
+    messageDedupEnabled: dedupEnabled,
+    messageDedupWindowSeconds: dedupWindow,
     shortContextAbortOnSummaryFailure: shortContextAbortOnSummaryFailure,
     shortContextSummaryProviderId: shortContextSummaryProviderId,
     shortContextSummaryModel: shortContextSummaryModel,
@@ -2456,6 +2554,18 @@ function ChatSettings({
               <button onClick={() => setRunTimeout(Math.max(0, runTimeout - 30))} type="button">−</button>
               <span className="stepper-val">{runTimeout}</span>
               <button onClick={() => setRunTimeout(runTimeout + 30)} type="button">+</button>
+            </div>
+          </div>
+          <div className="form-row">
+            <label>重复请求拦截</label>
+            <input checked={dedupEnabled} onChange={(event) => setDedupEnabled(event.target.checked)} type="checkbox" />
+          </div>
+          <div className="form-row" style={{ opacity: dedupEnabled ? 1 : 0.5 }}>
+            <label>重复窗口（秒）</label>
+            <div className="stepper">
+              <button onClick={() => setDedupWindow(Math.max(5, dedupWindow - 5))} type="button">−</button>
+              <span className="stepper-val">{dedupWindow}</span>
+              <button onClick={() => setDedupWindow(dedupWindow + 5)} type="button">+</button>
             </div>
           </div>
           <div className="form-row">
@@ -3443,13 +3553,95 @@ function NetworkSettings({
 }
 
 function AboutSettings({ setView }: { setView: (view: SettingsView) => void }) {
+  const [appVersion, setAppVersion] = useState("V1.0.0");
+  const [manifestUrl, setManifestUrl] = useState(readUpdateManifestUrl);
+  const [updateStatus, setUpdateStatus] = useState("未检查");
+  const [updateDetail, setUpdateDetail] = useState("");
+  const [checking, setChecking] = useState(false);
+  const [availableUpdate, setAvailableUpdate] = useState<UpdateManifest | null>(null);
+
+  useEffect(() => {
+    void getVersion().then((version) => setAppVersion(`V${version}`)).catch(() => {
+      setAppVersion("V1.0.0");
+    });
+  }, []);
+
+  const checkUpdates = async () => {
+    const url = manifestUrl.trim();
+    if (!url) {
+      setUpdateStatus("未配置更新源");
+      setUpdateDetail("请填写可访问的版本清单地址。");
+      setAvailableUpdate(null);
+      return;
+    }
+    setChecking(true);
+    setUpdateStatus("正在检查更新...");
+    setUpdateDetail("");
+    try {
+      const response = await fetch(url, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const manifest = parseUpdateManifest(await response.json());
+      if (!manifest.latestVersion) {
+        throw new Error("缺少 latestVersion");
+      }
+      const currentVersion = appVersion;
+      const comparison = compareVersionStrings(manifest.latestVersion, currentVersion);
+      if (comparison > 0) {
+        setAvailableUpdate(manifest);
+        setUpdateStatus(`发现新版本 ${manifest.latestVersion}`);
+        setUpdateDetail(manifest.notes?.trim() || "可点击下方按钮打开下载页。");
+      } else {
+        setAvailableUpdate(null);
+        setUpdateStatus("已经是最新版本");
+        setUpdateDetail(`当前 ${currentVersion}，远端 ${manifest.latestVersion}`);
+      }
+    } catch (error) {
+      setAvailableUpdate(null);
+      setUpdateStatus("检查失败");
+      setUpdateDetail(String(error));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const saveManifestUrl = () => {
+    writeUpdateManifestUrl(manifestUrl);
+    setUpdateStatus("更新源已保存");
+    setUpdateDetail("");
+  };
+
+  const openUpdateUrl = () => {
+    const target = availableUpdate?.downloadUrl || availableUpdate?.releaseUrl || manifestUrl.trim();
+    if (!target) return;
+    window.open(target, "_blank", "noopener,noreferrer");
+  };
+
   return (
     <div className="primary-panel embedded-panel about-panel">
       <div className="brand-mark about-logo"><Sparkles size={28} /></div>
       <h2>SynthChat</h2>
-      <p>v0.1.8 rebuild · 智能 AI 聊天机器人</p>
+      <p>{appVersion} · 智能 AI 聊天机器人</p>
       <div className="menu-card flat-card">
-        <MenuRow icon={RefreshCw} label="检查更新" value="本地重构版" iconColor="neutral" />
+        <div className="settings-form" style={{ padding: "12px 12px 8px" }}>
+          <label style={{ display: "grid", gap: 6 }}>
+            <span>更新源地址</span>
+            <input value={manifestUrl} onChange={(event) => setManifestUrl(event.target.value)} placeholder="GitHub Releases API 或 update.json 地址" />
+          </label>
+          <div className="form-actions" style={{ marginTop: 8 }}>
+            <button className="btn-secondary" onClick={saveManifestUrl} type="button">保存更新源</button>
+            <button className="btn-primary" onClick={() => void checkUpdates()} disabled={checking} type="button">
+              {checking ? "检查中..." : "检查更新"}
+            </button>
+          </div>
+          <div className="form-hint">{updateStatus}{updateDetail ? ` · ${updateDetail}` : ""}</div>
+          {availableUpdate ? (
+            <div className="form-actions" style={{ marginTop: 4 }}>
+              <button className="btn-secondary" onClick={openUpdateUrl} type="button">打开下载页</button>
+            </div>
+          ) : null}
+        </div>
         <MenuRow icon={Info} label="隐私说明及设置" onClick={() => setView("privacy")} iconColor="neutral" />
         <MenuRow icon={Info} label="软件声明" onClick={() => setView("statement")} iconColor="neutral" />
       </div>

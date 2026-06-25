@@ -78,6 +78,16 @@ pub async fn run_chat_turn(
             .and_then(|messages| messages.first())
             .map(|message| message.conversation_id.clone())
             .or_else(|| conversation_id.clone());
+        // Carry the final assistant message so listeners (e.g. the pet window)
+        // can react immediately instead of polling. This makes the hub the
+        // single, timely source of "the reply is ready" for every source.
+        let assistant_message = result.as_ref().ok().and_then(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "assistant")
+                .cloned()
+        });
         if let Some(resolved_conversation_id) = resolved_conversation_id {
             let _ = app.emit(
                 "synthchat-chat-event",
@@ -87,6 +97,7 @@ pub async fn run_chat_turn(
                     "personaId": persona_id,
                     "conversationId": resolved_conversation_id,
                     "ok": result.is_ok(),
+                    "message": assistant_message,
                 }),
             );
         }

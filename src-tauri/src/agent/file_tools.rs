@@ -398,6 +398,11 @@ fn read_pdf_file_tool(store: &AppStore, full_path: &Path, payload: &Value) -> Ap
             .and_then(Value::as_u64)
             .unwrap_or(80_000)
             .clamp(1_000, 500_000) as usize;
+        let loop_warning = track_file_tool_loop(
+            payload,
+            format!("read:{}:pdf_raw:{max_chars}", full_path.display()),
+            "read_file",
+        )?;
         let total_chars = content.chars().count();
         if total_chars > max_chars {
             return Err(AppError::BadRequest(format!(
@@ -423,7 +428,7 @@ fn read_pdf_file_tool(store: &AppStore, full_path: &Path, payload: &Value) -> Ap
             state.sha256,
             state.modified_unix_ms,
             content
-        ));
+        ) + loop_warning.as_deref().unwrap_or(""));
     }
     let char_mode = matches!(mode.as_str(), "char" | "chars" | "characters")
         || payload.get("charOffset").is_some()
@@ -444,6 +449,11 @@ fn read_pdf_file_tool(store: &AppStore, full_path: &Path, payload: &Value) -> Ap
             .or_else(|| payload.get("offset"))
             .and_then(Value::as_u64)
             .unwrap_or(0) as usize;
+        let loop_warning = track_file_tool_loop(
+            payload,
+            format!("read:{}:pdf_chars:{offset}:{limit}", full_path.display()),
+            "read_file",
+        )?;
         let total_chars = content.chars().count();
         let slice = content.chars().skip(offset).take(limit).collect::<String>();
         let partial = offset > 0 || offset + limit < total_chars;
@@ -466,7 +476,7 @@ fn read_pdf_file_tool(store: &AppStore, full_path: &Path, payload: &Value) -> Ap
             offset,
             limit,
             slice
-        ));
+        ) + loop_warning.as_deref().unwrap_or(""));
     }
 
     let offset = payload
@@ -486,6 +496,11 @@ fn read_pdf_file_tool(store: &AppStore, full_path: &Path, payload: &Value) -> Ap
         .and_then(Value::as_u64)
         .unwrap_or(500)
         .clamp(1, max_lines as u64) as usize;
+    let loop_warning = track_file_tool_loop(
+        payload,
+        format!("read:{}:pdf_lines:{offset}:{limit}", full_path.display()),
+        "read_file",
+    )?;
     let lines = content.split('\n').collect::<Vec<_>>();
     let total_lines = if content.is_empty() { 0 } else { lines.len() };
     let start = offset.saturating_sub(1).min(total_lines);
@@ -521,7 +536,7 @@ fn read_pdf_file_tool(store: &AppStore, full_path: &Path, payload: &Value) -> Ap
         truncated,
         next,
         body
-    ))
+    ) + loop_warning.as_deref().unwrap_or(""))
 }
 
 fn extract_pdf_text_best_effort(bytes: &[u8]) -> String {

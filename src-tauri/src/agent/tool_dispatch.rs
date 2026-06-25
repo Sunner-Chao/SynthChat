@@ -205,7 +205,7 @@ fn preview_at_line_boundary(text: &str, max_chars: usize) -> String {
 fn persisted_output_message(original: &str, path: &Path, preview: &str) -> String {
     let original_chars = original.chars().count();
     format!(
-        "<persisted-output>\nThis tool result was too large ({original_chars} characters).\nFull output saved to: {}\nUse read_file with offset/limit to inspect specific sections.\n\nPreview (first {} chars):\n{}\n...\n</persisted-output>",
+        "<persisted-output>\nThis tool result was too large ({original_chars} characters).\nFull output saved to: {}.\nIf you still need more detail for the current user request, read only the specific section you need with read_file offset/limit.\n\nPreview (first {} chars):\n{}\n...\n</persisted-output>",
         path.to_string_lossy(),
         preview.chars().count(),
         preview
@@ -215,7 +215,7 @@ fn persisted_output_message(original: &str, path: &Path, preview: &str) -> Strin
 fn persisted_observation_budget_message(original: &str, path: &Path, preview: &str) -> String {
     let original_chars = original.chars().count();
     format!(
-        "<persisted-output reason=\"turn-budget\">\nThis tool observation was persisted because the turn exceeded the aggregate prompt budget ({original_chars} characters in this observation).\nFull output saved to: {}\nUse read_file with offset/limit to inspect specific sections.\n\nPreview (first {} chars):\n{}\n...\n</persisted-output>",
+        "<persisted-output reason=\"turn-budget\">\nThis tool observation was persisted because the turn exceeded the aggregate prompt budget ({original_chars} characters in this observation).\nFull output saved to: {}.\nIf the current answer still needs more detail, read only the specific section you need with read_file offset/limit.\n\nPreview (first {} chars):\n{}\n...\n</persisted-output>",
         path.to_string_lossy(),
         preview.chars().count(),
         preview

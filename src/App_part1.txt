@@ -1,0 +1,157 @@
+import { ChangeEvent, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  Bot,
+  BookOpen,
+  Brain,
+  Camera,
+  Check,
+  ChevronRight,
+  Compass,
+  Edit3,
+  Copy,
+  ExternalLink,
+  FolderOpen,
+  Globe,
+  Heart,
+  Image,
+  ImagePlus,
+  Info,
+  Pencil,
+  Plus,
+  MessageSquareText,
+  Maximize2,
+  Newspaper,
+  Palette,
+  PlugZap,
+  Puzzle,
+  RefreshCw,
+  Search,
+  Send,
+  Settings,
+  Smartphone,
+  Smile,
+  Sparkles,
+  Trash2,
+  Upload,
+  Wand2,
+  Users,
+  X
+} from "lucide-react";
+import { useAppStore } from "./lib/store";
+import { api } from "./lib/api";
+import { listen } from "@tauri-apps/api/event";
+import { emit } from "@tauri-apps/api/event";
+import { Avatar, MenuRow } from "./components/common";
+import { SettingsPanel } from "./panels/SettingsPanel";
+import { AgentsPanel, MemoryPanel, SkillsPanel, WorldbooksPanel, PluginsPanel, McpPanel } from "./panels/ToolPanels";
+import { MomentsPanel } from "./panels/MomentsPanel";
+import { PersonaPanel } from "./panels/PersonaPanel";
+import { ChatExperience } from "./panels/ChatExperience";
+import { EnvironmentCheck } from "./panels/EnvironmentCheck";
+import { PET_ACTIVE_CONTEXT_EVENT, writeStoredPetActiveContext, type PetActiveContext } from "./lib/petContext";
+import type {
+  AccountConfig,
+  AgentConfig,
+  AgentQueuedRequest,
+  AgentRunEvent,
+  AppSection,
+  CapabilityAdapter,
+  ChatMessage,
+  EmojiGroup,
+  ImageProvider,
+  LlmProvider,
+  ManagedProcessEvent,
+  McpServer,
+  MomentComment,
+  MomentPost,
+  Persona,
+  ProfileConfig,
+  SkillSummary,
+  ThemeConfig,
+  ToolEvent,
+  ToolEventEnvelope,
+  WechatConfig,
+  WechatQrStartResult,
+  WechatQrStatusResult,
+  Worldbook
+} from "./lib/types";
+
+const navItems: Array<{ id: AppSection; label: string; icon: typeof MessageSquareText }> = [
+  { id: "chat", label: "聊天", icon: MessageSquareText },
+  { id: "contacts", label: "通讯录", icon: Users },
+  { id: "discover", label: "发现", icon: Compass },
+  { id: "personas", label: "角色", icon: Bot },
+  { id: "moments", label: "朋友圈", icon: Newspaper },
+  { id: "memory", label: "记忆", icon: Brain },
+  { id: "worldbooks", label: "世界书", icon: BookOpen },
+  { id: "plugins", label: "插件", icon: Puzzle },
+  { id: "mcp", label: "工具", icon: PlugZap },
+  { id: "agents", label: "智能体", icon: Sparkles },
+  { id: "skills", label: "技能", icon: Wand2 },
+  { id: "settings", label: "设置", icon: Settings }
+];
+
+const primaryNavItems = navItems.filter((item) =>
+  ["chat", "contacts", "discover", "settings"].includes(item.id)
+);
+
+function parseToolEvent(content: string): ToolEvent | null {
+  try {
+    const parsed = JSON.parse(content) as Partial<ToolEventEnvelope>;
+    if (parsed?.type === "toolEvent" && parsed.event) return parsed.event;
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function formatTime(value: string) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function isVisibleChatEventMessage(message: ChatMessage) {
+  return !(message.role === "user" && message.source === "proactive-internal");
+}
+
+function maskSecret(value?: string | null) {
+  const text = value?.trim() ?? "";
+  if (!text) return "未记录";
+  if (text.length <= 10) return $(.slice(0, 2))***;
+  return $(.slice(0, 6))...;
+}
+
+function providerPresetLabel(id: string) {
+  const labels: Record<string, string> = {
+    openai: "OpenAI (GPT)",
+    anthropic: "Anthropic (Claude)",
+    google: "Google (Gemini)",
+    deepseek: "DeepSeek",
+    siliconflow: "硅基流动",
+    custom: "自定义"
+  };
+  return labels[id] ?? id;
+}
+
+function providerPresetDefaults(id: string) {
+  const defaults: Record<string, { providerType: string; baseUrl: string; appendChatPath: boolean }> = {
+    openai: { providerType: "openai_compatible", baseUrl: "https://api.openai.com/v1", appendChatPath: true },
+    anthropic: { providerType: "anthropic", baseUrl: "https://api.anthropic.com/v1", appendChatPath: true },
+    google: { providerType: "gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta", appendChatPath: true },
+    deepseek: { providerType: "openai_compatible", baseUrl: "https://api.deepseek.com", appendChatPath: true },
+    siliconflow: { providerType: "openai_compatible", baseUrl: "https://api.siliconflow.cn/v1", appendChatPath: true },
+    custom: { providerType: "openai_compatible", baseUrl: "", appendChatPath: true }
+  };
+  return defaults[id] ?? defaults.custom;
+}
+
+const WECHAT_THINKING_MIN_VISIBLE_MS = 900;
+
+function imageProviderTypeLabel(id: string) {
+  const labels: Record<string, string> = {
+    openai_image: "OpenAI Image",
+    gemini_image: "Gemini Image",
+    novelai: "NovelAI"
+  };
+  return labels[id] ?? id;
+}

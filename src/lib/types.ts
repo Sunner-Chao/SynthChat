@@ -39,6 +39,8 @@ export interface ChatConfig {
   busyInputMode?: "queue" | "steer" | "interrupt" | string;
   autoTitleEnabled?: boolean;
   queueWaitSeconds: number;
+  messageDedupEnabled?: boolean;
+  messageDedupWindowSeconds?: number;
   delegationMaxConcurrentChildren?: number;
   delegationOrchestratorEnabled?: boolean;
   delegationSubagentAutoApprove?: boolean;

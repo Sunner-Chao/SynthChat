@@ -1129,8 +1129,8 @@ export const ChatExperience = memo(function ChatExperience() {
     }
     return results;
   }, [artifactMessages, attachments, messageToolEvents]);
-  const isProcessing = Boolean(activeConversationId && processingConversationIds.includes(activeConversationId));
   const canStopRun = Boolean(stoppableRun);
+  const isProcessing = canStopRun;
   const [showThinking, setShowThinking] = useState(false);
   // Keep the thinking row mounted through its exit animation so the
   // transition can play instead of the node being removed instantly.

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { Palette, SendHorizontal } from "lucide-react";
-import { api } from "./lib/api";
+import { api, convertFileSrc } from "./lib/api";
 import type { AgentRunEvent, ChatMessage, Conversation, Persona } from "./lib/types";
 import {
   PET_ACTIVE_CONTEXT_EVENT,
@@ -67,6 +67,7 @@ type PetCloudBubble = {
   id: string;
   text: string;
   tone: "soft" | "happy" | "active" | "error";
+  attachments?: Array<{fileName: string; path: string; mimeType?: string}>;
 };
 
 type PetCloudStyle = CSSProperties & {
@@ -116,17 +117,25 @@ function formatCloudText(text: string) {
 function latestAssistantMessage(messages: ChatMessage[]) {
   return [...messages]
     .reverse()
-    .find((message) => Boolean(messageToCloudText(message)));
+    .find((message) => message.role === "assistant" && Boolean(messageToCloudText(message)));
 }
 
 function messageToCloudText(message: ChatMessage | null | undefined) {
-  if (!message || message.role !== "assistant") return "";
-  return formatCloudText(
-    stripToolDirectiveBlocks(message.content)
-      .split(/\r?\n/)
-      .filter((line) => !isAttachmentContextLine(line) && !isMediaDirectiveLine(line))
-      .join("\n")
-  );
+  if (!message) return "";
+  const attachmentLines: string[] = [];
+  const textLines = stripToolDirectiveBlocks(message.content)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .flatMap((line) => {
+      const attachmentLine = attachmentContextLineText(line) ?? mediaDirectiveLineText(line);
+      if (attachmentLine) {
+        attachmentLines.push(attachmentLine);
+        return [];
+      }
+      return [line];
+    });
+  return formatCloudText([...textLines, ...attachmentLines].join("\n"));
 }
 
 function isAttachmentContextLine(line: string) {
@@ -140,9 +149,53 @@ function isAttachmentContextLine(line: string) {
   }
 }
 
+function attachmentContextLineText(line: string) {
+  const trimmed = line.trim();
+  if (!isAttachmentContextLine(trimmed)) return null;
+  try {
+    const parsed = JSON.parse(trimmed) as { fileName?: string; path?: string; mimeType?: string };
+    const name = parsed.fileName?.trim() || parsed.path?.split(/[\\/]/).pop()?.trim() || "未命名附件";
+    const mime = parsed.mimeType?.trim();
+    return mime ? `[附件] ${name} (${mime})` : `[附件] ${name}`;
+  } catch {
+    return "[附件]";
+  }
+}
+
 function isMediaDirectiveLine(line: string) {
   const trimmed = line.trim();
   return trimmed.includes("[media attached:") || /^`?MEDIA:\s*(?:"[^"]+"|'[^']+'|`[^`]+`|.+)`?$/i.test(trimmed);
+}
+
+function mediaDirectiveLineText(line: string) {
+  const trimmed = line.trim();
+  if (!isMediaDirectiveLine(trimmed)) return null;
+  const attachedMatch = trimmed.match(/\[media attached:\s*"([^"]+)"(?:\s*\(([^)]+)\))?\]\s*(.+)?$/i);
+  if (attachedMatch) {
+    const fileName = attachedMatch[3]?.trim() || attachedMatch[1]?.split(/[\\/]/).pop()?.trim() || "附件";
+    const mime = attachedMatch[2]?.trim();
+    return mime ? `[附件] ${fileName} (${mime})` : `[附件] ${fileName}`;
+  }
+  const mediaMatch = trimmed.match(/^`?MEDIA:\s*(?:"([^"]+)"|'([^']+)'|`([^`]+)`|(.+))`?$/i);
+  const name = mediaMatch?.slice(1).find((value) => value && value.trim())?.trim();
+  return name ? `[附件] ${name}` : "[附件]";
+}
+
+function extractCloudAttachments(rawContent: string): Array<{fileName: string; path: string; mimeType?: string}> {
+  const results: Array<{fileName: string; path: string; mimeType?: string}> = [];
+  for (const line of stripToolDirectiveBlocks(rawContent).split("\n")) {
+    const trimmed = line.trim();
+    if (isAttachmentContextLine(trimmed)) {
+      try {
+        const parsed = JSON.parse(trimmed) as { fileName?: string; path?: string; mimeType?: string };
+        if (parsed.path) results.push({ fileName: parsed.fileName || parsed.path.split("/").pop()?.split("\\").pop() || "附件", path: parsed.path, mimeType: parsed.mimeType });
+      } catch { /* ignore */ }
+    } else if (isMediaDirectiveLine(trimmed)) {
+      const m = trimmed.match(/\[media attached:\s*"([^"]+)"(?:\s*\(([^)]+)\))?\]/i);
+      if (m) results.push({ fileName: m[1].split("/").pop()?.split("\\").pop() || "附件", path: m[1], mimeType: m[2] });
+    }
+  }
+  return results;
 }
 
 function stripToolDirectiveBlocks(content: string) {
@@ -323,7 +376,7 @@ export function PetWindow() {
           source: "wechat"
         });
       }
-      showAssistantCloud(payload.message);
+      if (payload.message.role === "assistant") showAssistantCloud(payload.message);
     }).then((handler) => {
       unlisten = handler;
     });
@@ -342,7 +395,7 @@ export function PetWindow() {
       message?: ChatMessage;
     }>("synthchat-chat-event", (event) => {
       const payload = event.payload;
-      const relevantTypes = ["new_message", "assistant_message", "conversation_updated"];
+      const relevantTypes = ["new_message", "assistant_message", "conversation_updated", "turn_finished"];
       if (!relevantTypes.includes(payload.type) || !payload.conversationId) return;
 
       const context = activeContextRef.current ?? readStoredPetActiveContext();
@@ -371,9 +424,26 @@ export function PetWindow() {
         setPetContext(nextContext);
       }
 
-      if (payload.message?.role === "assistant") {
-        showAssistantCloud(payload.message);
+      // turn_finished is the authoritative "reply is ready" signal from the hub
+      // for every source. Show the carried assistant message immediately; if it
+      // has no cloud-renderable text (e.g. tool-only output) or was already
+      // shown, fall back to an immediate fetch of the latest assistant so the
+      // cloud never waits on the slow polling mirror.
+      if (payload.type === "turn_finished") {
+        if (payload.message && payload.message.role === "assistant" && messageToCloudText(payload.message)) {
+          showAssistantCloud(payload.message);
+        } else {
+          void refreshLatestAssistant(payload.conversationId, true, true);
+        }
         return;
+      }
+
+      if (payload.message && payload.message.role === "assistant") {
+        const text = messageToCloudText(payload.message);
+        if (text) {
+          showAssistantCloud(payload.message);
+          return;
+        }
       }
       void refreshLatestAssistant(payload.conversationId, true);
     }).then((handler) => {
@@ -608,14 +678,15 @@ export function PetWindow() {
     });
   }
 
-  function showCloud(text: string, tone: PetCloudBubble["tone"] = "soft", durationMs = 4200) {
+  function showCloud(text: string, tone: PetCloudBubble["tone"] = "soft", durationMs = 4200, attachments?: PetCloudBubble["attachments"]) {
     const formatted = formatCloudText(text);
-    if (!formatted) return;
+    if (!formatted && !attachments?.length) return;
     clearCloudTimer();
     setCloudBubble({
       id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-      text: formatted,
-      tone
+      text: formatted || "",
+      tone,
+      attachments
     });
     cloudTimerRef.current = window.setTimeout(() => {
       setCloudBubble(null);
@@ -631,19 +702,22 @@ export function PetWindow() {
       lastShownAssistantIdRef.current = message.id;
       lastSeenAssistantIdRef.current = message.id;
     }
-    showCloud(text, "active", durationMs);
+    const attachments = extractCloudAttachments(message.content);
+    showCloud(text, "active", durationMs, attachments.length ? attachments : undefined);
     if (modelLoadedRef.current) {
       postToPet({ type: "expression", id: "开心" });
     }
   }
 
-  async function refreshLatestAssistant(conversationId: string, showChanged: boolean) {
+  async function refreshLatestAssistant(conversationId: string, showChanged = true, force = false) {
     try {
       const messages = await api.listMessages(conversationId, PET_HISTORY_LIMIT, PET_PREVIEW_CHARS);
       const assistant = latestAssistantMessage(messages);
       if (!assistant) return null;
       const changed = assistant.id !== lastSeenAssistantIdRef.current;
-      if (showChanged && changed) {
+      if ((showChanged && changed) || force) {
+        // showAssistantCloud dedupes on lastShownAssistantIdRef, so forcing here
+        // is safe — it won't re-show a bubble that is already on screen.
         showAssistantCloud(assistant);
       }
       lastSeenAssistantIdRef.current = assistant.id;
@@ -1105,7 +1179,22 @@ export function PetWindow() {
             ref={cloudBubbleRef}
             style={cloudStyle()}
           >
-            <span className="pet-cloud-text" title={cloudBubble.text}>{cloudBubble.text}</span>
+            {cloudBubble.attachments?.map((a, i) => {
+              const isImage = a.mimeType?.startsWith("image/");
+              const ext = a.fileName.split(".").pop()?.toLowerCase() ?? "";
+              const docIcon: Record<string, string> = { pdf: "📄", pptx: "📊", ppt: "📊", docx: "📝", doc: "📝", xlsx: "📊", xls: "📊", txt: "📃", csv: "📊" };
+              return isImage ? (
+                <img key={i} className="pet-cloud-attachment-img" src={convertFileSrc(a.path)} alt={a.fileName} title={a.fileName} />
+              ) : (
+                <span key={i} className="pet-cloud-attachment-file" title={a.path}>
+                  <span className="pet-cloud-attachment-icon">{docIcon[ext] ?? "📎"}</span>
+                  <span className="pet-cloud-attachment-name">{a.fileName}</span>
+                </span>
+              );
+            })}
+            {cloudBubble.text ? (
+              <span className="pet-cloud-text" title={cloudBubble.text}>{cloudBubble.text}</span>
+            ) : null}
             <span className="pet-cloud-tail" aria-hidden="true">
               <span />
               <span />
