@@ -54,6 +54,7 @@ export interface ChatConfig {
   uiMessagePreviewChars?: number;
   uiStreamCharsPerSecond?: number;
   thinkingMinVisibleMs?: number;
+  petCloudDurationSeconds?: number;
   bottomFollowThresholdPx?: number;
   activePollIntervalMs?: number;
   idlePollIntervalMs?: number;
@@ -271,6 +272,7 @@ export interface ChatMessage {
   createdAt: string;
   source?: string;
   accountId?: string | null;
+  providerData?: unknown | null;
 }
 
 export interface ChatAttachment {

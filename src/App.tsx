@@ -288,18 +288,13 @@ export function App() {
       // drives its "thinking" UI solely from this pair and auto-follows the
       // turn's conversation, so timing is uniform across all sources.
       if (payload.type === "turn_started" && payload.conversationId) {
-        // Pet/wechat messages do NOT show desktop thinking UI - silently follow.
-        const isPetOrWechat = messageSource === "pet" || messageSource === "wechat";
-        if (!isPetOrWechat) {
-          showConversationProcessing(
-            payload.conversationId,
-            payload.personaId ?? null,
-            true,
-            externalSource
-          );
-        } else {
-          void refreshChatData(payload.conversationId, payload.personaId ?? null);
-        }
+        const shouldSwitchSection = externalSource && messageSource !== "pet" && messageSource !== "wechat";
+        showConversationProcessing(
+          payload.conversationId,
+          payload.personaId ?? null,
+          true,
+          shouldSwitchSection
+        );
         return;
       }
       if (payload.type === "turn_finished" && payload.conversationId) {

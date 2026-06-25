@@ -80,6 +80,7 @@ const fallbackConfig: AppConfig = {
     uiMessagePreviewChars: 12000,
     uiStreamCharsPerSecond: 36,
     thinkingMinVisibleMs: 1800,
+    petCloudDurationSeconds: 10,
     bottomFollowThresholdPx: 180,
     activePollIntervalMs: 1500,
     idlePollIntervalMs: 3000,

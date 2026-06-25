@@ -2280,6 +2280,7 @@ function ChatSettings({
   const [previewChars, setPreviewChars] = useState(config.uiMessagePreviewChars ?? 12000);
   const [streamChars, setStreamChars] = useState(config.uiStreamCharsPerSecond ?? 36);
   const [thinkingMs, setThinkingMs] = useState(config.thinkingMinVisibleMs ?? 1800);
+  const [petCloudDurationSeconds, setPetCloudDurationSeconds] = useState(config.petCloudDurationSeconds ?? 10);
   const [bottomThreshold, setBottomThreshold] = useState(config.bottomFollowThresholdPx ?? 180);
   const [activePollMs, setActivePollMs] = useState(config.activePollIntervalMs ?? 1500);
   const [idlePollMs, setIdlePollMs] = useState(config.idlePollIntervalMs ?? 3000);
@@ -2355,6 +2356,7 @@ function ChatSettings({
     setPreviewChars(config.uiMessagePreviewChars ?? 12000);
     setStreamChars(config.uiStreamCharsPerSecond ?? 36);
     setThinkingMs(config.thinkingMinVisibleMs ?? 1800);
+    setPetCloudDurationSeconds(config.petCloudDurationSeconds ?? 10);
     setBottomThreshold(config.bottomFollowThresholdPx ?? 180);
     setActivePollMs(config.activePollIntervalMs ?? 1500);
     setIdlePollMs(config.idlePollIntervalMs ?? 3000);
@@ -2408,7 +2410,7 @@ function ChatSettings({
     setStoredMessages(config.maxStoredMessagesPerConversation ?? 300);
     setStoredRuns(config.maxStoredAgentRuns ?? 50);
     setStoredTraces(config.maxStoredToolTraces ?? 100);
-  }, [config.activePollIntervalMs, config.agentRunTimeoutSeconds, config.artifactScanLimit, config.autoTitleEnabled, config.backgroundMemoryReviewEnabled, config.backgroundMemoryReviewMinMessages, config.backgroundSkillCuratorEnabled, config.backgroundSkillCuratorIntervalHours, config.backgroundSkillReviewAutoCreateEnabled, config.backgroundSkillReviewEnabled, config.bottomFollowThresholdPx, config.busyInputMode, config.delegationInheritMcpToolsets, config.delegationMaxConcurrentChildren, config.delegationOrchestratorEnabled, config.delegationSubagentAutoApprove, config.delegationSubagentModel, config.delegationSubagentProviderId, config.historyCleanupEnabled, config.historyRetentionDays, config.idlePollIntervalMs, config.intentAnalyzerMode, config.intentAnalyzerModel, config.intentAnalyzerProviderId, config.intentEmbeddingMinConfidence, config.intentLlmMaxTokens, config.intentLlmMinConfidence, config.intentLlmPrompt, config.intentLlmTimeoutSeconds, config.llmCredentialPoolStrategy, config.llmRetryBackoffMs, config.llmRetryCount, config.maxStoredAgentRuns, config.maxStoredMessagesPerConversation, config.maxStoredToolTraces, config.messageDedupEnabled, config.messageDedupWindowSeconds, config.queueWaitSeconds, config.responsesReasoningReplayEnabled, config.sendMessageToolEnabled, config.shortContextAbortOnSummaryFailure, config.shortContextSummaryModel, config.shortContextSummaryProviderId, config.skillHotReloadEnabled, config.skillHotReloadIntervalSeconds, config.thinkingMinVisibleMs, config.toolApprovalMode, config.toolCallRetryBackoffMs, config.toolCallRetryCount, config.toolEnvPassthrough, config.toolGuardrailExactFailureLimit, config.toolGuardrailExactFailureWarnAfter, config.toolGuardrailHardStopEnabled, config.toolGuardrailNoProgressLimit, config.toolGuardrailNoProgressWarnAfter, config.toolGuardrailSameToolFailureLimit, config.toolGuardrailSameToolFailureWarnAfter, config.toolGuardrailWarningsEnabled, config.toolParallelEnabled, config.toolParallelLimit, config.toolRouterLlmEnabled, config.toolRouterLlmMaxTokens, config.toolRouterLlmMinConfidence, config.toolRouterLlmPrompt, config.toolRouterLlmTimeoutSeconds, config.toolUseEnforcement, config.trustedCommandPatterns, config.trustedToolPatterns, config.uiMessageLimit, config.uiMessagePreviewChars, config.uiStreamCharsPerSecond]);
+  }, [config.activePollIntervalMs, config.agentRunTimeoutSeconds, config.artifactScanLimit, config.autoTitleEnabled, config.backgroundMemoryReviewEnabled, config.backgroundMemoryReviewMinMessages, config.backgroundSkillCuratorEnabled, config.backgroundSkillCuratorIntervalHours, config.backgroundSkillReviewAutoCreateEnabled, config.backgroundSkillReviewEnabled, config.bottomFollowThresholdPx, config.busyInputMode, config.delegationInheritMcpToolsets, config.delegationMaxConcurrentChildren, config.delegationOrchestratorEnabled, config.delegationSubagentAutoApprove, config.delegationSubagentModel, config.delegationSubagentProviderId, config.historyCleanupEnabled, config.historyRetentionDays, config.idlePollIntervalMs, config.intentAnalyzerMode, config.intentAnalyzerModel, config.intentAnalyzerProviderId, config.intentEmbeddingMinConfidence, config.intentLlmMaxTokens, config.intentLlmMinConfidence, config.intentLlmPrompt, config.intentLlmTimeoutSeconds, config.llmCredentialPoolStrategy, config.llmRetryBackoffMs, config.llmRetryCount, config.maxStoredAgentRuns, config.maxStoredMessagesPerConversation, config.maxStoredToolTraces, config.messageDedupEnabled, config.messageDedupWindowSeconds, config.petCloudDurationSeconds, config.queueWaitSeconds, config.responsesReasoningReplayEnabled, config.sendMessageToolEnabled, config.shortContextAbortOnSummaryFailure, config.shortContextSummaryModel, config.shortContextSummaryProviderId, config.skillHotReloadEnabled, config.skillHotReloadIntervalSeconds, config.thinkingMinVisibleMs, config.toolApprovalMode, config.toolCallRetryBackoffMs, config.toolCallRetryCount, config.toolEnvPassthrough, config.toolGuardrailExactFailureLimit, config.toolGuardrailExactFailureWarnAfter, config.toolGuardrailHardStopEnabled, config.toolGuardrailNoProgressLimit, config.toolGuardrailNoProgressWarnAfter, config.toolGuardrailSameToolFailureLimit, config.toolGuardrailSameToolFailureWarnAfter, config.toolGuardrailWarningsEnabled, config.toolParallelEnabled, config.toolParallelLimit, config.toolRouterLlmEnabled, config.toolRouterLlmMaxTokens, config.toolRouterLlmMinConfidence, config.toolRouterLlmPrompt, config.toolRouterLlmTimeoutSeconds, config.toolUseEnforcement, config.trustedCommandPatterns, config.trustedToolPatterns, config.uiMessageLimit, config.uiMessagePreviewChars, config.uiStreamCharsPerSecond]);
 
   const save = () => void onSave({
     busyInputMode: busyInputMode,
@@ -2431,6 +2433,7 @@ function ChatSettings({
     uiMessagePreviewChars: previewChars,
     uiStreamCharsPerSecond: streamChars,
     thinkingMinVisibleMs: thinkingMs,
+    petCloudDurationSeconds: petCloudDurationSeconds,
     bottomFollowThresholdPx: bottomThreshold,
     activePollIntervalMs: activePollMs,
     idlePollIntervalMs: idlePollMs,
@@ -3042,6 +3045,14 @@ function ChatSettings({
               <button onClick={() => setBottomThreshold(Math.max(24, bottomThreshold - 24))} type="button">−</button>
               <span className="stepper-val">{bottomThreshold}px</span>
               <button onClick={() => setBottomThreshold(Math.min(600, bottomThreshold + 24))} type="button">+</button>
+            </div>
+          </div>
+          <div className="form-row">
+            <label>桌宠气泡时长（秒）</label>
+            <div className="stepper">
+              <button onClick={() => setPetCloudDurationSeconds(Math.max(1, petCloudDurationSeconds - 1))} type="button">−</button>
+              <span className="stepper-val">{petCloudDurationSeconds}</span>
+              <button onClick={() => setPetCloudDurationSeconds(Math.min(120, petCloudDurationSeconds + 1))} type="button">+</button>
             </div>
           </div>
           <div className="form-row">

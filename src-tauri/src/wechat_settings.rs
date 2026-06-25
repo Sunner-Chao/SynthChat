@@ -2717,11 +2717,24 @@ pub async fn wechat_inbound_text(
         app,
     )
     .await;
-    emit_wechat_processing(app, &conversation_id, &persona.id, false);
     let mut messages = match messages_result {
         Ok(messages) => messages,
-        Err(error) => return Err(error),
+        Err(error) => {
+            emit_wechat_processing(app, &conversation_id, &persona.id, false);
+            return Err(error);
+        }
     };
+    let user_message = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user" && message.source == "wechat")
+        .cloned();
+    if let Some(message) = user_message.as_ref() {
+        // Re-emit from the caller thread so the desktop window cannot miss the
+        // persisted WeChat user message due to cross-thread event timing.
+        emit_wechat_user_message(app, &conversation_id, &persona.id, message);
+    }
+    emit_wechat_processing(app, &conversation_id, &persona.id, false);
     let mut reply_message = messages
         .iter()
         .rev()
@@ -2834,6 +2847,28 @@ fn emit_wechat_assistant_message(
             "personaId": persona_id,
             "conversationId": conversation_id,
             "message": message,
+        }),
+    );
+}
+
+fn emit_wechat_user_message(
+    app: Option<&AppHandle>,
+    conversation_id: &str,
+    persona_id: &str,
+    message: &ChatMessage,
+) {
+    let Some(app) = app else {
+        return;
+    };
+    let _ = app.emit(
+        "synthchat-chat-event",
+        json!({
+            "type": "new_message",
+            "source": "wechat",
+            "personaId": persona_id,
+            "conversationId": conversation_id,
+            "message": message,
+            "isLast": false,
         }),
     );
 }
