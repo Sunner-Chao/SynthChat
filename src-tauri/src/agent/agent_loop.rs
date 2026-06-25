@@ -170,6 +170,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
             "synthchat-chat-event",
             json!({
                 "type": "new_message",
+                "source": user.source,
                 "personaId": persona.id,
                 "conversationId": conversation.id,
                 "message": user,
@@ -1614,6 +1615,19 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     spawn_user_queue_drain_after_turn(store, &conversation.id, app);
     maybe_run_background_skill_curator(store, &chat_config)?;
     let saved_completed_run = store.agent_run(&saved_completed_run.run_id)?;
+    if let Some(app) = app {
+        let _ = app.emit(
+            "synthchat-chat-event",
+            json!({
+                "type": "assistant_message",
+                "source": assistant.source,
+                "personaId": persona.id,
+                "conversationId": conversation.id,
+                "message": assistant,
+                "isLast": true,
+            }),
+        );
+    }
     emit_agent_run_record(app, &saved_completed_run, Some(&assistant));
     Ok(vec![user, assistant])
 }

@@ -264,8 +264,10 @@ function formatTime(value?: string | number | null) {
 
 function runStateLabel(state: string) {
   const labels: Record<string, string> = {
+    pending: "排队中",
     started: "任务已启动",
     planning: "正在规划",
+    running: "正在思考",
     running_tool: "正在调用...",
     tool_completed: "成功",
     pendingApproval: "等待审批",
@@ -1130,6 +1132,10 @@ export const ChatExperience = memo(function ChatExperience() {
   const isProcessing = Boolean(activeConversationId && processingConversationIds.includes(activeConversationId));
   const canStopRun = Boolean(stoppableRun);
   const [showThinking, setShowThinking] = useState(false);
+  // Keep the thinking row mounted through its exit animation so the
+  // transition can play instead of the node being removed instantly.
+  const [thinkingMounted, setThinkingMounted] = useState(false);
+  const thinkingLeaveTimerRef = useRef<number | null>(null);
   const hasStreamingContent = useMemo(
     () => messages.some((m) => m.source === "desktop-stream" && m.content.length > 0),
     [messages]
@@ -1161,6 +1167,32 @@ export const ChatExperience = memo(function ChatExperience() {
     }, delay);
     return () => window.clearTimeout(timer);
   }, [isProcessing, hasStreamingContent, thinkingMinVisibleMs, firstCharShown]);
+
+  // Drive mount/unmount with an exit animation: mount immediately when
+  // showThinking turns on; when it turns off keep the node mounted with the
+  // leaving class long enough for the exit transition to finish, then unmount.
+  const THINKING_LEAVE_MS = 200;
+  useEffect(() => {
+    if (showThinking) {
+      if (thinkingLeaveTimerRef.current !== null) {
+        window.clearTimeout(thinkingLeaveTimerRef.current);
+        thinkingLeaveTimerRef.current = null;
+      }
+      setThinkingMounted(true);
+      return;
+    }
+    if (!thinkingMounted) return;
+    thinkingLeaveTimerRef.current = window.setTimeout(() => {
+      setThinkingMounted(false);
+      thinkingLeaveTimerRef.current = null;
+    }, THINKING_LEAVE_MS);
+    return () => {
+      if (thinkingLeaveTimerRef.current !== null) {
+        window.clearTimeout(thinkingLeaveTimerRef.current);
+        thinkingLeaveTimerRef.current = null;
+      }
+    };
+  }, [showThinking, thinkingMounted]);
 
   useEffect(() => {
     const isHidden = activeSection !== "chat";
@@ -1847,8 +1879,8 @@ export const ChatExperience = memo(function ChatExperience() {
                   runStates={runStates}
                 />
               )}
-              {showThinking ? (
-                <div className="claw-thinking-row">
+              {thinkingMounted ? (
+                <div className={`claw-thinking-row${showThinking ? "" : " is-leaving"}`}>
                   <span className="claw-thinking-orbit" aria-hidden="true">
                     <i />
                     <i />

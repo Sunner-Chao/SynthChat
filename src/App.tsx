@@ -240,6 +240,23 @@ export function App() {
       isLast?: boolean;
     }>("synthchat-chat-event", (event) => {
       const payload = event.payload;
+      const messageSource = payload.message?.source ?? payload.source ?? "";
+      if (
+        payload.type === "new_message"
+        && payload.conversationId
+        && payload.message?.role === "user"
+        && (messageSource === "wechat" || messageSource === "pet")
+      ) {
+        setConversationProcessing(payload.conversationId, true);
+        // Auto-follow: activate the originating conversation on the desktop so
+        // the thinking UI (scoped to the active conversation) reliably shows for
+        // messages that originated from WeChat or the pet window.
+        const targetConversationId = payload.conversationId;
+        void (async () => {
+          await refreshChatData(targetConversationId, payload.personaId ?? null);
+          setConversationProcessing(targetConversationId, true);
+        })();
+      }
       if (payload.type === "processing" && payload.conversationId) {
         setConversationProcessing(payload.conversationId, true);
         if (payload.source === "wechat") {

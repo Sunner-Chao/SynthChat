@@ -48,6 +48,17 @@ const ACTIVE_QUEUE_STATES = new Set(["pending", "running"]);
 
 // Module-level ref for pending settings view (not in React state to avoid batching delays)
 let pendingSettingsViewRef: string | null = null;
+
+// Grace window guarding against a refresh clearing a "processing" flag that was
+// just set (e.g. WeChat/pet emits a processing event before the user message is
+// persisted, so a concurrent refresh still sees a stale assistant tail).
+const PROCESSING_MARK_GRACE_MS = 1500;
+const processingMarkedAtCache = new Map<string, number>();
+function withinProcessingGrace(conversationId: string | null): boolean {
+  if (!conversationId) return false;
+  const markedAt = processingMarkedAtCache.get(conversationId);
+  return markedAt !== undefined && Date.now() - markedAt < PROCESSING_MARK_GRACE_MS;
+}
 export function consumePendingSettingsView(): string | null {
   const v = pendingSettingsViewRef;
   pendingSettingsViewRef = null;
@@ -697,7 +708,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       : [];
     const messages = mergeLocalUiMessages(backendMessages, state.messages, activeConversationId, messageLimit);
     const latestMessage = messages.at(-1);
-    const shouldClearProcessing = Boolean(activeConversationId && latestMessage?.role === "assistant");
+    const shouldClearProcessing =
+      Boolean(activeConversationId && latestMessage?.role === "assistant")
+      && !withinProcessingGrace(activeConversationId);
     if (
       state.activeConversationId === activeConversationId
       && sameConversations(state.conversations, conversations)
@@ -724,6 +737,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   setConversationProcessing: (conversationId, processing) => {
     if (!conversationId) return;
+    if (processing) {
+      processingMarkedAtCache.set(conversationId, Date.now());
+    } else {
+      processingMarkedAtCache.delete(conversationId);
+    }
     set((state) => {
       const exists = state.processingConversationIds.includes(conversationId);
       if (processing && !exists) {

@@ -5139,6 +5139,22 @@ button:disabled {
   background: var(--primary-light);
   font-size: 13px;
   box-shadow: 0 8px 24px color-mix(in srgb, var(--primary) 14%, transparent);
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  transform-origin: left center;
+  animation: claw-thinking-enter 220ms var(--ease-smooth);
+  transition:
+    opacity 200ms var(--ease-smooth),
+    transform 200ms var(--ease-smooth),
+    box-shadow 200ms var(--ease-smooth),
+    background-color 200ms var(--ease-smooth);
+}
+
+.claw-thinking-row.is-leaving {
+  opacity: 0;
+  transform: translateY(4px) scale(0.985);
+  box-shadow: 0 0 0 color-mix(in srgb, var(--primary) 0%, transparent);
+  pointer-events: none;
 }
 
 .claw-step.active svg,
@@ -5182,6 +5198,17 @@ button:disabled {
   36% {
     opacity: 1;
     transform: translateY(-4px) scale(1.08);
+  }
+}
+
+@keyframes claw-thinking-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
   }
 }
 

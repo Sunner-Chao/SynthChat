@@ -21,6 +21,7 @@ const PET_PREVIEW_CHARS = 1200;
 const PET_MESSAGE_MIRROR_INTERVAL_MS = 3200;
 const PET_GLOBAL_LOOK_INTERVAL_MS = 32;
 const PET_GLOBAL_LOOK_IDLE_MS = 3000;
+const PET_ASSISTANT_CLOUD_DURATION_MS = 10000;
 
 const AVAILABLE_MODELS = [
   { id: "tororo", name: "Tororo", path: "/pet/model/Tororo/tororo.model3.json", greeting: "Tororo 到啦。" },
@@ -115,12 +116,39 @@ function formatCloudText(text: string) {
 function latestAssistantMessage(messages: ChatMessage[]) {
   return [...messages]
     .reverse()
-    .find((message) => message.role === "assistant" && message.content.trim());
+    .find((message) => Boolean(messageToCloudText(message)));
 }
 
 function messageToCloudText(message: ChatMessage | null | undefined) {
   if (!message || message.role !== "assistant") return "";
-  return formatCloudText(message.content);
+  return formatCloudText(
+    stripToolDirectiveBlocks(message.content)
+      .split(/\r?\n/)
+      .filter((line) => !isAttachmentContextLine(line) && !isMediaDirectiveLine(line))
+      .join("\n")
+  );
+}
+
+function isAttachmentContextLine(line: string) {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("{") || !trimmed.includes("\"attachment\"")) return false;
+  try {
+    const parsed = JSON.parse(trimmed) as { type?: string };
+    return parsed?.type === "attachment";
+  } catch {
+    return false;
+  }
+}
+
+function isMediaDirectiveLine(line: string) {
+  const trimmed = line.trim();
+  return trimmed.includes("[media attached:") || /^`?MEDIA:\s*(?:"[^"]+"|'[^']+'|`[^`]+`|.+)`?$/i.test(trimmed);
+}
+
+function stripToolDirectiveBlocks(content: string) {
+  const match = /(^|\n)\s*<(?:tool_call|tool_calls|function=|function_call|function_calls|tool_result)(?:\s|>|=)/i.exec(content);
+  if (!match || match.index < 0) return content;
+  return content.slice(0, match.index).trimEnd();
 }
 
 function touchCloudText(count: number) {
@@ -159,7 +187,8 @@ export function PetWindow() {
   const globalLookInFlightRef = useRef(false);
   const lastLookMoveAtRef = useRef(Date.now());
   const lastLookPointRef = useRef<{ x: number; y: number } | null>(null);
-  const lastAssistantIdRef = useRef<string | null>(null);
+  const lastSeenAssistantIdRef = useRef<string | null>(null);
+  const lastShownAssistantIdRef = useRef<string | null>(null);
   const pokeCountRef = useRef(0);
   const lastPokeAtRef = useRef(0);
   const initialGreetingShownRef = useRef(false);
@@ -282,7 +311,7 @@ export function PetWindow() {
       if (payload.type !== "proactive_message" || !payload.message) return;
       const context = activeContextRef.current ?? readStoredPetActiveContext();
       if (context?.conversationId && payload.conversationId && context.conversationId !== payload.conversationId) return;
-      showAssistantCloud(payload.message, 5600);
+      showAssistantCloud(payload.message);
     }).then((handler) => {
       unlisten = handler;
     });
@@ -306,10 +335,18 @@ export function PetWindow() {
 
       const context = activeContextRef.current ?? readStoredPetActiveContext();
       const isCurrentConversation = context?.conversationId === payload.conversationId;
-      const shouldFollowIncomingWechat = payload.source === "wechat" && (!context?.conversationId || !isCurrentConversation);
-      if (!isCurrentConversation && !shouldFollowIncomingWechat) return;
+      const eventSource = payload.source ?? payload.message?.source ?? "";
+      const hasContext = Boolean(context?.conversationId);
+      // Follow rules:
+      // - WeChat-originated messages always follow (locked or not).
+      // - When the pet has no locked context yet, follow whatever conversation
+      //   is active on the desktop so assistant replies still surface as a cloud.
+      const shouldFollowIncomingWechat = eventSource === "wechat" && (!hasContext || !isCurrentConversation);
+      const shouldFollowWhenUnbound = !hasContext;
+      const shouldFollow = shouldFollowIncomingWechat || shouldFollowWhenUnbound;
+      if (!isCurrentConversation && !shouldFollow) return;
 
-      if (shouldFollowIncomingWechat) {
+      if (shouldFollow && !isCurrentConversation) {
         const nextContext: PetActiveContext = {
           conversationId: payload.conversationId,
           conversationTitle: null,
@@ -317,13 +354,13 @@ export function PetWindow() {
           personaName: null,
           agentId: null,
           updatedAt: new Date().toISOString(),
-          source: "wechat"
+          source: shouldFollowIncomingWechat ? "wechat" : (eventSource || "desktop")
         };
         setPetContext(nextContext);
       }
 
       if (payload.message?.role === "assistant") {
-        showAssistantCloud(payload.message, 5200);
+        showAssistantCloud(payload.message);
         return;
       }
       void refreshLatestAssistant(payload.conversationId, true);
@@ -341,6 +378,10 @@ export function PetWindow() {
       const payload = event.payload;
       const context = activeContextRef.current ?? readStoredPetActiveContext();
       if (!context?.conversationId || context.conversationId !== payload.conversationId) return;
+      if (payload.message?.role === "assistant") {
+        showAssistantCloud(payload.message);
+        return;
+      }
       if (payload.state === "failed" || payload.state === "aborted") {
         showCloud("任务没有完成。", "error", 3200);
       }
@@ -570,10 +611,14 @@ export function PetWindow() {
     }, durationMs);
   }
 
-  function showAssistantCloud(message: ChatMessage, durationMs = 5200) {
+  function showAssistantCloud(message: ChatMessage, durationMs = PET_ASSISTANT_CLOUD_DURATION_MS) {
     const text = messageToCloudText(message);
     if (!text) return;
-    lastAssistantIdRef.current = message.id;
+    if (message.id) {
+      if (message.id === lastShownAssistantIdRef.current) return;
+      lastShownAssistantIdRef.current = message.id;
+      lastSeenAssistantIdRef.current = message.id;
+    }
     showCloud(text, "active", durationMs);
     if (modelLoadedRef.current) {
       postToPet({ type: "expression", id: "开心" });
@@ -585,11 +630,11 @@ export function PetWindow() {
       const messages = await api.listMessages(conversationId, PET_HISTORY_LIMIT, PET_PREVIEW_CHARS);
       const assistant = latestAssistantMessage(messages);
       if (!assistant) return null;
-      const changed = assistant.id !== lastAssistantIdRef.current;
-      lastAssistantIdRef.current = assistant.id;
+      const changed = assistant.id !== lastSeenAssistantIdRef.current;
       if (showChanged && changed) {
-        showAssistantCloud(assistant, 5200);
+        showAssistantCloud(assistant);
       }
+      lastSeenAssistantIdRef.current = assistant.id;
       return assistant;
     } catch (error) {
       console.error("pet message mirror failed:", error);
@@ -687,7 +732,7 @@ export function PetWindow() {
     try {
       const context = await resolvePetSendContext();
       updatePetActiveContext(context);
-      const previousAssistantId = lastAssistantIdRef.current;
+      const previousAssistantId = lastSeenAssistantIdRef.current;
       const messages = await api.sendChatMessage({
         conversationId: context.conversationId,
         personaId: context.personaId,
@@ -699,7 +744,7 @@ export function PetWindow() {
       });
       const assistant = latestAssistantMessage(messages) ?? await waitForAssistantReply(context.conversationId, previousAssistantId);
       if (assistant) {
-        showAssistantCloud(assistant, 5600);
+        showAssistantCloud(assistant);
       } else {
         showCloud("处理中...", "soft", 2600);
       }
