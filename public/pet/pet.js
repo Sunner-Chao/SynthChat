@@ -110,7 +110,7 @@ function layoutModel() {
     if (!model || !modelNaturalSize || modelScale === null) return;
     model.scale.set(modelScale);
     model.anchor.set(0.5, 0.5);
-    model.position.set(window.innerWidth * 0.5, window.innerHeight * 0.56);
+    model.position.set(window.innerWidth * 0.5, window.innerHeight * 0.6);
     reportModelBounds();
 }
 
@@ -221,8 +221,8 @@ async function loadModel(url = DEFAULT_MODEL_URL, options = {}) {
                     height: Math.max(1, nextModel.height)
                 };
                 modelScale = Math.min(
-                    (window.innerHeight * 0.82) / modelNaturalSize.height,
-                    (window.innerWidth * 0.88) / modelNaturalSize.width
+                    (window.innerHeight * 0.74) / modelNaturalSize.height,
+                    (window.innerWidth * 0.84) / modelNaturalSize.width
                 );
                 app.stage.addChild(model);
 
@@ -307,6 +307,9 @@ canvas.addEventListener("dblclick", (event) => {
 canvas.addEventListener("pointermove", (event) => {
     const overModel = pointInModelBounds(event.clientX, event.clientY);
     setModelHover(overModel);
+    if (!draggingModel) {
+        focusScreenPoint(event.clientX, event.clientY, false);
+    }
     if (draggingModel && activePointerId === event.pointerId) {
         queueModelDragMove(event.screenX, event.screenY);
     }

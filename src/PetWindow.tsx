@@ -19,6 +19,8 @@ const PET_ACTIVE_CONTEXT_SOURCE = "pet";
 const PET_HISTORY_LIMIT = 40;
 const PET_PREVIEW_CHARS = 1200;
 const PET_MESSAGE_MIRROR_INTERVAL_MS = 3200;
+const PET_GLOBAL_LOOK_INTERVAL_MS = 32;
+const PET_GLOBAL_LOOK_IDLE_MS = 3000;
 
 const AVAILABLE_MODELS = [
   { id: "tororo", name: "Tororo", path: "/pet/model/Tororo/tororo.model3.json", greeting: "Tororo 到啦。" },
@@ -82,10 +84,16 @@ type PetCloudStyle = CSSProperties & {
 };
 
 type PetCursorPosition = {
+  x?: number;
+  y?: number;
+  screenX?: number;
+  screenY?: number;
   clientX?: number;
   clientY?: number;
   windowWidth?: number;
   windowHeight?: number;
+  windowScreenX?: number;
+  windowScreenY?: number;
 };
 
 type PetDragPoint = {
@@ -101,7 +109,7 @@ function formatCloudText(text: string) {
     .join(" ")
     .trim();
   if (!normalized) return "";
-  return normalized.length > 220 ? `${normalized.slice(0, 220)}...` : normalized;
+  return normalized.length > 360 ? `${normalized.slice(0, 360)}...` : normalized;
 }
 
 function latestAssistantMessage(messages: ChatMessage[]) {
@@ -147,6 +155,10 @@ export function PetWindow() {
   const sendingRef = useRef(false);
   const mirrorInitializedRef = useRef(false);
   const cloudTimerRef = useRef<number | null>(null);
+  const globalLookTimerRef = useRef<number | null>(null);
+  const globalLookInFlightRef = useRef(false);
+  const lastLookMoveAtRef = useRef(Date.now());
+  const lastLookPointRef = useRef<{ x: number; y: number } | null>(null);
   const lastAssistantIdRef = useRef<string | null>(null);
   const pokeCountRef = useRef(0);
   const lastPokeAtRef = useRef(0);
@@ -155,6 +167,7 @@ export function PetWindow() {
   const hideTimeoutRef = useRef<number | null>(null);
   const isNearModelRef = useRef(false);
   const modelMenuOpenRef = useRef(false);
+  const showInputRef = useRef(true);
 
   const [input, setInput] = useState("");
   const [activeContext, setActiveContext] = useState<PetActiveContext | null>(activeContextRef.current);
@@ -173,6 +186,7 @@ export function PetWindow() {
       document.body.classList.remove("pet-window-body");
       document.documentElement.classList.remove("pet-window-html");
       clearCloudTimer();
+      clearGlobalLookTimer();
       void syncPetPointerPassthrough(false);
       stopModelDrag();
     };
@@ -193,6 +207,10 @@ export function PetWindow() {
   useEffect(() => {
     sendingRef.current = sending;
   }, [sending]);
+
+  useEffect(() => {
+    showInputRef.current = showInput;
+  }, [showInput]);
 
   useEffect(() => {
     modelMenuOpenRef.current = modelMenuOpen;
@@ -343,8 +361,7 @@ export function PetWindow() {
         const { clientX, clientY } = point;
         const overModel = pointNearModel(clientX, clientY);
         const inPetUi = isPointerInPetUi(clientX, clientY);
-        const inputFocused = document.activeElement === inputRef.current;
-        const isNear = overModel || inPetUi || modelMenuOpenRef.current || inputFocused;
+        const isNear = overModel || inPetUi || modelMenuOpenRef.current;
 
         void syncPetPointerPassthrough(!isNear);
 
@@ -362,6 +379,8 @@ export function PetWindow() {
             }
             hideTimeoutRef.current = window.setTimeout(() => {
               if (!modelMenuOpenRef.current) {
+                inputRef.current?.blur();
+                showInputRef.current = false;
                 setShowInput(false);
               }
               hideTimeoutRef.current = null;
@@ -379,6 +398,17 @@ export function PetWindow() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    clearGlobalLookTimer();
+    if (!modelLoaded) return;
+    lastLookPointRef.current = null;
+    lastLookMoveAtRef.current = Date.now();
+    globalLookTimerRef.current = window.setInterval(() => {
+      void updateGlobalLook();
+    }, PET_GLOBAL_LOOK_INTERVAL_MS);
+    return clearGlobalLookTimer;
+  }, [modelLoaded]);
 
   useEffect(() => {
     const onMessage = (event: MessageEvent<PetMessage>) => {
@@ -479,6 +509,14 @@ export function PetWindow() {
     }
   }
 
+  function clearGlobalLookTimer() {
+    if (globalLookTimerRef.current !== null) {
+      window.clearInterval(globalLookTimerRef.current);
+      globalLookTimerRef.current = null;
+    }
+    globalLookInFlightRef.current = false;
+  }
+
   function clearInputHideTimer() {
     if (hideTimeoutRef.current !== null) {
       window.clearTimeout(hideTimeoutRef.current);
@@ -489,15 +527,18 @@ export function PetWindow() {
   function revealInput() {
     clearInputHideTimer();
     isNearModelRef.current = true;
+    showInputRef.current = true;
     setShowInput(true);
   }
 
   function scheduleInputHide() {
-    if (modelMenuOpenRef.current || document.activeElement === inputRef.current) return;
+    if (modelMenuOpenRef.current) return;
     isNearModelRef.current = false;
     clearInputHideTimer();
     hideTimeoutRef.current = window.setTimeout(() => {
-      if (!modelMenuOpenRef.current && document.activeElement !== inputRef.current) {
+      if (!modelMenuOpenRef.current) {
+        inputRef.current?.blur();
+        showInputRef.current = false;
         setShowInput(false);
       }
       hideTimeoutRef.current = null;
@@ -740,6 +781,59 @@ export function PetWindow() {
     };
   }
 
+  async function updateGlobalLook() {
+    if (!modelLoadedRef.current || globalLookInFlightRef.current) return;
+    globalLookInFlightRef.current = true;
+    try {
+      const position = await invoke<PetCursorPosition>("cursor_position");
+      if (!modelLoadedRef.current) return;
+
+      const point = normalizeCursorPosition(position);
+      const currentX = typeof position.x === "number" ? position.x : position.screenX;
+      const currentY = typeof position.y === "number" ? position.y : position.screenY;
+      const hasGlobalPoint = typeof currentX === "number" && typeof currentY === "number";
+
+      if (point && hasGlobalPoint) {
+        const previousPoint = lastLookPointRef.current;
+        if (
+          !previousPoint
+          || Math.abs(previousPoint.x - currentX) > 1
+          || Math.abs(previousPoint.y - currentY) > 1
+        ) {
+          lastLookMoveAtRef.current = Date.now();
+          lastLookPointRef.current = { x: currentX, y: currentY };
+          postToPet({
+            type: "look",
+            x: point.clientX,
+            y: point.clientY,
+            clientX: point.clientX,
+            clientY: point.clientY,
+            instant: false
+          });
+          return;
+        }
+      }
+
+      if (Date.now() - lastLookMoveAtRef.current > PET_GLOBAL_LOOK_IDLE_MS) {
+        const centerX = window.innerWidth / 2;
+        const centerY = window.innerHeight / 2;
+        postToPet({
+          type: "look",
+          x: centerX,
+          y: centerY,
+          clientX: centerX,
+          clientY: centerY,
+          instant: false
+        });
+        lastLookMoveAtRef.current = Date.now();
+      }
+    } catch {
+      // pet.js can still use in-window pointer movement if global cursor lookup fails.
+    } finally {
+      globalLookInFlightRef.current = false;
+    }
+  }
+
   function rectContainsPoint(element: Element | null, clientX: number, clientY: number, padding = 0) {
     if (!element) return false;
     const rect = element.getBoundingClientRect();
@@ -753,6 +847,12 @@ export function PetWindow() {
   }
 
   function isPointerInPetUi(clientX: number, clientY: number) {
+    if (!showInputRef.current && !modelMenuOpenRef.current) {
+      return Boolean(
+        rectContainsPoint(modelMenuRef.current, clientX, clientY, 8)
+        || rectContainsPoint(cloudBubbleRef.current, clientX, clientY, 4)
+      );
+    }
     if (
       rectContainsPoint(inputShellRef.current, clientX, clientY, 8)
       || rectContainsPoint(modelMenuRef.current, clientX, clientY, 8)
@@ -852,42 +952,65 @@ export function PetWindow() {
 
   function cloudStyle(): PetCloudStyle {
     const bounds = modelBoundsRef.current;
-    const width = Math.min(400, Math.max(292, window.innerWidth - 28));
-    const height = 106;
-    const fallbackLeft = Math.max(14, Math.round((window.innerWidth - width) / 2));
-    const fallbackTop = Math.max(14, Math.round(window.innerHeight * 0.12));
+    const viewportWidth = Math.max(1, window.innerWidth);
+    const viewportHeight = Math.max(1, window.innerHeight);
+    const width = Math.min(430, Math.max(292, viewportWidth - 28));
+    const height = 112;
+    const fallbackLeft = Math.max(14, Math.round((viewportWidth - width) / 2));
+    const fallbackTop = 12;
     if (!bounds) {
+      const startX = Math.round(width * 0.54);
+      const tailX = Math.round(width * 0.58);
+      const tailY = height + 38;
       return {
         left: `${fallbackLeft}px`,
         top: `${fallbackTop}px`,
-        width: `${width}px`
+        width: `${width}px`,
+        "--pet-cloud-tail-start-x": `${startX}px`,
+        "--pet-cloud-tail-start-y": `${height - 10}px`,
+        "--pet-cloud-tail-x": `${tailX}px`,
+        "--pet-cloud-tail-y": `${tailY}px`,
+        "--pet-cloud-tail-length": "48px",
+        "--pet-cloud-tail-angle": "88deg",
+        "--pet-cloud-dot-1-x": `${Math.round(startX + (tailX - startX) * 0.34)}px`,
+        "--pet-cloud-dot-1-y": `${height + 6}px`,
+        "--pet-cloud-dot-2-x": `${Math.round(startX + (tailX - startX) * 0.64)}px`,
+        "--pet-cloud-dot-2-y": `${height + 24}px`,
+        "--pet-cloud-dot-3-x": `${tailX}px`,
+        "--pet-cloud-dot-3-y": `${tailY}px`
       };
     }
 
-    const anchorX = bounds.x + bounds.width * 0.64;
-    const anchorY = bounds.y + bounds.height * 0.28;
-    const gap = 24;
-    const preferRight = anchorX + gap + width <= window.innerWidth - 14 || anchorX < window.innerWidth * 0.48;
-    const left = preferRight
-      ? Math.min(window.innerWidth - width - 14, anchorX + gap)
-      : Math.max(14, anchorX - width - gap);
-    const top = Math.min(
-      Math.max(14, anchorY - height * 0.66),
-      Math.max(14, window.innerHeight - height - 78)
+    const anchorX = bounds.x + bounds.width * 0.52;
+    const modelTop = bounds.y;
+    const gap = Math.max(12, bounds.height * 0.05);
+    const speechBandBottom = Math.max(126, Math.min(176, viewportHeight * 0.34));
+    let top = Math.max(8, Math.min(18, speechBandBottom - height - 12));
+    const desiredLeft = anchorX - width * 0.54;
+    const left = Math.min(
+      Math.max(14, desiredLeft),
+      Math.max(14, viewportWidth - width - 14)
     );
-    const tailX = Math.min(width + 52, Math.max(-52, anchorX - left));
-    const tailY = Math.min(height + 58, Math.max(-18, anchorY - top));
-    const startX = preferRight ? 30 : width - 30;
-    const startY = Math.min(height - 22, Math.max(34, tailY < height * 0.45 ? height * 0.48 : height * 0.72));
+    const bubbleBottomAbs = top + height;
+    let tailXAbs = Math.min(viewportWidth - 14, Math.max(14, anchorX));
+    let tailYAbs = Math.min(viewportHeight - 74, Math.max(modelTop - gap, modelTop));
+    if (tailYAbs < bubbleBottomAbs) {
+      top = Math.max(8, modelTop - gap - height);
+      tailYAbs = Math.max(top + height, modelTop - gap);
+    }
+    const tailX = Math.min(width + 64, Math.max(-64, tailXAbs - left));
+    const tailY = Math.max(height + 18, tailYAbs - top);
+    const startX = Math.min(width - 46, Math.max(46, width * 0.5 + (tailX - width * 0.5) * 0.34));
+    const startY = height - 12;
     const dx = tailX - startX;
     const dy = tailY - startY;
     const dot = (ratio: number) => ({
       x: Math.round(startX + dx * ratio),
       y: Math.round(startY + dy * ratio)
     });
-    const dot1 = dot(0.24);
-    const dot2 = dot(0.54);
-    const dot3 = dot(0.82);
+    const dot1 = dot(0.32);
+    const dot2 = dot(0.62);
+    const dot3 = dot(0.9);
 
     return {
       left: `${Math.round(left)}px`,
@@ -909,7 +1032,7 @@ export function PetWindow() {
   }
 
   return (
-    <main className="live2d-pet-shell">
+    <main className={`live2d-pet-shell${cloudBubble ? " is-speaking" : ""}`}>
       <iframe
         className="live2d-pet-frame"
         ref={frameRef}
@@ -917,22 +1040,23 @@ export function PetWindow() {
         title="SynthPet Live2D"
       />
 
-      {cloudBubble ? (
-        <section
-          className={`pet-cloud-bubble is-${cloudBubble.tone}`}
-          key={cloudBubble.id}
-          ref={cloudBubbleRef}
-          style={cloudStyle()}
-          aria-live="polite"
-        >
-          <span className="pet-cloud-text" title={cloudBubble.text}>{cloudBubble.text}</span>
-          <span className="pet-cloud-tail" aria-hidden="true">
-            <span />
-            <span />
-            <span />
-          </span>
-        </section>
-      ) : null}
+      <section className={`pet-speech-area${cloudBubble ? " has-bubble" : ""}`} aria-live="polite">
+        {cloudBubble ? (
+          <section
+            className={`pet-cloud-bubble is-${cloudBubble.tone}`}
+            key={cloudBubble.id}
+            ref={cloudBubbleRef}
+            style={cloudStyle()}
+          >
+            <span className="pet-cloud-text" title={cloudBubble.text}>{cloudBubble.text}</span>
+            <span className="pet-cloud-tail" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </span>
+          </section>
+        ) : null}
+      </section>
 
       <section
         className={`pet-input-shell${showInput ? "" : " is-hidden"}${modelMenuOpen ? " is-menu-open" : ""}`}
