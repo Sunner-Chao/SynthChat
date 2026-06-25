@@ -1255,6 +1255,15 @@ async fn trigger_proactive_for_persona(
         .into_iter()
         .map(|message| message.id)
         .collect::<std::collections::HashSet<_>>();
+    let _ = app.emit(
+        "synthchat-chat-event",
+        json!({
+            "type": "processing",
+            "source": "proactive",
+            "personaId": persona.id,
+            "conversationId": conversation_id,
+        }),
+    );
     let request = SendChatRequest {
         conversation_id: Some(conversation_id.clone()),
         persona_id: Some(persona.id.clone()),
@@ -1263,7 +1272,21 @@ async fn trigger_proactive_for_persona(
         provider_data: Some(json!({"source": "proactive-internal", "silent": true})),
         queue_item_id: None,
     };
-    let generated = agent::run_chat_turn(store, request, Some(app)).await?;
+    let generated = match agent::run_chat_turn(store, request, Some(app)).await {
+        Ok(messages) => messages,
+        Err(error) => {
+            let _ = app.emit(
+                "synthchat-chat-event",
+                json!({
+                    "type": "conversation_updated",
+                    "source": "proactive",
+                    "personaId": persona.id,
+                    "conversationId": conversation_id,
+                }),
+            );
+            return Err(error);
+        }
+    };
     let mut messages = store.messages(&conversation_id, None)?;
     let internal_user_ids = generated
         .iter()
@@ -1286,17 +1309,16 @@ async fn trigger_proactive_for_persona(
         if let Ok(conversation) = store.conversation(&conversation_id) {
             wechat_settings::dispatch_desktop_reply_to_wechat(&conversation, &assistant.content);
         }
-        let _ = app.emit(
-            "synthchat-chat-event",
-            json!({
-                "type": "new_message",
-                "personaId": persona.id,
-                "conversationId": conversation_id,
-                "message": assistant,
-                "isLast": true,
-            }),
-        );
     }
+    let _ = app.emit(
+        "synthchat-chat-event",
+        json!({
+            "type": "conversation_updated",
+            "source": "proactive",
+            "personaId": persona.id,
+            "conversationId": conversation_id,
+        }),
+    );
     Ok(true)
 }
 

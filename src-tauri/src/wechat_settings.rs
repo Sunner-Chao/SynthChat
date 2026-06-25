@@ -128,6 +128,7 @@ pub struct WechatPollResult {
 pub struct WechatProcessedInbound {
     pub user_id: String,
     pub text: String,
+    pub conversation_id: Option<String>,
     pub delivered: bool,
     pub delivery_error: Option<String>,
 }
@@ -2589,6 +2590,17 @@ pub async fn wechat_poll_once(
         processed.push(WechatProcessedInbound {
             user_id,
             text: content,
+            conversation_id: result
+                .messages
+                .iter()
+                .filter_map(|message| {
+                    message
+                        .get("conversationId")
+                        .or_else(|| message.get("conversation_id"))
+                        .and_then(Value::as_str)
+                })
+                .next()
+                .map(str::to_string),
             delivered: result.delivered,
             delivery_error: result.delivery_error,
         });
@@ -2812,6 +2824,16 @@ fn emit_wechat_assistant_message(
             "conversationId": conversation_id,
             "message": message,
             "isLast": true,
+        }),
+    );
+    let _ = app.emit(
+        "synthchat-pet-event",
+        json!({
+            "type": "proactive_message",
+            "source": "wechat",
+            "personaId": persona_id,
+            "conversationId": conversation_id,
+            "message": message,
         }),
     );
 }

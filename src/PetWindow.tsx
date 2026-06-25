@@ -310,7 +310,19 @@ export function PetWindow() {
       const payload = event.payload;
       if (payload.type !== "proactive_message" || !payload.message) return;
       const context = activeContextRef.current ?? readStoredPetActiveContext();
-      if (context?.conversationId && payload.conversationId && context.conversationId !== payload.conversationId) return;
+      const isWechat = payload.message.source === "wechat" || (payload as { source?: string }).source === "wechat";
+      if (context?.conversationId && payload.conversationId && context.conversationId !== payload.conversationId && !isWechat) return;
+      if (isWechat && payload.conversationId && context?.conversationId !== payload.conversationId) {
+        setPetContext({
+          conversationId: payload.conversationId,
+          conversationTitle: null,
+          personaId: null,
+          personaName: null,
+          agentId: null,
+          updatedAt: new Date().toISOString(),
+          source: "wechat"
+        });
+      }
       showAssistantCloud(payload.message);
     }).then((handler) => {
       unlisten = handler;

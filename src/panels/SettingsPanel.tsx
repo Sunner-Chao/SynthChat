@@ -802,6 +802,18 @@ function AccountsSettings({
     try {
       const result = await api.wechatPollOnce(detail.id);
       await refreshAccounts();
+      const conversationId = result.processed.find((item) => item.conversationId)?.conversationId;
+      if (conversationId) {
+        const store = useAppStore.getState();
+        store.setSection("chat");
+        store.setConversationProcessing(conversationId, true);
+        void store.refreshChatData(conversationId, detail.linkedPersona || null).then(() => {
+          store.setConversationProcessing(conversationId, true);
+          window.setTimeout(() => {
+            useAppStore.getState().setConversationProcessing(conversationId, false);
+          }, 900);
+        });
+      }
       setPollStatus(result.receivedCount
         ? `收到 ${result.receivedCount} 条，已处理 ${result.processed.length} 条，跳过 ${result.skippedCount} 条`
         : "没有新的微信消息");

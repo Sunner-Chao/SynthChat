@@ -804,6 +804,7 @@ export interface WechatInboundResult {
 export interface WechatProcessedInbound {
   userId: string;
   text: string;
+  conversationId?: string | null;
   delivered: boolean;
   deliveryError?: string | null;
 }

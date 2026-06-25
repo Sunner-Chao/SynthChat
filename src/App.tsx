@@ -145,6 +145,8 @@ function providerPresetDefaults(id: string) {
   return defaults[id] ?? defaults.custom;
 }
 
+const WECHAT_THINKING_MIN_VISIBLE_MS = 900;
+
 function imageProviderTypeLabel(id: string) {
   const labels: Record<string, string> = {
     openai_image: "OpenAI Image",
@@ -181,6 +183,40 @@ export function App() {
   const activeConversationId = useAppStore((state) => state.activeConversationId);
   const themes = useAppStore((state) => state.themes);
   const lastCountedMessageRef = useRef<Map<string, string>>(new Map());
+  const processingStartedAtRef = useRef<Map<string, number>>(new Map());
+
+  const showConversationProcessing = useCallback((
+    conversationId: string,
+    personaId?: string | null,
+    follow = false,
+    switchSection = false
+  ) => {
+    if (!conversationId) return;
+    processingStartedAtRef.current.set(conversationId, Date.now());
+    if (switchSection) {
+      setSection("chat");
+    }
+    setConversationProcessing(conversationId, true);
+    if (follow) {
+      void (async () => {
+        await refreshChatData(conversationId, personaId ?? null);
+        setConversationProcessing(conversationId, true);
+      })();
+    }
+  }, [refreshChatData, setConversationProcessing, setSection]);
+
+  const hideConversationProcessing = useCallback((conversationId: string) => {
+    if (!conversationId) return;
+    const startedAt = processingStartedAtRef.current.get(conversationId);
+    const delay = startedAt
+      ? Math.max(0, WECHAT_THINKING_MIN_VISIBLE_MS - (Date.now() - startedAt))
+      : 0;
+    window.setTimeout(() => {
+      if (startedAt && processingStartedAtRef.current.get(conversationId) !== startedAt) return;
+      processingStartedAtRef.current.delete(conversationId);
+      setConversationProcessing(conversationId, false);
+    }, delay);
+  }, [setConversationProcessing]);
 
   useEffect(() => {
     void bootstrap();
@@ -241,33 +277,32 @@ export function App() {
     }>("synthchat-chat-event", (event) => {
       const payload = event.payload;
       const messageSource = payload.message?.source ?? payload.source ?? "";
-      if (
-        payload.type === "new_message"
-        && payload.conversationId
-        && payload.message?.role === "user"
-        && (messageSource === "wechat" || messageSource === "pet")
-      ) {
-        setConversationProcessing(payload.conversationId, true);
-        // Auto-follow: activate the originating conversation on the desktop so
-        // the thinking UI (scoped to the active conversation) reliably shows for
-        // messages that originated from WeChat or the pet window.
-        const targetConversationId = payload.conversationId;
-        void (async () => {
-          await refreshChatData(targetConversationId, payload.personaId ?? null);
-          setConversationProcessing(targetConversationId, true);
-        })();
+      const externalSource =
+        messageSource !== "desktop"
+        && messageSource !== "desktop-control"
+        && messageSource !== "proactive-internal";
+
+      // Authoritative thinking lifecycle: the backend emits turn_started /
+      // turn_finished for EVERY user-facing turn (desktop, pet, wechat,
+      // proactive), in order, from the single hub (run_chat_turn). The desktop
+      // drives its "thinking" UI solely from this pair and auto-follows the
+      // turn's conversation, so timing is uniform across all sources.
+      if (payload.type === "turn_started" && payload.conversationId) {
+        // Auto-follow the turn's conversation for all sources; only jump the
+        // desktop to the chat view for externally-originated turns (pet, wechat,
+        // proactive) so a desktop user isn't yanked out of another section.
+        showConversationProcessing(
+          payload.conversationId,
+          payload.personaId ?? null,
+          true,
+          externalSource
+        );
+        return;
       }
-      if (payload.type === "processing" && payload.conversationId) {
-        setConversationProcessing(payload.conversationId, true);
-        if (payload.source === "wechat") {
-          void (async () => {
-            await refreshChatData(payload.conversationId ?? null, payload.personaId ?? null);
-            setConversationProcessing(payload.conversationId ?? "", true);
-          })();
-        }
-      }
-      if ((payload.type === "assistant_message" || payload.type === "conversation_updated") && payload.conversationId) {
-        setConversationProcessing(payload.conversationId, false);
+      if (payload.type === "turn_finished" && payload.conversationId) {
+        hideConversationProcessing(payload.conversationId);
+        void refreshChatData(payload.conversationId ?? null, payload.personaId ?? null);
+        return;
       }
       if (
         payload.conversationId
@@ -305,7 +340,7 @@ export function App() {
     return () => {
       if (unlisten) unlisten();
     };
-  }, [incrementConversationUnread, refreshChatData, setConversationProcessing, upsertIncomingMessage]);
+  }, [hideConversationProcessing, incrementConversationUnread, refreshChatData, setConversationProcessing, showConversationProcessing, upsertIncomingMessage]);
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;
@@ -337,9 +372,16 @@ export function App() {
     void listen<AgentRunEvent>("synthchat-agent-run-event", (event) => {
       const payload = event.payload;
       handleAgentRunEvent(payload);
+      // Processing visibility is owned by the authoritative turn_started /
+      // turn_finished lifecycle (see synthchat-chat-event handler). Here we only
+      // reinforce the running state for long multi-run turns; we never clear it,
+      // so an individual run completing can't prematurely hide the thinking UI
+      // while the hub turn is still finalizing (e.g. dispatching the reply).
       if (payload.conversationId) {
         const running = !["completed", "failed", "aborted"].includes(payload.state);
-        setConversationProcessing(payload.conversationId, running);
+        if (running) {
+          setConversationProcessing(payload.conversationId, true);
+        }
       }
       if (payload.message) {
         upsertIncomingMessage(payload.message);
@@ -573,6 +615,18 @@ function ContactsPanel() {
     try {
       const result = await api.wechatPollOnce(linkedAccount.id);
       await refreshAccounts();
+      const conversationId = result.processed.find((item) => item.conversationId)?.conversationId;
+      if (conversationId) {
+        const store = useAppStore.getState();
+        store.setSection("chat");
+        store.setConversationProcessing(conversationId, true);
+        void store.refreshChatData(conversationId, selectedPersona?.id ?? null).then(() => {
+          store.setConversationProcessing(conversationId, true);
+          window.setTimeout(() => {
+            useAppStore.getState().setConversationProcessing(conversationId, false);
+          }, WECHAT_THINKING_MIN_VISIBLE_MS);
+        });
+      }
       setPollStatus(result.receivedCount
         ? `收到 ${result.receivedCount} 条，已处理 ${result.processed.length} 条，跳过 ${result.skippedCount} 条`
         : "没有新的微信消息");

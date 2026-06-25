@@ -19,12 +19,80 @@ use crate::{
 };
 
 use super::*;
+
+/// Resolve the user-facing source label for a chat turn from its request
+/// `provider_data.source`, defaulting to "desktop". Mirrors the source logic
+/// used when persisting the user message.
+fn turn_source_label(request: &SendChatRequest) -> String {
+    request
+        .provider_data
+        .as_ref()
+        .and_then(|data| data.get("source"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+        .unwrap_or("desktop")
+        .to_string()
+}
+
 pub async fn run_chat_turn(
     store: &AppStore,
     request: SendChatRequest,
     app: Option<&AppHandle>,
 ) -> AppResult<Vec<ChatMessage>> {
-    run_chat_turn_with_app(store, request, ToolExecutionContext::Interactive, app).await
+    // The desktop window is the hub: every user-facing turn — desktop, pet,
+    // wechat, proactive — flows through here. Emit a single authoritative pair
+    // of lifecycle events (turn_started / turn_finished) so the frontend can
+    // drive the "thinking" UI from one source of truth instead of inferring it
+    // from a scatter of per-source events. turn_finished is guaranteed to fire
+    // on every exit path (success, early return, or error).
+    let conversation_id = request
+        .conversation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    let source = turn_source_label(&request);
+    let persona_id = request.persona_id.clone();
+
+    if let (Some(app), Some(conversation_id)) = (app, conversation_id.as_deref()) {
+        let _ = app.emit(
+            "synthchat-chat-event",
+            json!({
+                "type": "turn_started",
+                "source": source,
+                "personaId": persona_id,
+                "conversationId": conversation_id,
+            }),
+        );
+    }
+
+    let result = run_chat_turn_with_app(store, request, ToolExecutionContext::Interactive, app).await;
+
+    if let Some(app) = app {
+        // Prefer the conversation id reported by the result (covers the case
+        // where the request had no id and the backend created one).
+        let resolved_conversation_id = result
+            .as_ref()
+            .ok()
+            .and_then(|messages| messages.first())
+            .map(|message| message.conversation_id.clone())
+            .or_else(|| conversation_id.clone());
+        if let Some(resolved_conversation_id) = resolved_conversation_id {
+            let _ = app.emit(
+                "synthchat-chat-event",
+                json!({
+                    "type": "turn_finished",
+                    "source": source,
+                    "personaId": persona_id,
+                    "conversationId": resolved_conversation_id,
+                    "ok": result.is_ok(),
+                }),
+            );
+        }
+    }
+
+    result
 }
 
 pub(super) async fn run_chat_turn_in_context(

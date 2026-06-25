@@ -54,6 +54,7 @@ let pendingSettingsViewRef: string | null = null;
 // persisted, so a concurrent refresh still sees a stale assistant tail).
 const PROCESSING_MARK_GRACE_MS = 1500;
 const processingMarkedAtCache = new Map<string, number>();
+const processingClearTimerCache = new Map<string, number>();
 function withinProcessingGrace(conversationId: string | null): boolean {
   if (!conversationId) return false;
   const markedAt = processingMarkedAtCache.get(conversationId);
@@ -738,22 +739,42 @@ export const useAppStore = create<AppState>((set, get) => ({
   setConversationProcessing: (conversationId, processing) => {
     if (!conversationId) return;
     if (processing) {
-      processingMarkedAtCache.set(conversationId, Date.now());
-    } else {
-      processingMarkedAtCache.delete(conversationId);
-    }
-    set((state) => {
-      const exists = state.processingConversationIds.includes(conversationId);
-      if (processing && !exists) {
-        return { processingConversationIds: [...state.processingConversationIds, conversationId] };
+      const clearTimer = processingClearTimerCache.get(conversationId);
+      if (clearTimer !== undefined) {
+        window.clearTimeout(clearTimer);
+        processingClearTimerCache.delete(conversationId);
       }
-      if (!processing && exists) {
+      processingMarkedAtCache.set(conversationId, Date.now());
+      set((state) => {
+        if (state.processingConversationIds.includes(conversationId)) return state;
+        return { processingConversationIds: [...state.processingConversationIds, conversationId] };
+      });
+      return;
+    }
+    const markedAt = processingMarkedAtCache.get(conversationId);
+    const elapsed = markedAt === undefined ? PROCESSING_MARK_GRACE_MS : Date.now() - markedAt;
+    const remaining = Math.max(0, PROCESSING_MARK_GRACE_MS - elapsed);
+    const clearProcessing = () => {
+      processingMarkedAtCache.delete(conversationId);
+      processingClearTimerCache.delete(conversationId);
+      set((state) => {
+        if (!state.processingConversationIds.includes(conversationId)) return state;
         return {
           processingConversationIds: state.processingConversationIds.filter((id) => id !== conversationId)
         };
-      }
-      return state;
-    });
+      });
+    };
+    const pendingTimer = processingClearTimerCache.get(conversationId);
+    if (pendingTimer !== undefined) {
+      window.clearTimeout(pendingTimer);
+      processingClearTimerCache.delete(conversationId);
+    }
+    if (remaining <= 0) {
+      clearProcessing();
+      return;
+    }
+    const timer = window.setTimeout(clearProcessing, remaining);
+    processingClearTimerCache.set(conversationId, timer);
   },
   incrementConversationUnread: (conversationId, amount = 1) => {
     if (!conversationId || amount <= 0) return;
