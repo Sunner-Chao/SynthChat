@@ -738,6 +738,30 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                     &text,
                                     &mut event,
                                 )?;
+                                let mut tool_message = ChatMessage::new(
+                                    conversation.id.clone(),
+                                    "tool",
+                                    json!({"type": "toolEvent", "event": event.clone()})
+                                        .to_string(),
+                                    "desktop-agent-tool",
+                                );
+                                tool_message.provider_data = reply.provider_data.clone();
+                                let _tool_message = store.append_message(tool_message)?;
+                                history.push(_tool_message);
+                                push_tool_event_record(&mut run, &event);
+                                if let Some(assistant) = pause_run_for_clarify_tool(
+                                    store,
+                                    app,
+                                    &mut run,
+                                    &conversation.id,
+                                    &text,
+                                    &event,
+                                )? {
+                                    return Ok(vec![user, assistant]);
+                                }
+                                let saved_tool_run = store.save_agent_run(run.clone())?;
+                                run = saved_tool_run.clone();
+                                emit_agent_run_record(app, &run, None);
                                 let observation_text = append_subdirectory_hints_to_tool_result(
                                     &agent,
                                     &tool_name,
@@ -767,28 +791,6 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                         break;
                                     }
                                 }
-                                let mut tool_message = ChatMessage::new(
-                                    conversation.id.clone(),
-                                    "tool",
-                                    json!({"type": "toolEvent", "event": event.clone()})
-                                        .to_string(),
-                                    "desktop-agent-tool",
-                                );
-                                tool_message.provider_data = reply.provider_data.clone();
-                                let _tool_message = store.append_message(tool_message)?;
-                                history.push(_tool_message);
-                                push_tool_event_record(&mut run, &event);
-                                if let Some(assistant) = pause_run_for_clarify_tool(
-                                    store,
-                                    app,
-                                    &mut run,
-                                    &conversation.id,
-                                    &text,
-                                    &event,
-                                )? {
-                                    return Ok(vec![user, assistant]);
-                                }
-                                emit_agent_run_record(app, &run, None);
                             }
                             Err(error) => {
                                 record_tool_failed_for_run(
@@ -1080,6 +1082,20 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                     &text,
                                     &mut event,
                                 )?;
+                                let mut tool_message = ChatMessage::new(
+                                    conversation.id.clone(),
+                                    "tool",
+                                    json!({"type": "toolEvent", "event": event.clone()})
+                                        .to_string(),
+                                    "desktop-agent-tool",
+                                );
+                                tool_message.provider_data = reply.provider_data.clone();
+                                let _tool_message = store.append_message(tool_message)?;
+                                history.push(_tool_message);
+                                push_tool_event_record(&mut run, &event);
+                                let saved_tool_run = store.save_agent_run(run.clone())?;
+                                run = saved_tool_run.clone();
+                                emit_agent_run_record(app, &run, None);
                                 let observation_text = append_subdirectory_hints_to_tool_result(
                                     &agent,
                                     &tool_name,
@@ -1109,18 +1125,6 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                         break;
                                     }
                                 }
-                                let mut tool_message = ChatMessage::new(
-                                    conversation.id.clone(),
-                                    "tool",
-                                    json!({"type": "toolEvent", "event": event.clone()})
-                                        .to_string(),
-                                    "desktop-agent-tool",
-                                );
-                                tool_message.provider_data = reply.provider_data.clone();
-                                let _tool_message = store.append_message(tool_message)?;
-                                history.push(_tool_message);
-                                push_tool_event_record(&mut run, &event);
-                                emit_agent_run_record(app, &run, None);
                             }
                             Err(error) => {
                                 record_tool_failed_for_run(
@@ -1380,6 +1384,20 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                     &text,
                                     &mut event,
                                 )?;
+                                let mut tool_message = ChatMessage::new(
+                                    conversation.id.clone(),
+                                    "tool",
+                                    json!({"type": "toolEvent", "event": event.clone()})
+                                        .to_string(),
+                                    "desktop-agent-tool",
+                                );
+                                tool_message.provider_data = reply.provider_data.clone();
+                                let _tool_message = store.append_message(tool_message)?;
+                                history.push(_tool_message);
+                                push_tool_event_record(&mut run, &event);
+                                let saved_tool_run = store.save_agent_run(run.clone())?;
+                                run = saved_tool_run.clone();
+                                emit_agent_run_record(app, &run, None);
                                 let tool_source =
                                     format!("{}:{}", definition.server_id, definition.tool_name);
                                 let observation_text = append_subdirectory_hints_to_tool_result(
@@ -1411,18 +1429,6 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                         break;
                                     }
                                 }
-                                let mut tool_message = ChatMessage::new(
-                                    conversation.id.clone(),
-                                    "tool",
-                                    json!({"type": "toolEvent", "event": event.clone()})
-                                        .to_string(),
-                                    "desktop-agent-tool",
-                                );
-                                tool_message.provider_data = reply.provider_data.clone();
-                                let _tool_message = store.append_message(tool_message)?;
-                                history.push(_tool_message);
-                                push_tool_event_record(&mut run, &event);
-                                emit_agent_run_record(app, &run, None);
                             }
                             Err(error) => {
                                 record_tool_failed_for_run(

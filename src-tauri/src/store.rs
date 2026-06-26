@@ -42,6 +42,7 @@ const TOOL_ARTIFACT_PREVIEW_BYTES: u64 = 8 * 1024;
 const MANAGED_PROCESS_FINISHED_TTL_SECONDS: u64 = 1800;
 const MAX_MANAGED_PROCESSES: usize = 64;
 const RUNTIME_RELOAD_RECENT_RUN_GRACE_SECONDS: i64 = 600;
+const STALE_WRITE_FILE_RECOVERY_SECONDS: i64 = 120;
 const DIALOG_BRIDGE_HOST: &str = "hermes-dialog-bridge.invalid";
 const DIALOG_BRIDGE_URL_PATTERN: &str = "http://hermes-dialog-bridge.invalid/*";
 const DIALOG_BRIDGE_SCRIPT: &str = r#"
@@ -292,6 +293,23 @@ fn order_llm_provider_credentials(
 fn conversation_preview_message(message: &ChatMessage) -> bool {
     matches!(message.role.as_str(), "user" | "assistant")
         && !(message.role == "user" && message.source == "proactive-internal")
+}
+
+fn refresh_conversation_preview_from_messages(
+    conversation: &mut Conversation,
+    messages: &[ChatMessage],
+) {
+    if let Some(last) = messages
+        .iter()
+        .rev()
+        .find(|message| conversation_preview_message(message))
+    {
+        conversation.last_message = last.content.chars().take(120).collect();
+        conversation.updated_at = last.created_at.clone();
+    } else {
+        conversation.updated_at = now_iso();
+        conversation.last_message.clear();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1910,6 +1928,99 @@ mod tests {
             store.conversation(&conversation.id).unwrap().last_message,
             "third"
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn finalize_proactive_messages_keeps_concurrent_wechat_append() {
+        let dir = std::env::temp_dir().join(format!(
+            "synthchat-proactive-finalize-race-{}",
+            new_id("state")
+        ));
+        let path = dir.join("state.json");
+        let store = AppStore::new(path).unwrap();
+        let persona = store.persona(None).unwrap();
+        let conversation = store
+            .create_conversation(Some("proactive finalize".into()), Some(persona.id.clone()))
+            .unwrap();
+
+        let existing = store
+            .append_message(ChatMessage::new(
+                conversation.id.clone(),
+                "user",
+                "desktop seed".into(),
+                "desktop",
+            ))
+            .unwrap();
+        let proactive_user = store
+            .append_message(ChatMessage::new(
+                conversation.id.clone(),
+                "user",
+                "internal".into(),
+                "proactive-internal",
+            ))
+            .unwrap();
+        let proactive_assistant = store
+            .append_message(ChatMessage::new(
+                conversation.id.clone(),
+                "assistant",
+                "poke".into(),
+                "desktop-agent",
+            ))
+            .unwrap();
+        let wechat = store
+            .append_message(ChatMessage::new(
+                conversation.id.clone(),
+                "user",
+                "wechat hello".into(),
+                "wechat",
+            ))
+            .unwrap();
+
+        let assistant_ids = HashSet::from([proactive_assistant.id.clone()]);
+        let internal_ids = HashSet::from([proactive_user.id.clone()]);
+        let messages = store
+            .finalize_proactive_messages(&conversation.id, &assistant_ids, &internal_ids)
+            .unwrap();
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                existing.id.as_str(),
+                proactive_assistant.id.as_str(),
+                wechat.id.as_str()
+            ]
+        );
+        assert!(!messages.iter().any(|message| message.id == proactive_user.id));
+        assert_eq!(
+            messages
+                .iter()
+                .find(|message| message.id == proactive_assistant.id)
+                .unwrap()
+                .source,
+            "proactive"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .find(|message| message.id == wechat.id)
+                .unwrap()
+                .source,
+            "wechat"
+        );
+
+        let saved = store.messages(&conversation.id, None).unwrap();
+        assert_eq!(saved.len(), 3);
+        assert!(saved.iter().any(|message| message.id == wechat.id));
+
+        let conversation = store.conversation(&conversation.id).unwrap();
+        assert_eq!(conversation.last_message, "wechat hello");
+        assert_eq!(conversation.updated_at, wechat.created_at);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -5169,6 +5280,202 @@ fn normalize_interrupted_runs(state: &mut PersistedState) {
             item.started_at = None;
             item.completed_at = None;
         }
+    }
+}
+
+fn normalize_stale_landed_write_file_runs(state: &mut PersistedState) -> bool {
+    let now = Utc::now();
+    let completed_at = now_iso();
+    let mut changed = false;
+    for run_index in 0..state.agent_runs.len() {
+        if !matches!(state.agent_runs[run_index].state.as_str(), "started" | "running") {
+            continue;
+        }
+        let activity_at = agent_run_activity_at(&state.agent_runs[run_index], now);
+        if now
+            .signed_duration_since(activity_at)
+            .num_seconds()
+            < STALE_WRITE_FILE_RECOVERY_SECONDS
+        {
+            continue;
+        }
+        let recovered_events = state.agent_runs[run_index]
+            .tool_events
+            .iter()
+            .filter_map(|event| landed_write_file_recovery_event(event, &completed_at, activity_at))
+            .collect::<Vec<_>>();
+        if recovered_events.is_empty() {
+            continue;
+        }
+        {
+            let run = &mut state.agent_runs[run_index];
+            for event in &recovered_events {
+                replace_run_tool_event_with_completed(run, event);
+            }
+            let any_running = run
+                .tool_events
+                .iter()
+                .any(|event| event.get("status").and_then(Value::as_str) == Some("running"));
+            if !any_running {
+                run.state = "completed".into();
+                run.error = None;
+                run.completed_at = Some(completed_at.clone());
+            }
+            run.updated_at = completed_at.clone();
+            run.last_activity_at = Some(completed_at.clone());
+            run.last_activity_desc = Some("recovered landed write_file tool event".into());
+            run.checkpoints.push(AgentCheckpointRecord {
+                checkpoint_id: new_id("ckpt"),
+                run_id: run.run_id.clone(),
+                iteration: run.checkpoints.len() as u32 + 1,
+                created_at: completed_at.clone(),
+                state: "recovered_landed_write_file".into(),
+                completed_call_ids: recovered_events
+                    .iter()
+                    .filter_map(|event| tool_event_provider_call_id(event).map(str::to_string))
+                    .collect(),
+                event_refs: recovered_events
+                    .iter()
+                    .filter_map(|event| tool_event_provider_call_id(event).map(str::to_string))
+                    .collect(),
+                summary: "Recovered stale running write_file event after verified file write landed."
+                    .into(),
+            });
+        }
+        let conversation_id = state.agent_runs[run_index].conversation_id.clone();
+        if let Some(messages) = state.messages.get_mut(&conversation_id) {
+            for recovered in &recovered_events {
+                replace_matching_tool_event_messages(messages, recovered);
+            }
+        }
+        changed = true;
+    }
+    changed
+}
+
+fn landed_write_file_recovery_event(
+    event: &Value,
+    completed_at: &str,
+    fallback_started_at: DateTime<Utc>,
+) -> Option<Value> {
+    if event.get("status").and_then(Value::as_str) != Some("running") {
+        return None;
+    }
+    let tool_name = event
+        .get("toolName")
+        .or_else(|| event.get("tool_name"))
+        .and_then(Value::as_str)?;
+    if tool_name != "write_file" {
+        return None;
+    }
+    let payload = event.get("raw")?.get("payload")?;
+    let path = payload.get("path").and_then(Value::as_str)?.trim();
+    let content = payload.get("content").and_then(Value::as_str)?;
+    if path.is_empty() {
+        return None;
+    }
+    let full_path = PathBuf::from(path);
+    if !full_path.is_absolute() || !full_path.is_file() {
+        return None;
+    }
+    let actual = fs::read_to_string(&full_path).ok()?;
+    if normalize_text_for_landed_write_recovery(&actual)
+        != normalize_text_for_landed_write_recovery(content)
+    {
+        return None;
+    }
+    let mut recovered = event.clone();
+    let elapsed_ms = recovered_tool_elapsed_ms(event, completed_at, fallback_started_at);
+    if let Some(object) = recovered.as_object_mut() {
+        object.insert("status".into(), Value::String("completed".into()));
+        object.insert("ok".into(), Value::Bool(true));
+        object.insert("timedOut".into(), Value::Bool(false));
+        object.insert("elapsedMs".into(), json!(elapsed_ms));
+        object.insert(
+            "summary".into(),
+            Value::String("文件已写入；已从卡住的 write_file 状态恢复。".into()),
+        );
+        object.insert(
+            "text".into(),
+            Value::String(
+                serde_json::to_string_pretty(&json!({
+                    "success": true,
+                    "tool": "write_file",
+                    "path": full_path.to_string_lossy(),
+                    "bytes_written": actual.len(),
+                    "chars_written": actual.chars().count(),
+                    "bytesWritten": actual.len(),
+                    "charsWritten": actual.chars().count(),
+                    "recoveredFromStaleRunning": true
+                }))
+                .unwrap_or_else(|_| "{\"success\":true}".into()),
+            ),
+        );
+        object.insert("error".into(), Value::Null);
+        object.insert(
+            "path".into(),
+            Value::String(full_path.to_string_lossy().to_string()),
+        );
+        object.insert("exists".into(), Value::Bool(true));
+        object.insert("recoveredAt".into(), Value::String(completed_at.to_string()));
+    }
+    Some(recovered)
+}
+
+fn recovered_tool_elapsed_ms(
+    event: &Value,
+    completed_at: &str,
+    fallback_started_at: DateTime<Utc>,
+) -> u128 {
+    if let Some(value) = event.get("elapsedMs").and_then(Value::as_u64).filter(|value| *value > 0) {
+        return value as u128;
+    }
+    let Some(completed_at) = DateTime::parse_from_rfc3339(completed_at)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+    else {
+        return 0;
+    };
+    event
+        .get("raw")
+        .and_then(|raw| raw.get("__runningToolStartedAt"))
+        .or_else(|| event.get("startedAt"))
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|started| {
+            completed_at
+                .signed_duration_since(started.with_timezone(&Utc))
+                .num_milliseconds()
+                .max(0) as u128
+        })
+        .unwrap_or_else(|| {
+            completed_at
+                .signed_duration_since(fallback_started_at)
+                .num_milliseconds()
+                .max(0) as u128
+        })
+}
+
+fn normalize_text_for_landed_write_recovery(content: &str) -> String {
+    content
+        .strip_prefix('\u{feff}')
+        .unwrap_or(content)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+}
+
+fn replace_matching_tool_event_messages(messages: &mut [ChatMessage], recovered: &Value) {
+    for message in messages {
+        let Some(event) = message_tool_event(message) else {
+            continue;
+        };
+        if event.get("status").and_then(Value::as_str) != Some("running") {
+            continue;
+        }
+        if !tool_event_identity_matches(&event, recovered) {
+            continue;
+        }
+        message.content = json!({"type": "toolEvent", "event": recovered}).to_string();
     }
 }
 
@@ -8817,16 +9124,51 @@ impl AppStore {
             s.messages
                 .insert(conversation_id.to_string(), messages.clone());
             if let Some(conv) = s.conversations.iter_mut().find(|c| c.id == conversation_id) {
-                if let Some(last) = messages
-                    .iter()
-                    .rev()
-                    .find(|message| conversation_preview_message(message))
-                {
-                    conv.last_message = last.content.chars().take(120).collect();
-                    conv.updated_at = last.created_at.clone();
-                }
+                refresh_conversation_preview_from_messages(conv, &messages);
             }
             self.persist(s)
+        })
+    }
+
+    pub fn finalize_proactive_messages(
+        &self,
+        conversation_id: &str,
+        assistant_message_ids: &HashSet<String>,
+        internal_user_ids: &HashSet<String>,
+    ) -> AppResult<Vec<ChatMessage>> {
+        self.with_state(|s| {
+            let messages = {
+                let messages = s.messages.entry(conversation_id.to_string()).or_default();
+                for message in messages.iter_mut() {
+                    if assistant_message_ids.contains(&message.id) && message.role == "assistant" {
+                        message.source = "proactive".into();
+                    }
+                }
+                if !internal_user_ids.is_empty() {
+                    messages.retain(|message| !internal_user_ids.contains(&message.id));
+                }
+                messages.clone()
+            };
+
+            if let Some(conv) = s.conversations.iter_mut().find(|c| c.id == conversation_id) {
+                refresh_conversation_preview_from_messages(conv, &messages);
+            }
+
+            if let Some(context) = s.short_context.get_mut(conversation_id) {
+                if context
+                    .boundary_id
+                    .as_ref()
+                    .is_some_and(|id| internal_user_ids.contains(id))
+                {
+                    context.boundary_id = None;
+                    context.summary.clear();
+                    context.summary_tokens = 0;
+                    context.summary_messages = 0;
+                }
+            }
+
+            self.persist(s)?;
+            Ok(messages)
         })
     }
 
@@ -10151,6 +10493,7 @@ impl AppStore {
         self.with_state(|s| {
             let now = Utc::now();
             let mut expired = false;
+            let recovered = normalize_stale_landed_write_file_runs(s);
             let mut expired_conversations = HashSet::new();
             for run in s.agent_runs.iter_mut().filter(|run| {
                 run.parent_run_id.is_none()
@@ -10187,6 +10530,7 @@ impl AppStore {
                     run.error = Some(summary);
                     run.updated_at = completed_at.clone();
                     run.completed_at = Some(completed_at);
+                    close_running_tool_events(run, "canceled", "运行已超时");
                     expired_conversations.insert(run.conversation_id.clone());
                     expired = true;
                 }
@@ -10199,7 +10543,7 @@ impl AppStore {
                     "agent-runs-query",
                 );
             }
-            if expired {
+            if expired || recovered {
                 self.persist(s)?;
             }
             Ok(s.agent_runs.clone())
@@ -10223,6 +10567,7 @@ impl AppStore {
         self.with_state(|s| {
             let now = Utc::now();
             let mut expired = false;
+            let recovered = normalize_stale_landed_write_file_runs(s);
             let mut expired_conversations = HashSet::new();
             for run in s.agent_runs.iter_mut().filter(|run| {
                 run.conversation_id == conversation_id
@@ -10260,6 +10605,7 @@ impl AppStore {
                     run.error = Some(summary);
                     run.updated_at = completed_at.clone();
                     run.completed_at = Some(completed_at);
+                    close_running_tool_events(run, "canceled", "运行已超时");
                     expired_conversations.insert(run.conversation_id.clone());
                     expired = true;
                 }
@@ -10272,7 +10618,7 @@ impl AppStore {
                     "active-run-query",
                 );
             }
-            if expired {
+            if expired || recovered {
                 self.persist(s)?;
             }
             Ok(s.agent_runs

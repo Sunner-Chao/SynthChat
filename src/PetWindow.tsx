@@ -1,9 +1,9 @@
-import { useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { Palette, SendHorizontal } from "lucide-react";
 import { api, convertFileSrc } from "./lib/api";
-import type { AgentRunEvent, ChatMessage, Conversation, Persona } from "./lib/types";
+import type { AgentRunEvent, ChatMessage, Conversation, EmojiGroup, Persona } from "./lib/types";
 import {
   PET_ACTIVE_CONTEXT_EVENT,
   PET_ACTIVE_CONTEXT_STORAGE_KEY,
@@ -80,6 +80,13 @@ type PetAttachment = {
   fileName: string;
   path: string;
   mimeType?: string;
+};
+
+type PetAttachmentRender = PetAttachment & {
+  resolvedPath: string;
+  isEmojiAsset: boolean;
+  hidden: boolean;
+  imageFailed?: boolean;
 };
 
 type PetCloudStyle = CSSProperties & {
@@ -274,6 +281,41 @@ function attachmentIdentity(attachment: PetAttachment) {
   return `${attachment.path}::${attachment.fileName}::${attachment.mimeType ?? ""}`;
 }
 
+function isImageAttachment(attachment: Pick<PetAttachment, "path" | "mimeType" | "fileName">) {
+  const mime = attachment.mimeType?.toLowerCase() ?? "";
+  if (mime.startsWith("image/")) return true;
+  const target = `${attachment.path} ${attachment.fileName}`.toLowerCase();
+  return /\.(png|jpe?g|gif|webp|bmp|svg)$/.test(target);
+}
+
+function normalizeEmojiPathKey(path: string) {
+  return path.replace(/\//g, "\\").toLowerCase();
+}
+
+function isEmojiAssetPath(path: string) {
+  return normalizeEmojiPathKey(path).includes("\\emoji\\");
+}
+
+function tryRepairEmojiAttachmentPath(
+  path: string,
+  emojiPathIndex: Map<string, string>,
+  emojiFileFallbackIndex: Map<string, string>
+) {
+  const normalized = normalizeEmojiPathKey(path);
+  if (emojiPathIndex.has(normalized)) {
+    return emojiPathIndex.get(normalized) ?? path;
+  }
+  const marker = "\\emoji\\";
+  const markerIndex = normalized.indexOf(marker);
+  if (markerIndex < 0) return path;
+  const relative = normalized.slice(markerIndex + marker.length);
+  const segments = relative.split("\\").filter(Boolean);
+  if (segments.length < 3) return path;
+  const [groupId, emotionId, fileName] = segments;
+  const canonical = emojiFileFallbackIndex.get(`${groupId}::${emotionId}::${fileName}`);
+  return canonical ?? path;
+}
+
 function assistantCloudPayload(message: ChatMessage | null | undefined) {
   if (!message || message.role !== "assistant") return null;
   const text = messageToCloudText(message);
@@ -346,6 +388,8 @@ export function PetWindow() {
   const isNearModelRef = useRef(false);
   const modelMenuOpenRef = useRef(false);
   const showInputRef = useRef(true);
+  const [brokenCloudImages, setBrokenCloudImages] = useState<Record<string, true>>({});
+  const [emojiGroups, setEmojiGroups] = useState<EmojiGroup[]>([]);
 
   const [input, setInput] = useState("");
   const [activeContext, setActiveContext] = useState<PetActiveContext | null>(activeContextRef.current);
@@ -357,6 +401,39 @@ export function PetWindow() {
   const [showInput, setShowInput] = useState(true);
   const [petWindowMode, setPetWindowMode] = useState<PetWindowMode>("model");
   const [dockEdge, setDockEdge] = useState<PetDockEdge>("right");
+
+  const renderedCloudAttachments = useMemo(() => {
+    const attachments = cloudBubble?.attachments ?? [];
+    if (attachments.length === 0) return [] as PetAttachmentRender[];
+    const emojiPathIndex = new Map<string, string>();
+    const emojiFileFallbackIndex = new Map<string, string>();
+    for (const group of emojiGroups) {
+      const imagePaths = Object.values(group.emotionImages ?? {}).flat();
+      for (const imagePath of imagePaths) {
+        emojiPathIndex.set(normalizeEmojiPathKey(imagePath), imagePath);
+        const normalized = normalizeEmojiPathKey(imagePath);
+        const markerIndex = normalized.indexOf("\\emoji\\");
+        if (markerIndex < 0) continue;
+        const segments = normalized.slice(markerIndex + "\\emoji\\".length).split("\\").filter(Boolean);
+        if (segments.length < 3) continue;
+        const [groupId, emotionId, fileName] = segments;
+        emojiFileFallbackIndex.set(`${groupId}::${emotionId}::${fileName}`, imagePath);
+      }
+    }
+    return attachments.map((attachment) => {
+      const isEmojiAsset = isEmojiAssetPath(attachment.path);
+      const resolvedPath = tryRepairEmojiAttachmentPath(attachment.path, emojiPathIndex, emojiFileFallbackIndex);
+      const resolvedKnown = emojiPathIndex.has(normalizeEmojiPathKey(resolvedPath));
+      const imageFailed = Boolean(brokenCloudImages[resolvedPath]);
+      return {
+        ...attachment,
+        resolvedPath,
+        isEmojiAsset,
+        imageFailed,
+        hidden: isEmojiAsset && (!resolvedKnown || imageFailed)
+      };
+    });
+  }, [brokenCloudImages, cloudBubble?.attachments, emojiGroups]);
 
   useEffect(() => {
     document.body.classList.add("pet-window-body");
@@ -391,6 +468,25 @@ export function PetWindow() {
   useEffect(() => {
     showInputRef.current = showInput;
   }, [showInput]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadEmojiGroups = async () => {
+      try {
+        const groups = await api.listEmojiGroups();
+        if (!cancelled) setEmojiGroups(groups);
+      } catch (error) {
+        if (!cancelled) {
+          console.warn("pet emoji group load failed:", error);
+          setEmojiGroups([]);
+        }
+      }
+    };
+    void loadEmojiGroups();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     modelMenuOpenRef.current = modelMenuOpen;
@@ -791,6 +887,7 @@ export function PetWindow() {
     const formatted = formatCloudText(text);
     if (!formatted && !attachments?.length) return;
     clearCloudTimer();
+    setBrokenCloudImages({});
     setCloudBubble({
       id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
       text: formatted || "",
@@ -1322,10 +1419,12 @@ export function PetWindow() {
     const viewportWidth = Math.max(1, window.innerWidth);
     const viewportHeight = Math.max(1, window.innerHeight);
     const width = Math.min(430, Math.max(292, viewportWidth - 28));
-    const attachmentRows = cloudBubble?.attachments?.length ?? 0;
+    const visibleAttachments = renderedCloudAttachments.filter((attachment) => !attachment.hidden);
+    const imageAttachmentRows = visibleAttachments.filter((attachment) => isImageAttachment(attachment)).length;
+    const fileAttachmentRows = visibleAttachments.length - imageAttachmentRows;
     const estimatedTextLines = Math.max(1, Math.ceil((cloudBubble?.text?.length ?? 0) / 26));
     const estimatedTextHeight = Math.min(144, estimatedTextLines * 22);
-    const estimatedAttachmentHeight = Math.min(168, attachmentRows * 44);
+    const estimatedAttachmentHeight = Math.min(196, imageAttachmentRows * 92 + fileAttachmentRows * 42);
     const height = Math.max(112, Math.min(238, 38 + estimatedTextHeight + estimatedAttachmentHeight));
     const fallbackLeft = Math.max(14, Math.round((viewportWidth - width) / 2));
     const fallbackTop = 12;
@@ -1439,14 +1538,27 @@ export function PetWindow() {
             key={cloudBubble.id}
             style={cloudStyle()}
           >
-            {cloudBubble.attachments?.map((a, i) => {
-              const isImage = a.mimeType?.startsWith("image/");
+            {renderedCloudAttachments.map((a, i) => {
+              if (a.hidden) return null;
+              const isImage = isImageAttachment(a) && !a.imageFailed;
               const ext = a.fileName.split(".").pop()?.toLowerCase() ?? "";
               const docIcon: Record<string, string> = { pdf: "📄", pptx: "📊", ppt: "📊", docx: "📝", doc: "📝", xlsx: "📊", xls: "📊", txt: "📃", csv: "📊" };
               return isImage ? (
-                <img key={i} className="pet-cloud-attachment-img" src={convertFileSrc(a.path)} alt={a.fileName} title={a.fileName} />
+                <img
+                  key={i}
+                  className="pet-cloud-attachment-img"
+                  src={convertFileSrc(a.resolvedPath)}
+                  alt={a.fileName}
+                  title={a.fileName}
+                  onError={() => {
+                    setBrokenCloudImages((current) => {
+                      if (current[a.resolvedPath]) return current;
+                      return { ...current, [a.resolvedPath]: true };
+                    });
+                  }}
+                />
               ) : (
-                <span key={i} className="pet-cloud-attachment-file" title={a.path}>
+                <span key={i} className="pet-cloud-attachment-file" title={a.resolvedPath || a.path}>
                   <span className="pet-cloud-attachment-icon">{docIcon[ext] ?? "📎"}</span>
                   <span className="pet-cloud-attachment-name">{a.fileName}</span>
                 </span>

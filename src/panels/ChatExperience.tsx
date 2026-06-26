@@ -36,7 +36,7 @@ import {
 } from "lucide-react";
 import { api } from "../lib/api";
 import { useAppStore } from "../lib/store";
-import type { AgentControlCommand, AgentDefinition, AgentRunRecord, AgentRuntimeEvent, ChatAttachment, ChatMessage, LlmProvider, ManagedProcessEvent, ModelCatalogEntry, ToolEvent, ToolEventEnvelope } from "../lib/types";
+import type { AgentControlCommand, AgentDefinition, AgentRunPhase, AgentRunRecord, AgentRuntimeEvent, ChatAttachment, ChatMessage, LlmProvider, ManagedProcessEvent, ModelCatalogEntry, ToolEvent, ToolEventEnvelope } from "../lib/types";
 import { Avatar } from "../components/common";
 
 type ComposerAttachment = ChatAttachment & {
@@ -65,7 +65,14 @@ const DEFAULT_THINKING_MIN_VISIBLE_MS = 1800;
 const DEFAULT_BOTTOM_FOLLOW_THRESHOLD_PX = 180;
 const DEFAULT_ACTIVE_POLL_INTERVAL_MS = 1500;
 const DEFAULT_IDLE_POLL_INTERVAL_MS = 3000;
-const conversationScrollPositionCache = new Map<string, number>();
+type ConversationScrollMemory = {
+  top: number;
+  anchorMessageId?: string;
+  anchorOffset?: number;
+};
+
+const conversationScrollPositionCache = new Map<string, ConversationScrollMemory>();
+const RUNNING_TOOL_STARTED_AT = "__runningToolStartedAt";
 
 function clampCount(value: number | undefined, fallback: number, min: number, max: number) {
   if (!Number.isFinite(value)) return fallback;
@@ -204,6 +211,32 @@ function parseToolEvent(content: string): ToolEvent | null {
   return null;
 }
 
+function toolEventStartKey(event: Pick<ToolEvent, "callId" | "referenceId" | "serverId" | "toolName">) {
+  if (event.callId) return `call:${event.callId}`;
+  if (event.referenceId) return `ref:${event.referenceId}`;
+  return `${event.serverId}.${event.toolName}`;
+}
+
+function toolEventStartedAt(event: ToolEvent): string | null {
+  const raw = event.raw as Record<string, unknown> | null | undefined;
+  const value = raw?.[RUNNING_TOOL_STARTED_AT];
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function withToolEventStartedAt(event: ToolEvent, startedAt?: string | null): ToolEvent {
+  if (!startedAt || event.status !== "running" || toolEventStartedAt(event)) return event;
+  const raw = event.raw && typeof event.raw === "object" && !Array.isArray(event.raw)
+    ? event.raw as Record<string, unknown>
+    : {};
+  return {
+    ...event,
+    raw: {
+      ...raw,
+      [RUNNING_TOOL_STARTED_AT]: startedAt
+    }
+  };
+}
+
 function parseManagedProcessEvent(content: string): ManagedProcessEvent | null {
   try {
     const parsed = JSON.parse(content) as { type?: string; event?: ManagedProcessEvent };
@@ -262,13 +295,22 @@ function formatTime(value?: string | number | null) {
   return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
 }
 
+function formatDurationMs(value: number) {
+  const ms = Math.max(0, Math.floor(value));
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const minutes = Math.floor(ms / 60_000);
+  const seconds = Math.floor((ms % 60_000) / 1000);
+  return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
+}
+
 function runStateLabel(state: string) {
   const labels: Record<string, string> = {
     pending: "排队中",
     started: "任务已启动",
     planning: "正在规划",
     running: "正在思考",
-    running_tool: "正在调用...",
+    running_tool: "执行中...",
     tool_completed: "成功",
     pendingApproval: "等待审批",
     finalizing: "正在整理",
@@ -284,9 +326,9 @@ function runPhaseLabel(phase: string) {
     planner_started: "开始规划",
     planner_decision: "规划决策",
     approval_required: "等待审批",
-    tool_started: "正在调用...",
+    tool_started: "执行中...",
     tool_message_recorded: "成功",
-    tool_batch_started: "正在调用...",
+    tool_batch_started: "执行中...",
     tool_batch_completed: "成功",
     steer_injected: "用户补充已注入",
     subagent_started: "子任务启动",
@@ -505,7 +547,7 @@ function acpUpdateLinesFromDetail(detail: unknown) {
 }
 
 function eventStatusLabel(event: ToolEvent) {
-  if (event.status === "running") return "正在调用...";
+  if (event.status === "running") return "执行中...";
   if (event.ok) return "成功";
   return "失败";
 }
@@ -517,13 +559,13 @@ function isCanceledToolEvent(event: ToolEvent) {
 function materializeToolEvent(event: ToolEvent, terminalRunState?: string | null): ToolEvent {
   if (event.status !== "running" || !isTerminalRunState(terminalRunState)) return event;
   const summary = terminalRunState === "completed"
-    ? "运行已完成"
+    ? "运行已完成，工具调用已结束"
     : terminalRunState === "aborted"
-      ? "运行已取消"
-      : "运行已结束";
+      ? "运行已取消，工具调用已结束"
+      : "运行已失败，工具调用已结束";
   return {
     ...event,
-    status: "canceled",
+    status: terminalRunState === "failed" ? "failed" : "canceled",
     ok: false,
     summary,
     error: summary
@@ -576,6 +618,21 @@ function selectVisibleToolEvents(events: ToolEvent[]) {
     .filter((item) => !suppressed.has(toolEventMessageKey(item.event)))
     .sort((a, b) => a.index - b.index)
     .map((item) => item.event);
+}
+
+function runningToolStartTimesFromPhases(phases: AgentRunPhase[] | undefined | null) {
+  const starts = new Map<string, string>();
+  for (const phase of phases ?? []) {
+    if (phase.phase !== "tool_started" && phase.phase !== "tool_batch_started") continue;
+    const detail = phase.detail && typeof phase.detail === "object" ? phase.detail as Record<string, unknown> : {};
+    const serverId = typeof detail.serverId === "string" ? detail.serverId : "";
+    const toolName = typeof detail.toolName === "string" ? detail.toolName : "";
+    const callId = typeof detail.callId === "string" ? detail.callId : "";
+    const referenceId = typeof detail.referenceId === "string" ? detail.referenceId : "";
+    if (!serverId || !toolName) continue;
+    starts.set(toolEventStartKey({ callId, referenceId, serverId, toolName }), phase.updatedAt);
+  }
+  return starts;
 }
 
 function agentLabel(agent: AgentDefinition | null | undefined) {
@@ -1040,15 +1097,20 @@ export const ChatExperience = memo(function ChatExperience() {
   const activeRunActivityAt = activeRun?.lastActivityAt ?? storedRun?.lastActivityAt ?? activeRun?.updatedAt ?? storedRun?.updatedAt ?? null;
   const activeRunActivityDesc = activeRun?.lastActivityDesc ?? storedRun?.lastActivityDesc ?? null;
   const stoppableRun = activeRun ?? (storedRun && !["completed", "failed", "aborted"].includes(storedRun.state) ? storedRun : null);
+  const activeRunPhases = activeRun?.accumulatedPhases
+    ?? (activeRun?.phase ? [{ phase: activeRun.phase, detail: activeRun.detail, updatedAt: activeRun.updatedAt }] : storedRun?.phaseEvents ?? []);
+  const activeToolStartTimes = useMemo(
+    () => runningToolStartTimesFromPhases(activeRunPhases),
+    [activeRunPhases]
+  );
   const activeToolEvents: ToolEvent[] = (activeRun?.accumulatedToolEvents?.length
     ? activeRun.accumulatedToolEvents
     : activeRun?.toolEvent
       ? [activeRun.toolEvent]
       : []
   )
+    .map((event) => withToolEventStartedAt(event, activeToolStartTimes.get(toolEventStartKey(event)) ?? activeRunActivityAt ?? activeRun?.updatedAt ?? null))
     .map((event) => materializeToolEvent(event, event.runId ? runStates.get(event.runId) : null));
-  const activeRunPhases = activeRun?.accumulatedPhases
-    ?? (activeRun?.phase ? [{ phase: activeRun.phase, detail: activeRun.detail, updatedAt: activeRun.updatedAt }] : storedRun?.phaseEvents ?? []);
   const activeProcessEvents = useMemo(
     () => managedProcessEvents
       .filter((event) => event.conversationId === activeConversationId || Boolean(activeRun?.runId && event.runId === activeRun.runId))
@@ -1060,7 +1122,7 @@ export const ChatExperience = memo(function ChatExperience() {
   const messageToolEvents = useMemo(() => selectVisibleToolEvents(recentMessages
     .map((message) => {
       const event = message.role === "tool" ? parseToolEvent(message.content) : null;
-      return event ? materializeToolEvent(event, event.runId ? runStates.get(event.runId) : null) : null;
+      return event ? materializeToolEvent(withToolEventStartedAt(event, message.createdAt), event.runId ? runStates.get(event.runId) : null) : null;
     })
     .filter((event): event is ToolEvent => event !== null)), [recentMessages, runStates]);
   const graphEvents = activeToolEvents.length > 0 ? selectVisibleToolEvents(activeToolEvents) : messageToolEvents;
@@ -1279,15 +1341,56 @@ export const ChatExperience = memo(function ChatExperience() {
   const prevConversationIdRef = useRef<string | null>(activeConversationId);
   const prevActiveSectionRef = useRef(activeSection);
   const scrollOnNextMessagesRef = useRef<"bottom" | "restore" | null>(null);
-  const scrollRestoreTargetRef = useRef<{ conversationId: string; top: number } | null>(null);
+  const scrollRestoreTargetRef = useRef<{ conversationId: string; memory: ConversationScrollMemory } | null>(null);
   const conversationActivatedAtRef = useRef<number>(Date.now());
   const notifiedAssistantMessageIdsRef = useRef<Set<string>>(new Set());
 
+  const getScrollAnchor = useCallback((element: HTMLDivElement): ConversationScrollMemory => {
+    const base: ConversationScrollMemory = { top: element.scrollTop };
+    const nodes = element.querySelectorAll<HTMLElement>("[data-message-id]");
+    const containerTop = element.getBoundingClientRect().top;
+    const containerBottom = containerTop + element.clientHeight;
+    for (const node of Array.from(nodes)) {
+      const messageId = node.dataset.messageId?.trim();
+      if (!messageId) continue;
+      const rect = node.getBoundingClientRect();
+      if (rect.bottom <= containerTop) continue;
+      if (rect.top >= containerBottom) break;
+      return {
+        top: element.scrollTop,
+        anchorMessageId: messageId,
+        anchorOffset: rect.top - containerTop
+      };
+    }
+    return base;
+  }, []);
+
+  const canPersistScrollPosition = useCallback((element: HTMLDivElement | null) => {
+    if (!element) return false;
+    if (activeSection !== "chat") return false;
+    return element.clientHeight > 0 && element.scrollHeight > 0;
+  }, [activeSection]);
+
+  const applyScrollMemory = useCallback((element: HTMLDivElement, memory: ConversationScrollMemory) => {
+    let targetTop = memory.top;
+    if (memory.anchorMessageId) {
+      const anchor = Array.from(element.querySelectorAll<HTMLElement>("[data-message-id]"))
+        .find((node) => node.dataset.messageId === memory.anchorMessageId);
+      if (anchor) {
+        targetTop = anchor.offsetTop - (memory.anchorOffset ?? 0);
+      }
+    }
+    const maxTop = Math.max(0, element.scrollHeight - element.clientHeight);
+    const nextTop = Math.min(Math.max(0, targetTop), maxTop);
+    element.scrollTop = nextTop;
+    return nextTop;
+  }, []);
+
   const saveCurrentScrollPosition = useCallback((conversationId: string | null) => {
     const element = scrollRef.current;
-    if (!element || !conversationId) return;
-    conversationScrollPositionCache.set(conversationId, element.scrollTop);
-  }, []);
+    if (!element || !conversationId || !canPersistScrollPosition(element)) return;
+    conversationScrollPositionCache.set(conversationId, getScrollAnchor(element));
+  }, [canPersistScrollPosition, getScrollAnchor]);
 
   const restoreSavedScrollPosition = useCallback((conversationId: string | null) => {
     if (!conversationId) return () => {};
@@ -1312,9 +1415,10 @@ export const ChatExperience = memo(function ChatExperience() {
         scrollToBottom();
         return;
       }
-      const maxTop = Math.max(0, element.scrollHeight - element.clientHeight);
-      const nextTop = Math.min(saved, maxTop);
-      element.scrollTop = nextTop;
+      const nextTop = applyScrollMemory(element, saved);
+      if (canPersistScrollPosition(element)) {
+        conversationScrollPositionCache.set(conversationId, getScrollAnchor(element));
+      }
       const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
       const near = distanceFromBottom <= bottomFollowThresholdPx;
       nearBottomRef.current = near;
@@ -1333,7 +1437,7 @@ export const ChatExperience = memo(function ChatExperience() {
     return () => {
       cancelled = true;
     };
-  }, [bottomFollowThresholdPx, conversationUnreadCounts, markConversationRead, scrollToBottom]);
+  }, [applyScrollMemory, bottomFollowThresholdPx, conversationUnreadCounts, getScrollAnchor, markConversationRead, scrollToBottom]);
 
   const selectConversationWithScrollMemory = useCallback((conversationId: string) => {
     saveCurrentScrollPosition(activeConversationId);
@@ -1360,9 +1464,9 @@ export const ChatExperience = memo(function ChatExperience() {
       nearBottomRef.current = true;
       // Check if we have a saved position for this conversation
       const savedPosition = activeConversationId ? conversationScrollPositionCache.get(activeConversationId) : undefined;
-      scrollOnNextMessagesRef.current = savedPosition !== undefined ? "restore" : "bottom";
-      scrollRestoreTargetRef.current = activeConversationId && savedPosition !== undefined
-        ? { conversationId: activeConversationId, top: savedPosition }
+      scrollOnNextMessagesRef.current = savedPosition ? "restore" : "bottom";
+      scrollRestoreTargetRef.current = activeConversationId && savedPosition
+        ? { conversationId: activeConversationId, memory: savedPosition }
         : null;
     }
   }, [activeConversationId]);
@@ -1392,16 +1496,15 @@ export const ChatExperience = memo(function ChatExperience() {
       if (!el || el.scrollHeight <= 0) return false;
       if (mode === "restore" && convId) {
         const target = scrollRestoreTargetRef.current?.conversationId === convId
-          ? scrollRestoreTargetRef.current.top
+          ? scrollRestoreTargetRef.current.memory
           : conversationScrollPositionCache.get(convId);
-        if (target !== undefined) {
-          const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
-          el.scrollTop = Math.min(target, maxTop);
+        if (target) {
+          const appliedTop = applyScrollMemory(el, target);
           const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
           nearBottomRef.current = dist <= bottomFollowThresholdPx;
           setIsNearBottom(nearBottomRef.current);
           attempts += 1;
-          if (attempts >= 6 || Math.abs(el.scrollTop - Math.min(target, maxTop)) <= 2) {
+          if (attempts >= 6 || Math.abs(el.scrollTop - appliedTop) <= 2) {
             scrollOnNextMessagesRef.current = null;
             scrollRestoreTargetRef.current = null;
             return true;
@@ -1423,7 +1526,7 @@ export const ChatExperience = memo(function ChatExperience() {
     return () => {
       cancelled = true;
     };
-  }, [activeConversationId, bottomFollowThresholdPx, messages]);
+  }, [activeConversationId, applyScrollMemory, bottomFollowThresholdPx, messages]);
 
   const handleScroll = useCallback(() => {
     const element = scrollRef.current;
@@ -2415,7 +2518,7 @@ const MessageRow = memo(function MessageRow({
   const [previewSrc, setPreviewSrc] = useState<string | null>(null);
   const parsedToolEvent = message.role === "tool" ? parseToolEvent(message.content) : null;
   const toolEvent = parsedToolEvent
-    ? materializeToolEvent(parsedToolEvent, parsedToolEvent.runId ? runStates.get(parsedToolEvent.runId) : null)
+    ? materializeToolEvent(withToolEventStartedAt(parsedToolEvent, message.createdAt), parsedToolEvent.runId ? runStates.get(parsedToolEvent.runId) : null)
     : null;
   const processEvent = message.role === "tool" ? parseManagedProcessEvent(message.content) : null;
   const isUser = message.role === "user";
@@ -2427,7 +2530,7 @@ const MessageRow = memo(function MessageRow({
   if (processEvent) return <ManagedProcessMessage event={processEvent} />;
   if (!text) return null;
   return (
-    <div className={isUser ? "claw-message-row user" : "claw-message-row assistant"}>
+    <div className={isUser ? "claw-message-row user" : "claw-message-row assistant"} data-message-id={message.id}>
       <Avatar
         name={isUser ? profileName : personaName}
         src={isUser && profileAvatar ? api.assetUrl(profileAvatar) : !isUser && personaAvatar ? api.assetUrl(personaAvatar) : ""}
@@ -2652,13 +2755,21 @@ function compactSteps(events: ToolEvent[]): CompactStep[] {
 
 const TimelineStep = memo(function TimelineStep({ step, isLast }: { step: CompactStep; isLast: boolean }) {
   const [expanded, setExpanded] = useState(step.anyRunning);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const statusClass = step.anyRunning ? "running" : step.anyFailed ? "failed" : "done";
   const statusIcon = step.anyRunning
     ? <Loader2 size={14} className="claw-tl-icon-spin" />
     : step.anyFailed
       ? <AlertCircle size={14} />
       : <CheckCircle2 size={14} />;
-  const elapsedLabel = step.anyRunning ? "执行中..." : step.totalMs >= 1000 ? `${(step.totalMs / 1000).toFixed(1)}s` : `${step.totalMs}ms`;
+  const fallbackStartedAtMsRef = useRef(Date.now());
+  const elapsedLabel = step.anyRunning ? toolEventElapsedLabel(step.lastEvent, nowMs, fallbackStartedAtMsRef.current) : formatDurationMs(step.totalMs);
+
+  useEffect(() => {
+    if (!step.anyRunning) return;
+    const timer = window.setInterval(() => setNowMs(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [step.anyRunning]);
 
   return (
     <div className={`claw-tl-node claw-tl-node--${statusClass}${isLast ? " claw-tl-node--last" : ""}`}>
@@ -2705,10 +2816,19 @@ function toolEventReauthInfo(event: ToolEvent): { state: string; cacheState: str
   };
 }
 
-function toolEventElapsedLabel(event: ToolEvent): string {
-  if (event.status === "running") return "执行中...";
+function toolEventElapsedLabel(event: ToolEvent, nowMs = Date.now(), fallbackStartedAtMs?: number): string {
+  if (event.status === "running") {
+    const startedAt = toolEventStartedAt(event);
+    const startedMs = startedAt ? new Date(startedAt).getTime() : NaN;
+    const fallbackMs = Number.isFinite(fallbackStartedAtMs) ? Number(fallbackStartedAtMs) : nowMs;
+    const liveElapsedMs = Number.isFinite(startedMs)
+      ? Math.max(0, nowMs - startedMs)
+      : Math.max(1, nowMs - fallbackMs);
+    const elapsedMs = Math.max(event.elapsedMs, liveElapsedMs);
+    return formatDurationMs(Math.max(1, elapsedMs));
+  }
   if (event.elapsedMs > 0) {
-    return event.elapsedMs >= 1000 ? `${(event.elapsedMs / 1000).toFixed(1)}s` : `${event.elapsedMs}ms`;
+    return formatDurationMs(event.elapsedMs);
   }
   if (!event.ok || event.status === "failed") {
     return "即时返回";
@@ -2740,6 +2860,8 @@ function toolEventPathBadge(event: ToolEvent): { label: string; tone: "neutral" 
 
 const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
   const [expanded, setExpanded] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const fallbackStartedAtMsRef = useRef(Date.now());
   const canOpen = Boolean(event.path && event.exists);
   const isToolImage = canOpen && (event.eventType === "screenshot" || event.eventType === "image" || Boolean(event.mimeType?.startsWith("image/")));
   const isRunning = event.status === "running";
@@ -2749,10 +2871,16 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
   const bodyText = event.text?.trim() ?? "";
   const errorText = event.error?.trim() ?? "";
   const pathBadge = toolEventPathBadge(event);
-  const elapsedLabel = toolEventElapsedLabel(event);
+  const elapsedLabel = toolEventElapsedLabel(event, nowMs, fallbackStartedAtMsRef.current);
   const duplicateBody = Boolean(summaryText && bodyText && normalizeToolDetailText(summaryText) === normalizeToolDetailText(bodyText));
   const duplicateError = Boolean(errorText && (normalizeToolDetailText(errorText) === normalizeToolDetailText(summaryText) || normalizeToolDetailText(errorText) === normalizeToolDetailText(bodyText)));
   const hasDetails = Boolean(summaryText || event.path || isToolImage || canOpen || (bodyText && !duplicateBody) || (errorText && !duplicateError) || reauthInfo);
+
+  useEffect(() => {
+    if (!isRunning) return;
+    const timer = window.setInterval(() => setNowMs(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [isRunning]);
 
   return (
     <div className="claw-tool-message">

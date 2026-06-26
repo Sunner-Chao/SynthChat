@@ -1266,11 +1266,6 @@ async fn trigger_proactive_for_persona(
         .filter(|value| !value.is_empty())
         .unwrap_or("用户已经一段时间没有回复了。请根据角色设定与近期对话，主动发起一条贴合角色的简短消息。")
         .to_string();
-    let before_ids = store
-        .messages(&conversation_id, None)?
-        .into_iter()
-        .map(|message| message.id)
-        .collect::<std::collections::HashSet<_>>();
     let _ = app.emit(
         "synthchat-chat-event",
         json!({
@@ -1303,20 +1298,21 @@ async fn trigger_proactive_for_persona(
             return Err(error);
         }
     };
-    let mut messages = store.messages(&conversation_id, None)?;
     let internal_user_ids = generated
         .iter()
         .filter(|message| message.role == "user" && message.source == "proactive-internal")
         .map(|message| message.id.clone())
         .collect::<std::collections::HashSet<_>>();
-    for message in &mut messages {
-        if !before_ids.contains(&message.id) && message.role == "assistant" {
-            message.source = "proactive".into();
-            break;
-        }
-    }
-    messages.retain(|message| !internal_user_ids.contains(&message.id));
-    store.replace_conversation_messages(&conversation_id, messages.clone())?;
+    let assistant_message_ids = generated
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .map(|message| message.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let messages = store.finalize_proactive_messages(
+        &conversation_id,
+        &assistant_message_ids,
+        &internal_user_ids,
+    )?;
     if let Some(assistant) = messages
         .iter()
         .rev()
@@ -3478,7 +3474,16 @@ fn apply_persona_emoji(store: &AppStore, persona: &Persona, reply: String) -> St
         .wrapping_add(hash_to_u64(&persona.id))
         .wrapping_add(hash_to_u64(&reply));
     let (_, images) = available[(seed as usize) % available.len()];
-    let path = &images[(seed as usize + persona.id.len() + reply.len()) % images.len()];
+    let preferred_index = (seed as usize + persona.id.len() + reply.len()) % images.len();
+    let path = images
+        .iter()
+        .cycle()
+        .skip(preferred_index)
+        .take(images.len())
+        .find(|path| Path::new(path.as_str()).is_file());
+    let Some(path) = path else {
+        return reply;
+    };
     let mime = mime_for_image_path(path);
     format!("{reply}\n\n[media attached: {path} ({mime})]")
 }

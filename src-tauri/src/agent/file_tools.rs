@@ -970,8 +970,11 @@ pub(super) fn write_file_tool(
         let content = prepare_file_write_content(&full_path, content)?;
         fs::write(&full_path, &content)?;
         verify_text_write_landed(&full_path, &content)?;
-        record_registered_write(store, &full_path, "write_file", payload)?;
-        let edit_diagnostics = edit_diagnostics_for_paths_with_baselines(
+        let mut post_write_warnings = Vec::new();
+        if let Err(error) = record_registered_write(store, &full_path, "write_file", payload) {
+            post_write_warnings.push(format!("file registry update failed after write landed: {error}"));
+        }
+        let edit_diagnostics = match edit_diagnostics_for_paths_with_baselines(
             agent,
             &root,
             &[full_path.clone()],
@@ -982,7 +985,18 @@ pub(super) fn write_file_tool(
                     None
                 }
             },
-        )?;
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                post_write_warnings
+                    .push(format!("edit diagnostics failed after write landed: {error}"));
+                json!({
+                    "enabled": false,
+                    "postWriteWarning": true,
+                    "reason": error.to_string(),
+                })
+            }
+        };
         let lsp_delta_diagnostics = lsp_delta_diagnostics_blocking(&root, &full_path);
         Ok(serde_json::to_string_pretty(&json!({
             "success": true,
@@ -994,7 +1008,8 @@ pub(super) fn write_file_tool(
             "charsWritten": content.chars().count(),
             "editDiagnostics": edit_diagnostics,
             "lspBaseline": lsp_baseline,
-            "lspDeltaDiagnostics": lsp_delta_diagnostics
+            "lspDeltaDiagnostics": lsp_delta_diagnostics,
+            "postWriteWarnings": post_write_warnings
         }))?)
     })
 }
