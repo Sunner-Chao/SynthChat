@@ -247,8 +247,13 @@ fn expand_single_attachment_context(
         canonical.display()
     );
     if likely_binary(&canonical) || !mime_type_is_textual(mime_type) {
+        let advice = if mime_type.to_ascii_lowercase().starts_with("image/") {
+            "This image is available to vision-capable chat models as native image input. If the active chat model cannot inspect images directly, use vision_analyze with this path; do not use read_file for image bytes and do not infer its contents from the file name."
+        } else {
+            "This attachment is binary or non-text. Use a suitable tool such as transcribe_audio/read_file only if applicable; do not infer its contents from the file name."
+        };
         return Ok(format!(
-            "{header}\nThis attachment is binary or non-text. Use a suitable tool such as vision_analyze/transcribe_audio/read_file only if applicable; do not infer its contents from the file name."
+            "{header}\n{advice}"
         ));
     }
     if metadata.len() > 512 * 1024 {

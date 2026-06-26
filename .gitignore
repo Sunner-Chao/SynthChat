@@ -21,10 +21,11 @@ venv/
 release/
 .cache/
 
-
 target/
 runtime/
 # Large binary files - use download instead
 execute/*.exe
 model/*.bin
 videos/
+debug/
+target-codex-check/

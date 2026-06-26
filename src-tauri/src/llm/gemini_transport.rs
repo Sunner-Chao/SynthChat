@@ -659,6 +659,14 @@ pub(super) fn build_gemini_contents(history: Vec<ChatMessage>) -> Vec<Value> {
                 "user" => "user",
                 _ => return None,
             };
+            if item.role == "user" {
+                if let Some(parts) = gemini_provider_user_parts(&item) {
+                    return Some(vec![json!({
+                        "role": role,
+                        "parts": parts
+                    })]);
+                }
+            }
             let content = sanitize_provider_text(&item.content);
             if content.trim().is_empty() {
                 return None;
@@ -671,6 +679,33 @@ pub(super) fn build_gemini_contents(history: Vec<ChatMessage>) -> Vec<Value> {
         .flatten()
         .collect::<Vec<_>>();
     merge_adjacent_gemini_contents(contents)
+}
+
+fn gemini_provider_user_parts(message: &ChatMessage) -> Option<Vec<Value>> {
+    let provider_data = message.provider_data.as_ref()?;
+    let gemini = provider_data.get("gemini").unwrap_or(provider_data);
+    let parts = gemini.get("parts")?.as_array()?;
+    let parts = parts
+        .iter()
+        .filter(|part| {
+            part.get("text").and_then(Value::as_str).is_some()
+                || part.get("inlineData").is_some()
+                || part.get("inline_data").is_some()
+        })
+        .map(|part| {
+            if let Some(inline_data) = part.get("inline_data") {
+                let mut normalized = part.clone();
+                normalized["inlineData"] = inline_data.clone();
+                if let Some(object) = normalized.as_object_mut() {
+                    object.remove("inline_data");
+                }
+                normalized
+            } else {
+                part.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then_some(parts)
 }
 
 pub(super) fn merge_adjacent_gemini_contents(contents: Vec<Value>) -> Vec<Value> {

@@ -81,6 +81,24 @@ pub struct DetectedModelList {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PartialModelCapabilities {
+    supports_tools: Option<bool>,
+    supports_vision: Option<bool>,
+    supports_reasoning: Option<bool>,
+    supports_pdf: Option<bool>,
+    supports_audio_input: Option<bool>,
+    supports_structured_output: Option<bool>,
+    open_weights: Option<bool>,
+    input_modalities: Option<Vec<String>>,
+    output_modalities: Option<Vec<String>>,
+    context_window: Option<u64>,
+    max_output_tokens: Option<u64>,
+    model_family: Option<String>,
+    status: Option<String>,
+    knowledge_cutoff: Option<String>,
+}
+
 fn provider_mapping() -> &'static HashMap<&'static str, &'static str> {
     static MAPPING: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
     MAPPING.get_or_init(|| {
@@ -358,6 +376,14 @@ fn string_vec(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn lower_string_vec(value: Option<&Value>) -> Vec<String> {
+    string_vec(value)
+        .into_iter()
+        .map(|item| item.trim().to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
 fn positive_u64(value: Option<&Value>) -> Option<u64> {
     value
         .and_then(Value::as_u64)
@@ -368,6 +394,254 @@ fn positive_u64(value: Option<&Value>) -> Option<u64> {
                 .filter(|value| *value > 0.0)
                 .map(|value| value as u64)
         })
+}
+
+fn object_bool(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| object.get(*key))
+        .and_then(Value::as_bool)
+}
+
+fn object_u64(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| positive_u64(object.get(*key)))
+}
+
+fn object_string(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| object.get(*key))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn object_string_vec(
+    object: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<Vec<String>> {
+    keys.iter().find_map(|key| {
+        let values = lower_string_vec(object.get(*key));
+        if values.is_empty() {
+            None
+        } else {
+            Some(values)
+        }
+    })
+}
+
+fn object_modalities(object: &serde_json::Map<String, Value>) -> (Option<Vec<String>>, Option<Vec<String>>) {
+    let direct_input = object_string_vec(object, &["inputModalities", "input_modalities"]);
+    let direct_output = object_string_vec(object, &["outputModalities", "output_modalities"]);
+    let nested = object.get("modalities").and_then(Value::as_object);
+    let nested_input = nested
+        .and_then(|value| {
+            let modalities = lower_string_vec(value.get("input"));
+            if modalities.is_empty() {
+                None
+            } else {
+                Some(modalities)
+            }
+        });
+    let nested_output = nested
+        .and_then(|value| {
+            let modalities = lower_string_vec(value.get("output"));
+            if modalities.is_empty() {
+                None
+            } else {
+                Some(modalities)
+            }
+        });
+    (direct_input.or(nested_input), direct_output.or(nested_output))
+}
+
+fn partial_capabilities_from_object(
+    object: &serde_json::Map<String, Value>,
+) -> Option<PartialModelCapabilities> {
+    let (input_modalities, output_modalities) = object_modalities(object);
+    let partial = PartialModelCapabilities {
+        supports_tools: object_bool(object, &["supportsTools", "supports_tools", "tool_call"]),
+        supports_vision: object_bool(object, &["supportsVision", "supports_vision", "attachment"]),
+        supports_reasoning: object_bool(object, &["supportsReasoning", "supports_reasoning", "reasoning"]),
+        supports_pdf: object_bool(object, &["supportsPdf", "supports_pdf"]),
+        supports_audio_input: object_bool(object, &["supportsAudioInput", "supports_audio_input"]),
+        supports_structured_output: object_bool(
+            object,
+            &["supportsStructuredOutput", "supports_structured_output", "structured_output"],
+        ),
+        open_weights: object_bool(object, &["openWeights", "open_weights"]),
+        input_modalities,
+        output_modalities,
+        context_window: object_u64(object, &["contextWindow", "context_window", "inputTokenLimit"]),
+        max_output_tokens: object_u64(object, &["maxOutputTokens", "max_output_tokens", "outputTokenLimit"]),
+        model_family: object_string(object, &["modelFamily", "model_family", "family"]),
+        status: object_string(object, &["status"]),
+        knowledge_cutoff: object_string(object, &["knowledgeCutoff", "knowledge_cutoff", "knowledge"]),
+    };
+    let has_any = partial.supports_tools.is_some()
+        || partial.supports_vision.is_some()
+        || partial.supports_reasoning.is_some()
+        || partial.supports_pdf.is_some()
+        || partial.supports_audio_input.is_some()
+        || partial.supports_structured_output.is_some()
+        || partial.open_weights.is_some()
+        || partial.input_modalities.is_some()
+        || partial.output_modalities.is_some()
+        || partial.context_window.is_some()
+        || partial.max_output_tokens.is_some()
+        || partial.model_family.is_some()
+        || partial.status.is_some()
+        || partial.knowledge_cutoff.is_some();
+    has_any.then_some(partial)
+}
+
+fn normalize_modalities(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn apply_partial_capabilities(
+    mut base: ModelCapabilities,
+    partial: PartialModelCapabilities,
+    source: &str,
+) -> ModelCapabilities {
+    let explicit_input_modalities = partial.input_modalities.clone();
+    let explicit_output_modalities = partial.output_modalities.clone();
+    if let Some(input_modalities) = explicit_input_modalities.clone() {
+        base.input_modalities = normalize_modalities(input_modalities);
+    }
+    if let Some(output_modalities) = explicit_output_modalities {
+        base.output_modalities = normalize_modalities(output_modalities);
+    }
+    if let Some(value) = partial.supports_tools {
+        base.supports_tools = value;
+    }
+    if let Some(value) = partial.supports_reasoning {
+        base.supports_reasoning = value;
+    }
+    if let Some(value) = partial.supports_structured_output {
+        base.supports_structured_output = value;
+    }
+    if let Some(value) = partial.open_weights {
+        base.open_weights = value;
+    }
+    if let Some(value) = partial.context_window {
+        base.context_window = Some(value);
+    }
+    if let Some(value) = partial.max_output_tokens {
+        base.max_output_tokens = Some(value);
+    }
+    if let Some(value) = partial.model_family {
+        base.model_family = value;
+    }
+    if let Some(value) = partial.status {
+        base.status = value;
+    }
+    if let Some(value) = partial.knowledge_cutoff {
+        base.knowledge_cutoff = value;
+    }
+    if explicit_input_modalities.is_some() {
+        if partial.supports_vision.is_none() {
+            base.supports_vision = base.input_modalities.iter().any(|item| item == "image");
+        }
+        if partial.supports_pdf.is_none() {
+            base.supports_pdf = base.input_modalities.iter().any(|item| item == "pdf");
+        }
+        if partial.supports_audio_input.is_none() {
+            base.supports_audio_input = base.input_modalities.iter().any(|item| item == "audio");
+        }
+    }
+    if let Some(value) = partial.supports_vision {
+        base.supports_vision = value;
+    }
+    if let Some(value) = partial.supports_pdf {
+        base.supports_pdf = value;
+    }
+    if let Some(value) = partial.supports_audio_input {
+        base.supports_audio_input = value;
+    }
+    if base.supports_vision && !base.input_modalities.iter().any(|item| item == "image") {
+        base.input_modalities.push("image".into());
+        base.input_modalities = normalize_modalities(base.input_modalities);
+    }
+    if !base.supports_vision {
+        base.input_modalities.retain(|item| item != "image");
+    }
+    if base.supports_pdf && !base.input_modalities.iter().any(|item| item == "pdf") {
+        base.input_modalities.push("pdf".into());
+        base.input_modalities = normalize_modalities(base.input_modalities);
+    }
+    if base.supports_audio_input && !base.input_modalities.iter().any(|item| item == "audio") {
+        base.input_modalities.push("audio".into());
+        base.input_modalities = normalize_modalities(base.input_modalities);
+    }
+    base.source = source.to_string();
+    base
+}
+
+fn provider_model_config<'a>(
+    provider: &'a LlmProvider,
+    model_id: &str,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return None;
+    }
+    provider
+        .models
+        .as_object()
+        .and_then(|models| models.get(model_id))
+        .and_then(Value::as_object)
+}
+
+fn provider_model_override(
+    provider: &LlmProvider,
+    model_id: &str,
+    base: &ModelCapabilities,
+) -> Option<ModelCapabilities> {
+    let config = provider_model_config(provider, model_id)?;
+    let partial = config
+        .get("capabilities")
+        .and_then(Value::as_object)
+        .and_then(partial_capabilities_from_object)
+        .or_else(|| partial_capabilities_from_object(config))?;
+    Some(apply_partial_capabilities(
+        base.clone(),
+        partial,
+        "configured",
+    ))
+}
+
+fn curated_gateway_capabilities(provider: &LlmProvider, model_id: &str) -> Option<ModelCapabilities> {
+    let host = provider.base_url.trim().to_ascii_lowercase();
+    let model = model_id.trim().to_ascii_lowercase();
+    if host.contains("xiaomimimo.com") && model == "mimo-v2.5" {
+        return Some(ModelCapabilities {
+            provider_id: if provider.id.trim().is_empty() {
+                provider.provider_type.clone()
+            } else {
+                provider.id.clone()
+            },
+            model_id: model_id.to_string(),
+            models_dev_provider_id: models_dev_provider_id("xiaomi"),
+            supports_tools: true,
+            supports_vision: true,
+            supports_reasoning: false,
+            supports_pdf: false,
+            supports_audio_input: false,
+            supports_structured_output: true,
+            open_weights: false,
+            input_modalities: vec!["text".into(), "image".into()],
+            output_modalities: vec!["text".into()],
+            context_window: None,
+            max_output_tokens: None,
+            model_family: "mimo".into(),
+            status: String::new(),
+            knowledge_cutoff: String::new(),
+            source: "curated".into(),
+        });
+    }
+    None
 }
 
 fn capabilities_from_entry(
@@ -462,10 +736,13 @@ pub fn infer_model_capabilities(provider: &LlmProvider) -> ModelCapabilities {
     let model = provider.model.trim().to_ascii_lowercase();
     let supports_vision = model.contains("vision")
         || model.contains("gpt-4o")
+        || model.contains("gpt-4.1")
         || model.contains("gemini")
         || model.contains("claude-3")
+        || model.contains("claude-4")
         || model.contains("qwen-vl")
-        || model.contains("vl-");
+        || model.contains("vl-")
+        || model.contains("omni");
     let supports_reasoning = model.contains("reason")
         || model.contains("thinking")
         || model.contains("o1")
@@ -508,9 +785,15 @@ pub fn provider_model_capabilities(provider: &LlmProvider) -> ModelCapabilities 
     } else {
         provider.id.as_str()
     };
-    lookup_model_capabilities(provider_id, &provider.model)
-        .or_else(|| lookup_model_capabilities(&provider.provider_type, &provider.model))
-        .unwrap_or_else(|| infer_model_capabilities(provider))
+    let model_id = provider.model.trim();
+    let mut base = lookup_model_capabilities(provider_id, model_id)
+        .or_else(|| lookup_model_capabilities(&provider.provider_type, model_id))
+        .or_else(|| curated_gateway_capabilities(provider, model_id))
+        .unwrap_or_else(|| infer_model_capabilities(provider));
+    if let Some(overridden) = provider_model_override(provider, model_id, &base) {
+        base = overridden;
+    }
+    base
 }
 
 pub fn model_capability_prompt_block(provider: &LlmProvider) -> String {
@@ -757,6 +1040,70 @@ fn live_model_entry(provider_id: &str, model_id: &str, name: Option<&str>) -> Mo
     }
 }
 
+fn partial_capabilities_from_live_item(item: &Value) -> Option<PartialModelCapabilities> {
+    let object = item.as_object()?;
+    let (input_modalities, output_modalities) = object_modalities(object);
+    let mut partial = PartialModelCapabilities {
+        supports_tools: object_bool(object, &["supportsTools", "supports_tools", "tool_call"]),
+        supports_vision: object_bool(object, &["supportsVision", "supports_vision"]),
+        supports_reasoning: object_bool(object, &["supportsReasoning", "supports_reasoning", "reasoning"]),
+        supports_pdf: object_bool(object, &["supportsPdf", "supports_pdf"]),
+        supports_audio_input: object_bool(object, &["supportsAudioInput", "supports_audio_input"]),
+        supports_structured_output: object_bool(
+            object,
+            &["supportsStructuredOutput", "supports_structured_output", "structured_output"],
+        ),
+        open_weights: object_bool(object, &["openWeights", "open_weights"]),
+        input_modalities,
+        output_modalities,
+        context_window: object_u64(object, &["contextWindow", "context_window", "inputTokenLimit"]),
+        max_output_tokens: object_u64(object, &["maxOutputTokens", "max_output_tokens", "outputTokenLimit"]),
+        model_family: object_string(object, &["modelFamily", "model_family", "family"]),
+        status: object_string(object, &["status"]),
+        knowledge_cutoff: object_string(object, &["knowledgeCutoff", "knowledge_cutoff", "knowledge"]),
+    };
+    if partial.input_modalities.is_none() {
+        let methods = lower_string_vec(object.get("supportedGenerationMethods"));
+        if !methods.is_empty() {
+            partial.supports_tools = partial.supports_tools.or(Some(
+                methods
+                    .iter()
+                    .any(|method| matches!(method.as_str(), "generatecontent" | "streamgeneratecontent")),
+            ));
+        }
+    }
+    if partial.supports_vision.is_none() {
+        if let Some(input_modalities) = partial.input_modalities.as_ref() {
+            partial.supports_vision = Some(input_modalities.iter().any(|item| item == "image"));
+        }
+    }
+    if partial.supports_pdf.is_none() {
+        if let Some(input_modalities) = partial.input_modalities.as_ref() {
+            partial.supports_pdf = Some(input_modalities.iter().any(|item| item == "pdf"));
+        }
+    }
+    if partial.supports_audio_input.is_none() {
+        if let Some(input_modalities) = partial.input_modalities.as_ref() {
+            partial.supports_audio_input = Some(input_modalities.iter().any(|item| item == "audio"));
+        }
+    }
+    let has_any = partial.supports_tools.is_some()
+        || partial.supports_vision.is_some()
+        || partial.supports_reasoning.is_some()
+        || partial.supports_pdf.is_some()
+        || partial.supports_audio_input.is_some()
+        || partial.supports_structured_output.is_some()
+        || partial.open_weights.is_some()
+        || partial.input_modalities.is_some()
+        || partial.output_modalities.is_some()
+        || partial.context_window.is_some()
+        || partial.max_output_tokens.is_some()
+        || partial.model_family.is_some()
+        || partial.status.is_some()
+        || partial.knowledge_cutoff.is_some();
+    has_any.then_some(partial)
+}
+
 async fn fetch_openai_compatible_models(
     provider: &LlmProvider,
     base_url: &str,
@@ -884,11 +1231,19 @@ fn models_from_live_items(provider: &LlmProvider, items: Vec<Value>) -> Vec<Mode
             .or_else(|| item.get("name"))
             .and_then(Value::as_str)
             .map(|value| value.trim_start_matches("models/"));
-        entries.push(live_model_entry(
+        let mut entry = live_model_entry(
             provider_key,
             raw_id.trim_start_matches("models/"),
             name,
-        ));
+        );
+        if let Some(partial) = partial_capabilities_from_live_item(&item) {
+            entry.capabilities =
+                apply_partial_capabilities(entry.capabilities.clone(), partial, "live");
+            if entry.family.trim().is_empty() {
+                entry.family = entry.capabilities.model_family.clone();
+            }
+        }
+        entries.push(entry);
     }
     entries.sort_by(|left, right| left.id.cmp(&right.id));
     entries.dedup_by(|left, right| left.id == right.id);
@@ -1009,5 +1364,75 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(models_dev_provider_id(input), expected, "{input}");
         }
+    }
+
+    #[test]
+    fn provider_model_capabilities_honors_model_overrides() {
+        let mut provider = LlmProvider::default();
+        provider.id = "provider-test".into();
+        provider.provider_type = "anthropic".into();
+        provider.model = "mimo-v2.5".into();
+        provider.models = json!({
+            "mimo-v2.5": {
+                "capabilities": {
+                    "supportsVision": true,
+                    "supportsReasoning": true,
+                    "supportsStructuredOutput": true,
+                    "inputModalities": ["text", "image"],
+                    "contextWindow": 131072
+                }
+            }
+        });
+
+        let caps = provider_model_capabilities(&provider);
+        assert!(caps.supports_vision);
+        assert!(caps.supports_reasoning);
+        assert!(caps.supports_structured_output);
+        assert_eq!(caps.context_window, Some(131072));
+        assert_eq!(caps.input_modalities, vec!["image", "text"]);
+        assert_eq!(caps.source, "configured");
+    }
+
+    #[test]
+    fn provider_model_capabilities_uses_curated_gateway_hint() {
+        let mut provider = LlmProvider::default();
+        provider.id = "provider-mimo".into();
+        provider.provider_type = "anthropic".into();
+        provider.base_url = "https://token-plan-sgp.xiaomimimo.com/anthropic".into();
+        provider.model = "mimo-v2.5".into();
+
+        let caps = provider_model_capabilities(&provider);
+        assert!(caps.supports_vision);
+        assert!(caps.supports_tools);
+        assert_eq!(caps.source, "curated");
+        assert!(caps.input_modalities.iter().any(|item| item == "image"));
+    }
+
+    #[test]
+    fn live_items_parse_capabilities_from_metadata() {
+        let mut provider = LlmProvider::default();
+        provider.id = "provider-google".into();
+        provider.provider_type = "gemini".into();
+        let items = vec![json!({
+            "name": "models/gemini-2.5-pro",
+            "displayName": "Gemini 2.5 Pro",
+            "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
+            "inputModalities": ["TEXT", "IMAGE", "PDF"],
+            "outputModalities": ["TEXT"],
+            "supportsReasoning": true,
+            "inputTokenLimit": 1048576,
+            "outputTokenLimit": 65536
+        })];
+
+        let entries = models_from_live_items(&provider, items);
+        assert_eq!(entries.len(), 1);
+        let caps = &entries[0].capabilities;
+        assert!(caps.supports_tools);
+        assert!(caps.supports_vision);
+        assert!(caps.supports_pdf);
+        assert!(caps.supports_reasoning);
+        assert_eq!(caps.context_window, Some(1_048_576));
+        assert_eq!(caps.max_output_tokens, Some(65_536));
+        assert_eq!(caps.source, "live");
     }
 }

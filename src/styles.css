@@ -7999,6 +7999,33 @@ select:focus-visible {
   line-height: 1.6;
 }
 
+.settings-subpanel {
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  background: var(--surface-1);
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.settings-subpanel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-subpanel-head strong {
+  font-size: 13px;
+  color: var(--text-1);
+}
+
+.settings-subpanel-head small {
+  font-size: 12px;
+  color: var(--text-3);
+  text-align: right;
+}
+
 /* ── Card Header ── */
 .card-header {
   display: flex;

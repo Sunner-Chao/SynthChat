@@ -659,6 +659,28 @@ export interface LlmProvider {
   promptCacheMode?: "auto" | "on" | "off" | string;
   promptCacheTtl?: "5m" | "1h" | string;
   promptCacheLayout?: "auto" | "native" | "envelope" | string;
+  models?: Record<string, Record<string, unknown>>;
+}
+
+export interface ModelCapabilities {
+  provider_id?: string;
+  model_id?: string;
+  models_dev_provider_id?: string;
+  supports_tools?: boolean;
+  supports_vision?: boolean;
+  supports_reasoning?: boolean;
+  supports_pdf?: boolean;
+  supports_audio_input?: boolean;
+  supports_structured_output?: boolean;
+  open_weights?: boolean;
+  input_modalities?: string[];
+  output_modalities?: string[];
+  context_window?: number | null;
+  max_output_tokens?: number | null;
+  model_family?: string;
+  status?: string;
+  knowledge_cutoff?: string;
+  source?: string;
 }
 
 export interface ProfileConfig {
@@ -1298,13 +1320,7 @@ export interface ModelCatalogEntry {
   id: string;
   name: string;
   family?: string;
-  capabilities?: {
-    supports_tools?: boolean;
-    supports_vision?: boolean;
-    supports_reasoning?: boolean;
-    context_window?: number;
-    max_output_tokens?: number;
-  };
+  capabilities?: ModelCapabilities;
 }
 
 export interface DetectedModelList {

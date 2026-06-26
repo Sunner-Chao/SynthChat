@@ -1,18 +1,20 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     future::Future,
     path::PathBuf,
     time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::{
     error::{AppError, AppResult},
     hermes_auth::{
         mark_hermes_credential_pool_failure, mark_hermes_credential_pool_failure_for_source,
     },
+    model_catalog,
     models::{
         new_id, now_iso, AgentCheckpointRecord, AgentRunRecord, ChatConfig, ChatMessage,
         LlmProvider, Persona, ShortContextState, ToolDefinition,
@@ -1697,6 +1699,211 @@ fn llm_api_response_hook_payload(
     payload
 }
 
+#[derive(Debug, Clone)]
+struct ImageAttachmentPart {
+    file_name: String,
+    mime_type: String,
+    data_url: String,
+    base64_data: String,
+}
+
+fn history_with_native_image_attachments(
+    store: &AppStore,
+    provider: &LlmProvider,
+    persona: &Persona,
+    history: &[ChatMessage],
+    user_content: &str,
+) -> Vec<ChatMessage> {
+    let mut effective_provider = provider.clone();
+    if !persona.llm_model.trim().is_empty() {
+        effective_provider.model = persona.llm_model.trim().to_string();
+    }
+    let caps = model_catalog::provider_model_capabilities(&effective_provider);
+    if !caps.supports_vision {
+        return history.to_vec();
+    }
+    let attachment_root = store.data_dir().join("attachments");
+    let last_user_index = history.iter().rposition(|message| message.role == "user");
+    history
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            if message.role != "user" {
+                return message.clone();
+            }
+            let mut message = message.clone();
+            if Some(index) == last_user_index && !user_content.trim().is_empty() {
+                message.content = user_content.to_string();
+            }
+            let attachments = image_attachments_from_message(&message, &attachment_root);
+            if attachments.is_empty() {
+                return message;
+            }
+            message_with_native_image_parts(&message, &attachments)
+        })
+        .collect()
+}
+
+fn image_attachments_from_message(message: &ChatMessage, attachment_root: &PathBuf) -> Vec<ImageAttachmentPart> {
+    let root = attachment_root
+        .canonicalize()
+        .unwrap_or_else(|_| attachment_root.to_path_buf());
+    message
+        .content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('{') || !trimmed.contains("\"attachment\"") {
+                return None;
+            }
+            let value = serde_json::from_str::<Value>(trimmed).ok()?;
+            if value.get("type").and_then(Value::as_str) != Some("attachment") {
+                return None;
+            }
+            image_attachment_part_from_value(&value, &root)
+        })
+        .take(6)
+        .collect()
+}
+
+fn image_attachment_part_from_value(value: &Value, attachment_root: &PathBuf) -> Option<ImageAttachmentPart> {
+    let mime_type = value
+        .get("mimeType")
+        .or_else(|| value.get("mime_type"))
+        .and_then(Value::as_str)
+        .unwrap_or("application/octet-stream")
+        .trim();
+    if !mime_type.to_ascii_lowercase().starts_with("image/") {
+        return None;
+    }
+    let path_text = value.get("path").and_then(Value::as_str)?.trim();
+    let path = PathBuf::from(path_text);
+    let canonical = path.canonicalize().ok()?;
+    if !canonical.starts_with(attachment_root) || !canonical.is_file() {
+        return None;
+    }
+    let metadata = fs::metadata(&canonical).ok()?;
+    if metadata.len() == 0 || metadata.len() > 20 * 1024 * 1024 {
+        return None;
+    }
+    let bytes = fs::read(&canonical).ok()?;
+    use base64::Engine as _;
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let mime_type = normalized_image_mime(mime_type, &canonical);
+    let data_url = format!("data:{mime_type};base64,{base64_data}");
+    let file_name = value
+        .get("fileName")
+        .or_else(|| value.get("file_name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| canonical.file_name().and_then(|name| name.to_str()).map(str::to_string))
+        .unwrap_or_else(|| "image".into());
+    Some(ImageAttachmentPart {
+        file_name,
+        mime_type,
+        data_url,
+        base64_data,
+    })
+}
+
+fn normalized_image_mime(mime_type: &str, path: &PathBuf) -> String {
+    let lower = mime_type.trim().to_ascii_lowercase();
+    if lower.starts_with("image/") && lower != "image/jpg" {
+        return lower;
+    }
+    match path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_ascii_lowercase()) {
+        Some(ext) if ext == "jpg" || ext == "jpeg" => "image/jpeg".into(),
+        Some(ext) if ext == "webp" => "image/webp".into(),
+        Some(ext) if ext == "gif" => "image/gif".into(),
+        Some(ext) if ext == "bmp" => "image/bmp".into(),
+        _ => "image/png".into(),
+    }
+}
+
+fn message_with_native_image_parts(message: &ChatMessage, attachments: &[ImageAttachmentPart]) -> ChatMessage {
+    let mut next = message.clone();
+    let text = message.content.trim();
+    let mut openai_content = Vec::new();
+    let mut responses_content = Vec::new();
+    let mut anthropic_content = Vec::new();
+    let mut gemini_parts = Vec::new();
+    if !text.is_empty() {
+        openai_content.push(json!({"type": "text", "text": text}));
+        responses_content.push(json!({"type": "input_text", "text": text}));
+        anthropic_content.push(json!({"type": "text", "text": text}));
+        gemini_parts.push(json!({"text": text}));
+    }
+    for attachment in attachments {
+        openai_content.push(json!({
+            "type": "image_url",
+            "image_url": { "url": attachment.data_url }
+        }));
+        responses_content.push(json!({
+            "type": "input_image",
+            "image_url": attachment.data_url
+        }));
+        anthropic_content.push(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": attachment.mime_type,
+                "data": attachment.base64_data
+            }
+        }));
+        gemini_parts.push(json!({
+            "inlineData": {
+                "mimeType": attachment.mime_type,
+                "data": attachment.base64_data
+            }
+        }));
+    }
+    let mut root = next
+        .provider_data
+        .take()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let attachments_meta = attachments
+        .iter()
+        .map(|attachment| {
+            json!({
+                "fileName": attachment.file_name,
+                "mimeType": attachment.mime_type,
+                "bytesBase64": attachment.base64_data.len()
+            })
+        })
+        .collect::<Vec<_>>();
+    merge_provider_data_object(&mut root, "openai", json!({ "content": openai_content }));
+    merge_provider_data_object(&mut root, "responses", json!({ "content": responses_content }));
+    merge_provider_data_object(&mut root, "anthropic", json!({ "content": anthropic_content }));
+    merge_provider_data_object(&mut root, "gemini", json!({ "parts": gemini_parts }));
+    root.insert(
+        "nativeImageAttachments".into(),
+        json!({
+            "count": attachments.len(),
+            "attachments": attachments_meta
+        }),
+    );
+    next.provider_data = Some(Value::Object(root));
+    next
+}
+
+fn merge_provider_data_object(root: &mut Map<String, Value>, key: &str, value: Value) {
+    match root.get_mut(key).and_then(Value::as_object_mut) {
+        Some(existing) => {
+            if let Some(incoming) = value.as_object() {
+                for (field, field_value) in incoming {
+                    existing.insert(field.clone(), field_value.clone());
+                }
+            }
+        }
+        None => {
+            root.insert(key.into(), value);
+        }
+    }
+}
+
 pub(super) async fn complete_chat_with_provider_failover(
     store: &AppStore,
     run_id: Option<&str>,
@@ -1742,12 +1949,20 @@ pub(super) async fn complete_chat_with_provider_failover(
             let attempt_number = attempt_index + 1;
             let attempt_started = Instant::now();
             let attempt_persona = persona_with_max_tokens_override(persona, max_tokens_override);
+            let attempt_history =
+                history_with_native_image_attachments(
+                    store,
+                    &attempt_provider,
+                    &attempt_persona,
+                    &request_history,
+                    user_content,
+                );
             let api_hook_payload = llm_api_request_hook_payload(
                 run_id,
                 provider,
                 attempt_number,
                 &system_prompt,
-                &request_history,
+                &attempt_history,
                 user_content,
                 native_tools,
             );
@@ -1762,7 +1977,7 @@ pub(super) async fn complete_chat_with_provider_failover(
                     &attempt_provider,
                     &attempt_persona,
                     system_prompt.clone(),
-                    request_history.clone(),
+                    attempt_history,
                     user_content,
                     native_tools,
                     &crate::llm::LlmCallOptions {

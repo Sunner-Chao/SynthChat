@@ -699,6 +699,15 @@ pub(super) fn build_responses_payload(
         if role == "assistant" && replayed_message_item {
             continue;
         }
+        if role == "user" {
+            if let Some(content) = responses_provider_user_content(&item) {
+                input.push(json!({
+                    "role": role,
+                    "content": content
+                }));
+                continue;
+            }
+        }
         let part_type = if role == "assistant" {
             "output_text"
         } else {
@@ -707,6 +716,27 @@ pub(super) fn build_responses_payload(
         push_responses_text_item(&mut input, &role, part_type, &content);
     }
     (instructions, input)
+}
+
+fn responses_provider_user_content(message: &ChatMessage) -> Option<Vec<Value>> {
+    let provider_data = message.provider_data.as_ref()?;
+    let responses = provider_data.get("responses").unwrap_or(provider_data);
+    let content = responses
+        .get("content")
+        .or_else(|| responses.get("contentParts"))
+        .or_else(|| responses.get("content_parts"))?
+        .as_array()?;
+    let content = content
+        .iter()
+        .filter(|part| {
+            matches!(
+                part.get("type").and_then(Value::as_str),
+                Some("input_text" | "input_image")
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    (!content.is_empty()).then_some(content)
 }
 
 fn push_responses_text_item(input: &mut Vec<Value>, role: &str, part_type: &str, content: &str) {

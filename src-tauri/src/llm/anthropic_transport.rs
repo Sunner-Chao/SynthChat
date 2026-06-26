@@ -502,6 +502,12 @@ pub(super) fn build_anthropic_messages(history: Vec<ChatMessage>) -> Vec<Value> 
             }
             continue;
         }
+        if item.role == "user" {
+            if let Some(blocks) = anthropic_provider_user_content(&item) {
+                push_anthropic_content_message(&mut messages, "user", blocks);
+                continue;
+            }
+        }
         if let Some(message) = sanitized_wire_message(item, true) {
             push_anthropic_text_message(&mut messages, &message.role, &message.content);
         }
@@ -559,6 +565,27 @@ fn anthropic_replay_blocks_from_provider_data(provider_data: &Option<Value>) -> 
         .filter(|block| anthropic_replay_block_is_required(block))
         .cloned()
         .collect()
+}
+
+fn anthropic_provider_user_content(message: &ChatMessage) -> Option<Vec<Value>> {
+    let provider_data = message.provider_data.as_ref()?;
+    let anthropic = provider_data.get("anthropic").unwrap_or(provider_data);
+    let blocks = anthropic
+        .get("content")
+        .or_else(|| anthropic.get("contentBlocks"))
+        .or_else(|| anthropic.get("content_blocks"))?
+        .as_array()?;
+    let content = blocks
+        .iter()
+        .filter(|block| {
+            matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("text" | "image")
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    (!content.is_empty()).then_some(content)
 }
 
 fn anthropic_replay_block_is_required(block: &Value) -> bool {

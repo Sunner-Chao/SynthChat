@@ -27,6 +27,7 @@ import type {
   MemoryEntry,
   MemoryStatus,
   ModelCatalogEntry,
+  ModelCapabilities,
   Persona,
   PluginAuxiliaryTaskSummary,
   ProfileConfig,
@@ -463,6 +464,22 @@ export async function detectProviderModels(provider: LlmProvider): Promise<Detec
   }));
 }
 
+export async function inferProviderModelCapabilities(provider: LlmProvider): Promise<ModelCapabilities> {
+  return call("infer_provider_model_capabilities", { provider }, () => ({
+    provider_id: provider.id,
+    model_id: provider.model,
+    supports_tools: provider.providerType !== "echo",
+    supports_vision: false,
+    supports_reasoning: false,
+    supports_pdf: false,
+    supports_audio_input: false,
+    supports_structured_output: provider.providerType !== "echo",
+    input_modalities: ["text"],
+    output_modalities: ["text"],
+    source: "fallback"
+  }));
+}
+
 export async function environmentCheck(): Promise<EnvCheckResult> {
   return call("environment_check", {}, () => ({
     items: [{ id: "frontend", name: "前端预览", status: "ok", detail: "Standalone mock mode." }],
@@ -708,6 +725,7 @@ export const api: Record<string, any> = {
   resetTokenUsage: () => ok("已重置"),
   listAgenticModels,
   detectProviderModels,
+  inferProviderModelCapabilities,
   environmentCheck,
   checkEnvironment: environmentCheck,
   getShortContextState: (conversationId: string) => call("get_short_context_state", { conversationId }, () => ({

@@ -23950,17 +23950,18 @@ fn api_server_usage_by_model(calls: &[Value]) -> Vec<Value> {
 }
 
 fn api_server_model_capabilities_value(provider: &crate::models::LlmProvider) -> Value {
+    let caps = crate::model_catalog::provider_model_capabilities(provider);
     json!({
-        "supports_tools": provider.provider_type != "echo",
-        "supports_vision": false,
-        "supports_reasoning": provider.model.to_ascii_lowercase().contains("reason")
-            || provider.model.to_ascii_lowercase().contains("thinking"),
-        "context_window": Value::Null,
-        "max_output_tokens": Value::Null,
-        "model_family": provider.provider_type,
+        "supports_tools": caps.supports_tools,
+        "supports_vision": caps.supports_vision,
+        "supports_reasoning": caps.supports_reasoning,
+        "context_window": caps.context_window,
+        "max_output_tokens": caps.max_output_tokens,
+        "model_family": if caps.model_family.trim().is_empty() { provider.provider_type.clone() } else { caps.model_family.clone() },
         "desktopConfigured": true,
         "providerId": provider.id,
-        "enabled": provider.enabled
+        "enabled": provider.enabled,
+        "source": caps.source
     })
 }
 
@@ -28912,15 +28913,18 @@ fn api_server_handle_model_info(store: &AppStore) -> AppResult<Value> {
         "config_context_length": config_context_length,
         "effective_context_length": config_context_length,
         "capabilities": {
-            "supports_tools": true,
-            "supports_vision": provider.as_ref().map(|p| p.provider_type.contains("vision") || p.model.to_ascii_lowercase().contains("vision") || p.model.to_ascii_lowercase().contains("gpt-4o")).unwrap_or(false),
-            "supports_reasoning": provider.as_ref().map(|p| {
-                let lower = p.model.to_ascii_lowercase();
-                lower.contains("reason") || lower.contains("o1") || lower.contains("o3") || lower.contains("r1")
-            }).unwrap_or(false),
+            "supports_tools": provider.as_ref().map(crate::model_catalog::provider_model_capabilities).map(|caps| caps.supports_tools).unwrap_or(true),
+            "supports_vision": provider.as_ref().map(crate::model_catalog::provider_model_capabilities).map(|caps| caps.supports_vision).unwrap_or(false),
+            "supports_reasoning": provider.as_ref().map(crate::model_catalog::provider_model_capabilities).map(|caps| caps.supports_reasoning).unwrap_or(false),
             "context_window": config_context_length,
-            "max_output_tokens": 0,
-            "model_family": provider.as_ref().and_then(|p| p.preset.clone()).unwrap_or(provider_type.clone())
+            "max_output_tokens": provider.as_ref().map(crate::model_catalog::provider_model_capabilities).and_then(|caps| caps.max_output_tokens).unwrap_or(0),
+            "model_family": provider.as_ref().map(crate::model_catalog::provider_model_capabilities).map(|caps| {
+                if caps.model_family.trim().is_empty() {
+                    provider_type.clone()
+                } else {
+                    caps.model_family
+                }
+            }).unwrap_or(provider_type.clone())
         },
         "schema": "hermes_dashboard_model_info_desktop_v1",
         "nativeApiServerRoute": "/api/model/info",

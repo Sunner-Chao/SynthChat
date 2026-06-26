@@ -36,6 +36,7 @@ import type {
   LlmProvider,
   ModelCatalogEntry,
   McpServer,
+  ModelCapabilities,
   Persona,
   ProfileConfig,
   SearchProvider,
@@ -98,6 +99,75 @@ function formatTokenK(tokens: number) {
   }
   const value = tokens / 1000;
   return `${Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)}K`;
+}
+
+type ModelCapabilityOverrideValue = "auto" | "on" | "off";
+
+function normalizeProviderModels(value: LlmProvider["models"] | undefined): Record<string, Record<string, unknown>> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return value as Record<string, Record<string, unknown>>;
+}
+
+function currentModelConfig(provider: LlmProvider | null): Record<string, unknown> {
+  if (!provider || !provider.model?.trim()) return {};
+  const models = normalizeProviderModels(provider.models);
+  const config = models[provider.model.trim()];
+  return config && typeof config === "object" && !Array.isArray(config) ? config : {};
+}
+
+function currentModelCapabilityOverrides(provider: LlmProvider | null): Record<string, unknown> {
+  const config = currentModelConfig(provider);
+  const capabilities = config.capabilities;
+  return capabilities && typeof capabilities === "object" && !Array.isArray(capabilities)
+    ? capabilities as Record<string, unknown>
+    : {};
+}
+
+function capabilityOverrideValue(provider: LlmProvider | null, key: string): ModelCapabilityOverrideValue {
+  const value = currentModelCapabilityOverrides(provider)[key];
+  if (value === true) return "on";
+  if (value === false) return "off";
+  return "auto";
+}
+
+function setCapabilityOverride(
+  provider: LlmProvider,
+  key: string,
+  next: ModelCapabilityOverrideValue
+): LlmProvider {
+  const model = provider.model.trim();
+  if (!model) return provider;
+  const models = { ...normalizeProviderModels(provider.models) };
+  const currentConfig = currentModelConfig(provider);
+  const nextConfig: Record<string, unknown> = { ...currentConfig };
+  const currentCapabilities = currentModelCapabilityOverrides(provider);
+  const nextCapabilities: Record<string, unknown> = { ...currentCapabilities };
+  if (next === "auto") {
+    delete nextCapabilities[key];
+  } else {
+    nextCapabilities[key] = next === "on";
+  }
+  if (Object.keys(nextCapabilities).length > 0) {
+    nextConfig.capabilities = nextCapabilities;
+  } else {
+    delete nextConfig.capabilities;
+  }
+  if (Object.keys(nextConfig).length > 0) {
+    models[model] = nextConfig;
+  } else {
+    delete models[model];
+  }
+  return { ...provider, models };
+}
+
+function formatCapabilitySource(source?: string) {
+  if (!source) return "unknown";
+  if (source === "configured") return "手动覆盖";
+  if (source === "live") return "实时模型端点";
+  if (source === "models.dev") return "models.dev";
+  if (source === "curated") return "内置兼容规则";
+  if (source === "heuristic") return "名称兜底推断";
+  return source;
 }
 
 function providerPresetLabel(id: string) {
@@ -1140,6 +1210,8 @@ function ProviderSettings({
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [catalogSource, setCatalogSource] = useState("");
   const [catalogError, setCatalogError] = useState("");
+  const [draftCapabilities, setDraftCapabilities] = useState<ModelCapabilities | null>(null);
+  const [capabilityLoading, setCapabilityLoading] = useState(false);
   const fetchCatalogModels = async (provider: LlmProvider) => {
     setCatalogLoading(true);
     try {
@@ -1155,9 +1227,31 @@ function ProviderSettings({
       setCatalogLoading(false);
     }
   };
+  const fetchDraftCapabilities = async (provider: LlmProvider) => {
+    if (!provider.model?.trim()) {
+      setDraftCapabilities(null);
+      return;
+    }
+    setCapabilityLoading(true);
+    try {
+      const result = await api.inferProviderModelCapabilities(provider);
+      setDraftCapabilities(result);
+    } catch {
+      setDraftCapabilities(null);
+    } finally {
+      setCapabilityLoading(false);
+    }
+  };
   useEffect(() => {
     if (draft) void fetchCatalogModels(draft);
   }, [draft?.id, draft?.providerType, draft?.baseUrl, draft?.apiKeyEnv, draft?.apiKey]);
+  useEffect(() => {
+    if (draft) {
+      void fetchDraftCapabilities(draft);
+    } else {
+      setDraftCapabilities(null);
+    }
+  }, [draft?.id, draft?.providerType, draft?.baseUrl, draft?.apiKeyEnv, draft?.apiKey, draft?.model, JSON.stringify(draft?.models ?? {})]);
   useEffect(() => {
     if (selectedId && !selected) {
       setSelectedId("");
@@ -1362,6 +1456,69 @@ function ProviderSettings({
               <option value="envelope">OpenAI/OpenRouter envelope</option>
             </select></label>
             <label>API Key（可选）<input type="password" value={draft.apiKey ?? ""} onChange={(event) => setDraft((d) => d ? { ...d, apiKey: event.target.value || null } : d)} /></label>
+            {draft.model?.trim() ? (
+              <div className="settings-subpanel">
+                <div className="settings-subpanel-head">
+                  <strong>模型能力覆盖</strong>
+                  <small>{capabilityLoading ? "检测中..." : `当前来源：${formatCapabilitySource(draftCapabilities?.source)}`}</small>
+                </div>
+                <div className="two-column">
+                  <label>原生识图
+                    <select
+                      value={capabilityOverrideValue(draft, "supportsVision")}
+                      onChange={(event) => setDraft((d) => d ? setCapabilityOverride(d, "supportsVision", event.target.value as ModelCapabilityOverrideValue) : d)}
+                    >
+                      <option value="auto">自动判断</option>
+                      <option value="on">强制开启</option>
+                      <option value="off">强制关闭</option>
+                    </select>
+                  </label>
+                  <label>推理模式
+                    <select
+                      value={capabilityOverrideValue(draft, "supportsReasoning")}
+                      onChange={(event) => setDraft((d) => d ? setCapabilityOverride(d, "supportsReasoning", event.target.value as ModelCapabilityOverrideValue) : d)}
+                    >
+                      <option value="auto">自动判断</option>
+                      <option value="on">强制开启</option>
+                      <option value="off">强制关闭</option>
+                    </select>
+                  </label>
+                </div>
+                <div className="two-column">
+                  <label>工具调用
+                    <select
+                      value={capabilityOverrideValue(draft, "supportsTools")}
+                      onChange={(event) => setDraft((d) => d ? setCapabilityOverride(d, "supportsTools", event.target.value as ModelCapabilityOverrideValue) : d)}
+                    >
+                      <option value="auto">自动判断</option>
+                      <option value="on">强制开启</option>
+                      <option value="off">强制关闭</option>
+                    </select>
+                  </label>
+                  <label>结构化输出
+                    <select
+                      value={capabilityOverrideValue(draft, "supportsStructuredOutput")}
+                      onChange={(event) => setDraft((d) => d ? setCapabilityOverride(d, "supportsStructuredOutput", event.target.value as ModelCapabilityOverrideValue) : d)}
+                    >
+                      <option value="auto">自动判断</option>
+                      <option value="on">强制开启</option>
+                      <option value="off">强制关闭</option>
+                    </select>
+                  </label>
+                </div>
+                {draftCapabilities ? (
+                  <small className="form-hint">
+                    当前生效：识图 {draftCapabilities.supports_vision ? "开启" : "关闭"} ·
+                    工具 {draftCapabilities.supports_tools ? "开启" : "关闭"} ·
+                    推理 {draftCapabilities.supports_reasoning ? "开启" : "关闭"} ·
+                    结构化 {draftCapabilities.supports_structured_output ? "开启" : "关闭"}
+                    {draftCapabilities.input_modalities?.length ? ` · 输入 ${draftCapabilities.input_modalities.join("/")}` : ""}
+                  </small>
+                ) : (
+                  <small className="form-hint">选择模型后可对当前模型单独指定能力；留在“自动判断”时将使用后端发现结果。</small>
+                )}
+              </div>
+            ) : null}
             <button className="btn-danger-outline" onClick={() => void remove(draft)} type="button">删除服务商</button>
           </div>
         ) : (
