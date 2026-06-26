@@ -1103,6 +1103,10 @@ pub struct AgentQueuedRequest {
     pub persona_id: String,
     pub user_message_id: String,
     pub content: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_data: Option<Value>,
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
@@ -1120,6 +1124,8 @@ impl AgentQueuedRequest {
             persona_id,
             user_message_id: user_message.id.clone(),
             content: user_message.content.clone(),
+            source: user_message.source.clone(),
+            provider_data: user_message.provider_data.clone(),
             status: "pending".into(),
             created_at: now.clone(),
             updated_at: now,
@@ -1127,6 +1133,17 @@ impl AgentQueuedRequest {
             completed_at: None,
             error: None,
         }
+    }
+
+    pub fn request_provider_data(&self) -> Option<Value> {
+        self.provider_data.clone().or_else(|| {
+            let source = self.source.trim();
+            if source.is_empty() {
+                None
+            } else {
+                Some(json!({ "source": source }))
+            }
+        })
     }
 }
 

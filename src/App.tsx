@@ -43,7 +43,9 @@ import { listen } from "@tauri-apps/api/event";
 import { emit } from "@tauri-apps/api/event";
 import { Avatar, MenuRow } from "./components/common";
 import { SettingsPanel } from "./panels/SettingsPanel";
-import { AgentsPanel, MemoryPanel, SkillsPanel, WorldbooksPanel, PluginsPanel, McpPanel } from "./panels/ToolPanels";
+import { AgentsPanel, MemoryPanel, WorldbooksPanel, PluginsPanel } from "./panels/ToolPanels";
+import { McpExtensionPanel } from "./panels/McpExtensionPanel";
+import { SkillsCenterPanel } from "./panels/SkillsCenterPanel";
 import { MomentsPanel } from "./panels/MomentsPanel";
 import { PersonaPanel } from "./panels/PersonaPanel";
 import { ChatExperience } from "./panels/ChatExperience";
@@ -570,13 +572,12 @@ function ActivePanel({ section }: { section: AppSection }) {
   if (section === "discover") return <DiscoverPanel />;
   if (section === "moments") return <MomentsPanel />;
   if (section === "personas") return <PersonaPanel />;
-  if (section === "mcp") return <McpPanel />;
+  if (section === "mcp") return <McpExtensionPanel />;
   if (section === "settings") return <SettingsPanel />;
   if (section === "memory") return <MemoryPanel />;
-  if (section === "worldbooks") return <WorldbooksPanel />;
   if (section === "plugins") return <PluginsPanel />;
   if (section === "agents") return <AgentsPanel />;
-  if (section === "skills") return <SkillsPanel />;
+  if (section === "skills") return <SkillsCenterPanel />;
   return null;
 }
 

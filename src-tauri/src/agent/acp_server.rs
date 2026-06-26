@@ -423,7 +423,7 @@ async fn acp_drain_session_queue_after_prompt(
             persona_id: Some(item.persona_id.clone()),
             agent_id: None,
             content: item.content.clone(),
-            provider_data: None,
+            provider_data: item.request_provider_data(),
             queue_item_id: Some(item.id.clone()),
         };
         let run_result = if let Some(sink) = notification_sink {
@@ -442,7 +442,16 @@ async fn acp_drain_session_queue_after_prompt(
                 .map(|messages| (messages, None))
         };
         let (status, error, messages, streamed_agent_message) = match run_result {
-            Ok((messages, streamed)) => ("completed", None, messages, streamed),
+            Ok((messages, streamed)) => {
+                crate::wechat_settings::finalize_queued_wechat_turn(
+                    store,
+                    &messages,
+                    item.provider_data.as_ref(),
+                    item.started_at.as_deref(),
+                )
+                .await?;
+                ("completed", None, messages, streamed)
+            }
             Err(error) => {
                 let error_text = error.to_string();
                 ("failed", Some(error_text), Vec::new(), None)

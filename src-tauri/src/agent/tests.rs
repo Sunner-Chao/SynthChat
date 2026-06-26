@@ -8017,6 +8017,62 @@ fn busy_input_modes_queue_steer_and_interrupt_active_run() {
 }
 
 #[test]
+fn busy_input_queue_preserves_request_source_and_provider_data() {
+    let dir = std::env::temp_dir().join(format!("synthchat-busy-origin-{}", new_id("test")));
+    fs::create_dir_all(&dir).unwrap();
+    let store = AppStore::new(dir.join("state.json")).unwrap();
+    let persona = store.persona(None).unwrap();
+    let conversation = store
+        .create_conversation(Some("Busy Origin".into()), Some(persona.id.clone()))
+        .unwrap();
+    let mut run = AgentRunRecord::new(
+        conversation.id.clone(),
+        persona.id.clone(),
+        conversation.agent_id.clone(),
+    );
+    run.run_id = "run_busy_origin".into();
+    run.state = "running".into();
+    store.save_agent_run(run).unwrap();
+
+    let request = SendChatRequest {
+        conversation_id: Some(conversation.id.clone()),
+        persona_id: Some(persona.id.clone()),
+        agent_id: None,
+        content: "queued wechat prompt".into(),
+        provider_data: Some(json!({
+            "source": "wechat",
+            "accountId": "wechat-account-1",
+            "userId": "wechat-user-1",
+            "contextToken": "ctx-1"
+        })),
+        queue_item_id: None,
+    };
+    let queued = handle_busy_conversation_input_for_request(
+        &store,
+        &conversation,
+        &persona,
+        &request,
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(queued.len(), 2);
+    let queue = store.agent_queue().unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].source, "wechat");
+    assert_eq!(
+        queue[0].provider_data.as_ref().unwrap()["accountId"],
+        "wechat-account-1"
+    );
+    assert_eq!(
+        queue[0].provider_data.as_ref().unwrap()["contextToken"],
+        "ctx-1"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn hermes_gateway_control_command_bypass_recognizes_registered_names_only() {
     for command in [
         "model",

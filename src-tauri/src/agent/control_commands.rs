@@ -11736,12 +11736,35 @@ pub(super) fn enqueue_prompt_for_conversation(
     persona: &Persona,
     prompt: &str,
 ) -> AppResult<(ChatMessage, crate::models::AgentQueuedRequest)> {
-    let user_message = ChatMessage::new(
+    enqueue_prompt_for_conversation_with_origin(
+        store,
+        conversation,
+        persona,
+        prompt,
+        Some("desktop-control-queue"),
+        None,
+    )
+}
+
+pub(super) fn enqueue_prompt_for_conversation_with_origin(
+    store: &AppStore,
+    conversation: &Conversation,
+    persona: &Persona,
+    prompt: &str,
+    source: Option<&str>,
+    provider_data: Option<Value>,
+) -> AppResult<(ChatMessage, crate::models::AgentQueuedRequest)> {
+    let source = source
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("desktop-control-queue");
+    let mut user_message = ChatMessage::new(
         conversation.id.clone(),
         "user",
         prompt.trim().to_string(),
-        "desktop-control-queue",
+        source,
     );
+    user_message.provider_data = provider_data;
     let saved = store.append_message(user_message)?;
     let queued =
         store.enqueue_agent_request(conversation.id.clone(), persona.id.clone(), &saved)?;
@@ -11761,7 +11784,7 @@ async fn drain_agent_queue_for_conversation(
             persona_id: Some(item.persona_id.clone()),
             agent_id: None,
             content: item.content.clone(),
-            provider_data: None,
+            provider_data: item.request_provider_data(),
             queue_item_id: Some(item.id.clone()),
         };
         let status = match Box::pin(run_chat_turn_with_app(
@@ -11772,7 +11795,16 @@ async fn drain_agent_queue_for_conversation(
         ))
         .await
         {
-            Ok(_) => "completed",
+            Ok(messages) => {
+                crate::wechat_settings::finalize_queued_wechat_turn(
+                    store,
+                    &messages,
+                    item.provider_data.as_ref(),
+                    item.started_at.as_deref(),
+                )
+                .await?;
+                "completed"
+            }
             Err(error) => {
                 let failed = store
                     .complete_agent_queue_item(&item.id, "failed", Some(error.to_string()))?

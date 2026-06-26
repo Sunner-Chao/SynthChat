@@ -216,9 +216,13 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         clarification_response_context_for_turn(store, &conversation.id, &request.content)?
             .unwrap_or_else(|| request.content.clone())
     };
-    if let Some(messages) =
-        handle_busy_conversation_input(store, &conversation, &persona, &request.content, app)?
-    {
+    if let Some(messages) = handle_busy_conversation_input_for_request(
+        store,
+        &conversation,
+        &persona,
+        &request,
+        app,
+    )? {
         return Ok(messages);
     }
     let chat_config = store.config()?.chat;
@@ -1766,7 +1770,7 @@ async fn drain_queued_requests_for_conversation(
             persona_id: Some(item.persona_id.clone()),
             agent_id: None,
             content: item.content.clone(),
-            provider_data: None,
+            provider_data: item.request_provider_data(),
             queue_item_id: Some(item.id.clone()),
         };
         let status = match Box::pin(run_chat_turn_with_app(
@@ -1777,7 +1781,16 @@ async fn drain_queued_requests_for_conversation(
         ))
         .await
         {
-            Ok(_) => "completed",
+            Ok(messages) => {
+                crate::wechat_settings::finalize_queued_wechat_turn(
+                    store,
+                    &messages,
+                    item.provider_data.as_ref(),
+                    item.started_at.as_deref(),
+                )
+                .await?;
+                "completed"
+            }
             Err(error) => {
                 let failed = store
                     .complete_agent_queue_item(&item.id, "failed", Some(error.to_string()))?
@@ -1967,7 +1980,7 @@ async fn drain_goal_continuations_for_conversation(
             persona_id: Some(item.persona_id.clone()),
             agent_id: None,
             content: item.content.clone(),
-            provider_data: None,
+            provider_data: item.request_provider_data(),
             queue_item_id: Some(item.id.clone()),
         };
         let status = match Box::pin(run_chat_turn_with_app(
@@ -1978,7 +1991,16 @@ async fn drain_goal_continuations_for_conversation(
         ))
         .await
         {
-            Ok(_) => "completed",
+            Ok(messages) => {
+                crate::wechat_settings::finalize_queued_wechat_turn(
+                    store,
+                    &messages,
+                    item.provider_data.as_ref(),
+                    item.started_at.as_deref(),
+                )
+                .await?;
+                "completed"
+            }
             Err(error) => {
                 let failed = store
                     .complete_agent_queue_item(&item.id, "failed", Some(error.to_string()))?
@@ -2450,6 +2472,48 @@ pub(super) fn handle_busy_conversation_input(
     content: &str,
     app: Option<&AppHandle>,
 ) -> AppResult<Option<Vec<ChatMessage>>> {
+    handle_busy_conversation_input_with_origin(
+        store,
+        conversation,
+        persona,
+        content,
+        None,
+        None,
+        app,
+    )
+}
+
+pub(super) fn handle_busy_conversation_input_for_request(
+    store: &AppStore,
+    conversation: &Conversation,
+    persona: &Persona,
+    request: &SendChatRequest,
+    app: Option<&AppHandle>,
+) -> AppResult<Option<Vec<ChatMessage>>> {
+    handle_busy_conversation_input_with_origin(
+        store,
+        conversation,
+        persona,
+        &request.content,
+        request
+            .provider_data
+            .as_ref()
+            .and_then(|data| data.get("source"))
+            .and_then(Value::as_str),
+        request.provider_data.clone(),
+        app,
+    )
+}
+
+fn handle_busy_conversation_input_with_origin(
+    store: &AppStore,
+    conversation: &Conversation,
+    persona: &Persona,
+    content: &str,
+    source: Option<&str>,
+    provider_data: Option<Value>,
+    app: Option<&AppHandle>,
+) -> AppResult<Option<Vec<ChatMessage>>> {
     let Some(active) = store.active_agent_run_for_conversation(&conversation.id)? else {
         return Ok(None);
     };
@@ -2481,8 +2545,14 @@ pub(super) fn handle_busy_conversation_input(
             Ok(Some(vec![user, assistant]))
         }
         _ => {
-            let (user, queued) =
-                enqueue_prompt_for_conversation(store, conversation, persona, content)?;
+            let (user, queued) = enqueue_prompt_for_conversation_with_origin(
+                store,
+                conversation,
+                persona,
+                content,
+                source,
+                provider_data,
+            )?;
             emit_agent_queue_event(app, "queued", Some(&queued), Some(&conversation.id));
             let assistant = store.append_message(control_message(
                 conversation,

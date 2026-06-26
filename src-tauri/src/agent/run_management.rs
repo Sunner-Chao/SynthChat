@@ -1142,11 +1142,20 @@ pub async fn drain_all_agent_queues(
             persona_id: Some(item.persona_id.clone()),
             agent_id: None,
             content: item.content.clone(),
-            provider_data: None,
+            provider_data: item.request_provider_data(),
             queue_item_id: Some(item.id.clone()),
         };
         let (status, error) = match run_chat_turn(store, request, app).await {
-            Ok(_) => ("completed", None),
+            Ok(messages) => {
+                crate::wechat_settings::finalize_queued_wechat_turn(
+                    store,
+                    &messages,
+                    item.provider_data.as_ref(),
+                    item.started_at.as_deref(),
+                )
+                .await?;
+                ("completed", None)
+            }
             Err(error) => ("failed", Some(error.to_string())),
         };
         let mut completed = store

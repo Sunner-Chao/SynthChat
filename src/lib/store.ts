@@ -909,11 +909,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
     }
     let activeConversationId = state.activeConversationId;
-    const activeConversation = state.conversations.find((item) => item.id === activeConversationId);
+    let activeConversation = state.conversations.find((item) => item.id === activeConversationId) ?? null;
     if (!activeConversationId || !activeConversation || (personaId && activeConversation.personaId !== personaId)) {
       const persona = personaId ? state.personas.find((item) => item.id === personaId) : null;
       const conversation = await api.createConversation(persona?.name, personaId);
       activeConversationId = conversation.id;
+      activeConversation = conversation;
       const conversations = await api.listConversations();
       const messageLimit = uiMessageLimit(state.config);
       const previewChars = uiMessagePreviewChars(state.config);

@@ -2709,6 +2709,7 @@ pub async fn wechat_inbound_text(
                 "source": "wechat",
                 "accountId": account.id,
                 "userId": user_id,
+                "contextToken": context_token.clone(),
                 "agentId": persona.agent_id,
             })),
             queue_item_id: None,
@@ -2737,7 +2738,7 @@ pub async fn wechat_inbound_text(
     let mut reply_message = messages
         .iter()
         .rev()
-        .find(|message| message.role == "assistant" && message.source != "desktop-agent-error")
+        .find(|message| is_wechat_deliverable_assistant_message(message))
         .cloned();
     if let Some(message) = reply_message.as_ref() {
         if let Some(attached) =
@@ -2751,13 +2752,6 @@ pub async fn wechat_inbound_text(
                 }
             }
         }
-    }
-    if reply_message.is_none() {
-        reply_message = messages
-            .iter()
-            .rev()
-            .find(|message| message.role == "assistant")
-            .cloned();
     }
     if let Some(message) = reply_message.as_ref() {
         persist_wechat_assistant_message_if_missing(store, message)?;
@@ -2879,6 +2873,85 @@ fn emit_wechat_processing(
             "conversationId": conversation_id,
         }),
     );
+}
+
+fn is_wechat_deliverable_assistant_message(message: &ChatMessage) -> bool {
+    message.role == "assistant"
+        && message.source != "desktop-agent-error"
+        && message.source != "desktop-control"
+        && message.source != "desktop-diagnosis"
+        && !message.source.starts_with("desktop-local-")
+}
+
+fn provider_data_string(provider_data: Option<&Value>, keys: &[&str]) -> Option<String> {
+    let data = provider_data?;
+    keys.iter().find_map(|key| {
+        data.get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+pub async fn finalize_queued_wechat_turn(
+    store: &AppStore,
+    messages: &[ChatMessage],
+    provider_data: Option<&Value>,
+    turn_started_at: Option<&str>,
+) -> AppResult<()> {
+    let source = provider_data_string(provider_data, &["source"]).unwrap_or_default();
+    if source != "wechat" {
+        return Ok(());
+    }
+    let account_id = match provider_data_string(provider_data, &["accountId", "account_id"]) {
+        Some(value) => value,
+        None => return Ok(()),
+    };
+    let user_id = match provider_data_string(provider_data, &["userId", "user_id"]) {
+        Some(value) => value,
+        None => return Ok(()),
+    };
+    let Some(account) = list_accounts()?
+        .into_iter()
+        .find(|account| account.id == account_id)
+    else {
+        return Ok(());
+    };
+    let mut reply_message = messages
+        .iter()
+        .rev()
+        .find(|message| is_wechat_deliverable_assistant_message(message))
+        .cloned();
+    if let Some(message) = reply_message.as_ref() {
+        if let Some(started_at) = turn_started_at {
+            if let Some(attached) = attach_wechat_deliverable_to_reply(
+                store,
+                &message.conversation_id,
+                started_at,
+                message,
+            )? {
+                reply_message = Some(attached);
+            }
+        }
+    }
+    let reply = reply_message
+        .as_ref()
+        .map(|message| message.content.clone())
+        .unwrap_or_default();
+    if reply.trim().is_empty() {
+        return Ok(());
+    }
+    let context_token = provider_data_string(provider_data, &["contextToken", "context_token"]);
+    let (_, delivery_error) =
+        dispatch_reply_to_wechat(&account, &user_id, &reply, context_token.as_deref()).await;
+    if let Some(error) = delivery_error {
+        eprintln!(
+            "SynthChat queued wechat delivery failed: account={} user={} error={}",
+            account.id, user_id, error
+        );
+    }
+    Ok(())
 }
 
 pub fn dispatch_desktop_reply_to_wechat(conversation: &crate::models::Conversation, text: &str) {
@@ -3059,6 +3132,24 @@ mod tests {
         let content = append_media_contexts("这是一条语音转文字", &[]);
         assert_eq!(content, "这是一条语音转文字");
         assert!(!content.contains("media attached"));
+    }
+
+    #[test]
+    fn wechat_delivery_filter_skips_control_assistant_messages() {
+        let control = ChatMessage::new(
+            "conv-1".into(),
+            "assistant",
+            "queued".into(),
+            "desktop-control",
+        );
+        let normal = ChatMessage::new(
+            "conv-1".into(),
+            "assistant",
+            "正常回复".into(),
+            "desktop-agent",
+        );
+        assert!(!is_wechat_deliverable_assistant_message(&control));
+        assert!(is_wechat_deliverable_assistant_message(&normal));
     }
 
     #[test]
