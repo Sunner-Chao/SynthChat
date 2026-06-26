@@ -373,7 +373,9 @@ fn track_anthropic_stream_replay_block(
     }
 
     let delta = payload.get("delta");
-    let delta_type = delta.and_then(|value| value.get("type")).and_then(Value::as_str);
+    let delta_type = delta
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str);
     if !replay_blocks.contains_key(&index)
         && matches!(
             delta_type,

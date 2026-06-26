@@ -1866,7 +1866,9 @@ fn skipped_disabled_send_message_event(
         mime_type: Some("text/plain".into()),
         text: Some(text.clone()),
         error: None,
-        raw: Some(redact_json_value(json!({"payload": replay_payload.clone(), "skipped": true}))),
+        raw: Some(redact_json_value(
+            json!({"payload": replay_payload.clone(), "skipped": true}),
+        )),
     };
     store.append_tool_trace(ToolTraceEntry {
         id: new_id("trace"),

@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::Path,
     sync::{Mutex, OnceLock},
 };
 
@@ -397,6 +398,7 @@ pub(super) fn tool_started_event(
     tool_name: &str,
     payload: &Value,
 ) -> ToolEvent {
+    let path = payload_path_for_tool_event(payload);
     ToolEvent {
         status: Some("running".into()),
         reference_id: None,
@@ -423,11 +425,8 @@ pub(super) fn tool_started_event(
             }
         ),
         summary: "工具调用开始".into(),
-        path: payload
-            .get("path")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        exists: None,
+        path: path.clone(),
+        exists: path.as_deref().map(tool_event_path_exists),
         mime_type: None,
         text: None,
         error: None,
@@ -442,6 +441,7 @@ pub(super) fn tool_failed_event(
     payload: &Value,
     error: &str,
 ) -> ToolEvent {
+    let path = payload_path_for_tool_event(payload);
     let error_json = serde_json::from_str::<Value>(error).ok();
     let error = error_json
         .as_ref()
@@ -500,16 +500,28 @@ pub(super) fn tool_failed_event(
             }
         ),
         summary: display_error.clone(),
-        path: payload
-            .get("path")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        exists: None,
+        path: path.clone(),
+        exists: path.as_deref().map(tool_event_path_exists),
         mime_type: Some("text/plain".into()),
         text: None,
         error: Some(display_error),
         raw: Some(redact_json_value(raw)),
     }
+}
+
+fn payload_path_for_tool_event(payload: &Value) -> Option<String> {
+    payload
+        .get("path")
+        .or_else(|| payload.get("dst"))
+        .or_else(|| payload.get("target"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn tool_event_path_exists(path: &str) -> bool {
+    Path::new(path).exists()
 }
 
 fn normalize_tool_event_for_display(event: &mut ToolEvent) {

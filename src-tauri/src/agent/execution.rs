@@ -5497,7 +5497,16 @@ fn decode_utf16_terminal_output(bytes: &[u8]) -> Option<String> {
         (&bytes[2..], true)
     } else if bytes.starts_with(&[0xfe, 0xff]) {
         (&bytes[2..], false)
-    } else if bytes.len() >= 4 && bytes.iter().skip(1).step_by(2).take(16).filter(|byte| **byte == 0).count() >= 4 {
+    } else if bytes.len() >= 4
+        && bytes
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .take(16)
+            .filter(|byte| **byte == 0)
+            .count()
+            >= 4
+    {
         (bytes, true)
     } else {
         return None;
@@ -5595,7 +5604,10 @@ mod terminal_output_decode_tests {
         for unit in "中文路径".encode_utf16() {
             bytes.extend(unit.to_le_bytes());
         }
-        assert_eq!(decode_utf16_terminal_output(&bytes).as_deref(), Some("中文路径"));
+        assert_eq!(
+            decode_utf16_terminal_output(&bytes).as_deref(),
+            Some("中文路径")
+        );
     }
 }
 
@@ -8545,17 +8557,20 @@ fn host_user_spec() -> Option<String> {
 }
 
 fn docker_image_uses_init_entrypoint(docker: &str, image: &str) -> bool {
-    hidden_std_command_output(docker, [
+    hidden_std_command_output(
+        docker,
+        [
             "image",
             "inspect",
             image,
             "--format",
             "{{json .Config.Entrypoint}}",
-        ])
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| docker_entrypoint_uses_init(&String::from_utf8_lossy(&output.stdout)))
-        .unwrap_or(false)
+        ],
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .map(|output| docker_entrypoint_uses_init(&String::from_utf8_lossy(&output.stdout)))
+    .unwrap_or(false)
 }
 
 fn docker_entrypoint_uses_init(raw: &str) -> bool {
@@ -8909,23 +8924,26 @@ fn find_docker_terminal_container(docker: &str, key: &str, running_only: bool) -
 }
 
 fn docker_container_id_by_name(docker: &str, name: &str) -> Option<String> {
-    hidden_std_command_output(docker, [
+    hidden_std_command_output(
+        docker,
+        [
             "ps",
             "-a",
             "--filter",
             &format!("name=^/{name}$"),
             "--format",
             "{{.ID}}",
-        ])
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .map(str::to_string)
-        })
+        ],
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .and_then(|output| {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_string)
+    })
 }
 
 fn maybe_reap_docker_orphans(docker: &str) -> usize {
@@ -8945,7 +8963,9 @@ fn maybe_reap_docker_orphans(docker: &str) -> usize {
     }
     let lifetime = env_u64("TERMINAL_LIFETIME_SECONDS", 300).max(60);
     let max_age_seconds = lifetime.saturating_mul(2);
-    let output = hidden_std_command_output(docker, [
+    let output = hidden_std_command_output(
+        docker,
+        [
             "container",
             "prune",
             "-f",
@@ -8958,7 +8978,8 @@ fn maybe_reap_docker_orphans(docker: &str) -> usize {
             ),
             "--filter",
             &format!("until={max_age_seconds}s"),
-        ]);
+        ],
+    );
     let Ok(output) = output else {
         return 0;
     };
@@ -9046,11 +9067,14 @@ fn docker_container_snapshot() -> Value {
 }
 
 fn docker_container_running(docker: &str, container_id: &str) -> bool {
-    hidden_std_command_output(docker, ["inspect", "-f", "{{.State.Running}}", container_id])
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
-        .unwrap_or(false)
+    hidden_std_command_output(
+        docker,
+        ["inspect", "-f", "{{.State.Running}}", container_id],
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
+    .unwrap_or(false)
 }
 
 fn cleanup_docker_terminal_containers(target_session: Option<&str>) -> usize {
@@ -9094,7 +9118,9 @@ fn cleanup_docker_terminal_containers(target_session: Option<&str>) -> usize {
 }
 
 fn cleanup_all_labeled_docker_terminal_containers(docker: &str) -> usize {
-    let output = hidden_std_command_output(docker, [
+    let output = hidden_std_command_output(
+        docker,
+        [
             "ps",
             "-a",
             "--filter",
@@ -9106,7 +9132,8 @@ fn cleanup_all_labeled_docker_terminal_containers(docker: &str) -> usize {
             ),
             "--format",
             "{{.ID}}",
-        ]);
+        ],
+    );
     let Ok(output) = output else {
         return 0;
     };

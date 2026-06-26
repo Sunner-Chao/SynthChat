@@ -358,8 +358,7 @@ pub(super) fn llm_failure_recovery_hints(kind: &str, message: &str) -> Value {
         kind,
         "context_overflow" | "payload_too_large" | "long_context_tier"
     );
-    let should_strip_reasoning =
-        matches!(kind, "invalid_encrypted_content" | "thinking_signature");
+    let should_strip_reasoning = matches!(kind, "invalid_encrypted_content" | "thinking_signature");
     let should_strip_image_payloads = matches!(
         kind,
         "image_too_large" | "multimodal_tool_content_unsupported"

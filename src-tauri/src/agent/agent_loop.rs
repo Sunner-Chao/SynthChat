@@ -67,7 +67,8 @@ pub async fn run_chat_turn(
         );
     }
 
-    let result = run_chat_turn_with_app(store, request, ToolExecutionContext::Interactive, app).await;
+    let result =
+        run_chat_turn_with_app(store, request, ToolExecutionContext::Interactive, app).await;
 
     if let Some(app) = app {
         // Prefer the conversation id reported by the result (covers the case
@@ -207,11 +208,6 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         let assistant = store.append_message(control)?;
         return Ok(vec![user, assistant]);
     }
-    if let Some(messages) =
-        handle_busy_conversation_input(store, &conversation, &persona, &request.content, app)?
-    {
-        return Ok(messages);
-    }
     let direct_skill_invocation =
         build_direct_skill_slash_invocation_for_content(store, &conversation, &request.content)?;
     let effective_request_content = if let Some(invocation) = direct_skill_invocation {
@@ -220,6 +216,11 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         clarification_response_context_for_turn(store, &conversation.id, &request.content)?
             .unwrap_or_else(|| request.content.clone())
     };
+    if let Some(messages) =
+        handle_busy_conversation_input(store, &conversation, &persona, &request.content, app)?
+    {
+        return Ok(messages);
+    }
     let chat_config = store.config()?.chat;
     let enriched_user_content = expand_context_references(
         &agent,
@@ -321,12 +322,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
             updated_at: now_iso(),
         });
         run.updated_at = now_iso();
-        append_parent_phase_event(
-            store,
-            &saved_run.run_id,
-            "llm_route_corrected",
-            detail,
-        )?;
+        append_parent_phase_event(store, &saved_run.run_id, "llm_route_corrected", detail)?;
     }
     if let Some(base_url) = base_url_override
         .map(|value| value.trim().trim_end_matches('/').to_string())
@@ -1729,7 +1725,11 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     Ok(vec![user, assistant])
 }
 
-fn spawn_user_queue_drain_after_turn(store: &AppStore, conversation_id: &str, app: Option<&AppHandle>) {
+fn spawn_user_queue_drain_after_turn(
+    store: &AppStore,
+    conversation_id: &str,
+    app: Option<&AppHandle>,
+) {
     let Some(app) = app.cloned() else {
         return;
     };
@@ -2882,9 +2882,7 @@ fn llm_route_summary(
     error: &str,
 ) -> String {
     let provider = providers.first();
-    let provider_id = provider
-        .map(|provider| provider.id.as_str())
-        .unwrap_or("-");
+    let provider_id = provider.map(|provider| provider.id.as_str()).unwrap_or("-");
     let provider_type = provider
         .map(|provider| provider.provider_type.as_str())
         .unwrap_or("-");

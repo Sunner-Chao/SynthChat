@@ -2705,6 +2705,39 @@ function toolEventReauthInfo(event: ToolEvent): { state: string; cacheState: str
   };
 }
 
+function toolEventElapsedLabel(event: ToolEvent): string {
+  if (event.status === "running") return "执行中...";
+  if (event.elapsedMs > 0) {
+    return event.elapsedMs >= 1000 ? `${(event.elapsedMs / 1000).toFixed(1)}s` : `${event.elapsedMs}ms`;
+  }
+  if (!event.ok || event.status === "failed") {
+    return "即时返回";
+  }
+  return "0ms";
+}
+
+function toolEventPathBadge(event: ToolEvent): { label: string; tone: "neutral" | "success" | "warning" | "danger" } {
+  const errorText = `${event.summary ?? ""} ${event.error ?? ""}`.toLowerCase();
+  if (event.status === "running") {
+    return { label: "检查中", tone: "warning" };
+  }
+  if (typeof event.exists === "boolean") {
+    return event.exists
+      ? { label: "存在", tone: "success" }
+      : { label: "文件不存在", tone: "danger" };
+  }
+  if (errorText.includes("file registry stale check failed")) {
+    return { label: "读状态已失效", tone: "warning" };
+  }
+  if (errorText.includes("cannot read current file") || errorText.includes("os error 2")) {
+    return { label: "无法读取", tone: "danger" };
+  }
+  if (!event.ok || event.status === "failed") {
+    return { label: "未校验", tone: "neutral" };
+  }
+  return { label: "未提供状态", tone: "neutral" };
+}
+
 const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
   const [expanded, setExpanded] = useState(false);
   const canOpen = Boolean(event.path && event.exists);
@@ -2715,7 +2748,8 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
   const summaryText = event.summary?.trim() ?? "";
   const bodyText = event.text?.trim() ?? "";
   const errorText = event.error?.trim() ?? "";
-  const pathState = typeof event.exists === "boolean" ? (event.exists ? "存在" : "不存在") : "未确认";
+  const pathBadge = toolEventPathBadge(event);
+  const elapsedLabel = toolEventElapsedLabel(event);
   const duplicateBody = Boolean(summaryText && bodyText && normalizeToolDetailText(summaryText) === normalizeToolDetailText(bodyText));
   const duplicateError = Boolean(errorText && (normalizeToolDetailText(errorText) === normalizeToolDetailText(summaryText) || normalizeToolDetailText(errorText) === normalizeToolDetailText(bodyText)));
   const hasDetails = Boolean(summaryText || event.path || isToolImage || canOpen || (bodyText && !duplicateBody) || (errorText && !duplicateError) || reauthInfo);
@@ -2732,7 +2766,7 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
         >
           <Wrench size={15} />
           <strong>{event.title || `${event.serverId}.${event.toolName}`}</strong>
-          <small>{eventStatusLabel(event)} · {event.elapsedMs}ms</small>
+          <small>{eventStatusLabel(event)} · {elapsedLabel}</small>
           {hasDetails ? (
             <span className={`claw-tool-chevron${expanded ? " claw-tool-chevron--open" : ""}`}>
               <ChevronRight size={14} />
@@ -2746,7 +2780,7 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
               <div className="claw-tool-path">
                 <FileText size={14} />
                 <code>{event.path}</code>
-                <span>{pathState}</span>
+                <span className={`claw-tool-path-badge claw-tool-path-badge--${pathBadge.tone}`}>{pathBadge.label}</span>
               </div>
             ) : null}
             {isToolImage && event.path ? (

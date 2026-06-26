@@ -804,7 +804,8 @@ async fn fetch_anthropic_models(
     if let Some(key) = api_key {
         headers.insert(
             "x-api-key",
-            HeaderValue::from_str(key).map_err(|error| format!("invalid x-api-key header: {error}"))?,
+            HeaderValue::from_str(key)
+                .map_err(|error| format!("invalid x-api-key header: {error}"))?,
         );
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
     }

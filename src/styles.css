@@ -6033,6 +6033,38 @@ button:disabled {
   font-size: 11px;
 }
 
+.claw-tool-path-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 68px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--divider);
+  background: color-mix(in srgb, var(--surface-3) 72%, transparent);
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.claw-tool-path-badge--success {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 35%, var(--divider));
+  background: color-mix(in srgb, var(--success-light) 72%, var(--surface-2));
+}
+
+.claw-tool-path-badge--warning {
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 35%, var(--divider));
+  background: color-mix(in srgb, var(--warning-light) 72%, var(--surface-2));
+}
+
+.claw-tool-path-badge--danger {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--divider));
+  background: color-mix(in srgb, var(--danger-light) 72%, var(--surface-2));
+}
+
 .claw-tool-image {
   display: block;
   width: min(100%, 520px);
@@ -10411,7 +10443,7 @@ select:focus-visible {
   display: -webkit-box;
   width: 100%;
   min-width: 0;
-  max-height: 8em;
+  max-height: 12.8em;
   overflow: hidden;
   padding: 0 2px;
   text-overflow: ellipsis;
@@ -10419,7 +10451,7 @@ select:focus-visible {
   overflow-wrap: break-word;
   word-break: break-word;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 5;
+  -webkit-line-clamp: 8;
   text-shadow: 0 0.5px 0 rgba(255, 255, 255, 0.6);
   cursor: default;
   font-family: "Outfit", "Noto Sans SC", "Microsoft YaHei", -apple-system, sans-serif;

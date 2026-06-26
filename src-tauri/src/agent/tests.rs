@@ -6211,6 +6211,27 @@ fn tool_event_record_merges_running_failure_event() {
 }
 
 #[test]
+fn tool_failed_event_marks_missing_path_as_nonexistent() {
+    let missing_path = std::env::temp_dir()
+        .join(format!("synthchat-missing-{}.txt", new_id("tool-event-test")));
+    let payload = json!({"path": missing_path.to_string_lossy().to_string()});
+    let failed = tool_failed_event(
+        "run-test",
+        "__internal",
+        "write_file",
+        &payload,
+        "file registry stale check failed: cannot read current file (os error 2)",
+    );
+
+    assert_eq!(failed.status.as_deref(), Some("failed"));
+    assert_eq!(
+        failed.path.as_deref(),
+        Some(missing_path.to_string_lossy().as_ref())
+    );
+    assert_eq!(failed.exists, Some(false));
+}
+
+#[test]
 fn llm_failure_classifier_routes_provider_recovery_reasons() {
     assert_eq!(
         classify_llm_failure(&AppError::Llm("provider returned 429: rate limit".into())),
@@ -52691,10 +52712,7 @@ fn file_mutation_result_classifier_requires_landed_json() {
 #[test]
 fn delete_and_move_file_tools_accept_paths_outside_workspace() {
     let dir = std::env::temp_dir().join(format!("synthchat-file-move-{}", new_id("test")));
-    let outside = std::env::temp_dir().join(format!(
-        "synthchat-file-outside-{}",
-        new_id("test")
-    ));
+    let outside = std::env::temp_dir().join(format!("synthchat-file-outside-{}", new_id("test")));
     fs::create_dir_all(&dir).unwrap();
     fs::create_dir_all(&outside).unwrap();
     fs::write(dir.join("move-me.txt"), "move").unwrap();
@@ -53670,10 +53688,8 @@ fn context_reference_collector_supports_quoted_file_ranges() {
 #[test]
 fn context_reference_file_read_accepts_paths_outside_workspace() {
     let dir = std::env::temp_dir().join(format!("synthchat-context-ref-{}", new_id("test")));
-    let outside = std::env::temp_dir().join(format!(
-        "synthchat-context-ref-outside-{}",
-        new_id("test")
-    ));
+    let outside =
+        std::env::temp_dir().join(format!("synthchat-context-ref-outside-{}", new_id("test")));
     fs::create_dir_all(dir.join("src")).unwrap();
     fs::create_dir_all(&outside).unwrap();
     fs::write(dir.join("src").join("note.txt"), "reference body").unwrap();

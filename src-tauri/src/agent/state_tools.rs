@@ -622,7 +622,9 @@ pub(super) fn document_tool(store: &AppStore, run_id: &str, payload: &Value) -> 
         .map(str::trim)
         .unwrap_or("");
     if content.is_empty() {
-        return Err(AppError::BadRequest("document requires payload.content".into()));
+        return Err(AppError::BadRequest(
+            "document requires payload.content".into(),
+        ));
     }
     let name = payload
         .get("name")
@@ -881,8 +883,11 @@ fn zip_start_file<W: Write + std::io::Seek>(
     name: &str,
     options: zip::write::SimpleFileOptions,
 ) -> AppResult<()> {
-    zip.start_file(name, options)
-        .map_err(|error| AppError::BadRequest(format!("failed to write document zip entry {name}: {error}")))
+    zip.start_file(name, options).map_err(|error| {
+        AppError::BadRequest(format!(
+            "failed to write document zip entry {name}: {error}"
+        ))
+    })
 }
 
 fn pptx_slides(title: &str, content: &str) -> Vec<PptxSlide> {
@@ -989,7 +994,9 @@ fn pptx_presentation_xml(slide_count: usize) -> String {
 }
 
 fn pptx_presentation_rels_xml(slide_count: usize) -> String {
-    let mut rels = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="slideMasters/slideMaster1.xml"/>"#);
+    let mut rels = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="slideMasters/slideMaster1.xml"/>"#,
+    );
     for index in 1..=slide_count {
         let rid = index + 1;
         rels.push_str(&format!(r#"<Relationship Id="rId{rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide{index}.xml"/>"#));
@@ -1002,11 +1009,41 @@ fn pptx_slide_xml(slide: &PptxSlide) -> String {
     let body = if slide.title_slide {
         format!(
             "{}{}",
-            pptx_text_box(2, &slide.title, &[], 760_000, 1_890_000, 10_640_000, 1_300_000, 44, true),
-            pptx_text_box(3, "Generated document deck", &[], 1_250_000, 3_420_000, 9_600_000, 650_000, 18, false)
+            pptx_text_box(
+                2,
+                &slide.title,
+                &[],
+                760_000,
+                1_890_000,
+                10_640_000,
+                1_300_000,
+                44,
+                true
+            ),
+            pptx_text_box(
+                3,
+                "Generated document deck",
+                &[],
+                1_250_000,
+                3_420_000,
+                9_600_000,
+                650_000,
+                18,
+                false
+            )
         )
     } else {
-        pptx_text_box(2, &slide.title, &slide.lines, 700_000, 520_000, 10_800_000, 5_700_000, 30, true)
+        pptx_text_box(
+            2,
+            &slide.title,
+            &slide.lines,
+            700_000,
+            520_000,
+            10_800_000,
+            5_700_000,
+            30,
+            true,
+        )
     };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:bg><p:bgPr><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:effectLst/></p:bgPr></p:bg><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>{body}</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>"#
@@ -1060,16 +1097,22 @@ fn spreadsheet_rows(content: &str) -> Vec<Vec<String>> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
             if line.contains('\t') {
-                line.split('\t').map(|cell| cell.trim().to_string()).collect()
+                line.split('\t')
+                    .map(|cell| cell.trim().to_string())
+                    .collect()
             } else {
-                line.split(',').map(|cell| cell.trim().to_string()).collect()
+                line.split(',')
+                    .map(|cell| cell.trim().to_string())
+                    .collect()
             }
         })
         .collect()
 }
 
 fn xlsx_sheet_xml(rows: &[Vec<String>]) -> String {
-    let mut sheet = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>"#);
+    let mut sheet = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>"#,
+    );
     for (row_index, row) in rows.iter().enumerate() {
         let number = row_index + 1;
         sheet.push_str(&format!(r#"<row r="{number}">"#));

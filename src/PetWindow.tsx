@@ -19,6 +19,7 @@ const PET_ACTIVE_CONTEXT_SOURCE = "pet";
 const PET_HISTORY_LIMIT = 40;
 const PET_PREVIEW_CHARS = 1200;
 const PET_MESSAGE_MIRROR_INTERVAL_MS = 3200;
+const PET_RECENT_CONVERSATION_MIRROR_INTERVAL_MS = 2400;
 const PET_GLOBAL_LOOK_INTERVAL_MS = 32;
 const PET_GLOBAL_LOOK_IDLE_MS = 3000;
 const DEFAULT_PET_ASSISTANT_CLOUD_DURATION_SECONDS = 10;
@@ -29,13 +30,13 @@ const PET_EDGE_POINTER_THRESHOLD_PX = 96;
 const PET_ORB_CLICK_MOVE_TOLERANCE_PX = 5;
 
 const AVAILABLE_MODELS = [
-  { id: "tororo", name: "Tororo", path: "/pet/model/Tororo/tororo.model3.json", greeting: "Tororo 到啦。" },
-  { id: "hijiki", name: "Hijiki", path: "/pet/model/Hijiki/hijiki.model3.json", greeting: "Hijiki 换好了。" },
-  { id: "mao", name: "Mao", path: "/pet/model/Mao/Mao.model3.json", greeting: "Mao 在这里。" },
-  { id: "wanko", name: "Wanko", path: "/pet/model/Wanko/Wanko.model3.json", greeting: "汪，我换好啦。" },
-  { id: "hiyori", name: "Hiyori", path: "/pet/model/Hiyori/Hiyori.model3.json", greeting: "Hiyori 来了。" },
-  { id: "natori", name: "Natori", path: "/pet/model/Natori/Natori.model3.json", greeting: "夏鸟已经就位。" },
-  { id: "mark", name: "Mark", path: "/pet/model/Mark/Mark.model3.json", greeting: "Mark is ready." }
+  { id: "tororo", name: "Tororo", path: "/pet/model/Tororo/tororo.model3.json", greeting: "Tororo 到啦。", headX: 0.5, headY: 0.24, tailGap: 28 },
+  { id: "hijiki", name: "Hijiki", path: "/pet/model/Hijiki/hijiki.model3.json", greeting: "Hijiki 换好了。", headX: 0.5, headY: 0.23, tailGap: 30 },
+  { id: "mao", name: "Mao", path: "/pet/model/Mao/Mao.model3.json", greeting: "Mao 在这里。", headX: 0.51, headY: 0.22, tailGap: 32 },
+  { id: "wanko", name: "Wanko", path: "/pet/model/Wanko/Wanko.model3.json", greeting: "汪，我换好啦。", headX: 0.5, headY: 0.2, tailGap: 30 },
+  { id: "hiyori", name: "Hiyori", path: "/pet/model/Hiyori/Hiyori.model3.json", greeting: "Hiyori 来了。", headX: 0.5, headY: 0.19, tailGap: 34 },
+  { id: "natori", name: "Natori", path: "/pet/model/Natori/Natori.model3.json", greeting: "夏鸟已经就位。", headX: 0.49, headY: 0.2, tailGap: 34 },
+  { id: "mark", name: "Mark", path: "/pet/model/Mark/Mark.model3.json", greeting: "Mark is ready.", headX: 0.5, headY: 0.22, tailGap: 32 }
 ];
 
 type PetModel = (typeof AVAILABLE_MODELS)[number];
@@ -308,7 +309,7 @@ export function PetWindow() {
   const activeContextRef = useRef<PetActiveContext | null>(readStoredPetActiveContext());
   const frameReadyRef = useRef(false);
   const selectedModelRef = useRef<PetModel>(
-    AVAILABLE_MODELS.find((model) => model.id === "mao") ?? AVAILABLE_MODELS[0]
+    AVAILABLE_MODELS.find((model) => model.id === "hiyori") ?? AVAILABLE_MODELS[0]
   );
   const pendingModelLoadRef = useRef<{ model: PetModel; force: boolean } | null>(null);
   const modelBoundsRef = useRef<PetModelBounds | null>(null);
@@ -1321,7 +1322,11 @@ export function PetWindow() {
     const viewportWidth = Math.max(1, window.innerWidth);
     const viewportHeight = Math.max(1, window.innerHeight);
     const width = Math.min(430, Math.max(292, viewportWidth - 28));
-    const height = 112;
+    const attachmentRows = cloudBubble?.attachments?.length ?? 0;
+    const estimatedTextLines = Math.max(1, Math.ceil((cloudBubble?.text?.length ?? 0) / 26));
+    const estimatedTextHeight = Math.min(144, estimatedTextLines * 22);
+    const estimatedAttachmentHeight = Math.min(168, attachmentRows * 44);
+    const height = Math.max(112, Math.min(238, 38 + estimatedTextHeight + estimatedAttachmentHeight));
     const fallbackLeft = Math.max(14, Math.round((viewportWidth - width) / 2));
     const fallbackTop = 12;
     if (!bounds) {
@@ -1404,7 +1409,7 @@ export function PetWindow() {
       <iframe
         className="live2d-pet-frame"
         ref={frameRef}
-        src="/pet/index.html"
+        src="/pet/index.html?v=20260626-hiyori-cloud"
         title="SynthPet Live2D"
       />
 

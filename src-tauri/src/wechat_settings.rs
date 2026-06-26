@@ -215,7 +215,8 @@ fn maybe_restore_legacy_data_file(name: &str, target: &Path) {
         return;
     }
     for candidate in legacy_data_path_candidates(name) {
-        if candidate == target || !candidate.exists() || !file_has_non_whitespace_bytes(&candidate) {
+        if candidate == target || !candidate.exists() || !file_has_non_whitespace_bytes(&candidate)
+        {
             continue;
         }
         if let Some(parent) = target.parent() {
@@ -2741,12 +2742,9 @@ pub async fn wechat_inbound_text(
         .find(|message| message.role == "assistant" && message.source != "desktop-agent-error")
         .cloned();
     if let Some(message) = reply_message.as_ref() {
-        if let Some(attached) = attach_wechat_deliverable_to_reply(
-            store,
-            &conversation_id,
-            &turn_started_at,
-            message,
-        )? {
+        if let Some(attached) =
+            attach_wechat_deliverable_to_reply(store, &conversation_id, &turn_started_at, message)?
+        {
             let attached_id = attached.id.clone();
             reply_message = Some(attached.clone());
             for item in &mut messages {
@@ -2790,10 +2788,11 @@ fn attach_wechat_deliverable_to_reply(
     message: &ChatMessage,
 ) -> AppResult<Option<ChatMessage>> {
     if message.content.contains("[media attached:")
-        || message
-            .content
-            .lines()
-            .any(|line| line.trim().get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("MEDIA:")))
+        || message.content.lines().any(|line| {
+            line.trim()
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("MEDIA:"))
+        })
     {
         return Ok(None);
     }

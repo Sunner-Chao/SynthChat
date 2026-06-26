@@ -287,6 +287,7 @@ use memory::{
     manage_memory_tool_for_run, memory_provider_tool, memory_tool, memory_tool_for_run,
     recall_memory_tool, remember_fact_tool, remember_fact_tool_for_run,
 };
+pub(crate) use memory_manager::sync_builtin_memory_markdown;
 use memory_manager::{
     build_memory_context_block, builtin_memory_prefetch, memory_pre_compress_context,
     on_memory_turn_start, on_memory_turn_synced, on_memory_write,
@@ -310,13 +311,13 @@ pub use run_management::{
     list_agent_run_artifacts, rerun_agent_run, resume_agent_run,
     spawn_background_chat_turn_for_job,
 };
+pub(crate) use runtime_events::emit_pet_assistant_event;
 use runtime_events::{
     append_planner_trace, emit_agent_run_record, push_tool_event_record, record_tool_event_for_run,
     record_tool_failed_for_run, record_tool_started_for_run, subscribe_agent_run_record,
     tool_failed_event, tool_failed_transition_events, tool_started_event,
 };
 pub(crate) use runtime_events::{emit_agent_goal_event, emit_agent_queue_event};
-pub(crate) use runtime_events::emit_pet_assistant_event;
 
 pub(crate) fn agent_runtime_events(
     store: &AppStore,
@@ -394,8 +395,8 @@ use shell_hooks::{
 use skills::{skill_manage_tool, skill_view_tool, skills_list_tool};
 use spotify_status::spotify_status_tool;
 use state_tools::{
-    artifact_tool, automatic_mutation_checkpoint, checkpoint_tool, file_state_tool,
-    list_artifacts_tool, document_tool, todo_tool,
+    artifact_tool, automatic_mutation_checkpoint, checkpoint_tool, document_tool, file_state_tool,
+    list_artifacts_tool, todo_tool,
 };
 use teams_pipeline::teams_pipeline_tool;
 use tool_dispatch::*;

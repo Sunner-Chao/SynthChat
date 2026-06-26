@@ -113,8 +113,19 @@ fn legacy_state_path_candidates() -> Vec<PathBuf> {
     }
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join("synthchat-data").join("state.json"));
-        candidates.push(cwd.join("src-tauri").join("target").join("debug").join("synthchat-data").join("state.json"));
-        candidates.push(cwd.join("target").join("debug").join("synthchat-data").join("state.json"));
+        candidates.push(
+            cwd.join("src-tauri")
+                .join("target")
+                .join("debug")
+                .join("synthchat-data")
+                .join("state.json"),
+        );
+        candidates.push(
+            cwd.join("target")
+                .join("debug")
+                .join("synthchat-data")
+                .join("state.json"),
+        );
     }
     candidates
 }
@@ -122,9 +133,7 @@ fn legacy_state_path_candidates() -> Vec<PathBuf> {
 fn resolve_state_path(app: Option<&AppHandle>) -> PathBuf {
     let app_data_dir = app
         .and_then(|handle| handle.path().app_data_dir().ok())
-        .or_else(|| {
-            dirs::data_dir().map(|dir| dir.join("cc.synthchat.v1"))
-        })
+        .or_else(|| dirs::data_dir().map(|dir| dir.join("cc.synthchat.v1")))
         .unwrap_or_else(|| {
             std::env::current_exe()
                 .ok()
@@ -152,7 +161,12 @@ fn resolve_state_path(app: Option<&AppHandle>) -> PathBuf {
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("."));
-            for name in ["accounts.json", "emoji_groups.json", "wechat.json", "processes.json"] {
+            for name in [
+                "accounts.json",
+                "emoji_groups.json",
+                "wechat.json",
+                "processes.json",
+            ] {
                 let source = candidate_dir.join(name);
                 let target = target_dir.join(name);
                 if source.exists() && !target.exists() {
@@ -3542,7 +3556,10 @@ fn asset_url(path: String) -> String {
 
 fn pet_window_target_size(mode: &str) -> PhysicalSize<u32> {
     match mode {
-        "model" => PhysicalSize::new(PET_MODEL_WINDOW_WIDTH as u32, PET_MODEL_WINDOW_HEIGHT as u32),
+        "model" => PhysicalSize::new(
+            PET_MODEL_WINDOW_WIDTH as u32,
+            PET_MODEL_WINDOW_HEIGHT as u32,
+        ),
         "orb" => PhysicalSize::new(PET_ORB_WINDOW_WIDTH as u32, PET_ORB_WINDOW_HEIGHT as u32),
         "dock" => PhysicalSize::new(PET_DOCK_WINDOW_WIDTH as u32, PET_DOCK_WINDOW_HEIGHT as u32),
         _ => PhysicalSize::new(PET_WINDOW_WIDTH as u32, PET_WINDOW_HEIGHT as u32),
@@ -3560,8 +3577,12 @@ fn clamp_pet_window_position(
     let min_x = monitor_origin.x;
     let max_x = monitor_origin.x + monitor_size.width as i32 - width as i32;
     let min_y = monitor_origin.y + PET_WINDOW_SAFE_MARGIN;
-    let max_y = monitor_origin.y + monitor_size.height as i32 - height as i32 - PET_WINDOW_SAFE_MARGIN;
-    PhysicalPosition::new(x.clamp(min_x, max_x.max(min_x)), y.clamp(min_y, max_y.max(min_y)))
+    let max_y =
+        monitor_origin.y + monitor_size.height as i32 - height as i32 - PET_WINDOW_SAFE_MARGIN;
+    PhysicalPosition::new(
+        x.clamp(min_x, max_x.max(min_x)),
+        y.clamp(min_y, max_y.max(min_y)),
+    )
 }
 
 fn place_pet_window_for_mode(
@@ -3639,7 +3660,9 @@ fn pet_window_set_ignore_cursor_events(app: AppHandle, ignore: bool) -> AppResul
 
 fn ensure_pet_window(app: &AppHandle, focus: bool) -> AppResult<()> {
     if let Some(window) = app.get_webview_window(PET_WINDOW_LABEL) {
-        window.show().map_err(|error| AppError::BadRequest(error.to_string()))?;
+        window
+            .show()
+            .map_err(|error| AppError::BadRequest(error.to_string()))?;
         let _ = clamp_existing_pet_window(&window);
         if focus {
             window
@@ -3673,12 +3696,20 @@ fn ensure_pet_window(app: &AppHandle, focus: bool) -> AppResult<()> {
     {
         let origin = monitor.position();
         let size = monitor.size();
-        let x = origin.x + size.width.saturating_sub(PET_MODEL_WINDOW_WIDTH as u32 + 24) as i32;
-        let y = origin.y + size.height.saturating_sub(PET_MODEL_WINDOW_HEIGHT as u32 + 64) as i32;
+        let x = origin.x
+            + size
+                .width
+                .saturating_sub(PET_MODEL_WINDOW_WIDTH as u32 + 24) as i32;
+        let y = origin.y
+            + size
+                .height
+                .saturating_sub(PET_MODEL_WINDOW_HEIGHT as u32 + 64) as i32;
         let _ = window.set_position(PhysicalPosition::new(x, y));
     }
 
-    window.show().map_err(|error| AppError::BadRequest(error.to_string()))?;
+    window
+        .show()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
     if focus {
         window
             .set_focus()
@@ -3769,7 +3800,9 @@ fn show_main_window(app: AppHandle) -> AppResult<()> {
             .unminimize()
             .map_err(|error| AppError::BadRequest(error.to_string()))?;
     }
-    window.show().map_err(|error| AppError::BadRequest(error.to_string()))?;
+    window
+        .show()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
     window
         .set_focus()
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
@@ -3788,7 +3821,9 @@ fn toggle_main_window(app: AppHandle) -> AppResult<()> {
         .is_minimized()
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
     if visible && !minimized {
-        window.hide().map_err(|error| AppError::BadRequest(error.to_string()))?;
+        window
+            .hide()
+            .map_err(|error| AppError::BadRequest(error.to_string()))?;
         return Ok(());
     }
     if minimized {
@@ -3796,7 +3831,9 @@ fn toggle_main_window(app: AppHandle) -> AppResult<()> {
             .unminimize()
             .map_err(|error| AppError::BadRequest(error.to_string()))?;
     }
-    window.show().map_err(|error| AppError::BadRequest(error.to_string()))?;
+    window
+        .show()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
     window
         .set_focus()
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
@@ -3844,7 +3881,16 @@ fn cursor_position(app: AppHandle) -> AppResult<Value> {
         .cursor_position()
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
     let window = app.get_webview_window(PET_WINDOW_LABEL);
-    let (window_x, window_y, window_width, window_height, screen_x, screen_y, screen_width, screen_height) = if let Some(window) = window {
+    let (
+        window_x,
+        window_y,
+        window_width,
+        window_height,
+        screen_x,
+        screen_y,
+        screen_width,
+        screen_height,
+    ) = if let Some(window) = window {
         let position = window
             .outer_position()
             .map_err(|error| AppError::BadRequest(error.to_string()))?;

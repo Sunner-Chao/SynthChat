@@ -7,6 +7,8 @@ use crate::models::ChatConfig;
 
 use super::truncate_for_prompt;
 
+const CONTRACT_FAILURE_REPEAT_LIMIT: u32 = 2;
+
 pub(super) struct ToolLoopGuardrails {
     warnings_enabled: bool,
     hard_stop_enabled: bool,
@@ -18,6 +20,8 @@ pub(super) struct ToolLoopGuardrails {
     no_progress_limit: u32,
     exact_failures: HashMap<String, u32>,
     same_tool_failures: HashMap<String, u32>,
+    contract_failures: HashMap<String, u32>,
+    same_tool_contract_failures: HashMap<String, u32>,
     no_progress: HashMap<String, (String, u32)>,
 }
 
@@ -34,6 +38,8 @@ impl ToolLoopGuardrails {
             no_progress_limit: config.tool_guardrail_no_progress_limit.max(1),
             exact_failures: HashMap::new(),
             same_tool_failures: HashMap::new(),
+            contract_failures: HashMap::new(),
+            same_tool_contract_failures: HashMap::new(),
             no_progress: HashMap::new(),
         }
     }
@@ -76,6 +82,7 @@ impl ToolLoopGuardrails {
         let signature = tool_call_signature(tool_name, payload);
         let failed = failed || classify_tool_failure(tool_name, result).0;
         if failed {
+            let contract_failure = tool_contract_failure_detail(tool_name, result);
             let exact_count = self
                 .exact_failures
                 .entry(signature.clone())
@@ -87,6 +94,31 @@ impl ToolLoopGuardrails {
                 .entry(tool_name.to_string())
                 .and_modify(|count| *count += 1)
                 .or_insert(1);
+            if let Some(contract_failure) = contract_failure {
+                let contract_count = self
+                    .contract_failures
+                    .entry(signature.clone())
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                let same_tool_contract_count = self
+                    .same_tool_contract_failures
+                    .entry(tool_name.to_string())
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                if *contract_count >= CONTRACT_FAILURE_REPEAT_LIMIT {
+                    return Some(ToolGuardrailOutcome::halt(format!(
+                        "Tool loop guardrail stopped {tool_name}: required fields are missing from the tool payload and the same malformed call failed {contract_count} times. Rebuild the call using the documented schema instead of retrying it unchanged. Latest error: {contract_failure}"
+                    )));
+                }
+                if *same_tool_contract_count >= CONTRACT_FAILURE_REPEAT_LIMIT {
+                    return Some(ToolGuardrailOutcome::halt(format!(
+                        "Tool loop guardrail stopped {tool_name}: required fields are still missing from the tool payload after {same_tool_contract_count} failed attempts in this run. Rebuild the call using the documented schema before retrying. Latest error: {contract_failure}"
+                    )));
+                }
+            } else {
+                self.contract_failures.remove(&signature);
+                self.same_tool_contract_failures.remove(tool_name);
+            }
             if self.hard_stop_enabled && *same_count >= self.same_tool_failure_limit {
                 return Some(ToolGuardrailOutcome::halt(format!(
                     "Tool loop guardrail stopped {tool_name}: it failed {same_count} times in this run. Inspect the latest error and choose a different tool path."
@@ -112,6 +144,8 @@ impl ToolLoopGuardrails {
 
         self.exact_failures.remove(&signature);
         self.same_tool_failures.remove(tool_name);
+        self.contract_failures.remove(&signature);
+        self.same_tool_contract_failures.remove(tool_name);
         if !is_idempotent_tool(tool_name) {
             self.no_progress.remove(&signature);
             return None;
@@ -376,6 +410,38 @@ pub(super) fn classify_tool_failure(tool_name: &str, result: &str) -> (bool, Str
     (false, String::new())
 }
 
+fn tool_contract_failure_detail(tool_name: &str, result: &str) -> Option<String> {
+    let text = normalized_error_text(result);
+    if text.is_empty() {
+        return None;
+    }
+    let lower = text.to_lowercase();
+    let tool_prefix = format!("{} requires payload", tool_name.to_lowercase());
+    if lower.contains(&tool_prefix)
+        || lower.contains("requires payload.")
+        || lower.contains("requires payload ")
+    {
+        return Some(text);
+    }
+    None
+}
+
+fn normalized_error_text(result: &str) -> String {
+    if let Ok(data) = serde_json::from_str::<Value>(result.trim()) {
+        if let Some(error) = data.get("error").and_then(Value::as_str) {
+            return collapse_whitespace(error);
+        }
+        if let Some(message) = data.get("message").and_then(Value::as_str) {
+            return collapse_whitespace(message);
+        }
+    }
+    collapse_whitespace(result)
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn terminal_exit_code(result: &str) -> Option<i64> {
     if let Ok(data) = serde_json::from_str::<Value>(result.trim()) {
         return data
@@ -496,6 +562,10 @@ fn localize_tool_guardrail_message(message: &str) -> String {
         || message.contains("this read-only call returned the same result")
     {
         format!("{tool_name} 连续返回相同内容，继续调用不会推进任务。")
+    } else if message.contains("required fields are missing from the tool payload")
+        || message.contains("required fields are still missing from the tool payload")
+    {
+        format!("{tool_name} 缺少必填 payload 字段，继续重试同类调用不会成功。")
     } else if message.contains("identical arguments failed") || message.contains("same call failed")
     {
         format!("{tool_name} 使用相同参数反复失败。")
@@ -546,7 +616,7 @@ mod tests {
 
     use super::{
         classify_tool_failure, is_idempotent_tool, stable_hash, tool_call_signature,
-        ToolLoopGuardrails,
+        tool_contract_failure_detail, ToolLoopGuardrails,
     };
 
     #[test]
@@ -580,6 +650,23 @@ mod tests {
             .0
         );
         assert!(!classify_tool_failure("write_file", r#"{"success":true,"bytesWritten":12}"#).0);
+    }
+
+    #[test]
+    fn contract_failure_detection_matches_payload_schema_errors() {
+        assert_eq!(
+            tool_contract_failure_detail(
+                "write_file",
+                "bad request: bad request: write_file requires payload.path"
+            ),
+            Some("bad request: bad request: write_file requires payload.path".into())
+        );
+        assert!(tool_contract_failure_detail(
+            "read_file",
+            r#"{"error":"read_file requires payload.path"}"#
+        )
+        .is_some());
+        assert!(tool_contract_failure_detail("search_files", "Error executing tool").is_none());
     }
 
     #[test]
@@ -660,5 +747,82 @@ mod tests {
 
         let before = guardrails.before_call("search_files", &payload).unwrap();
         assert!(before.halt);
+    }
+
+    #[test]
+    fn guardrails_halt_repeated_contract_failures_by_default() {
+        let config = ChatConfig::default();
+        let mut guardrails = ToolLoopGuardrails::new(&config);
+        let payload = json!({});
+
+        let first = guardrails.after_call(
+            "write_file",
+            &payload,
+            "bad request: bad request: write_file requires payload.path",
+            true,
+        );
+        assert!(first.is_none());
+
+        let halt = guardrails
+            .after_call(
+                "write_file",
+                &payload,
+                "bad request: bad request: write_file requires payload.path",
+                true,
+            )
+            .unwrap();
+        assert!(halt.halt);
+        assert!(halt.message.contains("required fields are missing"));
+    }
+
+    #[test]
+    fn guardrails_halt_same_tool_contract_failures_even_with_changed_payload() {
+        let config = ChatConfig::default();
+        let mut guardrails = ToolLoopGuardrails::new(&config);
+
+        let first = guardrails.after_call(
+            "write_file",
+            &json!({}),
+            "bad request: bad request: write_file requires payload.path",
+            true,
+        );
+        assert!(first.is_none());
+
+        let halt = guardrails
+            .after_call(
+                "write_file",
+                &json!({"path": "notes.txt"}),
+                "bad request: bad request: write_file requires payload.content",
+                true,
+            )
+            .unwrap();
+        assert!(halt.halt);
+        assert!(halt.message.contains("required fields are still missing"));
+    }
+
+    #[test]
+    fn guardrails_halt_repeated_read_file_contract_failures_by_default() {
+        let config = ChatConfig::default();
+        let mut guardrails = ToolLoopGuardrails::new(&config);
+        let payload = json!({});
+
+        let first = guardrails.after_call(
+            "read_file",
+            &payload,
+            "bad request: bad request: read_file requires payload.path",
+            true,
+        );
+        assert!(first.is_none());
+
+        let halt = guardrails
+            .after_call(
+                "read_file",
+                &payload,
+                "bad request: bad request: read_file requires payload.path",
+                true,
+            )
+            .unwrap();
+        assert!(halt.halt);
+        assert!(halt.message.contains("required fields are missing"));
     }
 }

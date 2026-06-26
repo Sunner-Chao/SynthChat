@@ -1,3 +1,9 @@
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
+
 use serde_json::json;
 
 use crate::{
@@ -13,12 +19,171 @@ use super::{
 
 const MEMORY_OPEN_TAG: &str = "<memory-context>";
 const MEMORY_CLOSE_TAG: &str = "</memory-context>";
+const HERMES_MEMORY_DIR: &str = ".hermes/memories";
+const HERMES_MEMORY_FILE: &str = "MEMORY.md";
+const HERMES_USER_FILE: &str = "USER.md";
+
+fn hermes_memory_root(store: &AppStore) -> PathBuf {
+    if let Some(home) = std::env::var_os("HERMES_HOME") {
+        let root = PathBuf::from(home);
+        if root.ends_with(".hermes") {
+            return root.join("memories");
+        }
+        return root.join(HERMES_MEMORY_DIR);
+    }
+    store.data_dir().join(HERMES_MEMORY_DIR)
+}
+
+fn hermes_memory_file_path(store: &AppStore, target: &str) -> PathBuf {
+    let name = if target.eq_ignore_ascii_case("user") {
+        HERMES_USER_FILE
+    } else {
+        HERMES_MEMORY_FILE
+    };
+    hermes_memory_root(store).join(name)
+}
+
+fn ensure_hermes_memory_dir(store: &AppStore) -> AppResult<PathBuf> {
+    let dir = hermes_memory_root(store);
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn render_hermes_memory_markdown(memories: &[MemoryEntry], target: &str) -> String {
+    let title = if target.eq_ignore_ascii_case("user") {
+        "# USER"
+    } else {
+        "# MEMORY"
+    };
+    let mut lines = vec![
+        title.to_string(),
+        String::new(),
+        format!(
+            "<!-- SynthChat Hermes-compatible snapshot: target={}, entries={} -->",
+            target,
+            memories.len()
+        ),
+        String::new(),
+    ];
+    for memory in memories {
+        let summary = sanitize_memory_context(&memory.summary);
+        if summary.trim().is_empty() {
+            continue;
+        }
+        lines.push(format!(
+            "- [{}] ({}) {}",
+            memory.importance,
+            memory.updated_at,
+            summary.replace('\n', " ")
+        ));
+    }
+    if lines.len() == 4 {
+        lines.push("- (empty)".into());
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn parse_hermes_memory_markdown(
+    store: &AppStore,
+    persona: &Persona,
+    target: &str,
+    path: &Path,
+) -> Vec<MemoryEntry> {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return vec![];
+    };
+    let mut items = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("- [") {
+            continue;
+        }
+        let Some(after_open) = trimmed.strip_prefix("- [") else {
+            continue;
+        };
+        let Some((importance_text, rest)) = after_open.split_once(']') else {
+            continue;
+        };
+        let importance = importance_text
+            .trim()
+            .parse::<u8>()
+            .unwrap_or(3)
+            .clamp(1, 5);
+        let mut summary = rest.trim();
+        if let Some(after_date) = summary
+            .strip_prefix('(')
+            .and_then(|value| value.split_once(')'))
+        {
+            summary = after_date.1.trim();
+        }
+        if summary.is_empty() || summary == "(empty)" {
+            continue;
+        }
+        if crate::store::scan_memory_content(summary).is_some() {
+            continue;
+        }
+        items.push(MemoryEntry {
+            id: String::new(),
+            persona_id: persona.id.clone(),
+            target: target.to_string(),
+            summary: summary.to_string(),
+            importance,
+            created_at: String::new(),
+            updated_at: String::new(),
+        });
+    }
+    items
+}
+
+pub(crate) fn sync_builtin_memory_markdown(store: &AppStore, persona: &Persona) -> AppResult<()> {
+    ensure_hermes_memory_dir(store)?;
+    let all = store.memories(Some(&persona.id))?;
+    for target in ["memory", "user"] {
+        let items = all
+            .iter()
+            .filter(|memory| memory.target == target)
+            .cloned()
+            .collect::<Vec<_>>();
+        fs::write(
+            hermes_memory_file_path(store, target),
+            render_hermes_memory_markdown(&items, target),
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn import_builtin_memory_markdown(store: &AppStore, persona: &Persona) -> AppResult<()> {
+    let mut by_summary: BTreeMap<(String, String), MemoryEntry> = store
+        .memories(Some(&persona.id))?
+        .into_iter()
+        .map(|memory| ((memory.target.clone(), memory.summary.clone()), memory))
+        .collect();
+    let mut changed = false;
+    for target in ["memory", "user"] {
+        let path = hermes_memory_file_path(store, target);
+        for parsed in parse_hermes_memory_markdown(store, persona, target, &path) {
+            let key = (parsed.target.clone(), parsed.summary.clone());
+            if by_summary.contains_key(&key) {
+                continue;
+            }
+            let saved = store.save_memory(parsed)?;
+            by_summary.insert(key, saved);
+            changed = true;
+        }
+    }
+    if changed {
+        sync_builtin_memory_markdown(store, persona)?;
+    }
+    Ok(())
+}
 
 pub(super) fn builtin_memory_prefetch(
     store: &AppStore,
     persona: &Persona,
     query: &str,
 ) -> AppResult<Vec<MemoryEntry>> {
+    let _ = import_builtin_memory_markdown(store, persona);
     let enabled = persona
         .memory
         .get("enabled")
@@ -91,6 +256,7 @@ pub(super) fn on_memory_turn_synced(
     user_content: &str,
     assistant_content: &str,
 ) -> AppResult<()> {
+    let _ = sync_builtin_memory_markdown(store, persona);
     append_parent_phase_event(
         store,
         run_id,
@@ -113,6 +279,7 @@ pub(super) fn on_memory_write(
     target: &str,
     content: &str,
 ) -> AppResult<()> {
+    let _ = sync_builtin_memory_markdown(store, persona);
     let mirrored = mirror_memory_write_to_holographic(store, action, target, content)?;
     if run_id.trim().is_empty() {
         return Ok(());
@@ -157,6 +324,7 @@ pub(super) fn memory_provider_prompt_context(
     memory_blocks: &[MemoryEntry],
     query: &str,
 ) -> AppResult<String> {
+    let _ = ensure_hermes_memory_dir(store);
     let builtin_lines = memory_blocks.iter().map(|memory| {
         format!(
             "- [builtin:{} importance {}] {}",

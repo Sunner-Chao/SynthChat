@@ -264,7 +264,9 @@ fn parse_hermes_tool_markup(text: &str) -> Option<Value> {
 fn parse_function_equals_tool_markup(text: &str) -> Option<Value> {
     let open_idx = find_ascii_case_insensitive(text, "<function=", 0)?;
     let name_start = open_idx + "<function=".len();
-    let name_end = text[name_start..].find('>').map(|offset| name_start + offset)?;
+    let name_end = text[name_start..]
+        .find('>')
+        .map(|offset| name_start + offset)?;
     let tool_name = decode_basic_xml_entities(
         text[name_start..name_end]
             .trim()
@@ -295,7 +297,10 @@ fn extract_parameter_tags(text: &str) -> Vec<(String, String)> {
     let mut cursor = 0usize;
     while let Some(open_idx) = find_ascii_case_insensitive(text, "<parameter=", cursor) {
         let name_start = open_idx + "<parameter=".len();
-        let Some(name_end) = text[name_start..].find('>').map(|offset| name_start + offset) else {
+        let Some(name_end) = text[name_start..]
+            .find('>')
+            .map(|offset| name_start + offset)
+        else {
             break;
         };
         let name = decode_basic_xml_entities(
@@ -305,9 +310,7 @@ fn extract_parameter_tags(text: &str) -> Vec<(String, String)> {
                 .trim_matches('\''),
         );
         let value_start = name_end + 1;
-        let Some(value_end) =
-            find_ascii_case_insensitive(text, "</parameter>", value_start)
-        else {
+        let Some(value_end) = find_ascii_case_insensitive(text, "</parameter>", value_start) else {
             break;
         };
         if !name.trim().is_empty() {

@@ -6898,7 +6898,7 @@ pub(super) async fn api_server_chat_tab_gateway_dispatch_async_control(
         "approval.respond" | "sudo.respond" | "secret.respond" => {
             api_server_chat_tab_gateway_approval_respond(store, request).await
         }
-        "clarify.respond" => api_server_chat_tab_gateway_clarify_respond(store, request),
+        "clarify.respond" => api_server_chat_tab_gateway_clarify_respond(store, request).await,
         "voice.record" => api_server_chat_tab_gateway_voice_record_async(store, request).await,
         "voice.tts" => api_server_chat_tab_gateway_voice_tts(store, request).await,
         "rollback.restore" => api_server_chat_tab_gateway_rollback_restore(store, request).await,
@@ -7538,7 +7538,7 @@ fn api_server_chat_tab_gateway_pending_approval_id(
     Ok(approvals.into_iter().next().map(|approval| approval.id))
 }
 
-fn api_server_chat_tab_gateway_clarify_respond(
+async fn api_server_chat_tab_gateway_clarify_respond(
     store: &AppStore,
     request: &Value,
 ) -> AppResult<Value> {
@@ -7552,19 +7552,31 @@ fn api_server_chat_tab_gateway_clarify_respond(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::BadRequest("text required".into()))?;
     let conversation = api_server_chat_tab_gateway_session_from_params(store, &params)?;
-    let message = store.append_message(ChatMessage::new(
+    let persona = store.persona(conversation.persona_id.as_deref())?;
+    let mut message = ChatMessage::new(
         conversation.id.clone(),
         "user",
         text.to_string(),
         "tui_gateway_clarify",
-    ))?;
+    );
+    message.provider_data = Some(json!({
+        "source": "tui_gateway_clarify",
+        "apiServer": {
+            "surface": "chat_tab_gateway",
+            "method": "clarify.respond",
+        }
+    }));
+    let message = store.append_message(message)?;
+    let queued = store.enqueue_agent_request(conversation.id.clone(), persona.id, &message)?;
     Ok(json!({
-        "status": "recorded",
+        "status": "queued",
         "session_id": api_server_session_id(&conversation),
         "message": api_server_message_response(&api_server_session_id(&conversation), &message),
+        "queueItem": queued,
+        "queue_item": queued,
         "schema": "hermes_tui_clarify_respond_desktop_v1",
         "desktopAdaptation": true,
-        "boundary": "Hermes resumes a pending clarify prompt in the Python gateway; SynthChat records the clarification as a user turn for the native agent queue/runtime to consume."
+        "boundary": "Hermes resumes a pending clarify prompt in the Python gateway; SynthChat records the clarification as a user turn and enqueues the native runtime continuation so the pending desktop run resumes through the same queue/tool lifecycle."
     }))
 }
 
@@ -31191,19 +31203,15 @@ pub(super) async fn webhook_deliver_github_comment(payload: &Value) -> AppResult
 
     let mut command = Command::new("gh");
     command.hide_window();
-    let output = command
-        .args(&args)
-        .output()
-        .await
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                AppError::BadRequest("gh CLI not installed".into())
-            } else {
-                AppError::BadRequest(format!(
-                    "github_comment delivery failed to launch gh: {error}"
-                ))
-            }
-        })?;
+    let output = command.args(&args).output().await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AppError::BadRequest("gh CLI not installed".into())
+        } else {
+            AppError::BadRequest(format!(
+                "github_comment delivery failed to launch gh: {error}"
+            ))
+        }
+    })?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     Ok(json!({

@@ -3784,13 +3784,11 @@ pub(super) fn provider_matches_alias_hint(provider: &LlmProvider, hint: &str) ->
         provider.preset.as_deref().unwrap_or_default(),
         provider.base_url.as_str(),
     ];
-    fields
-        .iter()
-        .any(|field| {
-            let field = field.to_ascii_lowercase();
-            field.contains(&hint)
-                || (hint == "xiaomi" && (field.contains("mimo") || field.contains("xiaomimimo")))
-        })
+    fields.iter().any(|field| {
+        let field = field.to_ascii_lowercase();
+        field.contains(&hint)
+            || (hint == "xiaomi" && (field.contains("mimo") || field.contains("xiaomimimo")))
+    })
 }
 
 pub(super) fn format_model_control_reply(

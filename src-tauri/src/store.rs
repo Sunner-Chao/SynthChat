@@ -1906,7 +1906,10 @@ mod tests {
         assert_eq!(messages[0].content, "first");
         assert_eq!(messages[1].content, "second emoji");
         assert_eq!(messages[2].content, "third");
-        assert_eq!(store.conversation(&conversation.id).unwrap().last_message, "third");
+        assert_eq!(
+            store.conversation(&conversation.id).unwrap().last_message,
+            "third"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -2012,11 +2015,8 @@ mod tests {
         fs::write(&output, b"pdf").unwrap();
 
         let mut state = PersistedState::default();
-        let mut conversation = Conversation::new(
-            "wechat delivery".into(),
-            "default".into(),
-            "default".into(),
-        );
+        let mut conversation =
+            Conversation::new("wechat delivery".into(), "default".into(), "default".into());
         conversation.wechat_account_id = Some("wechat-account".into());
         let conversation_id = conversation.id.clone();
         let mut run =
@@ -2278,10 +2278,8 @@ mod tests {
 
     #[test]
     fn reload_from_disk_preserves_in_memory_active_run() {
-        let dir = std::env::temp_dir().join(format!(
-            "synthchat-active-run-reload-{}",
-            new_id("state")
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("synthchat-active-run-reload-{}", new_id("state")));
         let path = dir.join("state.json");
         let store = AppStore::new(path.clone()).unwrap();
         let conversation = store
@@ -5151,8 +5149,7 @@ fn normalize_interrupted_runs(state: &mut PersistedState) {
         } else if state.agent_runs[run_index].state == "failed"
             && state.agent_runs[run_index].error.as_deref() == Some(summary)
         {
-            interrupted_conversations
-                .insert(state.agent_runs[run_index].conversation_id.clone());
+            interrupted_conversations.insert(state.agent_runs[run_index].conversation_id.clone());
         }
     }
     for conversation_id in interrupted_conversations {
@@ -5197,9 +5194,10 @@ fn timestamp_is_after(left: &str, right: &str) -> bool {
 }
 
 fn timestamp_age_seconds(value: &str, now: &DateTime<Utc>) -> Option<i64> {
-    DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|value| now.signed_duration_since(value.with_timezone(&Utc)).num_seconds())
+    DateTime::parse_from_rfc3339(value).ok().map(|value| {
+        now.signed_duration_since(value.with_timezone(&Utc))
+            .num_seconds()
+    })
 }
 
 fn recently_updated_agent_run(run: &AgentRunRecord, now: &DateTime<Utc>) -> bool {
@@ -5209,7 +5207,10 @@ fn recently_updated_agent_run(run: &AgentRunRecord, now: &DateTime<Utc>) -> bool
 }
 
 fn upsert_agent_run(items: &mut Vec<AgentRunRecord>, item: AgentRunRecord) {
-    if let Some(index) = items.iter().position(|existing| existing.run_id == item.run_id) {
+    if let Some(index) = items
+        .iter()
+        .position(|existing| existing.run_id == item.run_id)
+    {
         items[index] = item;
     } else {
         items.insert(0, item);
@@ -5217,10 +5218,7 @@ fn upsert_agent_run(items: &mut Vec<AgentRunRecord>, item: AgentRunRecord) {
 }
 
 fn upsert_conversation(items: &mut Vec<Conversation>, item: Conversation) {
-    if let Some(index) = items
-        .iter()
-        .position(|existing| existing.id == item.id)
-    {
+    if let Some(index) = items.iter().position(|existing| existing.id == item.id) {
         if timestamp_is_after(&item.updated_at, &items[index].updated_at) {
             items[index] = item;
         }
@@ -5533,14 +5531,11 @@ fn recoverable_deliverable_from_tool_event(event: &Value) -> Option<RecoveredRun
         .or_else(|| string_path_if_file(payload.get("path").and_then(Value::as_str)))
         .or_else(|| string_path_if_file(event.get("path").and_then(Value::as_str)))?;
     let media_tag = media_tag.unwrap_or_else(|| format!(r#"MEDIA:"{}""#, media_path));
-    let visible_path = string_path_if_file(
-        event
-            .pointer("/raw/payload/path")
-            .and_then(Value::as_str),
-    )
-    .or_else(|| string_path_if_file(payload.get("sourcePath").and_then(Value::as_str)))
-    .or_else(|| string_path_if_file(event.get("path").and_then(Value::as_str)))
-    .unwrap_or_else(|| media_path.clone());
+    let visible_path =
+        string_path_if_file(event.pointer("/raw/payload/path").and_then(Value::as_str))
+            .or_else(|| string_path_if_file(payload.get("sourcePath").and_then(Value::as_str)))
+            .or_else(|| string_path_if_file(event.get("path").and_then(Value::as_str)))
+            .unwrap_or_else(|| media_path.clone());
     let name = payload
         .get("name")
         .or_else(|| payload.get("title"))
@@ -5658,16 +5653,16 @@ fn attach_deliverable_to_existing_message_in_state(
     } else {
         format!("{base}\n{marker}")
     };
-    let mut provider_data = message
-        .provider_data
-        .take()
-        .unwrap_or_else(|| json!({}));
+    let mut provider_data = message.provider_data.take().unwrap_or_else(|| json!({}));
     if !provider_data.is_object() {
         provider_data = json!({ "originalProviderData": provider_data });
     }
     if let Some(object) = provider_data.as_object_mut() {
         object.insert("deliverableAttachedFromRunId".into(), json!(run_id));
-        object.insert("deliverableAttachedFrom".into(), json!("wechat_turn_deliverable"));
+        object.insert(
+            "deliverableAttachedFrom".into(),
+            json!("wechat_turn_deliverable"),
+        );
         object.insert("warning".into(), json!(warning));
         object.insert("mediaPath".into(), json!(&deliverable.media_path));
         object.insert("mediaTag".into(), json!(&deliverable.media_tag));
@@ -8842,10 +8837,9 @@ impl AppStore {
         content: String,
     ) -> AppResult<ChatMessage> {
         self.with_state(|s| {
-            let messages = s
-                .messages
-                .get_mut(conversation_id)
-                .ok_or_else(|| AppError::NotFound(format!("conversation messages {conversation_id}")))?;
+            let messages = s.messages.get_mut(conversation_id).ok_or_else(|| {
+                AppError::NotFound(format!("conversation messages {conversation_id}"))
+            })?;
             let message = messages
                 .iter_mut()
                 .find(|message| message.id == message_id)
@@ -11014,7 +11008,7 @@ impl AppStore {
     }
 
     pub fn save_memory(&self, mut memory: MemoryEntry) -> AppResult<MemoryEntry> {
-        self.with_state(|s| {
+        let saved = self.with_state(|s| {
             if !s
                 .personas
                 .iter()
@@ -11060,14 +11054,28 @@ impl AppStore {
             });
             self.persist(s)?;
             Ok(memory)
-        })
+        })?;
+        let persona = self.persona(Some(&saved.persona_id))?;
+        crate::agent::sync_builtin_memory_markdown(self, &persona)?;
+        Ok(saved)
     }
 
     pub fn delete_memory(&self, id: &str) -> AppResult<()> {
-        self.with_state(|s| {
+        let persona_id = self.with_state(|s| {
+            let persona_id = s
+                .memories
+                .iter()
+                .find(|memory| memory.id == id)
+                .map(|memory| memory.persona_id.clone());
             s.memories.retain(|memory| memory.id != id);
-            self.persist(s)
-        })
+            self.persist(s)?;
+            Ok(persona_id)
+        })?;
+        if let Some(persona_id) = persona_id {
+            let persona = self.persona(Some(&persona_id))?;
+            crate::agent::sync_builtin_memory_markdown(self, &persona)?;
+        }
+        Ok(())
     }
 
     pub fn short_context(&self, conversation_id: &str) -> AppResult<ShortContextState> {
@@ -12510,7 +12518,8 @@ fn safe_artifact_file_name(file_name: &str) -> String {
     let mut output = trimmed
         .chars()
         .map(|ch| {
-            if ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+            if ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+            {
                 '_'
             } else {
                 ch
@@ -12537,7 +12546,10 @@ fn unique_artifact_path(dir: &Path, file_name: &str) -> PathBuf {
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty())
         .unwrap_or("document");
-    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
     for index in 1..1000 {
         let candidate = if ext.is_empty() {
             dir.join(format!("{stem} ({index})"))

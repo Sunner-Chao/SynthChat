@@ -195,7 +195,10 @@ Current observations:
     )
 }
 
-fn render_persona_prompt_block(persona: Option<&Persona>, user_profile_name: Option<&str>) -> String {
+fn render_persona_prompt_block(
+    persona: Option<&Persona>,
+    user_profile_name: Option<&str>,
+) -> String {
     let Some(persona) = persona else {
         return user_profile_name
             .map(|name| format!("User profile: The user's preferred display name is {name}."))
