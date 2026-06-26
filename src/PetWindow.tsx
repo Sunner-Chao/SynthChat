@@ -19,7 +19,6 @@ const PET_ACTIVE_CONTEXT_SOURCE = "pet";
 const PET_HISTORY_LIMIT = 40;
 const PET_PREVIEW_CHARS = 1200;
 const PET_MESSAGE_MIRROR_INTERVAL_MS = 3200;
-const PET_RECENT_CONVERSATION_MIRROR_INTERVAL_MS = 2400;
 const PET_GLOBAL_LOOK_INTERVAL_MS = 32;
 const PET_GLOBAL_LOOK_IDLE_MS = 3000;
 const DEFAULT_PET_ASSISTANT_CLOUD_DURATION_SECONDS = 10;
@@ -128,6 +127,11 @@ type PetDragPoint = {
 
 type PetDockEdge = "left" | "right";
 type PetWindowMode = "model" | "orb";
+
+type PetAssistantMirrorState = {
+  messageId: string;
+  signature: string;
+};
 
 function formatCloudText(text: string) {
   const normalized = text
@@ -370,15 +374,14 @@ export function PetWindow() {
   const modelLoadedRef = useRef(false);
   const ignoreCursorEventsRef = useRef(false);
   const sendingRef = useRef(false);
-  const mirrorInitializedRef = useRef(false);
   const cloudTimerRef = useRef<number | null>(null);
   const globalLookTimerRef = useRef<number | null>(null);
   const globalLookInFlightRef = useRef(false);
   const lastLookMoveAtRef = useRef(Date.now());
   const lastLookPointRef = useRef<{ x: number; y: number } | null>(null);
-  const lastSeenAssistantIdRef = useRef<string | null>(null);
-  const lastSeenAssistantSignatureRef = useRef<string | null>(null);
-  const lastShownAssistantSignatureRef = useRef<string | null>(null);
+  // Keep the latest rendered assistant watermark per conversation so the
+  // poll fallback cannot overwrite a newer event from another context.
+  const assistantMirrorStateRef = useRef<Map<string, PetAssistantMirrorState>>(new Map());
   const pokeCountRef = useRef(0);
   const lastPokeAtRef = useRef(0);
   const initialGreetingShownRef = useRef(false);
@@ -452,6 +455,12 @@ export function PetWindow() {
   useEffect(() => {
     activeContextRef.current = activeContext;
   }, [activeContext]);
+
+  useEffect(() => {
+    const conversationId = activeContext?.conversationId;
+    if (!conversationId) return;
+    void refreshLatestAssistant(conversationId, false);
+  }, [activeContext?.conversationId]);
 
   useEffect(() => {
     selectedModelRef.current = selectedModel;
@@ -535,7 +544,6 @@ export function PetWindow() {
       const context = parsePetActiveContext(event.payload);
       if (!context) return;
       setPetContext(context);
-      void refreshLatestAssistant(context.conversationId, false);
     }).then((handler) => {
       unlisten = handler;
     });
@@ -551,7 +559,6 @@ export function PetWindow() {
       const context = parsePetActiveContext(parsed);
       if (!context) return;
       setPetContext(context, false);
-      void refreshLatestAssistant(context.conversationId, false);
     };
     window.addEventListener("storage", onStorage);
     return () => {
@@ -564,8 +571,7 @@ export function PetWindow() {
     const refreshMirror = async () => {
       const conversationId = activeContextRef.current?.conversationId;
       if (!conversationId) return;
-      await refreshLatestAssistant(conversationId, mirrorInitializedRef.current);
-      mirrorInitializedRef.current = true;
+      await refreshLatestAssistant(conversationId, true);
     };
     void refreshMirror();
     const timer = window.setInterval(refreshMirror, PET_MESSAGE_MIRROR_INTERVAL_MS);
@@ -583,8 +589,15 @@ export function PetWindow() {
       const payload = event.payload;
       if ((payload.type !== "assistant_final" && payload.type !== "proactive_message") || !payload.message) return;
       const context = activeContextRef.current ?? readStoredPetActiveContext();
+      const hasContext = Boolean(context?.conversationId);
+      const isCurrentConversation = context?.conversationId === payload.conversationId;
       const isWechat = payload.message.source === "wechat" || (payload as { source?: string }).source === "wechat";
-      if (isWechat && payload.conversationId && context?.conversationId !== payload.conversationId) {
+      if (!payload.conversationId) {
+        if (assistantMessageVisibleInCloud(payload.message)) showAssistantCloud(payload.message);
+        return;
+      }
+      const shouldAdoptConversation = !isCurrentConversation && (isWechat || !hasContext);
+      if (shouldAdoptConversation) {
         setPetContext({
           conversationId: payload.conversationId,
           conversationTitle: null,
@@ -592,10 +605,13 @@ export function PetWindow() {
           personaName: null,
           agentId: null,
           updatedAt: new Date().toISOString(),
-          source: "wechat"
+          source: isWechat ? "wechat" : "desktop"
         });
       }
-      if (assistantMessageVisibleInCloud(payload.message)) showAssistantCloud(payload.message);
+      if (!isCurrentConversation && !shouldAdoptConversation) return;
+      if (assistantMessageVisibleInCloud(payload.message)) {
+        showAssistantCloud(payload.message, payload.conversationId);
+      }
     }).then((handler) => {
       unlisten = handler;
     });
@@ -900,37 +916,73 @@ export function PetWindow() {
     }, durationMs);
   }
 
-  function showAssistantCloud(message: ChatMessage, durationMs = assistantCloudDurationMsRef.current) {
+  function assistantMirrorState(conversationId: string | null | undefined) {
+    const resolvedConversationId = textValue(conversationId);
+    if (!resolvedConversationId) return null;
+    return assistantMirrorStateRef.current.get(resolvedConversationId) ?? null;
+  }
+
+  function rememberAssistantMirror(
+    conversationId: string | null | undefined,
+    message: ChatMessage,
+    signature: string
+  ) {
+    const resolvedConversationId = textValue(conversationId) || message.conversationId;
+    if (!resolvedConversationId) return;
+    assistantMirrorStateRef.current.set(resolvedConversationId, {
+      messageId: message.id,
+      signature
+    });
+  }
+
+  function assistantChangedSinceMirror(
+    conversationId: string | null | undefined,
+    message: ChatMessage,
+    signature: string
+  ) {
+    const previous = assistantMirrorState(textValue(conversationId) || message.conversationId);
+    if (!previous) return true;
+    return previous.messageId !== message.id || previous.signature !== signature;
+  }
+
+  function showAssistantCloud(
+    message: ChatMessage,
+    conversationId = message.conversationId,
+    durationMs = assistantCloudDurationMsRef.current
+  ) {
     if (!assistantMessageVisibleInCloud(message)) return;
     const payload = assistantCloudPayload(message);
     if (!payload) return;
-    if (payload.signature === lastShownAssistantSignatureRef.current) return;
-    lastShownAssistantSignatureRef.current = payload.signature;
-    lastSeenAssistantSignatureRef.current = payload.signature;
-    if (message.id) {
-      lastSeenAssistantIdRef.current = message.id;
-    }
+    if (!assistantChangedSinceMirror(conversationId, message, payload.signature)) return;
+    rememberAssistantMirror(conversationId, message, payload.signature);
     showCloud(payload.text, "active", durationMs, payload.attachments.length ? payload.attachments : undefined);
     if (modelLoadedRef.current) {
       postToPet({ type: "expression", id: "开心" });
     }
   }
 
-  async function refreshLatestAssistant(conversationId: string, showChanged = true, force = false) {
+  async function refreshLatestAssistant(conversationId: string, showChanged = true) {
+    if (!conversationId || activeContextRef.current?.conversationId !== conversationId) {
+      return null;
+    }
     try {
       const messages = await api.listMessages(conversationId, PET_HISTORY_LIMIT, PET_PREVIEW_CHARS);
+      if (activeContextRef.current?.conversationId !== conversationId) {
+        return null;
+      }
       const assistant = latestAssistantMessage(messages);
       if (!assistant) return null;
       const payload = assistantCloudPayload(assistant);
       if (!payload) return null;
-      const changed = payload.signature !== lastSeenAssistantSignatureRef.current;
-      if ((showChanged && changed) || force) {
-        // showAssistantCloud dedupes on the assistant payload signature, so forcing here
-        // is safe — it won't re-show a bubble that is already on screen.
-        showAssistantCloud(assistant);
+      if (!showChanged) {
+        rememberAssistantMirror(conversationId, assistant, payload.signature);
+        return assistant;
       }
-      lastSeenAssistantIdRef.current = assistant.id;
-      lastSeenAssistantSignatureRef.current = payload.signature;
+      if (assistantChangedSinceMirror(conversationId, assistant, payload.signature)) {
+        showAssistantCloud(assistant, conversationId);
+      } else {
+        rememberAssistantMirror(conversationId, assistant, payload.signature);
+      }
       return assistant;
     } catch (error) {
       console.error("pet message mirror failed:", error);
@@ -998,13 +1050,31 @@ export function PetWindow() {
     };
   }
 
-  async function waitForAssistantReply(conversationId: string, previousAssistantId: string | null) {
+  async function waitForAssistantReply(
+    conversationId: string,
+    previousAssistantState: PetAssistantMirrorState | null
+  ) {
     const deadline = Date.now() + 120000;
     while (Date.now() < deadline) {
       try {
         const messages = await api.listMessages(conversationId, PET_HISTORY_LIMIT, PET_PREVIEW_CHARS);
         const assistant = latestAssistantMessage(messages);
-        if (assistant && assistant.id !== previousAssistantId) return assistant;
+        if (!assistant) {
+          await new Promise((resolve) => window.setTimeout(resolve, 800));
+          continue;
+        }
+        const payload = assistantCloudPayload(assistant);
+        if (!payload) {
+          await new Promise((resolve) => window.setTimeout(resolve, 800));
+          continue;
+        }
+        if (
+          !previousAssistantState
+          || previousAssistantState.messageId !== assistant.id
+          || previousAssistantState.signature !== payload.signature
+        ) {
+          return assistant;
+        }
       } catch (error) {
         console.error("pet wait reply failed:", error);
         return null;
@@ -1028,7 +1098,7 @@ export function PetWindow() {
     try {
       const context = await resolvePetSendContext();
       updatePetActiveContext(context);
-      const previousAssistantId = lastSeenAssistantIdRef.current;
+      const previousAssistantState = assistantMirrorState(context.conversationId);
       const messages = await api.sendChatMessage({
         conversationId: context.conversationId,
         personaId: context.personaId,
@@ -1038,9 +1108,10 @@ export function PetWindow() {
           source: "pet"
         }
       });
-      const assistant = latestAssistantMessage(messages) ?? await waitForAssistantReply(context.conversationId, previousAssistantId);
+      const assistant = latestAssistantMessage(messages)
+        ?? await waitForAssistantReply(context.conversationId, previousAssistantState);
       if (assistant) {
-        showAssistantCloud(assistant);
+        showAssistantCloud(assistant, context.conversationId);
       } else {
         showCloud("处理中...", "soft", 2600);
       }
@@ -1416,64 +1487,75 @@ export function PetWindow() {
 
   function cloudStyle(): PetCloudStyle {
     const bounds = modelBoundsRef.current;
+    const modelProfile = selectedModelRef.current;
     const viewportWidth = Math.max(1, window.innerWidth);
     const viewportHeight = Math.max(1, window.innerHeight);
-    const width = Math.min(430, Math.max(292, viewportWidth - 28));
+    const maxBubbleWidth = Math.min(560, Math.max(320, viewportWidth - 28));
+    const minBubbleWidth = Math.min(maxBubbleWidth, 304);
     const visibleAttachments = renderedCloudAttachments.filter((attachment) => !attachment.hidden);
     const imageAttachmentRows = visibleAttachments.filter((attachment) => isImageAttachment(attachment)).length;
     const fileAttachmentRows = visibleAttachments.length - imageAttachmentRows;
-    const estimatedTextLines = Math.max(1, Math.ceil((cloudBubble?.text?.length ?? 0) / 26));
-    const estimatedTextHeight = Math.min(144, estimatedTextLines * 22);
-    const estimatedAttachmentHeight = Math.min(196, imageAttachmentRows * 92 + fileAttachmentRows * 42);
-    const height = Math.max(112, Math.min(238, 38 + estimatedTextHeight + estimatedAttachmentHeight));
+    const textLength = cloudBubble?.text?.trim().length ?? 0;
+    const targetCharsPerLine = textLength > 0 ? Math.ceil(textLength / 5) : 0;
+    const estimatedTextWidth = textLength > 0 ? 152 + targetCharsPerLine * 11 : minBubbleWidth;
+    const estimatedAttachmentWidth = imageAttachmentRows > 0 ? 356 : fileAttachmentRows > 0 ? 318 : 0;
+    const width = Math.max(
+      minBubbleWidth,
+      Math.min(maxBubbleWidth, Math.max(estimatedTextWidth, estimatedAttachmentWidth))
+    );
+    const estimatedCharsPerRenderedLine = Math.max(14, Math.floor((width - 72) / 11));
+    const estimatedVisibleTextLines = textLength > 0
+      ? Math.max(1, Math.min(5, Math.ceil(textLength / estimatedCharsPerRenderedLine)))
+      : 0;
+    const estimatedTextHeight = estimatedVisibleTextLines > 0 ? estimatedVisibleTextLines * 22 + 8 : 0;
+    const estimatedAttachmentHeight = Math.min(208, imageAttachmentRows * 96 + fileAttachmentRows * 44);
+    const height = Math.max(124, Math.min(268, 40 + estimatedTextHeight + estimatedAttachmentHeight));
     const fallbackLeft = Math.max(14, Math.round((viewportWidth - width) / 2));
-    const fallbackTop = 12;
+    const fallbackTop = 8;
     if (!bounds) {
       const startX = Math.round(width * 0.54);
       const tailX = Math.round(width * 0.58);
-      const tailY = height + 38;
+      const tailY = height + 46;
       return {
         left: `${fallbackLeft}px`,
         top: `${fallbackTop}px`,
         width: `${width}px`,
         "--pet-cloud-tail-start-x": `${startX}px`,
-        "--pet-cloud-tail-start-y": `${height - 10}px`,
+        "--pet-cloud-tail-start-y": `${height - 14}px`,
         "--pet-cloud-tail-x": `${tailX}px`,
         "--pet-cloud-tail-y": `${tailY}px`,
-        "--pet-cloud-tail-length": "48px",
+        "--pet-cloud-tail-length": "56px",
         "--pet-cloud-tail-angle": "88deg",
         "--pet-cloud-dot-1-x": `${Math.round(startX + (tailX - startX) * 0.34)}px`,
-        "--pet-cloud-dot-1-y": `${height + 6}px`,
+        "--pet-cloud-dot-1-y": `${height + 10}px`,
         "--pet-cloud-dot-2-x": `${Math.round(startX + (tailX - startX) * 0.64)}px`,
-        "--pet-cloud-dot-2-y": `${height + 24}px`,
+        "--pet-cloud-dot-2-y": `${height + 30}px`,
         "--pet-cloud-dot-3-x": `${tailX}px`,
         "--pet-cloud-dot-3-y": `${tailY}px`
       };
     }
 
-    const anchorX = bounds.x + bounds.width * 0.52;
-    const modelTop = bounds.y;
-    const headClearance = Math.max(20, bounds.height * 0.1);
-    const tailGap = Math.max(18, bounds.height * 0.06);
-    const speechBandBottom = Math.max(126, Math.min(176, viewportHeight * 0.34));
-    let top = Math.max(8, Math.min(18, speechBandBottom - height - 12));
-    const desiredLeft = anchorX - width * 0.54;
+    const headAnchorX = bounds.x + bounds.width * modelProfile.headX;
+    const headAnchorY = bounds.y + bounds.height * modelProfile.headY;
+    const bubbleHeadGap = Math.max(modelProfile.tailGap + 12, bounds.height * 0.11);
+    const tailHeadGap = Math.max(10, Math.round(modelProfile.tailGap * 0.42));
+    const desiredLeft = headAnchorX - width * 0.54;
     const left = Math.min(
       Math.max(14, desiredLeft),
       Math.max(14, viewportWidth - width - 14)
     );
-    let bubbleBottomAbs = top + height;
-    const tailXAbs = Math.min(viewportWidth - 14, Math.max(14, anchorX));
-    const desiredTailYAbs = Math.max(24, Math.min(viewportHeight - 74, modelTop - headClearance));
-    if (desiredTailYAbs < bubbleBottomAbs + tailGap) {
-      top = Math.max(8, desiredTailYAbs - tailGap - height);
-      bubbleBottomAbs = top + height;
-    }
-    const tailYAbs = Math.max(bubbleBottomAbs + tailGap, desiredTailYAbs);
+    const desiredBubbleBottomAbs = headAnchorY - bubbleHeadGap;
+    const bubbleBottomAbs = Math.max(height + 4, Math.min(viewportHeight - 18, desiredBubbleBottomAbs));
+    const top = Math.max(4, bubbleBottomAbs - height);
+    const tailXAbs = Math.min(viewportWidth - 14, Math.max(14, headAnchorX));
+    const tailYAbs = Math.max(
+      bubbleBottomAbs + 22,
+      Math.min(viewportHeight - 60, headAnchorY - tailHeadGap)
+    );
     const tailX = Math.min(width + 64, Math.max(-64, tailXAbs - left));
-    const tailY = Math.max(height + 18, tailYAbs - top);
+    const tailY = Math.max(height + 24, tailYAbs - top);
     const startX = Math.min(width - 46, Math.max(46, width * 0.5 + (tailX - width * 0.5) * 0.34));
-    const startY = height - 12;
+    const startY = height - 14;
     const dx = tailX - startX;
     const dy = tailY - startY;
     const dot = (ratio: number) => ({
@@ -1508,7 +1590,7 @@ export function PetWindow() {
       <iframe
         className="live2d-pet-frame"
         ref={frameRef}
-        src="/pet/index.html?v=20260626-hiyori-cloud"
+        src="/pet/index.html?v=20260626-hiyori-cloud-v2"
         title="SynthPet Live2D"
       />
 

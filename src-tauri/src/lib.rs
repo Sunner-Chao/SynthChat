@@ -51,12 +51,15 @@ const PET_WINDOW_LABEL: &str = "pet";
 const PET_WINDOW_WIDTH: f64 = 760.0;
 const PET_WINDOW_HEIGHT: f64 = 560.0;
 const PET_MODEL_WINDOW_WIDTH: f64 = 340.0;
-const PET_MODEL_WINDOW_HEIGHT: f64 = 440.0;
+const PET_MODEL_VISIBLE_HEIGHT: f64 = 440.0;
+const PET_MODEL_TOP_BUFFER_HEIGHT: f64 = 96.0;
+const PET_MODEL_WINDOW_HEIGHT: f64 = PET_MODEL_VISIBLE_HEIGHT + PET_MODEL_TOP_BUFFER_HEIGHT;
 const PET_ORB_WINDOW_WIDTH: f64 = 84.0;
 const PET_ORB_WINDOW_HEIGHT: f64 = 84.0;
 const PET_DOCK_WINDOW_WIDTH: f64 = 48.0;
 const PET_DOCK_WINDOW_HEIGHT: f64 = 108.0;
-const PET_WINDOW_SAFE_MARGIN: i32 = 16;
+const PET_WINDOW_SAFE_MARGIN_TOP: i32 = 0;
+const PET_WINDOW_SAFE_MARGIN_BOTTOM: i32 = 16;
 const TRAY_ID: &str = "synthchat-tray";
 const TRAY_OPEN_ID: &str = "open";
 const TRAY_PET_ID: &str = "pet";
@@ -1126,7 +1129,7 @@ async fn wechat_poll_once(
     account_id: String,
     timeout_seconds: Option<u64>,
 ) -> AppResult<wechat_settings::WechatPollResult> {
-    wechat_settings::wechat_poll_once(&store, Some(&app), account_id, timeout_seconds).await
+    wechat_settings::wechat_poll_once(&store, &app, account_id, timeout_seconds).await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1140,7 +1143,7 @@ async fn wechat_inbound_text(
 ) -> AppResult<wechat_settings::WechatInboundResult> {
     wechat_settings::wechat_inbound_text(
         &store,
-        Some(&app),
+        &app,
         account_id,
         user_id,
         text,
@@ -3581,9 +3584,10 @@ fn clamp_pet_window_position(
 ) -> PhysicalPosition<i32> {
     let min_x = monitor_origin.x;
     let max_x = monitor_origin.x + monitor_size.width as i32 - width as i32;
-    let min_y = monitor_origin.y + PET_WINDOW_SAFE_MARGIN;
-    let max_y =
-        monitor_origin.y + monitor_size.height as i32 - height as i32 - PET_WINDOW_SAFE_MARGIN;
+    let min_y = monitor_origin.y + PET_WINDOW_SAFE_MARGIN_TOP;
+    let max_y = monitor_origin.y + monitor_size.height as i32
+        - height as i32
+        - PET_WINDOW_SAFE_MARGIN_BOTTOM;
     PhysicalPosition::new(
         x.clamp(min_x, max_x.max(min_x)),
         y.clamp(min_y, max_y.max(min_y)),
@@ -3603,7 +3607,7 @@ fn place_pet_window_for_mode(
         .outer_size()
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
     let current_center_x = current_position.x + current_size.width as i32 / 2;
-    let current_center_y = current_position.y + current_size.height as i32 / 2;
+    let current_bottom_y = current_position.y + current_size.height as i32;
     window
         .set_size(size)
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
@@ -3614,7 +3618,7 @@ fn place_pet_window_for_mode(
         let origin = monitor.position();
         let monitor_size = monitor.size();
         let mut x = current_center_x - size.width as i32 / 2;
-        let y = current_center_y - size.height as i32 / 2;
+        let y = current_bottom_y - size.height as i32;
         if mode == "dock" || mode == "orb" {
             x = match dock_edge.unwrap_or(PetDockEdge::Right) {
                 PetDockEdge::Left => origin.x,

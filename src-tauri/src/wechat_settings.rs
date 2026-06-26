@@ -2390,10 +2390,10 @@ fn wechat_chat_thread_stack_size() -> usize {
 async fn run_wechat_chat_turn(
     store: &AppStore,
     request: SendChatRequest,
-    app: Option<&AppHandle>,
+    app: &AppHandle,
 ) -> AppResult<Vec<ChatMessage>> {
     let store = store.clone();
-    let app = app.cloned();
+    let app = app.clone();
     let (tx, rx) = mpsc::channel();
     thread::Builder::new()
         .name("synthchat-wechat-chat-turn".to_string())
@@ -2403,9 +2403,7 @@ async fn run_wechat_chat_turn(
                 .enable_all()
                 .build()
             {
-                Ok(runtime) => {
-                    runtime.block_on(agent::run_chat_turn(&store, request, app.as_ref()))
-                }
+                Ok(runtime) => runtime.block_on(agent::run_chat_turn(&store, request, Some(&app))),
                 Err(error) => Err(AppError::BadRequest(format!(
                     "failed to create wechat chat runtime: {error}"
                 ))),
@@ -2480,7 +2478,7 @@ async fn dispatch_reply_to_wechat(
 
 pub async fn wechat_poll_once(
     store: &AppStore,
-    app: Option<&AppHandle>,
+    app: &AppHandle,
     account_id: String,
     timeout_seconds: Option<u64>,
 ) -> AppResult<WechatPollResult> {
@@ -2652,7 +2650,7 @@ pub async fn run_wechat_poll_loop(store: AppStore, app: AppHandle) {
             );
             let result = wechat_poll_once(
                 &store,
-                Some(&app),
+                &app,
                 account.id.clone(),
                 Some(timeout_seconds),
             )
@@ -2673,7 +2671,7 @@ pub async fn run_wechat_poll_loop(store: AppStore, app: AppHandle) {
 
 pub async fn wechat_inbound_text(
     store: &AppStore,
-    app: Option<&AppHandle>,
+    app: &AppHandle,
     account_id: String,
     user_id: String,
     text: String,
@@ -2819,14 +2817,11 @@ fn persist_wechat_assistant_message_if_missing(
 }
 
 fn emit_wechat_assistant_message(
-    app: Option<&AppHandle>,
+    app: &AppHandle,
     conversation_id: &str,
     persona_id: &str,
     message: &ChatMessage,
 ) {
-    let Some(app) = app else {
-        return;
-    };
     let _ = app.emit(
         "synthchat-chat-event",
         json!({
@@ -2851,14 +2846,11 @@ fn emit_wechat_assistant_message(
 }
 
 fn emit_wechat_user_message(
-    app: Option<&AppHandle>,
+    app: &AppHandle,
     conversation_id: &str,
     persona_id: &str,
     message: &ChatMessage,
 ) {
-    let Some(app) = app else {
-        return;
-    };
     let _ = app.emit(
         "synthchat-chat-event",
         json!({
@@ -2873,14 +2865,11 @@ fn emit_wechat_user_message(
 }
 
 fn emit_wechat_processing(
-    app: Option<&AppHandle>,
+    app: &AppHandle,
     conversation_id: &str,
     persona_id: &str,
     processing: bool,
 ) {
-    let Some(app) = app else {
-        return;
-    };
     let _ = app.emit(
         "synthchat-chat-event",
         json!({

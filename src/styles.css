@@ -9934,7 +9934,7 @@ select:focus-visible {
   min-width: 0;
   height: 100%;
   min-height: 0;
-  overflow: hidden;
+  overflow: visible;
   background: transparent;
 }
 
@@ -9946,7 +9946,7 @@ select:focus-visible {
   position: relative;
   width: 100vw;
   height: 100vh;
-  overflow: hidden;
+  overflow: visible;
   background: transparent;
   color: #18212f;
   font-family: Inter, "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
@@ -10068,10 +10068,10 @@ select:focus-visible {
 .pet-speech-area {
   position: absolute;
   z-index: 7;
-  top: 0;
+  top: -18px;
   left: 0;
   right: 0;
-  height: min(180px, 34vh);
+  height: min(228px, 40vh);
   overflow: visible;
   pointer-events: none;
 }
@@ -10354,8 +10354,8 @@ select:focus-visible {
   grid-template-columns: minmax(0, 1fr);
   align-items: center;
   overflow: visible;
-  min-height: 72px;
-  padding: 18px 30px 18px 28px;
+  min-height: 84px;
+  padding: 20px 34px 22px 30px;
   border: 1.5px solid rgba(255, 255, 255, 0.85);
   border-radius: 28px 34px 30px 36px / 30px 26px 34px 24px;
   background:
@@ -10373,11 +10373,11 @@ select:focus-visible {
   font-size: 13.5px;
   font-weight: 560;
   letter-spacing: 0.01em;
-  line-height: 1.58;
+  line-height: 1.62;
   animation: petCloudIn 300ms cubic-bezier(0.22, 1, 0.36, 1);
   backdrop-filter: blur(24px) saturate(1.4);
   -webkit-backdrop-filter: blur(24px) saturate(1.4);
-  max-width: min(440px, calc(100vw - 28px));
+  max-width: min(560px, calc(100vw - 28px));
   pointer-events: none;
   transform-origin: var(--pet-cloud-tail-x) var(--pet-cloud-tail-y);
   transition: opacity 400ms cubic-bezier(0.4, 0, 0.2, 1),
@@ -10447,7 +10447,7 @@ select:focus-visible {
   display: -webkit-box;
   width: 100%;
   min-width: 0;
-  max-height: 12.8em;
+  max-height: calc(1.62em * 5);
   overflow: hidden;
   padding: 0 2px;
   text-overflow: ellipsis;
@@ -10455,7 +10455,7 @@ select:focus-visible {
   overflow-wrap: break-word;
   word-break: break-word;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 8;
+  -webkit-line-clamp: 5;
   text-shadow: 0 0.5px 0 rgba(255, 255, 255, 0.6);
   cursor: default;
   font-family: "Outfit", "Noto Sans SC", "Microsoft YaHei", -apple-system, sans-serif;

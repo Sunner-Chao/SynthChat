@@ -37,6 +37,10 @@ let lastDragScreenY = null;
 const MODEL_HIT_PADDING = 28;
 const MODEL_DRAG_DELAY_MS = 240;
 const MODEL_TAP_DELAY_MS = 340;
+const MODEL_LAYOUT_BASE_HEIGHT = 440;
+const MODEL_VERTICAL_SCALE_RATIO = 0.74;
+const MODEL_HORIZONTAL_SCALE_RATIO = 0.84;
+const MODEL_VERTICAL_ANCHOR_RATIO = 0.6;
 const DEFAULT_MODEL_URL = "/pet/model/Hiyori/Hiyori.model3.json";
 
 let loadingModelKey = null;
@@ -108,11 +112,32 @@ function focusScreenPoint(clientX, clientY, instant = false) {
     model.focus(clientX, clientY, instant);
 }
 
+function modelLayoutMetrics() {
+    const effectiveHeight = Math.min(window.innerHeight, MODEL_LAYOUT_BASE_HEIGHT);
+    return {
+        width: window.innerWidth,
+        height: effectiveHeight,
+        topInset: Math.max(0, window.innerHeight - effectiveHeight)
+    };
+}
+
+function updateModelScale() {
+    if (!modelNaturalSize) return;
+    const metrics = modelLayoutMetrics();
+    modelScale = Math.min(
+        (metrics.height * MODEL_VERTICAL_SCALE_RATIO) / modelNaturalSize.height,
+        (metrics.width * MODEL_HORIZONTAL_SCALE_RATIO) / modelNaturalSize.width
+    );
+}
+
 function layoutModel() {
-    if (!model || !modelNaturalSize || modelScale === null) return;
+    if (!model || !modelNaturalSize) return;
+    updateModelScale();
+    if (modelScale === null) return;
+    const metrics = modelLayoutMetrics();
     model.scale.set(modelScale);
     model.anchor.set(0.5, 0.5);
-    model.position.set(window.innerWidth * 0.5, window.innerHeight * 0.6);
+    model.position.set(metrics.width * 0.5, metrics.topInset + metrics.height * MODEL_VERTICAL_ANCHOR_RATIO);
     reportModelBounds();
 }
 
@@ -232,11 +257,8 @@ async function loadModel(url = DEFAULT_MODEL_URL, options = {}) {
                     width: Math.max(1, nextModel.width),
                     height: Math.max(1, nextModel.height)
                 };
-                modelScale = Math.min(
-                    (window.innerHeight * 0.74) / modelNaturalSize.height,
-                    (window.innerWidth * 0.84) / modelNaturalSize.width
-                );
                 app.stage.addChild(model);
+                layoutModel();
 
                 const ctrl = model.internalModel.focusController;
                 if (ctrl) {
