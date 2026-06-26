@@ -35,6 +35,7 @@ import {
   X
 } from "lucide-react";
 import { api } from "../lib/api";
+import { resolvePersonaAgentBinding, resolvePersonaBoundAgent } from "../lib/personaAgentBinding";
 import { useAppStore } from "../lib/store";
 import type { AgentControlCommand, AgentDefinition, AgentRunPhase, AgentRunRecord, AgentRuntimeEvent, ChatAttachment, ChatMessage, LlmProvider, ManagedProcessEvent, ModelCatalogEntry, ToolEvent, ToolEventEnvelope } from "../lib/types";
 import { Avatar } from "../components/common";
@@ -830,6 +831,9 @@ export const ChatExperience = memo(function ChatExperience() {
   const incrementConversationUnread = useAppStore((state) => state.incrementConversationUnread);
   const markConversationRead = useAppStore((state) => state.markConversationRead);
   const setSection = useAppStore((state) => state.setSection);
+  const setFocusedAgentId = useAppStore((state) => state.setFocusedAgentId);
+  const setSkillsPanelMode = useAppStore((state) => state.setSkillsPanelMode);
+  const setMcpPanelMode = useAppStore((state) => state.setMcpPanelMode);
   const refreshChatData = useAppStore((state) => state.refreshChatData);
   const refreshAgents = useAppStore((state) => state.refreshAgents);
   const refreshSkills = useAppStore((state) => state.refreshSkills);
@@ -845,7 +849,6 @@ export const ChatExperience = memo(function ChatExperience() {
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
   const [selectedPersonaId, setSelectedPersonaId] = useState("");
-  const [selectedAgentId, setSelectedAgentId] = useState("");
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
   const [pickerEmojiGroups, setPickerEmojiGroups] = useState(emojiGroups);
@@ -921,6 +924,10 @@ export const ChatExperience = memo(function ChatExperience() {
 
   const personaById = useMemo(() => new Map(personas.map((persona) => [persona.id, persona])), [personas]);
   const selectedPersona = personaById.get(selectedPersonaId) ?? personas[0] ?? null;
+  const activeConversationPersona = useMemo(
+    () => (activeConversation?.personaId ? personaById.get(activeConversation.personaId) ?? null : null),
+    [activeConversation?.personaId, personaById]
+  );
   const defaultAgent = useMemo(() => agents.find((agent) => agent.isDefault) ?? agents[0] ?? null, [agents]);
   const renderLimit = clampCount(chatConfig?.uiMessageLimit, DEFAULT_RENDERED_MESSAGES, 40, 1000);
   const artifactScanLimit = clampCount(chatConfig?.artifactScanLimit, DEFAULT_ARTIFACT_SCAN_LIMIT, 20, renderLimit);
@@ -1018,11 +1025,8 @@ export const ChatExperience = memo(function ChatExperience() {
     return stats;
   }, [chatConfig?.maxContextRounds, chatConfig?.shortContextMode, messages]);
   const activeAgent = useMemo(() => {
-    if (selectedAgentId) return agents.find((agent) => agent.id === selectedAgentId) ?? defaultAgent;
-    if (selectedPersona?.agentId) return agents.find((agent) => agent.id === selectedPersona.agentId) ?? defaultAgent;
-    if (activeConversation?.agentId) return agents.find((agent) => agent.id === activeConversation.agentId) ?? defaultAgent;
-    return defaultAgent;
-  }, [activeConversation?.agentId, agents, defaultAgent, selectedAgentId, selectedPersona?.agentId]);
+    return resolvePersonaBoundAgent(activeConversationPersona, agents, activeConversation?.agentId) ?? defaultAgent;
+  }, [activeConversation?.agentId, activeConversationPersona, agents, defaultAgent]);
   const activeRun = useMemo(
     () => Object.values(activeAgentRuns).find((run) => run.conversationId === activeConversationId && !run.parentRunId),
     [activeAgentRuns, activeConversationId]
@@ -1031,6 +1035,32 @@ export const ChatExperience = memo(function ChatExperience() {
     .filter((item) => item.conversationId === activeConversationId)
     .filter((item) => item.status !== "completed")
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt)), [activeConversationId, agentQueue]);
+  const availableMcpServers = useMemo(
+    () => mcpServers.filter((server) => server.enabled),
+    [mcpServers]
+  );
+  const activeMcpServerIdSet = useMemo(() => {
+    if (!activeAgent?.mcpEnabled) return new Set<string>();
+    const configured = activeAgent.enabledMcpServers
+      .map((serverId) => serverId.trim())
+      .filter(Boolean);
+    return new Set(configured.length > 0 ? configured : availableMcpServers.map((server) => server.id));
+  }, [activeAgent?.enabledMcpServers, activeAgent?.mcpEnabled, availableMcpServers]);
+  const activeSkills = useMemo(() => {
+    if (!activeAgent?.skillsEnabled) return [];
+    const enabledIds = new Set(
+      activeAgent.enabledSkills
+        .map((skillId) => skillId.trim())
+        .filter(Boolean)
+    );
+    return skills.filter((skill) => enabledIds.has(skill.id));
+  }, [activeAgent?.enabledSkills, activeAgent?.skillsEnabled, skills]);
+
+  useEffect(() => {
+    if (activeSection !== "chat" || !activeAgent?.id) return;
+    setFocusedAgentId(activeAgent.id);
+  }, [activeAgent?.id, activeSection, setFocusedAgentId]);
+
   const slashCommandQuery = useMemo(() => {
     const value = draft.trimStart();
     if (!value.startsWith("/") && !value.startsWith("／")) return null;
@@ -1126,11 +1156,15 @@ export const ChatExperience = memo(function ChatExperience() {
     })
     .filter((event): event is ToolEvent => event !== null)), [recentMessages, runStates]);
   const graphEvents = activeToolEvents.length > 0 ? selectVisibleToolEvents(activeToolEvents) : messageToolEvents;
+  const providerBinding = useMemo(
+    () => resolvePersonaAgentBinding(activeConversationPersona, agents, llmProviders, activeConversation?.agentId),
+    [activeConversation?.agentId, activeConversationPersona, agents, llmProviders]
+  );
   const currentProvider = useMemo(() => {
-    const providerId = selectedPersona?.llmProvider || activeAgent?.llmProvider || "";
+    const providerId = providerBinding.providerId;
     return llmProviders.find((provider) => provider.id === providerId) ?? llmProviders[0] ?? null;
-  }, [activeAgent?.llmProvider, llmProviders, selectedPersona?.llmProvider]);
-  const effectiveModelValue = selectedPersona?.llmModel || activeAgent?.llmModel || currentProvider?.model || "";
+  }, [llmProviders, providerBinding.providerId]);
+  const effectiveModelValue = providerBinding.model || currentProvider?.model || "";
   useEffect(() => {
     if (!currentProvider) {
       setCatalogModels([]);
@@ -1311,9 +1345,12 @@ export const ChatExperience = memo(function ChatExperience() {
       `${item.title} ${item.lastMessage}`.toLowerCase().includes(needle)
     );
   }, [conversations, deferredQuery]);
-  const enabledMcpCount = useMemo(() => mcpServers.filter((server) => server.enabled).length, [mcpServers]);
-  const enabledSkillCount = useMemo(() => skills.filter((skill) => skill.enabled).length, [skills]);
-  const agentReady = Boolean(agentConfig?.enabled && (agentConfig.mcpEnabled || agentConfig.skillsEnabled));
+  const enabledMcpCount = useMemo(
+    () => availableMcpServers.filter((server) => activeMcpServerIdSet.has(server.id)).length,
+    [activeMcpServerIdSet, availableMcpServers]
+  );
+  const enabledSkillCount = useMemo(() => activeSkills.length, [activeSkills]);
+  const agentReady = Boolean(activeAgent?.enabled && (activeAgent.allowShell || activeAgent.mcpEnabled || activeAgent.skillsEnabled));
 
   const scrollToBottom = useCallback(() => {
     const el = scrollRef.current;
@@ -1648,6 +1685,16 @@ export const ChatExperience = memo(function ChatExperience() {
     if (!key) return;
     const option = modelOptions.find((item) => item.key === key);
     if (!option) return;
+    if (activeConversationPersona) {
+      const savedPersona = await savePersona({
+        ...activeConversationPersona,
+        agentId: activeAgent?.id ?? activeConversationPersona.agentId,
+        llmProvider: option.providerId,
+        llmModel: option.model
+      });
+      await refreshChatData(activeConversationId, savedPersona.id);
+      return;
+    }
     let nextAgent = activeAgent;
     if (nextAgent && (nextAgent.llmProvider !== option.providerId || nextAgent.llmModel !== option.model)) {
       nextAgent = {
@@ -1657,27 +1704,22 @@ export const ChatExperience = memo(function ChatExperience() {
       };
       await saveAgent(nextAgent);
     }
-    if (selectedPersona) {
-      const savedPersona = await savePersona({
-        ...selectedPersona,
-        agentId: nextAgent?.id ?? selectedPersona.agentId,
-        llmProvider: option.providerId,
-        llmModel: option.model
-      });
-      if (activeConversationId && nextAgent && activeConversation?.agentId !== nextAgent.id) {
-        await api.setConversationAgent(activeConversationId, nextAgent.id);
-      }
-      await refreshChatData(activeConversationId, savedPersona.id);
-    } else if (activeConversationId) {
+    if (activeConversationId) {
       await refreshChatData(activeConversationId, activeConversation?.personaId);
     }
   };
 
   const switchConversationAgent = async (agentId: string) => {
-    setSelectedAgentId(agentId);
+    if (!agentId || activeAgent?.id === agentId) return;
+    setFocusedAgentId(agentId);
+    if (activeConversationPersona) {
+      const savedPersona = await savePersona({ ...activeConversationPersona, agentId });
+      await refreshChatData(activeConversationId, savedPersona.id);
+      return;
+    }
     if (!activeConversationId) return;
     const conversation = await api.setConversationAgent(activeConversationId, agentId);
-    await refreshChatData(conversation.id, conversation.personaId ?? selectedPersona?.id);
+    await refreshChatData((conversation as any)?.id || activeConversationId, (conversation as any)?.personaId ?? activeConversation?.personaId);
   };
 
   const submit = async () => {
@@ -1690,9 +1732,10 @@ export const ChatExperience = memo(function ChatExperience() {
     setComposerError(null);
     setCompactionTipVisible(false);
     try {
-      if (selectedPersona && activeAgent && selectedPersona.agentId !== activeAgent.id) {
-        await savePersona({ ...selectedPersona, agentId: activeAgent.id });
+      if (activeConversationPersona && activeAgent && activeConversationPersona.agentId !== activeAgent.id) {
+        await savePersona({ ...activeConversationPersona, agentId: activeAgent.id });
       }
+      const outboundPersonaId = activeConversation?.personaId ?? selectedPersona?.id;
       const attachmentContext = readyAttachments
         .map((file) => JSON.stringify({
           type: "attachment",
@@ -1709,8 +1752,8 @@ export const ChatExperience = memo(function ChatExperience() {
         .join("\n");
       const outbound = [content, attachmentMarkers, attachmentContext].filter(Boolean).join("\n\n");
       setAttachments([]);
-      await sendMessage(outbound, selectedPersona?.id, activeAgent?.id);
-      window.setTimeout(() => void refreshChatData(activeConversationId, selectedPersona?.id), 500);
+      await sendMessage(outbound, outboundPersonaId, activeAgent?.id);
+      window.setTimeout(() => void refreshChatData(activeConversationId, outboundPersonaId), 500);
     } catch (error) {
       console.error("submit message failed", error);
       setDraft((current) => current.trim() ? current : content);
@@ -1909,17 +1952,28 @@ export const ChatExperience = memo(function ChatExperience() {
         </header>
 
         <div className="claw-runtime-strip">
-          <button onClick={() => setSection("agents")} type="button">
+          <button onClick={() => {
+            if (activeAgent?.id) setFocusedAgentId(activeAgent.id);
+            setSection("agents");
+          }} type="button">
             <Bot size={14} />
             <span>Agents</span>
             <strong>{agents.length}</strong>
           </button>
-          <button onClick={() => setSection("mcp")} type="button">
+          <button onClick={() => {
+            if (activeAgent?.id) setFocusedAgentId(activeAgent.id);
+            setMcpPanelMode("local");
+            setSection("mcp");
+          }} type="button">
             <Wrench size={14} />
             <span>MCP</span>
-            <strong>{enabledMcpCount}/{mcpServers.length}</strong>
+            <strong>{enabledMcpCount}/{availableMcpServers.length}</strong>
           </button>
-          <button onClick={() => setSection("skills")} type="button">
+          <button onClick={() => {
+            if (activeAgent?.id) setFocusedAgentId(activeAgent.id);
+            setSkillsPanelMode("local");
+            setSection("skills");
+          }} type="button">
             <Code2 size={14} />
             <span>Skills</span>
             <strong>{enabledSkillCount}/{skills.length}</strong>
@@ -1927,7 +1981,7 @@ export const ChatExperience = memo(function ChatExperience() {
           <button onClick={() => setSection("settings")} type="button">
             <Settings2 size={14} />
             <span>Config</span>
-            <strong>{agentConfig?.maxToolIterations ?? "-"}</strong>
+            <strong>{activeAgent?.maxToolIterations ?? agentConfig?.maxToolIterations ?? "-"}</strong>
           </button>
           <button onClick={() => void refreshAgentQueue()} type="button" title="刷新队列">
             <Clock size={14} />
@@ -2240,18 +2294,18 @@ export const ChatExperience = memo(function ChatExperience() {
                   </div>
                 </div>
                 <div className="claw-panel-head-right">
-                  {skills.length > 0 ? <small className="claw-count-badge">{skills.length}</small> : null}
+                  {activeSkills.length > 0 ? <small className="claw-count-badge">{activeSkills.length}</small> : null}
                   <span className="claw-panel-chevron">{skillsCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}</span>
                 </div>
               </div>
               <div className={`claw-panel-body${skillsCollapsed ? " claw-panel-body--collapsed" : ""}`}>
                 <div className="claw-skill-chips">
-                  {skills.slice(0, 8).map((skill) => (
+                  {activeSkills.slice(0, 8).map((skill) => (
                     <button key={skill.id} onClick={() => insertSkill(skill.name)} type="button" title={skill.description}>
                       /{skill.name}
                     </button>
                   ))}
-                  {skills.length === 0 ? <div className="claw-panel-hint-box"><Zap size={18} /><p>暂无技能，进入 Skills 安装内置技能。</p></div> : null}
+                  {activeSkills.length === 0 ? <div className="claw-panel-hint-box"><Zap size={18} /><p>当前智能体暂无已启用技能，进入 Skills 或 Agents 配置。</p></div> : null}
                 </div>
               </div>
             </div>

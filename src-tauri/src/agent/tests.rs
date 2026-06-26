@@ -2300,9 +2300,10 @@ def register(ctx):
         }])
         .unwrap();
 
-    let listed = skills_list_tool(&store, &json!({"query": "demo-skill:demo"})).unwrap();
+    let agent = store.agent(None).unwrap();
+    let listed = skills_list_tool(&store, &agent, &json!({"query": "demo-skill:demo"})).unwrap();
     assert!(listed.contains("Demo plugin skill"));
-    let viewed = skill_view_tool(&store, &json!({"name": "demo-skill:demo"})).unwrap();
+    let viewed = skill_view_tool(&store, &agent, &json!({"name": "demo-skill:demo"})).unwrap();
     assert!(viewed.contains("Demo Plugin Skill"));
 
     let _ = fs::remove_dir_all(dir);
@@ -8798,7 +8799,7 @@ fn model_control_command_resolves_aliases_and_provider_handoffs() {
 }
 
 #[test]
-fn effective_llm_persona_uses_agent_override_when_persona_is_unset() {
+fn effective_llm_persona_prefers_persona_route_before_agent() {
     let mut persona = Persona::default();
     persona.llm_provider.clear();
     persona.llm_model.clear();
@@ -8821,6 +8822,110 @@ fn effective_llm_persona_uses_agent_override_when_persona_is_unset() {
     );
     assert_eq!(effective.llm_provider, "provider-persona");
     assert_eq!(effective.llm_model, "model-persona");
+}
+
+#[test]
+fn save_persona_rebinds_existing_conversations_to_agent() {
+    let dir = std::env::temp_dir().join(format!("synthchat-persona-rebind-{}", new_id("test")));
+    fs::create_dir_all(&dir).unwrap();
+    let store = AppStore::new(dir.join("state.json")).unwrap();
+
+    let mut agent = AgentDefinition::default();
+    agent.id = "coder".into();
+    agent.name = "Coder".into();
+    agent.llm_provider = "provider-coder".into();
+    agent.llm_model = "model-coder".into();
+    store.save_agent(agent).unwrap();
+
+    let mut persona = store.persona(Some("default")).unwrap();
+    let conversation = store
+        .create_conversation(Some("Rebind".into()), Some(persona.id.clone()))
+        .unwrap();
+
+    persona.agent_id = "coder".into();
+    persona.llm_provider = "provider-persona".into();
+    persona.llm_model = "model-persona".into();
+    let saved_persona = store.save_persona(persona).unwrap();
+    let rebound = store.conversation(&conversation.id).unwrap();
+    let rebound_agent = store.agent(Some("coder")).unwrap();
+
+    assert_eq!(saved_persona.agent_id, "coder");
+    assert_eq!(saved_persona.llm_provider, "provider-persona");
+    assert_eq!(saved_persona.llm_model, "model-persona");
+    assert_eq!(rebound.agent_id, "coder");
+    assert_eq!(rebound_agent.llm_provider, "provider-persona");
+    assert_eq!(rebound_agent.llm_model, "model-persona");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn save_persona_syncs_bound_agent_route_fields_without_blank_override() {
+    let dir = std::env::temp_dir().join(format!("synthchat-persona-sync-{}", new_id("test")));
+    fs::create_dir_all(&dir).unwrap();
+    let store = AppStore::new(dir.join("state.json")).unwrap();
+
+    let mut agent = AgentDefinition::default();
+    agent.id = "coder".into();
+    agent.name = "Coder".into();
+    agent.llm_provider = "provider-a".into();
+    agent.llm_model = "model-a".into();
+    store.save_agent(agent.clone()).unwrap();
+
+    let mut persona = store.persona(Some("default")).unwrap();
+    persona.agent_id = "coder".into();
+    persona.llm_provider = "provider-b".into();
+    persona.llm_model = "model-b".into();
+    store.save_persona(persona).unwrap();
+
+    let saved_agent = store.agent(Some("coder")).unwrap();
+    assert_eq!(saved_agent.llm_provider, "provider-b");
+    assert_eq!(saved_agent.llm_model, "model-b");
+
+    let mut persona = store.persona(Some("default")).unwrap();
+    persona.llm_provider.clear();
+    persona.llm_model.clear();
+    store.save_persona(persona).unwrap();
+
+    let saved_agent = store.agent(Some("coder")).unwrap();
+    assert_eq!(saved_agent.llm_provider, "provider-b");
+    assert_eq!(saved_agent.llm_model, "model-b");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn delete_agent_rebinds_personas_and_conversations() {
+    let dir = std::env::temp_dir().join(format!("synthchat-agent-delete-{}", new_id("test")));
+    fs::create_dir_all(&dir).unwrap();
+    let store = AppStore::new(dir.join("state.json")).unwrap();
+
+    let mut fallback = store.agent(Some("default")).unwrap();
+    fallback.is_default = true;
+    fallback.name = "Fallback".into();
+    store.save_agent(fallback).unwrap();
+
+    let mut agent = AgentDefinition::default();
+    agent.id = "coder".into();
+    agent.name = "Coder".into();
+    agent.is_default = false;
+    store.save_agent(agent).unwrap();
+
+    let mut persona = store.persona(Some("default")).unwrap();
+    persona.agent_id = "coder".into();
+    let saved_persona = store.save_persona(persona).unwrap();
+    let conversation = store
+        .create_conversation(Some("Delete Agent".into()), Some(saved_persona.id.clone()))
+        .unwrap();
+
+    store.delete_agent("coder").unwrap();
+
+    let saved_persona = store.persona(Some("default")).unwrap();
+    let saved_conversation = store.conversation(&conversation.id).unwrap();
+    assert_eq!(saved_persona.agent_id, "default");
+    assert_eq!(saved_conversation.agent_id, "default");
+
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -45419,25 +45524,31 @@ fn skills_list_filters_query_and_enabled_only() {
             ),
         ])
         .unwrap();
+    let mut agent = store.agent(None).unwrap();
+    agent.skills_enabled = true;
+    agent.enabled_skills = vec!["browser/control".into()];
+    let agent = store.save_agent(agent).unwrap();
 
-    let all = skills_list_tool(&store, &json!({"query": "browser"})).unwrap();
+    let all = skills_list_tool(&store, &agent, &json!({"query": "browser"})).unwrap();
     let all_json: Value = serde_json::from_str(&all).unwrap();
     assert_eq!(all_json["success"].as_bool(), Some(true));
     assert_eq!(all_json["count"], 1);
     assert_eq!(all_json["skills"][0]["id"], "browser/control");
     assert_eq!(all_json["skills"][0]["category"], "browser");
     assert_eq!(all_json["categories"][0], "browser");
+    assert_eq!(all_json["skills"][0]["enabled"].as_bool(), Some(true));
 
-    let enabled = skills_list_tool(&store, &json!({"enabledOnly": true})).unwrap();
+    let enabled = skills_list_tool(&store, &agent, &json!({"enabledOnly": true})).unwrap();
     let enabled_json: Value = serde_json::from_str(&enabled).unwrap();
     assert_eq!(enabled_json["count"], 1);
     assert_eq!(enabled_json["skills"][0]["name"], "Browser Control");
 
-    let categorized = skills_list_tool(&store, &json!({"category": "docs"})).unwrap();
+    let categorized = skills_list_tool(&store, &agent, &json!({"category": "docs"})).unwrap();
     let categorized_json: Value = serde_json::from_str(&categorized).unwrap();
     assert_eq!(categorized_json["count"], 1);
     assert_eq!(categorized_json["category"], "docs");
     assert_eq!(categorized_json["skills"][0]["id"], "docs/write");
+    assert_eq!(categorized_json["skills"][0]["enabled"].as_bool(), Some(false));
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -45466,10 +45577,15 @@ fn skill_view_reads_skill_markdown_and_relative_files() {
             "skills/browser-control/SKILL.md".into(),
         )])
         .unwrap();
+    let mut agent = store.agent(None).unwrap();
+    agent.skills_enabled = true;
+    agent.enabled_skills = vec!["browser/control".into()];
+    let agent = store.save_agent(agent).unwrap();
 
-    let skill = skill_view_tool(&store, &json!({"name": "browser/control"})).unwrap();
+    let skill = skill_view_tool(&store, &agent, &json!({"name": "browser/control"})).unwrap();
     let skill_json: Value = serde_json::from_str(&skill).unwrap();
     assert_eq!(skill_json["success"].as_bool(), Some(true));
+    assert_eq!(skill_json["enabled"].as_bool(), Some(true));
     assert_eq!(skill_json["filePath"], "SKILL.md");
     assert!(skill_json["content"]
         .as_str()
@@ -45478,6 +45594,7 @@ fn skill_view_reads_skill_markdown_and_relative_files() {
 
     let linked = skill_view_tool(
         &store,
+        &agent,
         &json!({"name": "Browser Control", "filePath": "references/forms.md"}),
     )
     .unwrap();
@@ -45508,14 +45625,17 @@ fn skill_view_rejects_path_escape() {
         )])
         .unwrap();
 
+    let agent = store.agent(None).unwrap();
     let error = skill_view_tool(
         &store,
+        &agent,
         &json!({"name": "safe", "filePath": "../../secret.txt"}),
     )
     .unwrap_err();
     assert!(format!("{error}").contains("must stay inside"));
     let absolute = skill_view_tool(
         &store,
+        &agent,
         &json!({"name": "safe", "filePath": dir.join("secret.txt").display().to_string()}),
     )
     .unwrap_err();
@@ -45575,7 +45695,8 @@ Use snapshots before browser actions.
         }),
     )
     .unwrap();
-    let viewed = skill_view_tool(&store, &json!({"name": "managed-skill"})).unwrap();
+    let agent = store.agent(None).unwrap();
+    let viewed = skill_view_tool(&store, &agent, &json!({"name": "managed-skill"})).unwrap();
     assert!(viewed.contains("browser_cdp snapshots"));
 
     skill_manage_tool(

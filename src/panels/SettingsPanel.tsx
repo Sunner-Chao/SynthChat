@@ -10,6 +10,7 @@ import {
   Plus,
   Puzzle,
   RefreshCw,
+  Search,
   Settings,
   Smartphone,
   Smile,
@@ -22,6 +23,7 @@ import {
   PlugZap
 } from "lucide-react";
 import { api } from "../lib/api";
+import { filterSkillsByQuery } from "../lib/skillSearch";
 import { useAppStore, consumePendingSettingsView } from "../lib/store";
 import type {
   AccountConfig,
@@ -261,9 +263,13 @@ export function SettingsPanel() {
     saveAgentConfig,
     installBuiltinSkills,
     refreshSkills,
-    setSection
+    setSection,
+    focusedAgentId,
+    setSkillsPanelMode,
+    setMcpPanelMode
   } = useAppStore();
   const [view, setView] = useState<SettingsView>("menu");
+  const focusedAgent = agents.find((agent) => agent.id === focusedAgentId) ?? agents.find((agent) => agent.isDefault) ?? agents[0] ?? null;
 
   // Read pendingSettingsView once on mount (before paint)
   useLayoutEffect(() => {
@@ -404,8 +410,33 @@ export function SettingsPanel() {
         <MenuRow icon={Bot} label="识图服务" value={`${visionProviders.length} 个`} onClick={() => setView("visionProviders")} iconColor="indigo" />
         <MenuRow icon={Globe} label="浏览器服务" value={`${browserProviders.length} 个`} onClick={() => setView("browserProviders")} iconColor="blue" />
         <MenuRow icon={Wand2} label="视频总结" value={config.videoSummary?.enabled === false ? "已关闭" : config.videoSummary?.transcriber || "auto"} onClick={() => setView("videoSummary")} iconColor="purple" />
-        <MenuRow icon={Puzzle} label="MCP 扩展" value={mcpServers.length ? `${mcpServers.length} 个` : "未配置"} onClick={() => setSection("mcp")} iconColor="blue" />
-        <MenuRow icon={Bot} label="Agent 与 Skills" value={agentConfig?.enabled ? "已启用" : "未启用"} onClick={() => setView("agent")} iconColor="indigo" />
+        <MenuRow
+          icon={Puzzle}
+          label="MCP 扩展"
+          value={mcpServers.length ? `${mcpServers.length} 个全局服务` : "未配置"}
+          onClick={() => {
+            setMcpPanelMode("global");
+            setSection("mcp");
+          }}
+          iconColor="blue"
+        />
+        <MenuRow
+          icon={Bot}
+          label="Agent 配置"
+          value={focusedAgent?.name || `${agents.length} 个智能体`}
+          onClick={() => setSection("agents")}
+          iconColor="indigo"
+        />
+        <MenuRow
+          icon={Wand2}
+          label="Skills 技能包"
+          value={`${skills.length} 个全局技能`}
+          onClick={() => {
+            setSkillsPanelMode("global");
+            setSection("skills");
+          }}
+          iconColor="purple"
+        />
         <MenuRow icon={PlugZap} label="插件管理" value={`${plugins.length} 个`} onClick={() => setSection("plugins")} iconColor="red" />
         <MenuRow icon={Settings} label="对话设置" onClick={() => setView("chat")} iconColor="primary" />
         <MenuRow icon={Edit3} label="回复设置" onClick={() => setView("reply")} iconColor="indigo" />
@@ -495,7 +526,9 @@ function AgentSettings({
   refreshSkills: () => Promise<void>;
 }) {
   const [draft, setDraft] = useState(config);
+  const [skillSearch, setSkillSearch] = useState("");
   useEffect(() => setDraft(config), [config]);
+  const filteredSkills = useMemo(() => filterSkillsByQuery(skills, skillSearch), [skillSearch, skills]);
   const toggleSkill = (id: string) => {
     setDraft((current) => ({
       ...current,
@@ -622,7 +655,7 @@ function AgentSettings({
         <div className="agent-form-row single" style={{ marginTop: 12 }}>
           <div className="agent-field">
             <label>Skills 目录</label>
-            <input value={draft.skillsDir} onChange={(event) => setDraft((current) => ({ ...current, skillsDir: event.target.value }))} placeholder="留空使用默认目录" />
+            <input value={draft.skillsDir} onChange={(event) => setDraft((current) => ({ ...current, skillsDir: event.target.value }))} placeholder="留空使用内置 skills（项目目录或打包资源目录）" />
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
@@ -655,19 +688,36 @@ function AgentSettings({
       <div className="agent-settings-section">
         <div className="agent-settings-section-title">
           <Sparkles size={16} /><strong>Skills</strong>
-          <small>{draft.enabledSkills.length}/{skills.length} 已启用</small>
+          <small>
+            {draft.enabledSkills.length}/{skills.length} 已启用
+            {skillSearch.trim() ? ` · ${filteredSkills.length} 匹配` : ""}
+          </small>
         </div>
         {skills.length === 0 ? (
           <p className="form-hint">暂无 Skills</p>
         ) : (
-          <div className="agent-toggle-grid">
-            {skills.map((skill) => (
-              <button className={`agent-toggle-item ${draft.enabledSkills.includes(skill.id) ? "active" : ""}`} key={skill.id} type="button" onClick={() => toggleSkill(skill.id)}>
-                <span className="agent-toggle-item-label"><Sparkles size={16} /><span>{skill.name}</span></span>
-                <span className="agent-toggle-dot" />
-              </button>
-            ))}
-          </div>
+          <>
+            <div className="search-bar" style={{ marginBottom: 12 }}>
+              <Search size={16} />
+              <input
+                value={skillSearch}
+                onChange={(event) => setSkillSearch(event.target.value)}
+                placeholder="搜索技能名称 / ID / 描述"
+              />
+            </div>
+            {filteredSkills.length === 0 ? (
+              <p className="form-hint">没有匹配的 Skills</p>
+            ) : (
+              <div className="agent-toggle-grid">
+                {filteredSkills.map((skill) => (
+                  <button className={`agent-toggle-item ${draft.enabledSkills.includes(skill.id) ? "active" : ""}`} key={skill.id} type="button" onClick={() => toggleSkill(skill.id)}>
+                    <span className="agent-toggle-item-label"><Sparkles size={16} /><span>{skill.name}</span></span>
+                    <span className="agent-toggle-dot" />
+                  </button>
+                ))}
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>

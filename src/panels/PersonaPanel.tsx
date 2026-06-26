@@ -1,6 +1,7 @@
-import { ChangeEvent, useEffect, useState } from "react";
+import { ChangeEvent, useEffect, useMemo, useState } from "react";
 import { Camera, Check, FileAudio, FolderOpen, Image, ImagePlus, Mic, Pencil, Plus, Settings, Sparkles, Trash2, Wand2 } from "lucide-react";
 import { api } from "../lib/api";
+import { resolvePersonaAgentBinding } from "../lib/personaAgentBinding";
 import { useAppStore } from "../lib/store";
 import type { ChatConfig, ModelCatalogEntry, Persona } from "../lib/types";
 import { Avatar } from "../components/common";
@@ -110,6 +111,10 @@ export function PersonaPanel() {
 
   const avatarSrc = draft.avatarPath ? api.assetUrl(draft.avatarPath) : "";
   const chatConfig = config?.chat ?? null;
+  const personaBindings = useMemo(
+    () => new Map(personas.map((persona) => [persona.id, resolvePersonaAgentBinding(persona, agents, llmProviders)])),
+    [agents, llmProviders, personas]
+  );
   const saveChatConfig = async (patch: Partial<ChatConfig>) => {
     if (!config) return;
     await saveConfig({ ...config, chat: { ...config.chat, ...patch } });
@@ -126,17 +131,7 @@ export function PersonaPanel() {
         </div>
         <div className="persona-list">
           {personas.map((persona) => {
-            const provider = persona.llmProvider ? llmProviders.find((p) => p.id === persona.llmProvider) : null;
-            const modelInfo = persona.llmModel || provider?.model || "";
-            const providerName = provider?.name || "";
-            let infoText = "";
-            if (providerName || modelInfo) {
-              infoText = [providerName, modelInfo].filter(Boolean).join(" · ");
-            } else if (llmProviders.length > 0) {
-              infoText = "请选择服务商";
-            } else {
-              infoText = "未配置服务商";
-            }
+            const binding = personaBindings.get(persona.id);
             return (
               <button
                 className={persona.id === draft.id ? "persona-list-item active" : "persona-list-item"}
@@ -150,7 +145,7 @@ export function PersonaPanel() {
                 <Avatar name={persona.name} src={persona.avatarPath ? api.assetUrl(persona.avatarPath) : ""} />
                 <span>
                   <strong>{persona.name}</strong>
-                  <small>{infoText}</small>
+                  <small>{binding?.infoText ?? "未配置服务商"}</small>
                 </span>
               </button>
             );

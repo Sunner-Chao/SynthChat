@@ -8526,11 +8526,42 @@ impl AppStore {
         })
     }
 
-    pub fn save_persona(&self, persona: Persona) -> AppResult<Persona> {
+    pub fn save_persona(&self, mut persona: Persona) -> AppResult<Persona> {
         self.with_state(|s| {
+            if s.agents.is_empty() {
+                s.agents.push(AgentDefinition::default());
+            }
+            let resolved_agent = s
+                .agents
+                .iter()
+                .find(|agent| agent.id == persona.agent_id)
+                .cloned()
+                .or_else(|| s.agents.first().cloned())
+                .ok_or_else(|| AppError::NotFound("agent".into()))?;
+            persona.agent_id = resolved_agent.id.clone();
+            let persona_provider = persona.llm_provider.trim().to_string();
+            let persona_model = persona.llm_model.trim().to_string();
+            if !persona_provider.is_empty() || !persona_model.is_empty() {
+                if let Some(agent) = s.agents.iter_mut().find(|agent| agent.id == persona.agent_id) {
+                    if !persona_provider.is_empty() {
+                        agent.llm_provider = persona_provider.clone();
+                    }
+                    if !persona_model.is_empty() {
+                        agent.llm_model = persona_model.clone();
+                    }
+                    agent.updated_at = now_iso();
+                }
+            }
             s.personas.retain(|p| p.id != persona.id);
             s.personas.push(persona.clone());
             s.personas.sort_by(|a, b| a.name.cmp(&b.name));
+            let updated_at = now_iso();
+            for conversation in &mut s.conversations {
+                if conversation.persona_id.as_deref() == Some(persona.id.as_str()) {
+                    conversation.agent_id = persona.agent_id.clone();
+                    conversation.updated_at = updated_at.clone();
+                }
+            }
             self.persist(s)?;
             Ok(persona)
         })
@@ -8583,6 +8614,9 @@ impl AppStore {
         persona_id: Option<String>,
     ) -> AppResult<Conversation> {
         self.with_state(|s| {
+            if s.agents.is_empty() {
+                s.agents.push(AgentDefinition::default());
+            }
             let persona = s
                 .personas
                 .iter()
@@ -8590,10 +8624,17 @@ impl AppStore {
                 .or_else(|| s.personas.first())
                 .cloned()
                 .ok_or_else(|| AppError::NotFound("persona".into()))?;
+            let agent_id = s
+                .agents
+                .iter()
+                .find(|agent| agent.id == persona.agent_id)
+                .map(|agent| agent.id.clone())
+                .or_else(|| s.agents.first().map(|agent| agent.id.clone()))
+                .ok_or_else(|| AppError::NotFound("agent".into()))?;
             let title = title
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| persona.name.clone());
-            let conversation = Conversation::new(title, persona.id, persona.agent_id);
+            let conversation = Conversation::new(title, persona.id, agent_id);
             s.messages.insert(conversation.id.clone(), vec![]);
             s.conversations.push(conversation.clone());
             self.persist(s)?;
@@ -8819,19 +8860,54 @@ impl AppStore {
         persona_id: String,
     ) -> AppResult<Conversation> {
         self.with_state(|s| {
+            if s.agents.is_empty() {
+                s.agents.push(AgentDefinition::default());
+            }
             let persona = s
                 .personas
                 .iter()
                 .find(|persona| persona.id == persona_id)
                 .cloned()
                 .ok_or_else(|| AppError::NotFound(format!("persona {persona_id}")))?;
+            let agent_id = s
+                .agents
+                .iter()
+                .find(|agent| agent.id == persona.agent_id)
+                .map(|agent| agent.id.clone())
+                .or_else(|| s.agents.first().map(|agent| agent.id.clone()))
+                .ok_or_else(|| AppError::NotFound("agent".into()))?;
             let conv = s
                 .conversations
                 .iter_mut()
                 .find(|c| c.id == id)
                 .ok_or_else(|| AppError::NotFound(format!("conversation {id}")))?;
             conv.persona_id = Some(persona.id.clone());
-            conv.agent_id = persona.agent_id;
+            conv.agent_id = agent_id;
+            conv.updated_at = now_iso();
+            let saved = conv.clone();
+            self.persist(s)?;
+            Ok(saved)
+        })
+    }
+
+    pub fn set_conversation_agent(&self, id: &str, agent_id: String) -> AppResult<Conversation> {
+        self.with_state(|s| {
+            if s.agents.is_empty() {
+                s.agents.push(AgentDefinition::default());
+            }
+            let resolved_agent_id = s
+                .agents
+                .iter()
+                .find(|agent| agent.id == agent_id)
+                .map(|agent| agent.id.clone())
+                .or_else(|| s.agents.first().map(|agent| agent.id.clone()))
+                .ok_or_else(|| AppError::NotFound("agent".into()))?;
+            let conv = s
+                .conversations
+                .iter_mut()
+                .find(|c| c.id == id)
+                .ok_or_else(|| AppError::NotFound(format!("conversation {id}")))?;
+            conv.agent_id = resolved_agent_id;
             conv.updated_at = now_iso();
             let saved = conv.clone();
             self.persist(s)?;
@@ -10573,11 +10649,88 @@ impl AppStore {
 
     pub fn save_agent(&self, mut agent: AgentDefinition) -> AppResult<AgentDefinition> {
         self.with_state(|s| {
+            if s.agents.is_empty() {
+                s.agents.push(AgentDefinition::default());
+            }
+            let existing = s.agents.iter().find(|item| item.id == agent.id).cloned();
+            if let Some(current) = existing.as_ref() {
+                if agent.created_at.trim().is_empty() {
+                    agent.created_at = current.created_at.clone();
+                }
+            }
             agent.updated_at = now_iso();
+            if agent.created_at.trim().is_empty() {
+                agent.created_at = agent.updated_at.clone();
+            }
+            if agent.is_default {
+                for other in &mut s.agents {
+                    other.is_default = false;
+                }
+            }
             s.agents.retain(|a| a.id != agent.id);
             s.agents.push(agent.clone());
+            if !s.agents.iter().any(|item| item.is_default) {
+                if let Some(first) = s.agents.first_mut() {
+                    first.is_default = true;
+                    if first.id == agent.id {
+                        agent.is_default = true;
+                    }
+                }
+            }
             self.persist(s)?;
             Ok(agent)
+        })
+    }
+
+    pub fn delete_agent(&self, id: &str) -> AppResult<()> {
+        self.with_state(|s| {
+            if s.agents.len() <= 1 {
+                return Err(AppError::BadRequest("cannot delete the last agent".into()));
+            }
+            let index = s
+                .agents
+                .iter()
+                .position(|agent| agent.id == id)
+                .ok_or_else(|| AppError::NotFound(format!("agent {id}")))?;
+            let removed = s.agents.remove(index);
+            let fallback_index = s
+                .agents
+                .iter()
+                .position(|agent| agent.is_default)
+                .unwrap_or(0);
+            if removed.is_default || !s.agents.iter().any(|agent| agent.is_default) {
+                for (index, agent) in s.agents.iter_mut().enumerate() {
+                    agent.is_default = index == fallback_index;
+                    if agent.is_default {
+                        agent.updated_at = now_iso();
+                    }
+                }
+            }
+            let fallback_agent_id = s
+                .agents
+                .get(fallback_index)
+                .map(|agent| agent.id.clone())
+                .ok_or_else(|| AppError::NotFound("fallback agent".into()))?;
+            let updated_at = now_iso();
+            for persona in &mut s.personas {
+                if persona.agent_id == removed.id {
+                    persona.agent_id = fallback_agent_id.clone();
+                }
+            }
+            for conversation in &mut s.conversations {
+                if conversation.agent_id == removed.id {
+                    conversation.agent_id = fallback_agent_id.clone();
+                    conversation.updated_at = updated_at.clone();
+                }
+            }
+            for job in &mut s.scheduled_agent_jobs {
+                if job.agent_id.as_deref() == Some(removed.id.as_str()) {
+                    job.agent_id = Some(fallback_agent_id.clone());
+                    job.updated_at = updated_at.clone();
+                }
+            }
+            self.persist(s)?;
+            Ok(())
         })
     }
 

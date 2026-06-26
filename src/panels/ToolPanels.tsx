@@ -9,8 +9,101 @@ function listen<T>(event: string, handler: (event: { payload: T }) => void): Pro
   });
 }
 import { api } from "../lib/api";
+import { filterSkillsByQuery } from "../lib/skillSearch";
 import { useAppStore } from "../lib/store";
-import type { AgentControlCommand, AgentDefinition, AgentQueuedRequest, AgentRunRecord, AgentTodoItem, CapabilityAdapter, EnhancedSkillSummary, ManagedProcessSnapshot, MarketplaceSkill, MemoryStatus, PlannerTraceRecord, PluginAuxiliaryTaskSummary, PluginSummary, ScheduledAgentJob, ScheduledJobOutputRecord, SkillAuditLogEntry, SkillBundle, SkillInstallRecord, SkillTap, SkillTapStatus, SkillUpdateCheck, StateSnapshotManifest, ToolApprovalRequest, ToolArtifactRecord, ToolDefinition, ToolRouterTraceRecord, ToolTraceEntry, WorkspaceSnapshotManifest, Worldbook } from "../lib/types";
+import type { AgentControlCommand, AgentDefinition, AgentQueuedRequest, AgentRunRecord, AgentTodoItem, CapabilityAdapter, EnhancedSkillSummary, ManagedProcessSnapshot, MarketplaceSkill, MemoryStatus, ModelCatalogEntry, PlannerTraceRecord, PluginAuxiliaryTaskSummary, PluginSummary, ScheduledAgentJob, ScheduledJobOutputRecord, SkillAuditLogEntry, SkillBundle, SkillInstallRecord, SkillTap, SkillTapStatus, SkillUpdateCheck, StateSnapshotManifest, ToolApprovalRequest, ToolArtifactRecord, ToolDefinition, ToolRouterTraceRecord, ToolTraceEntry, WorkspaceSnapshotManifest, Worldbook } from "../lib/types";
+
+type SkillUrlPreset = {
+  id: string;
+  label: string;
+  url: string;
+  category: string;
+};
+
+const DEFAULT_SKILL_URL_PRESETS: SkillUrlPreset[] = [
+  {
+    id: "hermes-agent",
+    label: "hermes-agent",
+    url: "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/SKILL.md",
+    category: "autonomous-ai-agents"
+  },
+  {
+    id: "writing-plans",
+    label: "writing-plans",
+    url: "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/writing-plans/SKILL.md",
+    category: "software-development"
+  },
+  {
+    id: "systematic-debugging",
+    label: "systematic-debugging",
+    url: "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/systematic-debugging/SKILL.md",
+    category: "software-development"
+  },
+  {
+    id: "github-code-review",
+    label: "github-code-review",
+    url: "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/github/github-code-review/SKILL.md",
+    category: "github"
+  }
+] as const;
+
+const SKILL_URL_PRESETS_STORAGE_KEY = "synthchat.skillUrlPresets.v1";
+const DEFAULT_SKILL_URL_PRESET_ID_STORAGE_KEY = "synthchat.skillUrlPreset.default.v1";
+
+function normalizeSkillUrlPreset(value: unknown, index: number): SkillUrlPreset | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<SkillUrlPreset>;
+  const label = typeof candidate.label === "string" ? candidate.label.trim() : "";
+  const url = typeof candidate.url === "string" ? candidate.url.trim() : "";
+  if (!label || !url) return null;
+  const category = typeof candidate.category === "string" ? candidate.category.trim() : "";
+  const id = typeof candidate.id === "string" && candidate.id.trim() ? candidate.id.trim() : `preset-${index}-${label.toLowerCase().replace(/\s+/g, "-")}`;
+  return { id, label, url, category };
+}
+
+function loadSkillUrlPresets() {
+  try {
+    const raw = window.localStorage.getItem(SKILL_URL_PRESETS_STORAGE_KEY);
+    if (!raw) return DEFAULT_SKILL_URL_PRESETS.slice();
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return DEFAULT_SKILL_URL_PRESETS.slice();
+    const presets = parsed
+      .map((item, index) => normalizeSkillUrlPreset(item, index))
+      .filter((item): item is SkillUrlPreset => item !== null);
+    return presets.length > 0 ? presets : DEFAULT_SKILL_URL_PRESETS.slice();
+  } catch {
+    return DEFAULT_SKILL_URL_PRESETS.slice();
+  }
+}
+
+function saveSkillUrlPresets(presets: SkillUrlPreset[]) {
+  window.localStorage.setItem(SKILL_URL_PRESETS_STORAGE_KEY, JSON.stringify(presets));
+}
+
+function loadDefaultSkillUrlPresetId(presets: SkillUrlPreset[]) {
+  const raw = window.localStorage.getItem(DEFAULT_SKILL_URL_PRESET_ID_STORAGE_KEY)?.trim() ?? "";
+  if (raw && presets.some((preset) => preset.id === raw)) return raw;
+  return presets[0]?.id ?? "";
+}
+
+function saveDefaultSkillUrlPresetId(presetId: string) {
+  if (!presetId) {
+    window.localStorage.removeItem(DEFAULT_SKILL_URL_PRESET_ID_STORAGE_KEY);
+    return;
+  }
+  window.localStorage.setItem(DEFAULT_SKILL_URL_PRESET_ID_STORAGE_KEY, presetId);
+}
+
+function fallbackSkillUrlPresetLabel(url: string) {
+  try {
+    const parsed = new URL(url);
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    return parts.slice(-2).join("/") || parsed.hostname;
+  } catch {
+    return "custom-skill";
+  }
+}
+
 export function MemoryPanel() {
   const { memories, personas, saveMemory, deleteMemory, goBack } = useAppStore();
   const [personaId, setPersonaId] = useState("default");
@@ -2571,6 +2664,8 @@ export function AgentsPanel() {
   const [draft, setDraft] = useState<AgentDefinition | null>(null);
   const [saving, setSaving] = useState(false);
   const [search, setSearch] = useState("");
+  const [skillSearch, setSkillSearch] = useState("");
+  const [catalogModels, setCatalogModels] = useState<ModelCatalogEntry[]>([]);
   const [plannerTraces, setPlannerTraces] = useState<PlannerTraceRecord[]>([]);
   const [routerTraces, setRouterTraces] = useState<ToolRouterTraceRecord[]>([]);
 
@@ -2591,6 +2686,23 @@ export function AgentsPanel() {
   }, [selectedId, agents]);
 
   useEffect(() => {
+    const provider = llmProviders.find((item) => item.id === draft?.llmProvider);
+    if (!provider) {
+      setCatalogModels([]);
+      return;
+    }
+    let cancelled = false;
+    api.detectProviderModels(provider).then((result) => {
+      if (!cancelled) setCatalogModels(result.models ?? []);
+    }).catch(() => {
+      if (!cancelled) setCatalogModels([]);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [draft?.llmProvider, llmProviders]);
+
+  useEffect(() => {
     void api.listPlannerTraces().then((items) => setPlannerTraces(items.slice(0, 8)));
     void api.listToolRouterTraces().then((items) => setRouterTraces(items.slice(0, 8)));
   }, []);
@@ -2603,7 +2715,9 @@ export function AgentsPanel() {
     if (!draft) return;
     setSaving(true);
     try {
-      await saveAgent(draft);
+      const saved = await saveAgent(draft);
+      setSelectedId(saved.id);
+      setDraft({ ...saved });
     } finally {
       setSaving(false);
     }
@@ -2612,13 +2726,24 @@ export function AgentsPanel() {
   const remove = async (id: string) => {
     if (agents.length <= 1) return;
     await deleteAgent(id);
+    const remaining = useAppStore.getState().agents;
     if (selectedId === id) {
-      const next = agents.find((a) => a.id !== id);
-      if (next) {
-        setSelectedId(next.id);
-        setDraft({ ...next });
-      }
+      const next = remaining[0] ?? null;
+      setSelectedId(next?.id ?? "");
+      setDraft(next ? { ...next } : null);
     }
+  };
+
+  const duplicateAgent = (source: AgentDefinition) => {
+    setDraft({
+      ...source,
+      id: "",
+      name: `${source.name} (副本)`,
+      isDefault: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    });
+    setSelectedId("");
   };
 
   const createNew = () => {
@@ -2652,16 +2777,7 @@ export function AgentsPanel() {
   const createFromDefault = () => {
     const defaultAgent = agents.find((a) => a.isDefault) ?? agents[0];
     if (!defaultAgent) return;
-    const newAgent: AgentDefinition = {
-      ...defaultAgent,
-      id: "",
-      name: `${defaultAgent.name} (副本)`,
-      isDefault: false,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
-    setDraft(newAgent);
-    setSelectedId("");
+    duplicateAgent(defaultAgent);
   };
 
   const toggleMcpServer = (serverId: string) => {
@@ -2710,8 +2826,12 @@ export function AgentsPanel() {
   const filtered = agents.filter((a) =>
     `${a.name} ${a.description}`.toLowerCase().includes(search.toLowerCase())
   );
+  const filteredSkills = useMemo(() => filterSkillsByQuery(skills, skillSearch), [skillSearch, skills]);
 
   const activeAgentCount = agents.filter((a) => a.enabled).length;
+  const selectedProvider = draft
+    ? llmProviders.find((item) => item.id === draft.llmProvider) ?? llmProviders[0] ?? null
+    : null;
 
   return (
     <section className="primary-panel embedded-panel" style={{ padding: 0 }}>
@@ -2771,7 +2891,7 @@ export function AgentsPanel() {
                     </span>
                     <button
                       className="agent-card-action-tag"
-                      onClick={(e) => { e.stopPropagation(); const da = agents.find((a) => a.id === agent.id) ?? agent; setDraft({ ...da, id: "", name: `${da.name} (副本)`, isDefault: false, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }); setSelectedId(""); }}
+                      onClick={(e) => { e.stopPropagation(); duplicateAgent(agents.find((a) => a.id === agent.id) ?? agent); }}
                       type="button"
                       title="复制此智能体"
                     >
@@ -2793,9 +2913,14 @@ export function AgentsPanel() {
             )}
           </div>
           <div style={{ padding: "8px 16px", borderTop: "1px solid var(--divider)" }}>
-            <button onClick={createNew} type="button" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, width: "100%", padding: "10px", border: "1px dashed var(--divider)", borderRadius: "var(--radius-md)", background: "transparent", color: "var(--text-3)", fontSize: 13, cursor: "pointer", transition: "all 0.15s ease" }} onMouseEnter={(e) => { e.currentTarget.style.borderColor = "var(--primary)"; e.currentTarget.style.color = "var(--primary)"; e.currentTarget.style.background = "var(--primary-glow)"; }} onMouseLeave={(e) => { e.currentTarget.style.borderColor = "var(--divider)"; e.currentTarget.style.color = "var(--text-3)"; e.currentTarget.style.background = "transparent"; }}>
-              <Plus size={15} /> 新建智能体
-            </button>
+            <div className="inline-actions" style={{ width: "100%" }}>
+              <button onClick={createNew} type="button" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, flex: 1, padding: "10px", border: "1px dashed var(--divider)", borderRadius: "var(--radius-md)", background: "transparent", color: "var(--text-3)", fontSize: 13, cursor: "pointer", transition: "all 0.15s ease" }} onMouseEnter={(e) => { e.currentTarget.style.borderColor = "var(--primary)"; e.currentTarget.style.color = "var(--primary)"; e.currentTarget.style.background = "var(--primary-glow)"; }} onMouseLeave={(e) => { e.currentTarget.style.borderColor = "var(--divider)"; e.currentTarget.style.color = "var(--text-3)"; e.currentTarget.style.background = "transparent"; }}>
+                <Plus size={15} /> 新建智能体
+              </button>
+              <button className="btn-secondary" onClick={createFromDefault} type="button" style={{ flex: 1, fontSize: 13, padding: "10px 12px" }}>
+                复制默认
+              </button>
+            </div>
           </div>
         </div>
 
@@ -2812,6 +2937,9 @@ export function AgentsPanel() {
               <div className="agent-detail-actions">
                 <button className="btn-primary" onClick={save} type="button" disabled={saving} style={{ fontSize: 13, padding: "8px 20px" }}>
                   {saving ? "保存中..." : "保存"}
+                </button>
+                <button className="btn-secondary" onClick={() => draft && duplicateAgent(draft)} type="button" style={{ fontSize: 13, padding: "8px 16px" }}>
+                  复制
                 </button>
                 {draft.id && agents.length > 1 ? (
                   <button className="btn-danger-outline" onClick={() => void remove(draft.id)} type="button" style={{ fontSize: 13, padding: "8px 16px" }}>
@@ -2837,12 +2965,45 @@ export function AgentsPanel() {
               <div className="agent-form-row">
                 <div className="agent-field">
                   <label>服务商</label>
-                  <select value={draft.llmProvider} onChange={(e) => update("llmProvider", e.target.value)}>
+                  <select
+                    value={draft.llmProvider}
+                    onChange={(e) => {
+                      const nextProvider = llmProviders.find((item) => item.id === e.target.value);
+                      setDraft((current) => current ? {
+                        ...current,
+                        llmProvider: e.target.value,
+                        llmModel: nextProvider?.model ?? current.llmModel
+                      } : current);
+                    }}
+                  >
                     <option value="">默认</option>
                     {llmProviders.map((p) => (<option key={p.id} value={p.id}>{p.name}</option>))}
                   </select>
                 </div>
-                <div className="agent-field"><label>模型</label><input value={draft.llmModel} onChange={(e) => update("llmModel", e.target.value)} placeholder="留空使用默认模型" /></div>
+                <div className="agent-field">
+                  <label>模型 ID</label>
+                  <div className="model-select-row">
+                    {catalogModels.length > 0 ? (
+                      <select
+                        value={catalogModels.some((model) => model.id === draft.llmModel) ? draft.llmModel : ""}
+                        onChange={(e) => {
+                          const value = e.target.value;
+                          if (value) update("llmModel", value);
+                        }}
+                      >
+                        <option value="">从目录选择模型</option>
+                        {catalogModels.map((model) => (
+                          <option key={model.id} value={model.id}>{model.name || model.id}{model.family ? ` (${model.family})` : ""}</option>
+                        ))}
+                      </select>
+                    ) : null}
+                    <input
+                      value={draft.llmModel || selectedProvider?.model || ""}
+                      onChange={(e) => update("llmModel", e.target.value)}
+                      placeholder={catalogModels.length > 0 ? "或手动输入" : "留空使用默认模型"}
+                    />
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -2919,15 +3080,33 @@ export function AgentsPanel() {
 
             {skills.length > 0 ? (
               <div className="agent-section">
-                <div className="agent-section-head"><Sparkles size={16} /><strong>技能</strong><small>{draft.enabledSkills.length}/{skills.length} 已启用</small></div>
-                <div className="agent-toggle-grid">
-                  {skills.map((s) => (
-                    <button className={`agent-toggle-item ${draft.enabledSkills.includes(s.id) ? "active" : ""}`} key={s.id} onClick={() => toggleSkill(s.id)} type="button" title={s.description}>
-                      <span className="agent-toggle-item-label"><Sparkles size={16} /><span>{s.name}</span></span>
-                      <span className="agent-toggle-dot" />
-                    </button>
-                  ))}
+                <div className="agent-section-head">
+                  <Sparkles size={16} /><strong>技能</strong>
+                  <small>
+                    {draft.enabledSkills.length}/{skills.length} 已启用
+                    {skillSearch.trim() ? ` · ${filteredSkills.length} 匹配` : ""}
+                  </small>
                 </div>
+                <div className="search-bar" style={{ marginBottom: 12 }}>
+                  <Search size={16} />
+                  <input
+                    value={skillSearch}
+                    onChange={(event) => setSkillSearch(event.target.value)}
+                    placeholder="搜索技能名称 / ID / 描述"
+                  />
+                </div>
+                {filteredSkills.length === 0 ? (
+                  <p className="form-hint">没有匹配的技能</p>
+                ) : (
+                  <div className="agent-toggle-grid">
+                    {filteredSkills.map((s) => (
+                      <button className={`agent-toggle-item ${draft.enabledSkills.includes(s.id) ? "active" : ""}`} key={s.id} onClick={() => toggleSkill(s.id)} type="button" title={s.description}>
+                        <span className="agent-toggle-item-label"><Sparkles size={16} /><span>{s.name}</span></span>
+                        <span className="agent-toggle-dot" />
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             ) : null}
 
@@ -2987,11 +3166,28 @@ export function SkillsPanel() {
   } = useAppStore();
   const [tab, setTab] = useState<"installed" | "bundles" | "marketplace">("installed");
   const [agentId, setAgentId] = useState(agents[0]?.id ?? "");
+  const [installedSearchQuery, setInstalledSearchQuery] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [marketplaceSource, setMarketplaceSource] = useState<"local" | "tap" | "all">("local");
-  const [installUrl, setInstallUrl] = useState("");
+  const [skillUrlPresets, setSkillUrlPresets] = useState<SkillUrlPreset[]>(() => loadSkillUrlPresets());
+  const [defaultSkillUrlPresetId, setDefaultSkillUrlPresetId] = useState(() => {
+    const presets = loadSkillUrlPresets();
+    return loadDefaultSkillUrlPresetId(presets);
+  });
+  const [editingUrlPresetId, setEditingUrlPresetId] = useState<string | null>(null);
+  const [urlPresetLabel, setUrlPresetLabel] = useState("");
+  const [installLocalPath, setInstallLocalPath] = useState("");
+  const [installUrl, setInstallUrl] = useState<string>(() => {
+    const presets = loadSkillUrlPresets();
+    const presetId = loadDefaultSkillUrlPresetId(presets);
+    return presets.find((preset) => preset.id === presetId)?.url ?? presets[0]?.url ?? "";
+  });
   const [installName, setInstallName] = useState("");
-  const [installCategory, setInstallCategory] = useState("");
+  const [installCategory, setInstallCategory] = useState(() => {
+    const presets = loadSkillUrlPresets();
+    const presetId = loadDefaultSkillUrlPresetId(presets);
+    return presets.find((preset) => preset.id === presetId)?.category ?? "";
+  });
   const [installForce, setInstallForce] = useState(false);
   const [installNotice, setInstallNotice] = useState("");
   const [tapRepo, setTapRepo] = useState("");
@@ -3008,10 +3204,28 @@ export function SkillsPanel() {
   const [expandedSkill, setExpandedSkill] = useState<string | null>(null);
   const [skillConfigDraft, setSkillConfigDraft] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
+  const defaultSkillUrlPreset = useMemo(
+    () => skillUrlPresets.find((preset) => preset.id === defaultSkillUrlPresetId) ?? skillUrlPresets[0] ?? null,
+    [defaultSkillUrlPresetId, skillUrlPresets]
+  );
 
   useEffect(() => {
     if (agentId) void refreshSkillsForAgent(agentId);
   }, [agentId, refreshSkillsForAgent]);
+
+  useEffect(() => {
+    saveSkillUrlPresets(skillUrlPresets);
+  }, [skillUrlPresets]);
+
+  useEffect(() => {
+    if (!skillUrlPresets.some((preset) => preset.id === defaultSkillUrlPresetId)) {
+      const fallbackId = skillUrlPresets[0]?.id ?? "";
+      setDefaultSkillUrlPresetId(fallbackId);
+      saveDefaultSkillUrlPresetId(fallbackId);
+      return;
+    }
+    saveDefaultSkillUrlPresetId(defaultSkillUrlPresetId);
+  }, [defaultSkillUrlPresetId, skillUrlPresets]);
 
   useEffect(() => {
     void refreshSkillBundles();
@@ -3092,6 +3306,76 @@ export function SkillsPanel() {
       );
       setInstallNotice("已安装并启用");
       setInstallUrl("");
+      setInstallName("");
+      if (agentId) await refreshSkillsForAgent(agentId);
+      await refreshMarketplaceSkills(searchQuery || undefined, marketplaceSource);
+      await refreshInstallRecords();
+    } catch (error) {
+      setInstallNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const applyInstallUrlPreset = (preset: SkillUrlPreset) => {
+    setInstallUrl(preset.url);
+    setInstallCategory(preset.category);
+  };
+
+  const editInstallUrlPreset = (preset: SkillUrlPreset) => {
+    setEditingUrlPresetId(preset.id);
+    setUrlPresetLabel(preset.label);
+    setInstallUrl(preset.url);
+    setInstallCategory(preset.category);
+  };
+
+  const resetInstallUrlPresetEditor = () => {
+    setEditingUrlPresetId(null);
+    setUrlPresetLabel("");
+  };
+
+  const handleSaveInstallUrlPreset = () => {
+    const url = installUrl.trim();
+    if (!url) return;
+    const preset: SkillUrlPreset = {
+      id: editingUrlPresetId ?? `preset-${crypto.randomUUID()}`,
+      label: urlPresetLabel.trim() || fallbackSkillUrlPresetLabel(url),
+      url,
+      category: installCategory.trim()
+    };
+    setSkillUrlPresets((current) => {
+      if (editingUrlPresetId) {
+        return current.map((item) => item.id === editingUrlPresetId ? preset : item);
+      }
+      return [...current, preset];
+    });
+    resetInstallUrlPresetEditor();
+  };
+
+  const handleDeleteInstallUrlPreset = (presetId: string) => {
+    setSkillUrlPresets((current) => current.filter((preset) => preset.id !== presetId));
+    if (editingUrlPresetId === presetId) resetInstallUrlPresetEditor();
+  };
+
+  const handleSetDefaultInstallUrlPreset = (presetId: string) => {
+    setDefaultSkillUrlPresetId(presetId);
+  };
+
+  const handleInstallExternalPath = async () => {
+    const sourcePath = installLocalPath.trim();
+    if (!sourcePath) return;
+    setBusy(true);
+    setInstallNotice("");
+    try {
+      await api.installExternalSkillFile(
+        sourcePath,
+        installName.trim() || undefined,
+        installCategory.trim() || undefined,
+        agentId || undefined,
+        installForce
+      );
+      setInstallNotice("已从本地目录/文件安装并启用");
+      setInstallLocalPath("");
       setInstallName("");
       if (agentId) await refreshSkillsForAgent(agentId);
       await refreshMarketplaceSkills(searchQuery || undefined, marketplaceSource);
@@ -3281,6 +3565,11 @@ export function SkillsPanel() {
   };
 
   const enabledCount = skills.filter((s) => s.enabled).length;
+  const filteredInstalledSkills = useMemo(
+    () => filterSkillsByQuery(skills, installedSearchQuery),
+    [installedSearchQuery, skills]
+  );
+  const filteredEnabledCount = filteredInstalledSkills.filter((s) => s.enabled).length;
 
   return (
     <section className="primary-panel embedded-panel" style={{ padding: 0 }}>
@@ -3353,66 +3642,82 @@ export function SkillsPanel() {
             </div>
           ) : (
             <>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
                 <span style={{ fontSize: 13, color: "var(--text-3)" }}>
                   {enabledCount}/{skills.length} 已启用
+                  {installedSearchQuery.trim() ? ` · ${filteredEnabledCount}/${filteredInstalledSkills.length} 匹配` : ""}
                 </span>
+                <div className="search-bar" style={{ minWidth: 280, flex: "1 1 280px", marginLeft: "auto" }}>
+                  <Search size={16} />
+                  <input
+                    value={installedSearchQuery}
+                    onChange={(event) => setInstalledSearchQuery(event.target.value)}
+                    placeholder="搜索技能名称 / ID / 描述"
+                  />
+                </div>
               </div>
-              {skills.map((skill) => (
-                <div key={skill.id}>
-                  <div
-                    className="skill-card"
-                    onClick={() => openSkillConfig(skill)}
-                    role="button"
-                    tabIndex={0}
-                    onKeyDown={(e) => { if (e.key === "Enter") openSkillConfig(skill); }}
-                  >
-                    <span className="skill-card-icon">
-                      <Sparkles size={20} />
-                    </span>
-                    <div className="skill-card-info">
-                      <strong>{skill.name}</strong>
-                      <small>
-                        {skill.description}
-                        {skill.version ? ` · v${skill.version}` : ""}
-                        {skill.author ? ` · ${skill.author}` : ""}
-                      </small>
-                    </div>
-                    <div className="skill-card-right">
-                      <span className={`status-badge ${skill.enabled ? "enabled" : "disabled"}`}>
-                        {skill.enabled ? "启用" : "停用"}
+              {filteredInstalledSkills.length === 0 ? (
+                <div className="empty-state compact" style={{ minHeight: 200 }}>
+                  <div className="empty-icon-wrap"><Search size={36} strokeWidth={1.5} /></div>
+                  <p>没有匹配的技能</p>
+                </div>
+              ) : (
+                filteredInstalledSkills.map((skill) => (
+                  <div key={skill.id}>
+                    <div
+                      className="skill-card"
+                      onClick={() => openSkillConfig(skill)}
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(e) => { if (e.key === "Enter") openSkillConfig(skill); }}
+                    >
+                      <span className="skill-card-icon">
+                        <Sparkles size={20} />
                       </span>
-                      <ChevronRight size={16} style={{ color: "var(--text-3)" }} />
-                    </div>
-                  </div>
-                  {expandedSkill === skill.id ? (
-                    <div className="skill-config-panel">
-                      <div className="card-header" style={{ marginBottom: 12 }}>技能配置 — {skill.name}</div>
-                      <div className="settings-form">
-                        {Object.keys(skill.config).length === 0 ? (
-                          <p className="form-hint">该技能无可配置项</p>
-                        ) : (
-                          Object.entries(skill.config).map(([key, value]) => (
-                            <div className="form-group" key={key}>
-                              <div className="form-row">
-                                <label>{key}</label>
-                                <input
-                                  value={skillConfigDraft[key] ?? value}
-                                  onChange={(e) => setSkillConfigDraft((prev) => ({ ...prev, [key]: e.target.value }))}
-                                />
-                              </div>
-                            </div>
-                          ))
-                        )}
-                        <div className="inline-actions">
-                          <button onClick={() => handleSaveSkillConfig(skill.id)} type="button">保存配置</button>
-                          <button className="btn-secondary" onClick={() => setExpandedSkill(null)} type="button">取消</button>
-                        </div>
+                      <div className="skill-card-info">
+                        <strong>{skill.name}</strong>
+                        <small>
+                          {skill.description}
+                          {skill.version ? ` · v${skill.version}` : ""}
+                          {skill.author ? ` · ${skill.author}` : ""}
+                        </small>
+                      </div>
+                      <div className="skill-card-right">
+                        <span className={`status-badge ${skill.enabled ? "enabled" : "disabled"}`}>
+                          {skill.enabled ? "启用" : "停用"}
+                        </span>
+                        <ChevronRight size={16} style={{ color: "var(--text-3)" }} />
                       </div>
                     </div>
-                  ) : null}
-                </div>
-              ))}
+                    {expandedSkill === skill.id ? (
+                      <div className="skill-config-panel">
+                        <div className="card-header" style={{ marginBottom: 12 }}>技能配置 — {skill.name}</div>
+                        <div className="settings-form">
+                          {Object.keys(skill.config).length === 0 ? (
+                            <p className="form-hint">该技能无可配置项</p>
+                          ) : (
+                            Object.entries(skill.config).map(([key, value]) => (
+                              <div className="form-group" key={key}>
+                                <div className="form-row">
+                                  <label>{key}</label>
+                                  <input
+                                    value={skillConfigDraft[key] ?? value}
+                                    onChange={(e) => setSkillConfigDraft((prev) => ({ ...prev, [key]: e.target.value }))}
+                                  />
+                                </div>
+                              </div>
+                            ))
+                          )}
+                          <div className="inline-actions">
+                            <button onClick={() => handleSaveSkillConfig(skill.id)} type="button">保存配置</button>
+                            <button className="btn-secondary" onClick={() => setExpandedSkill(null)} type="button">取消</button>
+                          </div>
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                ))
+              )}
             </>
           )
         ) : null}
@@ -3450,16 +3755,16 @@ export function SkillsPanel() {
           <>
             <div className="skill-config-panel" style={{ marginBottom: 16 }}>
               <div className="card-header" style={{ marginBottom: 12 }}>
-                <ExternalLink size={15} /> 从 URL 安装
+                <Plus size={15} /> 从本地导入
               </div>
               <div className="settings-form">
                 <div className="form-row">
-                  <label>SKILL.md URL</label>
+                  <label>本地路径</label>
                   <input
-                    value={installUrl}
-                    onChange={(e) => setInstallUrl(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === "Enter") void handleInstallExternalUrl(); }}
-                    placeholder="https://example.com/SKILL.md"
+                    value={installLocalPath}
+                    onChange={(e) => setInstallLocalPath(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") void handleInstallExternalPath(); }}
+                    placeholder="SKILL.md 文件或完整 skill 目录"
                   />
                 </div>
                 <div className="form-row">
@@ -3475,6 +3780,89 @@ export function SkillsPanel() {
                   <span>允许覆盖审计阻断或同名 skill</span>
                 </label>
                 <div className="inline-actions">
+                  <button className="btn-primary" onClick={handleInstallExternalPath} disabled={busy || !installLocalPath.trim()} type="button">
+                    <Plus size={14} /> 导入本地 Skill
+                  </button>
+                </div>
+                {installNotice ? <p className="form-hint">{installNotice}</p> : null}
+              </div>
+            </div>
+            <div className="skill-config-panel" style={{ marginBottom: 16 }}>
+              <div className="card-header" style={{ marginBottom: 12 }}>
+                <ExternalLink size={15} /> 从 URL 安装
+              </div>
+              <div className="settings-form">
+                <div className="form-row">
+                  <label>常用 URL</label>
+                  <div style={{ display: "grid", gap: 8 }}>
+                    {skillUrlPresets.map((preset) => (
+                      <div className="adapter-row trace-row" key={preset.id}>
+                        <span className={`status-badge ${preset.id === defaultSkillUrlPresetId ? "enabled" : "warning"}`}>
+                          {preset.id === defaultSkillUrlPresetId ? "默认" : "预设"}
+                        </span>
+                        <div className="adapter-info">
+                          <strong>{preset.label}</strong>
+                          <code>{preset.url}</code>
+                          {preset.category ? <small>分类: {preset.category}</small> : null}
+                        </div>
+                        <div className="inline-actions">
+                          <button className="btn-secondary" onClick={() => applyInstallUrlPreset(preset)} type="button">使用</button>
+                          <button className="btn-secondary" onClick={() => editInstallUrlPreset(preset)} type="button">编辑</button>
+                          <button
+                            className="btn-secondary"
+                            onClick={() => handleSetDefaultInstallUrlPreset(preset.id)}
+                            disabled={preset.id === defaultSkillUrlPresetId}
+                            type="button"
+                          >
+                            设为默认
+                          </button>
+                          <button className="btn-secondary" onClick={() => handleDeleteInstallUrlPreset(preset.id)} type="button" title="删除预设">
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div className="form-row">
+                  <label>{editingUrlPresetId ? "编辑预设名称" : "新增预设名称"}</label>
+                  <input
+                    value={urlPresetLabel}
+                    onChange={(e) => setUrlPresetLabel(e.target.value)}
+                    placeholder={defaultSkillUrlPreset?.label || "例如 hermes-agent"}
+                  />
+                </div>
+                <div className="form-row">
+                  <label>公开 URL / SKILL.md URL</label>
+                  <input
+                    value={installUrl}
+                    onChange={(e) => setInstallUrl(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") void handleInstallExternalUrl(); }}
+                    placeholder="https://www.skills.sh/owner/repo/skill 或 https://example.com/SKILL.md"
+                  />
+                </div>
+                <p className="form-hint">支持 raw `SKILL.md` 直链，也支持 `skills.sh` 的具体技能详情页；首页或目录页不能直接安装。</p>
+                <div className="form-row">
+                  <label>名称</label>
+                  <input value={installName} onChange={(e) => setInstallName(e.target.value)} placeholder="留空使用 frontmatter" />
+                </div>
+                <div className="form-row">
+                  <label>分类</label>
+                  <input value={installCategory} onChange={(e) => setInstallCategory(e.target.value)} placeholder="例如 docs/research" />
+                </div>
+                <label className="checkbox-row">
+                  <input type="checkbox" checked={installForce} onChange={(e) => setInstallForce(e.target.checked)} />
+                  <span>允许覆盖审计阻断或同名 skill</span>
+                </label>
+                <div className="inline-actions">
+                  <button className="btn-secondary" onClick={handleSaveInstallUrlPreset} disabled={!installUrl.trim()} type="button">
+                    <Plus size={14} /> {editingUrlPresetId ? "更新预设" : "保存为预设"}
+                  </button>
+                  {editingUrlPresetId ? (
+                    <button className="btn-secondary" onClick={resetInstallUrlPresetEditor} type="button">
+                      取消编辑
+                    </button>
+                  ) : null}
                   <button className="btn-primary" onClick={handleInstallExternalUrl} disabled={busy || !installUrl.trim()} type="button">
                     <Download size={14} /> 安装 URL
                   </button>

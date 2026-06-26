@@ -751,6 +751,9 @@ fn save_persona(store: State<'_, AppStore>, mut persona: Persona) -> AppResult<P
             "persona id contains invalid characters".into(),
         ));
     }
+    persona.agent_id = persona.agent_id.trim().to_string();
+    persona.llm_provider = persona.llm_provider.trim().to_string();
+    persona.llm_model = persona.llm_model.trim().to_string();
     persona.temperature = persona.temperature.clamp(0.0, 2.0);
     persona.max_tokens = persona.max_tokens.clamp(128, 65536);
     normalize_persona_number(&mut persona.tool_policy, "timeoutSeconds", 1.0, 86400.0);
@@ -1175,6 +1178,15 @@ fn delete_conversation(store: State<'_, AppStore>, id: String) -> AppResult<()> 
 #[tauri::command(rename_all = "camelCase")]
 fn rename_conversation(store: State<'_, AppStore>, id: String, title: String) -> AppResult<()> {
     store.rename_conversation(&id, title)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn set_conversation_agent(
+    store: State<'_, AppStore>,
+    id: String,
+    agent_id: String,
+) -> AppResult<models::Conversation> {
+    store.set_conversation_agent(&id, agent_id)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -2274,7 +2286,44 @@ fn list_agents(store: State<'_, AppStore>) -> AppResult<Vec<AgentDefinition>> {
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn save_agent(store: State<'_, AppStore>, agent: AgentDefinition) -> AppResult<AgentDefinition> {
+fn save_agent(store: State<'_, AppStore>, mut agent: AgentDefinition) -> AppResult<AgentDefinition> {
+    agent.name = agent.name.trim().to_string();
+    if agent.name.is_empty() {
+        return Err(AppError::BadRequest("agent name is required".into()));
+    }
+    if agent.name.chars().count() > 100 {
+        return Err(AppError::BadRequest(
+            "agent name must be 100 characters or less".into(),
+        ));
+    }
+    agent.id = agent.id.trim().to_string();
+    if agent.id.is_empty() {
+        agent.id = new_id("agent");
+    }
+    if agent
+        .id
+        .chars()
+        .any(|ch| matches!(ch, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+    {
+        return Err(AppError::BadRequest(
+            "agent id contains invalid characters".into(),
+        ));
+    }
+    agent.description = agent.description.trim().to_string();
+    agent.workspace_dir = agent.workspace_dir.trim().to_string();
+    agent.llm_provider = agent.llm_provider.trim().to_string();
+    agent.llm_model = agent.llm_model.trim().to_string();
+    agent.skills_dir = agent.skills_dir.trim().to_string();
+    agent.max_subagents = agent.max_subagents.min(32);
+    agent.max_subagent_depth = agent.max_subagent_depth.clamp(1, 4);
+    agent.max_tool_iterations = agent.max_tool_iterations.clamp(1, 120);
+    let agents = store.agents()?;
+    if agents
+        .iter()
+        .any(|item| item.id != agent.id && item.name.eq_ignore_ascii_case(&agent.name))
+    {
+        return Err(AppError::BadRequest("agent name already exists".into()));
+    }
     store.save_agent(agent)
 }
 
@@ -2288,8 +2337,12 @@ async fn auto_describe_agent(
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn delete_agent(_store: State<'_, AppStore>, _id: String) -> AppResult<()> {
-    Ok(())
+fn delete_agent(store: State<'_, AppStore>, id: String) -> AppResult<()> {
+    let clean = id.trim();
+    if clean.is_empty() {
+        return Err(AppError::BadRequest("agent id is required".into()));
+    }
+    store.delete_agent(clean)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -2719,10 +2772,15 @@ async fn fetch_github_contents(
     repo: &str,
     path: &str,
 ) -> AppResult<Vec<GitHubContentEntry>> {
-    let url = format!(
-        "https://api.github.com/repos/{repo}/contents/{}",
-        path.replace(' ', "%20")
-    );
+    let normalized_path = path.trim_matches('/');
+    let url = if normalized_path.is_empty() {
+        format!("https://api.github.com/repos/{repo}/contents")
+    } else {
+        format!(
+            "https://api.github.com/repos/{repo}/contents/{}",
+            normalized_path.replace(' ', "%20")
+        )
+    };
     let response = client
         .get(url)
         .header("User-Agent", "SynthChat-Skills-Tap")
@@ -2856,28 +2914,16 @@ async fn fetch_skill_url(url: &str) -> AppResult<String> {
             "skill url must start with http:// or https://".into(),
         ));
     }
-    let response = skill_http_client()?
-        .get(trimmed)
-        .send()
-        .await
-        .map_err(|error| error::AppError::BadRequest(format!("fetch skill url failed: {error}")))?;
-    if let Some(length) = response.content_length() {
-        if length > 512 * 1024 {
-            return Err(error::AppError::BadRequest(
-                "skill url response is too large".into(),
-            ));
-        }
+    let parsed = reqwest::Url::parse(trimmed)
+        .map_err(|error| AppError::BadRequest(format!("invalid skill url: {error}")))?;
+    let client = skill_http_client()?;
+    let raw = fetch_text_url(&client, trimmed, "fetch skill url", "read skill url").await?;
+    if is_skills_sh_host(&parsed) {
+        return resolve_skills_sh_skill_url(&client, &parsed, &raw).await;
     }
-    let response = response
-        .error_for_status()
-        .map_err(|error| error::AppError::BadRequest(format!("fetch skill url failed: {error}")))?;
-    let raw = response
-        .text()
-        .await
-        .map_err(|error| error::AppError::BadRequest(format!("read skill url failed: {error}")))?;
-    if raw.len() > 512 * 1024 {
-        return Err(error::AppError::BadRequest(
-            "skill url response is too large".into(),
+    if looks_like_html_document(&raw) {
+        return Err(AppError::BadRequest(
+            "public url returned an HTML page; please provide a direct SKILL.md URL or a supported skills.sh skill page URL".into(),
         ));
     }
     Ok(raw)
@@ -2888,6 +2934,270 @@ fn skill_http_client() -> AppResult<reqwest::Client> {
         .timeout(Duration::from_secs(REMOTE_SKILL_FETCH_TIMEOUT_SECS))
         .build()
         .map_err(|error| AppError::BadRequest(format!("build skill http client failed: {error}")))
+}
+
+async fn fetch_text_url(
+    client: &reqwest::Client,
+    url: &str,
+    fetch_context: &str,
+    read_context: &str,
+) -> AppResult<String> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("{fetch_context} failed: {error}")))?;
+    if let Some(length) = response.content_length() {
+        if length > 512 * 1024 {
+            return Err(AppError::BadRequest(
+                "skill url response is too large".into(),
+            ));
+        }
+    }
+    let response = response
+        .error_for_status()
+        .map_err(|error| AppError::BadRequest(format!("{fetch_context} failed: {error}")))?;
+    let raw = response
+        .text()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("{read_context} failed: {error}")))?;
+    if raw.len() > 512 * 1024 {
+        return Err(AppError::BadRequest(
+            "skill url response is too large".into(),
+        ));
+    }
+    Ok(raw)
+}
+
+fn looks_like_html_document(raw: &str) -> bool {
+    let trimmed = raw.trim_start();
+    trimmed.starts_with("<!DOCTYPE html")
+        || trimmed.starts_with("<html")
+        || trimmed.starts_with("<HTML")
+}
+
+fn is_skills_sh_host(url: &reqwest::Url) -> bool {
+    matches!(
+        url.host_str().map(|host| host.to_ascii_lowercase()),
+        Some(host) if host == "skills.sh" || host == "www.skills.sh"
+    )
+}
+
+fn normalize_skill_lookup_token(value: &str) -> String {
+    let mut output = String::new();
+    let mut last_was_dash = false;
+    for ch in value.chars() {
+        let normalized = ch.to_ascii_lowercase();
+        if normalized.is_ascii_alphanumeric() {
+            output.push(normalized);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            output.push('-');
+            last_was_dash = true;
+        }
+    }
+    output.trim_matches('-').to_string()
+}
+
+fn parse_skills_sh_install_hint(html: &str) -> Option<(String, String)> {
+    let marker = "npx skills add ";
+    let start = html.find(marker)?;
+    let rest = &html[start + marker.len()..];
+    let split = rest.find(" --skill ")?;
+    let repo_url = rest[..split].trim();
+    let skill_rest = &rest[split + " --skill ".len()..];
+    let skill = skill_rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/' | '.'))
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if repo_url.starts_with("https://github.com/") && !skill.is_empty() {
+        Some((repo_url.to_string(), skill))
+    } else {
+        None
+    }
+}
+
+fn parse_skills_sh_path(url: &reqwest::Url) -> Option<(String, String)> {
+    let segments = url
+        .path_segments()
+        .map(|items| {
+            items
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if segments.len() < 3 {
+        return None;
+    }
+    let owner = segments.first()?;
+    let repo = segments.get(1)?;
+    let skill = segments.last()?;
+    Some((format!("https://github.com/{owner}/{repo}"), (*skill).to_string()))
+}
+
+fn parse_github_repo_identifier(repo_url: &str) -> Option<String> {
+    let trimmed = repo_url.trim().trim_end_matches('/');
+    let path = trimmed
+        .strip_prefix("https://github.com/")
+        .or_else(|| trimmed.strip_prefix("http://github.com/"))?;
+    let mut parts = path.split('/').filter(|value| !value.trim().is_empty());
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim().trim_end_matches(".git");
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+fn extract_frontmatter_name(raw: &str) -> Option<String> {
+    let mut lines = raw.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            break;
+        }
+        if let Some(value) = trimmed.strip_prefix("name:") {
+            let cleaned = value.trim().trim_matches('"').trim_matches('\'').trim();
+            if !cleaned.is_empty() {
+                return Some(cleaned.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_markdown_heading(raw: &str) -> Option<String> {
+    raw.lines().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("# ")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn skill_raw_matches_slug(raw: &str, target_slug: &str) -> bool {
+    extract_frontmatter_name(raw)
+        .into_iter()
+        .chain(extract_markdown_heading(raw))
+        .map(|value| normalize_skill_lookup_token(&value))
+        .any(|value| value == target_slug)
+}
+
+async fn resolve_skills_sh_skill_url(
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+    html: &str,
+) -> AppResult<String> {
+    let path_segments = url
+        .path_segments()
+        .map(|items| {
+            items
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if path_segments.len() < 3 {
+        return Err(AppError::BadRequest(
+            "skills.sh 首页或目录页不能直接安装；请使用具体技能详情页 URL，例如 https://www.skills.sh/vercel-labs/skills/find-skills".into(),
+        ));
+    }
+    let (repo_url, skill_slug) = parse_skills_sh_install_hint(html)
+        .or_else(|| parse_skills_sh_path(url))
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "无法从 skills.sh 页面解析技能来源；请改用具体技能详情页或直接粘贴 SKILL.md 原始链接".into(),
+            )
+        })?;
+    let repo = parse_github_repo_identifier(&repo_url).ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "无法解析 skills.sh 页面中的 GitHub 仓库地址: {repo_url}"
+        ))
+    })?;
+    fetch_github_skill_by_slug(client, &repo, &skill_slug).await
+}
+
+async fn fetch_github_skill_by_slug(
+    client: &reqwest::Client,
+    repo: &str,
+    skill_slug: &str,
+) -> AppResult<String> {
+    let target_slug = normalize_skill_lookup_token(skill_slug);
+    if target_slug.is_empty() {
+        return Err(AppError::BadRequest("invalid remote skill slug".into()));
+    }
+    for root in ["skills", ""] {
+        if let Some(raw) = search_github_skill_under_path(client, repo, root, &target_slug).await? {
+            return Ok(raw);
+        }
+    }
+    Err(AppError::BadRequest(format!(
+        "无法在 GitHub 仓库 {repo} 中定位 skills.sh 技能 `{skill_slug}`；请改用该技能的原始 SKILL.md 链接"
+    )))
+}
+
+async fn search_github_skill_under_path(
+    client: &reqwest::Client,
+    repo: &str,
+    root: &str,
+    target_slug: &str,
+) -> AppResult<Option<String>> {
+    let mut stack = vec![(root.trim_matches('/').to_string(), 0usize)];
+    let mut visited_entries = 0usize;
+    while let Some((path, depth)) = stack.pop() {
+        if visited_entries >= 160 || depth > 4 {
+            continue;
+        }
+        let entries = match fetch_github_contents(client, repo, &path).await {
+            Ok(items) => items,
+            Err(_) if depth == 0 => continue,
+            Err(_) => continue,
+        };
+        visited_entries += entries.len();
+        for entry in entries {
+            if entry.entry_type == "dir" {
+                if depth < 4 {
+                    stack.push((entry.path, depth + 1));
+                }
+                continue;
+            }
+            if entry.entry_type != "file" || !entry.name.eq_ignore_ascii_case("SKILL.md") {
+                continue;
+            }
+            let Some(download_url) = entry.download_url.as_deref() else {
+                continue;
+            };
+            let folder_slug = entry
+                .path
+                .trim_end_matches("/SKILL.md")
+                .rsplit('/')
+                .next()
+                .map(normalize_skill_lookup_token)
+                .unwrap_or_default();
+            if folder_slug != target_slug && !entry.path.to_ascii_lowercase().contains(target_slug) {
+                continue;
+            }
+            let raw = fetch_text_url(
+                client,
+                download_url,
+                "fetch GitHub skill content",
+                "read GitHub skill content",
+            )
+            .await?;
+            if folder_slug == target_slug || skill_raw_matches_slug(&raw, target_slug) {
+                return Ok(Some(raw));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn category_from_external_skill_id(skill_id: &str) -> Option<String> {
@@ -4167,6 +4477,7 @@ pub fn run() {
             create_conversation,
             delete_conversation,
             rename_conversation,
+            set_conversation_agent,
             list_messages,
             send_chat_message,
             delete_message,

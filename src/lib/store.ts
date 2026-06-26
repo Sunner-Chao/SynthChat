@@ -259,8 +259,15 @@ function sameConversations(left: Conversation[], right: Conversation[]) {
       && item.updatedAt === other.updatedAt
       && item.lastMessage === other.lastMessage
       && item.personaId === other.personaId
+      && item.agentId === other.agentId
       && item.wechatAccountId === other.wechatAccountId;
   });
+}
+
+function normalizeFocusedAgentId(agents: AgentDefinition[], preferred?: string | null) {
+  const trimmed = preferred?.trim() ?? "";
+  if (trimmed && agents.some((agent) => agent.id === trimmed)) return trimmed;
+  return agents.find((agent) => agent.isDefault)?.id ?? agents[0]?.id ?? null;
 }
 
 function sameMessages(left: ChatMessage[], right: ChatMessage[]) {
@@ -356,6 +363,9 @@ function mergeRunPhases(previous: AgentRunEvent | undefined, event: AgentRunEven
 interface AppState {
   activeSection: AppSection;
   previousSection: AppSection | null;
+  focusedAgentId: string | null;
+  skillsPanelMode: "local" | "global";
+  mcpPanelMode: "local" | "global";
   config: AppConfig | null;
   conversations: Conversation[];
   activeConversationId: string | null;
@@ -382,7 +392,6 @@ interface AppState {
   plugins: PluginSummary[];
   skillBundles: SkillBundle[];
   marketplaceSkills: MarketplaceSkill[];
-  selectedAgentId: string | null;
   moments: MomentPost[];
   personas: Persona[];
   mcpServers: McpServer[];
@@ -395,6 +404,9 @@ interface AppState {
   streamedAssistantIds: Set<string>;
   loading: boolean;
   setSection: (section: AppSection, settingsView?: string) => void;
+  setFocusedAgentId: (agentId: string | null) => void;
+  setSkillsPanelMode: (mode: "local" | "global") => void;
+  setMcpPanelMode: (mode: "local" | "global") => void;
   goBack: () => void;
   bootstrap: () => Promise<void>;
   refreshChatData: (preferredConversationId?: string | null, preferredPersonaId?: string | null) => Promise<void>;
@@ -451,7 +463,7 @@ interface AppState {
   refreshAgentRuns: () => Promise<void>;
   handleAgentRunEvent: (event: AgentRunEvent) => void;
   handleManagedProcessEvent: (event: ManagedProcessEvent) => void;
-  saveAgent: (agent: AgentDefinition) => Promise<void>;
+  saveAgent: (agent: AgentDefinition) => Promise<AgentDefinition>;
   deleteAgent: (id: string) => Promise<void>;
   refreshSkills: () => Promise<void>;
   refreshSkillsForAgent: (agentId: string) => Promise<void>;
@@ -477,6 +489,9 @@ interface AppState {
 export const useAppStore = create<AppState>((set, get) => ({
   activeSection: "chat",
   previousSection: null,
+  focusedAgentId: null,
+  skillsPanelMode: "global",
+  mcpPanelMode: "global",
   config: bootstrapCache?.config ?? null,
   conversations: [],
   activeConversationId: null,
@@ -503,7 +518,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   plugins: [],
   skillBundles: [],
   marketplaceSkills: [],
-  selectedAgentId: null,
   moments: [],
   personas: bootstrapCache?.personas ?? [],
   mcpServers: [],
@@ -521,6 +535,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
     set((state) => ({ activeSection, previousSection: state.activeSection }));
   },
+  setFocusedAgentId: (agentId) => {
+    set((state) => ({
+      focusedAgentId: normalizeFocusedAgentId(state.agents, agentId)
+    }));
+  },
+  setSkillsPanelMode: (skillsPanelMode) => set({ skillsPanelMode }),
+  setMcpPanelMode: (mcpPanelMode) => set({ mcpPanelMode }),
   goBack: () => {
     const { previousSection } = get();
     if (previousSection) {
@@ -617,6 +638,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       config,
       conversations,
       activeConversationId,
+      focusedAgentId: normalizeFocusedAgentId(agents, get().focusedAgentId),
       messages,
       moments,
       personas,
@@ -1249,9 +1271,18 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   savePersona: async (persona) => {
     const saved = await api.savePersona(persona);
+    const [agents, conversations] = await Promise.all([
+      api.listAgents(),
+      api.listConversations()
+    ]);
     set((state) => ({
       personas: [saved, ...state.personas.filter((item) => item.id !== saved.id)]
-        .sort((a, b) => a.name.localeCompare(b.name))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+      agents: agents
+        .slice()
+        .sort((a, b) => (b.isDefault ? 1 : 0) - (a.isDefault ? 1 : 0)),
+      focusedAgentId: normalizeFocusedAgentId(agents, state.focusedAgentId),
+      conversations
     }));
     return saved;
   },
@@ -1281,7 +1312,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   refreshAgents: async () => {
     const agents = await api.listAgents();
-    set({ agents });
+    set((state) => ({
+      agents,
+      focusedAgentId: normalizeFocusedAgentId(agents, state.focusedAgentId)
+    }));
   },
   refreshAgentQueue: async () => {
     const agentQueue = await api.listAgentQueue();
@@ -1391,12 +1425,36 @@ export const useAppStore = create<AppState>((set, get) => ({
     const saved = await api.saveAgent(agent);
     set((state) => ({
       agents: [saved, ...state.agents.filter((item) => item.id !== saved.id)]
-        .sort((a, b) => (b.isDefault ? 1 : 0) - (a.isDefault ? 1 : 0))
+        .sort((a, b) => (b.isDefault ? 1 : 0) - (a.isDefault ? 1 : 0)),
+      focusedAgentId: saved.id
     }));
+    return saved;
   },
   deleteAgent: async (id) => {
     await api.deleteAgent(id);
-    set((state) => ({ agents: state.agents.filter((agent) => agent.id !== id) }));
+    const state = get();
+    const [agents, personas, conversations] = await Promise.all([
+      api.listAgents(),
+      api.listPersonas(),
+      api.listConversations()
+    ]);
+    const currentActive = state.activeConversationId;
+    const activeConversationId = currentActive && conversations.some((item) => item.id === currentActive)
+      ? currentActive
+      : conversations[0]?.id ?? null;
+    const messageLimit = uiMessageLimit(state.config);
+    const previewChars = uiMessagePreviewChars(state.config);
+    const messages = activeConversationId
+      ? visibleChatMessages(await api.listMessages(activeConversationId, messageLimit, previewChars))
+      : [];
+    set({
+      agents,
+      focusedAgentId: normalizeFocusedAgentId(agents, state.focusedAgentId === id ? null : state.focusedAgentId),
+      personas,
+      conversations,
+      activeConversationId,
+      messages
+    });
   },
   refreshSkillsForAgent: async (agentId) => {
     const skills = await api.listSkillsForAgent(agentId);

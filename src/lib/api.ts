@@ -393,6 +393,18 @@ export async function renameConversation(id: string, title: string): Promise<voi
   return call("rename_conversation", { id, title }, () => undefined);
 }
 
+export async function setConversationAgent(id: string, agentId: string): Promise<Conversation> {
+  return call("set_conversation_agent", { id, agentId }, () => ({
+    id,
+    title: "当前会话",
+    personaId: undefined,
+    agentId,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    lastMessage: ""
+  }));
+}
+
 export async function listMessages(conversationId: string, limit?: number, previewChars?: number): Promise<ChatMessage[]> {
   return call("list_messages", { conversationId, limit, previewChars }, () => []);
 }
@@ -483,6 +495,7 @@ export const api: Record<string, any> = {
   createConversation,
   deleteConversation,
   renameConversation,
+  setConversationAgent,
   listMessages,
   sendChatMessage,
   deleteMessage: (messageId: string) => call("delete_message", { messageId }, () => undefined),

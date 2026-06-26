@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs,
+    env, fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
 };
@@ -24,7 +24,7 @@ const MAX_AUDIT_FILE_BYTES: u64 = 256 * 1024;
 
 pub fn list_skills(store: &AppStore) -> AppResult<Vec<EnhancedSkillSummary>> {
     let existing = store.skills()?;
-    if existing.is_empty() {
+    if existing.is_empty() || bundled_skill_catalog_needs_refresh(&existing) {
         install_builtin_skills(store)
     } else {
         Ok(existing)
@@ -48,18 +48,21 @@ pub fn list_skills_for_agent(
 }
 
 pub fn install_builtin_skills(store: &AppStore) -> AppResult<Vec<EnhancedSkillSummary>> {
-    let mut merged = store.skills()?;
-    let mut seen = merged
-        .iter()
-        .map(|skill| skill.id.clone())
-        .collect::<HashSet<_>>();
-    for root in discover_skill_roots() {
-        for path in find_skill_files(&root) {
-            if let Some(skill) = summarize_skill(&root, &path) {
+    let persisted = store.skills()?;
+    let mut merged = Vec::new();
+    let mut seen = HashSet::new();
+    for root in discover_skill_roots(store) {
+        for path in find_skill_files(&root.path) {
+            if let Some(skill) = summarize_skill(&root.path, &path, &root.source) {
                 if seen.insert(skill.id.clone()) {
                     merged.push(skill);
                 }
             }
+        }
+    }
+    for skill in persisted.into_iter().filter(|skill| !skill.is_bundled) {
+        if seen.insert(skill.id.clone()) {
+            merged.push(skill);
         }
     }
     merged.sort_by(|a, b| a.id.cmp(&b.id));
@@ -476,8 +479,18 @@ pub fn install_external_skill_file(
     force: bool,
 ) -> AppResult<EnhancedSkillSummary> {
     let source = PathBuf::from(source_path);
+    if source.is_dir() {
+        return install_external_skill_directory(
+            store,
+            &source,
+            name_override,
+            category,
+            agent_id,
+            force,
+        );
+    }
     if !source.is_file() {
-        return Err(AppError::NotFound(format!("skill file {source_path}")));
+        return Err(AppError::NotFound(format!("skill file or directory {source_path}")));
     }
     let raw = fs::read_to_string(&source)?;
     let fallback_name = source
@@ -495,6 +508,132 @@ pub fn install_external_skill_file(
         false,
         source_path,
     )
+}
+
+fn install_external_skill_directory(
+    store: &AppStore,
+    source_dir: &Path,
+    name_override: Option<&str>,
+    category: Option<&str>,
+    agent_id: Option<&str>,
+    force: bool,
+) -> AppResult<EnhancedSkillSummary> {
+    let source_skill_path = source_dir.join("SKILL.md");
+    if !source_skill_path.is_file() {
+        return Err(AppError::NotFound(format!(
+            "skill directory missing SKILL.md: {}",
+            source_dir.to_string_lossy()
+        )));
+    }
+    let raw = fs::read_to_string(&source_skill_path)?;
+    let metadata = frontmatter(&raw);
+    let name = name_override
+        .map(clean_meta_value)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| metadata.get("name").cloned())
+        .or_else(|| heading(&raw))
+        .unwrap_or_else(|| {
+            source_dir
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("external-skill")
+                .to_string()
+        });
+    let skill_slug = slug(&name);
+    if skill_slug.is_empty() {
+        return Err(AppError::BadRequest("invalid skill name".into()));
+    }
+    let category_slug = category
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .split(['/', '\\'])
+                .map(slug)
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .filter(|value| !value.is_empty());
+
+    let data_dir = store.data_dir();
+    let quarantine_dir = data_dir
+        .join("skills")
+        .join("quarantine")
+        .join(new_id("skill"));
+    copy_dir_contents(source_dir, &quarantine_dir)?;
+    let quarantine_skill_path = quarantine_dir.join("SKILL.md");
+    let mut staged = skill_summary_for_installed_path(
+        &quarantine_skill_path,
+        &name,
+        "external/quarantine",
+        "quarantine",
+    );
+    let audit = audit_skill(staged.clone());
+    let blocked = audit
+        .findings
+        .iter()
+        .any(|finding| finding.severity == "critical" || finding.severity == "high");
+    if blocked && !force {
+        let categories = audit
+            .findings
+            .iter()
+            .map(|finding| finding.category.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = fs::remove_dir_all(&quarantine_dir);
+        return Err(AppError::BadRequest(format!(
+            "skill audit blocked install: {categories}; pass force to override"
+        )));
+    }
+
+    let mut install_dir = data_dir.join("skills").join("external");
+    let mut id_parts = vec!["external".to_string()];
+    if let Some(category_slug) = &category_slug {
+        for part in category_slug.split('/') {
+            install_dir = install_dir.join(part);
+            id_parts.push(part.to_string());
+        }
+    }
+    install_dir = install_dir.join(&skill_slug);
+    id_parts.push(skill_slug);
+    let install_skill_path = install_dir.join("SKILL.md");
+    if install_skill_path.exists() && !force {
+        let _ = fs::remove_dir_all(&quarantine_dir);
+        return Err(AppError::BadRequest(format!(
+            "skill already exists at {}",
+            install_skill_path.to_string_lossy()
+        )));
+    }
+    if install_dir.exists() {
+        let _ = fs::remove_dir_all(&install_dir);
+    }
+    copy_dir_contents(&quarantine_dir, &install_dir)?;
+    let _ = fs::remove_dir_all(&quarantine_dir);
+
+    staged = skill_summary_for_installed_path(
+        &install_skill_path,
+        &name,
+        &id_parts.join("/"),
+        "external",
+    );
+    let mut skills = list_skills(store)?;
+    skills.retain(|skill| skill.id != staged.id);
+    skills.push(staged.clone());
+    skills.sort_by(|a, b| a.id.cmp(&b.id));
+    store.set_skills(skills)?;
+    if let Some(agent_id) = agent_id.filter(|value| !value.trim().is_empty()) {
+        store.enable_agent_skills(agent_id, vec![staged.id.clone()])?;
+    }
+    record_skill_install(
+        store,
+        &staged,
+        &source_dir.to_string_lossy(),
+        &audit,
+    )?;
+    Ok(staged)
 }
 
 pub fn install_external_skill_content(
@@ -819,23 +958,34 @@ pub fn update_skills_from_sources(
         if record.identifier.starts_with("http://") || record.identifier.starts_with("https://") {
             continue;
         }
-        let source_path = PathBuf::from(&record.identifier);
-        if !source_path.is_file() {
+        let source_root = PathBuf::from(&record.identifier);
+        let Some(source_path) = source_skill_markdown_path(&record.identifier) else {
             continue;
-        }
+        };
         let category = category_from_external_skill_id(&record.skill_id);
-        let raw = fs::read_to_string(&source_path)?;
-        let skill = install_external_skill_content(
-            store,
-            &raw,
-            &record.name,
-            Some(&record.name),
-            category.as_deref(),
-            agent_id,
-            force,
-            true,
-            &record.identifier,
-        )?;
+        let skill = if source_root.is_dir() {
+            install_external_skill_directory(
+                store,
+                &source_root,
+                Some(&record.name),
+                category.as_deref(),
+                agent_id,
+                force,
+            )?
+        } else {
+            let raw = fs::read_to_string(&source_path)?;
+            install_external_skill_content(
+                store,
+                &raw,
+                &record.name,
+                Some(&record.name),
+                category.as_deref(),
+                agent_id,
+                force,
+                true,
+                &record.identifier,
+            )?
+        };
         updated.push(skill);
     }
     Ok(updated)
@@ -1198,10 +1348,13 @@ fn check_skill_update_record(record: &SkillInstallRecord) -> SkillUpdateCheck {
             "remote URL checks require async refresh",
         );
     }
-    let source_path = PathBuf::from(&record.identifier);
-    if !source_path.is_file() {
-        return skill_update_check(record, "source_missing", "source SKILL.md path is missing");
-    }
+    let Some(source_path) = source_skill_markdown_path(&record.identifier) else {
+        return skill_update_check(
+            record,
+            "source_missing",
+            "source skill file or directory is missing",
+        );
+    };
     let installed_hash = fs::read_to_string(&installed_path)
         .map(|raw| stable_text_hash(&raw))
         .ok();
@@ -1221,6 +1374,15 @@ fn check_skill_update_record(record: &SkillInstallRecord) -> SkillUpdateCheck {
             "could not read source or installed content",
         ),
     }
+}
+
+fn source_skill_markdown_path(identifier: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(identifier);
+    if path.is_file() {
+        return Some(path);
+    }
+    let skill_md = path.join("SKILL.md");
+    skill_md.is_file().then_some(skill_md)
 }
 
 fn skill_update_check(record: &SkillInstallRecord, status: &str, detail: &str) -> SkillUpdateCheck {
@@ -1827,29 +1989,82 @@ fn skill_audit_finding(
     }
 }
 
-fn discover_skill_roots() -> Vec<PathBuf> {
+#[derive(Debug, Clone)]
+struct SkillRoot {
+    path: PathBuf,
+    source: String,
+}
+
+fn bundled_skill_catalog_needs_refresh(skills: &[EnhancedSkillSummary]) -> bool {
+    skills.iter().any(|skill| {
+        skill.is_bundled
+            && (!PathBuf::from(skill.path.trim()).is_file()
+                || legacy_hermes_skill_path(&skill.path))
+    })
+}
+
+fn legacy_hermes_skill_path(path: &str) -> bool {
+    path.replace('\\', "/")
+        .to_ascii_lowercase()
+        .contains("/hermes-agent/skills/")
+}
+
+fn discover_skill_roots(store: &AppStore) -> Vec<SkillRoot> {
     let mut roots = Vec::new();
-    if let Ok(current) = std::env::current_dir() {
-        roots.push(current.join("skills"));
-        roots.push(current.join("..").join("skills"));
-        roots.push(
-            current
-                .join("..")
-                .join("..")
-                .join("hermes-agent")
-                .join("skills"),
-        );
+    if let Ok(agent) = store.agent(None) {
+        let configured = agent.skills_dir.trim();
+        if !configured.is_empty() {
+            roots.push(skill_root(PathBuf::from(configured), "configured-directory"));
+        }
     }
-    roots.push(PathBuf::from(
-        r"D:\pro_sunner\demo_vscode\hermes-agent\skills",
+    if let Ok(configured) = env::var("SYNTHCHAT_SKILLS_DIR") {
+        let configured = configured.trim();
+        if !configured.is_empty() {
+            roots.push(skill_root(PathBuf::from(configured), "configured-directory"));
+        }
+    }
+    roots.push(skill_root(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("skills"),
+        "project",
     ));
+    if let Ok(current) = env::current_dir() {
+        roots.push(skill_root(current.join("skills"), "project"));
+        roots.push(skill_root(current.join("..").join("skills"), "project"));
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            roots.push(skill_root(parent.join("skills"), "bundled"));
+            roots.push(skill_root(parent.join("resources").join("skills"), "bundled"));
+            if let Some(grandparent) = parent.parent() {
+                roots.push(skill_root(grandparent.join("skills"), "bundled"));
+                roots.push(skill_root(
+                    grandparent.join("resources").join("skills"),
+                    "bundled",
+                ));
+            }
+        }
+    }
 
     let mut seen = HashSet::new();
     roots
         .into_iter()
-        .filter_map(|path| path.canonicalize().ok())
-        .filter(|path| path.is_dir() && seen.insert(path.clone()))
+        .filter_map(|root| {
+            root.path.canonicalize().ok().map(|path| SkillRoot {
+                path,
+                source: root.source,
+            })
+        })
+        .filter(|root| root.path.is_dir() && seen.insert(root.path.clone()))
         .collect()
+}
+
+fn skill_root(path: PathBuf, source: &str) -> SkillRoot {
+    SkillRoot {
+        path,
+        source: source.into(),
+    }
 }
 
 fn find_skill_files(root: &Path) -> Vec<PathBuf> {
@@ -1871,7 +2086,7 @@ fn find_skill_files(root: &Path) -> Vec<PathBuf> {
     found
 }
 
-fn summarize_skill(root: &Path, path: &Path) -> Option<EnhancedSkillSummary> {
+fn summarize_skill(root: &Path, path: &Path, source: &str) -> Option<EnhancedSkillSummary> {
     let raw = fs::read_to_string(path).ok()?;
     let metadata = frontmatter(&raw);
     let parent = path.parent()?;
@@ -1907,7 +2122,7 @@ fn summarize_skill(root: &Path, path: &Path) -> Option<EnhancedSkillSummary> {
         icon: "sparkles".into(),
         is_core: false,
         is_bundled: true,
-        source: "hermes-agent".into(),
+        source: source.into(),
         agent_id: String::new(),
         config: HashMap::new(),
         required_environment_variables: parse_frontmatter_list(
@@ -1916,6 +2131,24 @@ fn summarize_skill(root: &Path, path: &Path) -> Option<EnhancedSkillSummary> {
         ),
         required_credential_files: parse_frontmatter_list(&raw, "required_credential_files"),
     })
+}
+
+fn copy_dir_contents(source: &Path, destination: &Path) -> AppResult<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_dir_contents(&source_path, &destination_path)?;
+        } else if source_path.is_file() {
+            if let Some(parent) = destination_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(source_path, destination_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn frontmatter(raw: &str) -> HashMap<String, String> {

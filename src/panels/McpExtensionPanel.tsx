@@ -1,12 +1,26 @@
-import React, { useState } from "react";
-import { PlugZap, Plus, Trash2, Edit3, CheckCircle2, XCircle, Server, Command, Globe } from "lucide-react";
+import React, { useState, useEffect } from "react";
+import { PlugZap, Plus, Trash2, Edit3, Server, Command, Globe, ChevronRight, Settings2, UserSquare2 } from "lucide-react";
 import { useAppStore } from "../lib/store";
-import { McpServer } from "../lib/types";
+import { McpServer, AgentDefinition } from "../lib/types";
 
 export function McpExtensionPanel() {
-  const { mcpServers, saveMcpServers, goBack } = useAppStore();
+  const { 
+    mcpServers, saveMcpServers, goBack, 
+    mcpPanelMode, setMcpPanelMode,
+    focusedAgentId, setFocusedAgentId,
+    agents, saveAgent
+  } = useAppStore();
+  
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftServer, setDraftServer] = useState<Partial<McpServer>>({});
+
+  const focusedAgent = agents.find(a => a.id === focusedAgentId) || agents[0];
+
+  useEffect(() => {
+    if (!focusedAgentId && agents[0]) {
+      setFocusedAgentId(agents[0].id);
+    }
+  }, [agents, focusedAgentId, setFocusedAgentId]);
 
   const handleAdd = () => {
     const newId = `mcp-${Date.now()}`;
@@ -23,141 +37,297 @@ export function McpExtensionPanel() {
     setEditingId(newId);
   };
 
-  const handleSave = async () => {
-    if (!draftServer.id || !draftServer.name || !draftServer.command) return;
-    const existing = mcpServers.find(s => s.id === draftServer.id);
-    let newServers;
-    if (existing) {
-      newServers = mcpServers.map(s => s.id === draftServer.id ? { ...s, ...draftServer } as McpServer : s);
+  const handleSaveGlobal = async () => {
+    if (!draftServer.id) return;
+    let newServers = [...mcpServers];
+    const idx = newServers.findIndex(s => s.id === draftServer.id);
+    if (idx >= 0) {
+      newServers[idx] = draftServer as McpServer;
     } else {
-      newServers = [...mcpServers, draftServer as McpServer];
+      newServers.push(draftServer as McpServer);
     }
     await saveMcpServers(newServers);
     setEditingId(null);
   };
 
-  const handleDelete = async (id: string) => {
-    await saveMcpServers(mcpServers.filter(s => s.id !== id));
+  const handleDeleteGlobal = async (id: string) => {
+    if (!window.confirm("确定要删除这个 MCP Server 吗？")) return;
+    const newServers = mcpServers.filter(s => s.id !== id);
+    await saveMcpServers(newServers);
   };
 
-  const toggleEnable = async (server: McpServer) => {
-    await saveMcpServers(mcpServers.map(s => s.id === server.id ? { ...s, enabled: !s.enabled } : s));
+  const toggleEnableGlobal = async (id: string, enabled: boolean) => {
+    const newServers = mcpServers.map(s => s.id === id ? { ...s, enabled } : s);
+    await saveMcpServers(newServers);
+  };
+
+  const toggleLocalMcp = async (serverId: string, enabled: boolean) => {
+    if (!focusedAgent) return;
+    const currentEnabled = focusedAgent.enabledMcpServers || [];
+    const newEnabled = enabled 
+      ? [...currentEnabled, serverId]
+      : currentEnabled.filter(id => id !== serverId);
+    
+    await saveAgent({
+      ...focusedAgent,
+      enabledMcpServers: newEnabled
+    });
   };
 
   return (
-    <section className="primary-panel embedded-panel" style={{ background: "var(--background)", display: "flex", flexDirection: "column", height: "100vh" }}>
-      <div className="panel-title action-title" style={{ padding: "20px 24px", borderBottom: "1px solid var(--divider)", background: "var(--surface-1)" }}>
-        <button className="icon-only-btn" onClick={goBack} title="Back" type="button" style={{ marginRight: 12 }}>
-          <ChevronRightIcon />
+    <section className="primary-panel embedded-panel settings-form mcp-console" style={{ display: "flex", flexDirection: "column", height: "100%", padding: 0 }}>
+      <div className="panel-title action-title">
+        <button className="icon-only-btn" onClick={goBack} title="返回" type="button">
+          <ChevronRight size={19} style={{ transform: "rotate(180deg)" }} />
         </button>
-        <div className="panel-title-text" style={{ fontSize: "1.25rem", fontWeight: 600, display: "flex", alignItems: "center", gap: "8px" }}>
-          <PlugZap size={22} className="text-primary" />
-          <span>MCP Extension Center</span>
+        <div className="panel-title-text">
+          <PlugZap size={16} className="panel-title-icon" />
+          <span>MCP</span>
+          <strong>协议扩展配置 (Model Context Protocol)</strong>
         </div>
-        <div style={{ flex: 1 }} />
-        <button className="primary-btn" onClick={handleAdd} style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <Plus size={16} /> Add Server
-        </button>
       </div>
 
-      <div style={{ padding: "24px", overflowY: "auto", flex: 1, display: "flex", flexDirection: "column", gap: "16px" }}>
-        {mcpServers.length === 0 && !editingId && (
-          <div style={{ textAlign: "center", padding: "64px 20px", color: "var(--text-3)" }}>
-            <Server size={48} style={{ opacity: 0.2, margin: "0 auto 16px" }} />
-            <h3>No MCP Servers Configured</h3>
-            <p>Connect external Model Context Protocol servers to enhance your AI's capabilities.</p>
-          </div>
-        )}
+      <div style={{ padding: "16px 24px", display: "flex", gap: "16px", alignItems: "center", borderBottom: "1px solid var(--divider)", background: "var(--surface-1)" }}>
+        <div className="segmented-control">
+          <button 
+            className={`segmented-btn ${mcpPanelMode === "global" ? "active" : ""}`} 
+            onClick={() => setMcpPanelMode("global")}
+          >
+            <Settings2 size={15} /> 全局配置 (Global)
+          </button>
+          <button 
+            className={`segmented-btn ${mcpPanelMode === "local" ? "active" : ""}`} 
+            onClick={() => setMcpPanelMode("local")}
+          >
+            <UserSquare2 size={15} /> 局部配置 (Local)
+          </button>
+        </div>
+      </div>
 
-        {mcpServers.map(server => (
-          <div key={server.id} style={{ 
-            background: "var(--surface-1)", 
-            borderRadius: "12px", 
-            border: `1px solid ${server.enabled ? "rgba(34, 211, 238, 0.3)" : "var(--divider)"}`,
-            padding: "20px",
-            boxShadow: "0 4px 12px rgba(0,0,0,0.05)",
-            transition: "all 0.2s"
-          }}>
-            {editingId === server.id ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
-                <input className="text-input" placeholder="Server Name" value={draftServer.name || ""} onChange={e => setDraftServer({...draftServer, name: e.target.value})} />
-                <input className="text-input" placeholder="Command (e.g. node, python, npx)" value={draftServer.command || ""} onChange={e => setDraftServer({...draftServer, command: e.target.value})} />
-                <input className="text-input" placeholder="Args (comma separated)" value={(draftServer.args || []).join(", ")} onChange={e => setDraftServer({...draftServer, args: e.target.value.split(",").map(s => s.trim()).filter(Boolean)})} />
-                <select className="select-input" value={draftServer.transport || "stdio"} onChange={e => setDraftServer({...draftServer, transport: e.target.value as any})}>
-                  <option value="stdio">stdio</option>
-                  <option value="sse">sse</option>
-                  <option value="streamable_http">streamable_http</option>
-                </select>
-                <div style={{ display: "flex", gap: "12px", justifyContent: "flex-end", marginTop: "8px" }}>
-                  <button className="secondary-btn" onClick={() => setEditingId(null)}>Cancel</button>
-                  <button className="primary-btn" onClick={handleSave}>Save</button>
-                </div>
+      <div style={{ flex: 1, overflowY: "auto", padding: "24px", background: "var(--background)" }}>
+        
+        {mcpPanelMode === "global" ? (
+          /* ========================================= */
+          /* GLOBAL MCP CONFIGURATION                  */
+          /* ========================================= */
+          <>
+            {mcpServers.length === 0 && !editingId ? (
+              <div className="card beautiful-card" style={{ padding: "48px 24px", textAlign: "center", borderStyle: "dashed" }}>
+                <Server size={48} style={{ opacity: 0.2, margin: "0 auto 16px" }} />
+                <h3 style={{ margin: "0 0 8px 0", color: "var(--text-1)" }}>没有配置任何 MCP Server</h3>
+                <p style={{ margin: "0 0 24px 0", color: "var(--text-3)", fontSize: "0.9rem" }}>MCP 允许大模型连接到你的本地系统、外部 API、或企业级工具。</p>
+                <button className="btn-primary beautiful-btn-primary" onClick={handleAdd}>
+                  <Plus size={16} style={{ marginRight: 6 }} /> 添加第一个服务
+                </button>
               </div>
             ) : (
-              <div style={{ display: "flex", alignItems: "flex-start", gap: "16px" }}>
-                <div style={{
-                  width: 48, height: 48, borderRadius: "12px", 
-                  background: server.enabled ? "rgba(34, 211, 238, 0.1)" : "var(--surface-2)",
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                  color: server.enabled ? "var(--primary)" : "var(--text-3)"
-                }}>
-                  <Server size={24} />
-                </div>
-                <div style={{ flex: 1 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "8px" }}>
-                    <h3 style={{ margin: 0, fontSize: "1.1rem", color: server.enabled ? "var(--text-1)" : "var(--text-3)" }}>{server.name}</h3>
-                    <span style={{ 
-                      padding: "2px 8px", borderRadius: "999px", fontSize: "0.75rem", fontWeight: 600,
-                      background: server.enabled ? "rgba(34, 211, 238, 0.1)" : "var(--surface-2)",
-                      color: server.enabled ? "var(--primary)" : "var(--text-3)"
-                    }}>
-                      {server.enabled ? "Active" : "Disabled"}
-                    </span>
+              <div className="card-list">
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+                  <div>
+                    <h3 style={{ margin: 0, fontSize: "1rem", color: "var(--text-1)" }}>全局已安装的服务 (Global Servers)</h3>
+                    <small style={{ color: "var(--text-3)" }}>这些服务对所有智能体可见，但需在局部配置中为每个智能体单独勾选启用。</small>
                   </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: "16px", color: "var(--text-2)", fontSize: "0.85rem", marginBottom: "16px" }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Command size={14} /> {server.command} {(server.args||[]).join(" ")}</span>
-                    <span style={{ display: "flex", alignItems: "center", gap: 4 }}><Globe size={14} /> {server.transport}</span>
+                  <button className="btn-secondary" onClick={handleAdd}><Plus size={15} style={{ marginRight: 4 }}/> 添加服务</button>
+                </div>
+                
+                {mcpServers.map(server => (
+                  <div key={server.id} className="card beautiful-card" style={{ marginBottom: "16px" }}>
+                    <div className="adapter-row" style={{ padding: "16px", cursor: "default" }}>
+                      <span className={`row-icon ${server.enabled ? "indigo" : ""}`} style={{ color: server.enabled ? "var(--primary)" : "var(--text-3)" }}>
+                        {server.transport === "stdio" ? <Command size={18} /> : <Globe size={18} />}
+                      </span>
+                      <div className="adapter-info">
+                        <strong style={{ color: server.enabled ? "inherit" : "var(--text-3)" }}>{server.name}</strong>
+                        <small style={{ color: server.enabled ? "inherit" : "var(--text-3)" }}>{server.transport === "stdio" ? `${server.command} ${server.args.join(" ")}` : server.url}</small>
+                      </div>
+                      <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
+                        <label style={{ display: "flex", alignItems: "center", gap: "6px", cursor: "pointer", fontSize: "0.85rem", color: "var(--text-2)" }}>
+                          主开关
+                          <input type="checkbox" className="beautiful-checkbox" checked={server.enabled} onChange={e => toggleEnableGlobal(server.id, e.target.checked)} />
+                        </label>
+                        <button className="icon-btn" onClick={() => { setDraftServer(server); setEditingId(server.id); }} title="编辑">
+                          <Edit3 size={15} />
+                        </button>
+                        <button className="icon-btn" onClick={() => handleDeleteGlobal(server.id)} style={{ color: "var(--error)" }} title="删除">
+                          <Trash2 size={15} />
+                        </button>
+                      </div>
+                    </div>
+
+                    {editingId === server.id && (
+                      <div style={{ borderTop: "1px solid var(--divider)", padding: "16px", background: "var(--surface-1)" }}>
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px", marginBottom: "16px" }}>
+                          <div className="form-group">
+                            <label style={{ display: "block", marginBottom: 6, fontSize: "0.85rem", color: "var(--text-2)" }}>服务名称</label>
+                            <input className="text-input" value={draftServer.name || ""} onChange={e => setDraftServer({ ...draftServer, name: e.target.value })} style={{ width: "100%" }} />
+                          </div>
+                          <div className="form-group">
+                            <label style={{ display: "block", marginBottom: 6, fontSize: "0.85rem", color: "var(--text-2)" }}>通信方式 (Transport)</label>
+                            <select className="select-input" value={draftServer.transport || "stdio"} onChange={e => setDraftServer({ ...draftServer, transport: e.target.value as any })} style={{ width: "100%" }}>
+                              <option value="stdio">Stdio (本地进程)</option>
+                              <option value="sse">SSE (远程 HTTP)</option>
+                            </select>
+                          </div>
+                        </div>
+                        {draftServer.transport === "stdio" ? (
+                          <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: "16px", marginBottom: "16px" }}>
+                            <div className="form-group">
+                              <label style={{ display: "block", marginBottom: 6, fontSize: "0.85rem", color: "var(--text-2)" }}>命令 (Command)</label>
+                              <input className="text-input" value={draftServer.command || ""} onChange={e => setDraftServer({ ...draftServer, command: e.target.value })} style={{ width: "100%" }} placeholder="e.g. npx" />
+                            </div>
+                            <div className="form-group">
+                              <label style={{ display: "block", marginBottom: 6, fontSize: "0.85rem", color: "var(--text-2)" }}>参数 (Arguments, 空格分隔)</label>
+                              <input className="text-input" value={(draftServer.args || []).join(" ")} onChange={e => setDraftServer({ ...draftServer, args: e.target.value.split(" ").filter(Boolean) })} style={{ width: "100%" }} placeholder="-y @modelcontextprotocol/server-github" />
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="form-group" style={{ marginBottom: "16px" }}>
+                            <label style={{ display: "block", marginBottom: 6, fontSize: "0.85rem", color: "var(--text-2)" }}>SSE URL</label>
+                            <input className="text-input" value={draftServer.url || ""} onChange={e => setDraftServer({ ...draftServer, url: e.target.value })} style={{ width: "100%" }} placeholder="http://localhost:3000/sse" />
+                          </div>
+                        )}
+                        <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
+                          <button className="btn-secondary" onClick={() => setEditingId(null)}>取消</button>
+                          <button className="btn-primary beautiful-btn-primary" onClick={handleSaveGlobal}>保存更改</button>
+                        </div>
+                      </div>
+                    )}
                   </div>
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                  <button className="icon-btn" onClick={() => toggleEnable(server)} title={server.enabled ? "Disable" : "Enable"}>
-                    {server.enabled ? <XCircle size={18} /> : <CheckCircle2 size={18} />}
-                  </button>
-                  <button className="icon-btn" onClick={() => { setDraftServer(server); setEditingId(server.id); }}>
-                    <Edit3 size={18} />
-                  </button>
-                  <button className="icon-btn" style={{ color: "var(--error)" }} onClick={() => handleDelete(server.id)}>
-                    <Trash2 size={18} />
-                  </button>
-                </div>
+                ))}
+                
+                {/* New Server Draft */}
+                {editingId && !mcpServers.find(s => s.id === editingId) && (
+                  <div className="card beautiful-card" style={{ marginBottom: "16px" }}>
+                    <div className="card-header">添加新的 MCP 服务</div>
+                    <div style={{ padding: "16px", background: "var(--surface-1)" }}>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px", marginBottom: "16px" }}>
+                        <div className="form-group">
+                          <label style={{ display: "block", marginBottom: 6, fontSize: "0.85rem", color: "var(--text-2)" }}>服务名称</label>
+                          <input className="text-input" value={draftServer.name || ""} onChange={e => setDraftServer({ ...draftServer, name: e.target.value })} style={{ width: "100%" }} />
+                        </div>
+                        <div className="form-group">
+                          <label style={{ display: "block", marginBottom: 6, fontSize: "0.85rem", color: "var(--text-2)" }}>通信方式 (Transport)</label>
+                          <select className="select-input" value={draftServer.transport || "stdio"} onChange={e => setDraftServer({ ...draftServer, transport: e.target.value as any })} style={{ width: "100%" }}>
+                            <option value="stdio">Stdio (本地进程)</option>
+                            <option value="sse">SSE (远程 HTTP)</option>
+                          </select>
+                        </div>
+                      </div>
+                      {draftServer.transport === "stdio" ? (
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: "16px", marginBottom: "16px" }}>
+                          <div className="form-group">
+                            <label style={{ display: "block", marginBottom: 6, fontSize: "0.85rem", color: "var(--text-2)" }}>命令 (Command)</label>
+                            <input className="text-input" value={draftServer.command || ""} onChange={e => setDraftServer({ ...draftServer, command: e.target.value })} style={{ width: "100%" }} placeholder="e.g. npx" />
+                          </div>
+                          <div className="form-group">
+                            <label style={{ display: "block", marginBottom: 6, fontSize: "0.85rem", color: "var(--text-2)" }}>参数 (Arguments, 空格分隔)</label>
+                            <input className="text-input" value={(draftServer.args || []).join(" ")} onChange={e => setDraftServer({ ...draftServer, args: e.target.value.split(" ").filter(Boolean) })} style={{ width: "100%" }} placeholder="-y @modelcontextprotocol/server-github" />
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="form-group" style={{ marginBottom: "16px" }}>
+                          <label style={{ display: "block", marginBottom: 6, fontSize: "0.85rem", color: "var(--text-2)" }}>SSE URL</label>
+                          <input className="text-input" value={draftServer.url || ""} onChange={e => setDraftServer({ ...draftServer, url: e.target.value })} style={{ width: "100%" }} placeholder="http://localhost:3000/sse" />
+                        </div>
+                      )}
+                      <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
+                        <button className="btn-secondary" onClick={() => setEditingId(null)}>取消</button>
+                        <button className="btn-primary beautiful-btn-primary" onClick={handleSaveGlobal}>保存并添加</button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                
               </div>
             )}
-          </div>
-        ))}
-
-        {editingId && !mcpServers.find(s => s.id === editingId) && (
-          <div style={{ background: "var(--surface-1)", borderRadius: "12px", border: "1px solid rgba(34, 211, 238, 0.3)", padding: "20px", boxShadow: "0 4px 12px rgba(0,0,0,0.05)" }}>
-            <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
-              <input className="text-input" placeholder="Server Name" value={draftServer.name || ""} onChange={e => setDraftServer({...draftServer, name: e.target.value})} />
-              <input className="text-input" placeholder="Command (e.g. node, python, npx)" value={draftServer.command || ""} onChange={e => setDraftServer({...draftServer, command: e.target.value})} />
-              <input className="text-input" placeholder="Args (comma separated)" value={(draftServer.args || []).join(", ")} onChange={e => setDraftServer({...draftServer, args: e.target.value.split(",").map(s => s.trim()).filter(Boolean)})} />
-              <select className="select-input" value={draftServer.transport || "stdio"} onChange={e => setDraftServer({...draftServer, transport: e.target.value as any})}>
-                <option value="stdio">stdio</option>
-                <option value="sse">sse</option>
-                <option value="streamable_http">streamable_http</option>
-              </select>
-              <div style={{ display: "flex", gap: "12px", justifyContent: "flex-end", marginTop: "8px" }}>
-                <button className="secondary-btn" onClick={() => setEditingId(null)}>Cancel</button>
-                <button className="primary-btn" onClick={handleSave}>Save</button>
+          </>
+        ) : (
+          /* ========================================= */
+          /* LOCAL MCP CONFIGURATION                   */
+          /* ========================================= */
+          <>
+            {agents.length === 0 ? (
+              <div style={{ textAlign: "center", padding: "40px", color: "var(--text-3)" }}>
+                请先创建智能体，再为其配置局部工具。
               </div>
-            </div>
-          </div>
+            ) : (
+              <div style={{ display: "flex", gap: "24px", alignItems: "flex-start" }}>
+                {/* Agent Selector Sidebar */}
+                <div className="beautiful-sidebar card beautiful-card" style={{ width: "240px", flexShrink: 0 }}>
+                  <div className="card-header" style={{ fontSize: "0.9rem" }}>选择智能体</div>
+                  <div style={{ padding: "8px 0" }}>
+                    {agents.map(agent => (
+                      <div 
+                        key={agent.id}
+                        onClick={() => setFocusedAgentId(agent.id)}
+                        className={`adapter-row beautiful-row ${focusedAgentId === agent.id ? "active" : ""}`}
+                        style={{ cursor: "pointer", padding: "10px 16px", display: "grid", gridTemplateColumns: "auto 1fr" }}
+                      >
+                        <span className="row-icon indigo"><UserSquare2 size={16} /></span>
+                        <div className="adapter-info">
+                          <strong>{agent.name}</strong>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                
+                {/* Local Config Area */}
+                {focusedAgent ? (
+                  <div className="card beautiful-card" style={{ flex: 1 }}>
+                    <div className="card-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span>为 <strong>{focusedAgent.name}</strong> 启用 MCP 服务</span>
+                      <small style={{ fontWeight: "normal", color: "var(--text-3)" }}>{focusedAgent.enabledMcpServers?.length || 0} / {mcpServers.length} 已启用</small>
+                    </div>
+                    {mcpServers.length === 0 ? (
+                      <div style={{ padding: "32px", textAlign: "center", color: "var(--text-3)" }}>
+                        全局暂无 MCP 服务，请先切换到全局配置进行添加。
+                      </div>
+                    ) : (
+                      <div style={{ padding: "0" }}>
+                        {mcpServers.map((server, index) => {
+                          const isLocalEnabled = focusedAgent.enabledMcpServers?.includes(server.id) ?? false;
+                          const isGlobalEnabled = server.enabled;
+                          return (
+                            <label 
+                              key={server.id} 
+                              className="adapter-row" 
+                              style={{ 
+                                cursor: isGlobalEnabled ? "pointer" : "not-allowed", 
+                                padding: "16px 20px", 
+                                display: "grid", 
+                                gridTemplateColumns: "auto 1fr auto",
+                                margin: 0,
+                                borderBottom: index < mcpServers.length - 1 ? "1px solid var(--divider)" : "none",
+                                opacity: isGlobalEnabled ? 1 : 0.6
+                              }}
+                            >
+                              <span className={`row-icon ${isLocalEnabled ? "indigo" : ""}`} style={{ color: isLocalEnabled ? "var(--primary)" : "var(--text-3)" }}>
+                                {server.transport === "stdio" ? <Command size={18} /> : <Globe size={18} />}
+                              </span>
+                              <div className="adapter-info">
+                                <strong>{server.name} {!isGlobalEnabled && <span style={{ color: "var(--error)", fontSize: "0.8rem", fontWeight: "normal" }}>(全局未启用)</span>}</strong>
+                                <small>{server.transport === "stdio" ? `${server.command} ${server.args.join(" ")}` : server.url}</small>
+                              </div>
+                              <input 
+                                type="checkbox" 
+                                className="beautiful-checkbox"
+                                checked={isLocalEnabled} 
+                                disabled={!isGlobalEnabled}
+                                onChange={e => toggleLocalMcp(server.id, e.target.checked)} 
+                              />
+                            </label>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                ) : null}
+              </div>
+            )}
+          </>
         )}
       </div>
     </section>
   );
-}
-
-function ChevronRightIcon() {
-  return <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ transform: "rotate(180deg)" }}><path d="m9 18 6-6-6-6"/></svg>;
 }

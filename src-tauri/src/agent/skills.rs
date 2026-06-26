@@ -8,13 +8,17 @@ use serde_json::{json, Value};
 
 use crate::{
     error::{AppError, AppResult},
-    models::EnhancedSkillSummary,
+    models::{AgentDefinition, EnhancedSkillSummary},
     skills as skill_library,
     store::AppStore,
 };
 
 use super::{list_python_plugin_skills, string_arg, truncate_for_prompt};
-pub(super) fn skills_list_tool(store: &AppStore, payload: &Value) -> AppResult<String> {
+pub(super) fn skills_list_tool(
+    store: &AppStore,
+    agent: &AgentDefinition,
+    payload: &Value,
+) -> AppResult<String> {
     let query = payload
         .get("query")
         .and_then(Value::as_str)
@@ -32,7 +36,7 @@ pub(super) fn skills_list_tool(store: &AppStore, payload: &Value) -> AppResult<S
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_lowercase);
-    let mut skills = skills_with_python_plugins(store)?;
+    let mut skills = skills_with_python_plugins(store, Some(agent))?;
     skills.sort_by(|left, right| {
         skill_category(left)
             .cmp(&skill_category(right))
@@ -108,7 +112,11 @@ fn skill_category(skill: &EnhancedSkillSummary) -> String {
         .to_string()
 }
 
-pub(super) fn skill_view_tool(store: &AppStore, payload: &Value) -> AppResult<String> {
+pub(super) fn skill_view_tool(
+    store: &AppStore,
+    agent: &AgentDefinition,
+    payload: &Value,
+) -> AppResult<String> {
     let name = string_arg(payload, &["name", "id", "skill", "skillId", "skill_id"])
         .ok_or_else(|| AppError::BadRequest("skill_view requires payload.name".into()))?;
     let file_path = string_arg(payload, &["filePath", "file_path", "path"]);
@@ -118,7 +126,7 @@ pub(super) fn skill_view_tool(store: &AppStore, payload: &Value) -> AppResult<St
         .and_then(Value::as_u64)
         .unwrap_or(20_000)
         .clamp(500, 80_000) as usize;
-    let skills = skills_with_python_plugins(store)?;
+    let skills = skills_with_python_plugins(store, Some(agent))?;
     let skill = find_skill_by_name_or_id(&skills, &name).ok_or_else(|| {
         AppError::BadRequest(format!(
             "skill_view could not find skill '{name}'. Use skills_list first."
@@ -185,8 +193,15 @@ fn find_skill_by_name_or_id<'a>(
         })
 }
 
-fn skills_with_python_plugins(store: &AppStore) -> AppResult<Vec<EnhancedSkillSummary>> {
-    let mut skills = store.skills()?;
+fn skills_with_python_plugins(
+    store: &AppStore,
+    agent: Option<&AgentDefinition>,
+) -> AppResult<Vec<EnhancedSkillSummary>> {
+    let mut skills = if let Some(agent) = agent {
+        skill_library::list_skills_for_agent(store, &agent.id)?
+    } else {
+        store.skills()?
+    };
     for skill in list_python_plugin_skills(store)? {
         let id = format!("{}:{}", skill.plugin_id, skill.name);
         if skills
@@ -199,7 +214,7 @@ fn skills_with_python_plugins(store: &AppStore) -> AppResult<Vec<EnhancedSkillSu
             id: id.clone(),
             name: id,
             description: skill.description,
-            enabled: true,
+            enabled: agent.map(|value| value.skills_enabled).unwrap_or(true),
             path: skill.path.to_string_lossy().to_string(),
             version: String::new(),
             author: String::new(),
@@ -207,7 +222,7 @@ fn skills_with_python_plugins(store: &AppStore) -> AppResult<Vec<EnhancedSkillSu
             is_core: false,
             is_bundled: false,
             source: format!("python-plugin:{}", skill.plugin_name),
-            agent_id: String::new(),
+            agent_id: agent.map(|value| value.id.clone()).unwrap_or_default(),
             config: HashMap::new(),
             required_environment_variables: Vec::new(),
             required_credential_files: Vec::new(),
@@ -316,7 +331,7 @@ fn usize_arg(payload: &Value, keys: &[&str], default: usize) -> usize {
 }
 
 fn skill_manage_status(store: &AppStore) -> AppResult<Value> {
-    let skills = skills_with_python_plugins(store)?;
+    let skills = skills_with_python_plugins(store, None)?;
     let installs = skill_library::skill_install_records(store)?;
     let usage = skill_library::skill_usage_records(store)?;
     let taps = skill_library::list_skill_taps(store)?;

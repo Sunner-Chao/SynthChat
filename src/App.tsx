@@ -1,4 +1,4 @@
-import { ChangeEvent, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { ChangeEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Bot,
   BookOpen,
@@ -38,19 +38,25 @@ import {
   X
 } from "lucide-react";
 import { useAppStore } from "./lib/store";
+
+
 import { api } from "./lib/api";
 import { listen } from "@tauri-apps/api/event";
 import { emit } from "@tauri-apps/api/event";
 import { Avatar, MenuRow } from "./components/common";
+import { resolvePersonaAgentBinding } from "./lib/personaAgentBinding";
 import { SettingsPanel } from "./panels/SettingsPanel";
-import { AgentsPanel, MemoryPanel, WorldbooksPanel, PluginsPanel } from "./panels/ToolPanels";
+import { MemoryPanel, WorldbooksPanel, PluginsPanel } from "./panels/ToolPanels";
 import { McpExtensionPanel } from "./panels/McpExtensionPanel";
 import { SkillsCenterPanel } from "./panels/SkillsCenterPanel";
+import { AgentsManagerPanel } from "./panels/AgentsManagerPanel";
 import { MomentsPanel } from "./panels/MomentsPanel";
 import { PersonaPanel } from "./panels/PersonaPanel";
 import { ChatExperience } from "./panels/ChatExperience";
 import { EnvironmentCheck } from "./panels/EnvironmentCheck";
 import { PET_ACTIVE_CONTEXT_EVENT, writeStoredPetActiveContext, type PetActiveContext } from "./lib/petContext";
+import "./styles.css";
+import "./panels-beautiful.css";
 import type {
   AccountConfig,
   AgentConfig,
@@ -575,8 +581,9 @@ function ActivePanel({ section }: { section: AppSection }) {
   if (section === "mcp") return <McpExtensionPanel />;
   if (section === "settings") return <SettingsPanel />;
   if (section === "memory") return <MemoryPanel />;
+  if (section === "worldbooks") return <WorldbooksPanel />;
   if (section === "plugins") return <PluginsPanel />;
-  if (section === "agents") return <AgentsPanel />;
+  if (section === "agents") return <AgentsManagerPanel />;
   if (section === "skills") return <SkillsCenterPanel />;
   return null;
 }
@@ -584,8 +591,6 @@ function ActivePanel({ section }: { section: AppSection }) {
 function ContactsPanel() {
   const {
     personas,
-    llmProviders,
-    conversations,
     accounts,
     setSection,
     openPersonaConversation,
@@ -593,12 +598,18 @@ function ContactsPanel() {
     unlinkWechatAccount,
     refreshAccounts
   } = useAppStore();
+  const agents = useAppStore((state) => state.agents);
+  const llmProviders = useAppStore((state) => state.llmProviders);
   const [query, setQuery] = useState("");
   const [selectedPersonaId, setSelectedPersonaId] = useState(personas[0]?.id ?? "");
   const [showWechatSheet, setShowWechatSheet] = useState(false);
   const [pollStatus, setPollStatus] = useState("");
+  const personaBindings = useMemo(
+    () => new Map(personas.map((persona) => [persona.id, resolvePersonaAgentBinding(persona, agents, llmProviders)])),
+    [agents, llmProviders, personas]
+  );
   const filtered = personas.filter((persona) =>
-    `${persona.name} ${persona.id} ${persona.llmProvider} ${persona.llmModel}`.toLowerCase().includes(query.toLowerCase())
+    (personaBindings.get(persona.id)?.searchText ?? `${persona.name} ${persona.id}`.toLowerCase()).includes(query.toLowerCase())
   );
   const selectedPersona = personas.find((p) => p.id === selectedPersonaId) ?? personas[0] ?? null;
   const linkedAccount = selectedPersona ? accounts.find((account) => account.linkedPersona === selectedPersona.id) : null;
@@ -643,17 +654,7 @@ function ContactsPanel() {
         </div>
         <div className="card-list">
           {filtered.map((persona) => {
-            const provider = persona.llmProvider ? llmProviders.find((p) => p.id === persona.llmProvider) : null;
-            const modelInfo = persona.llmModel || provider?.model || "";
-            const providerName = provider?.name || "";
-            let infoText = "";
-            if (providerName || modelInfo) {
-              infoText = [providerName, modelInfo].filter(Boolean).join(" · ");
-            } else if (llmProviders.length > 0) {
-              infoText = "请选择服务商";
-            } else {
-              infoText = "未配置服务商";
-            }
+            const binding = personaBindings.get(persona.id);
             return (
               <button
                 className={persona.id === selectedPersonaId ? "contact-row active" : "contact-row"}
@@ -664,7 +665,7 @@ function ContactsPanel() {
                 <Avatar name={persona.name} src={persona.avatarPath ? api.assetUrl(persona.avatarPath) : ""} />
                 <span>
                   <strong>{persona.name}</strong>
-                  <small>{infoText}</small>
+                  <small>{binding?.infoText ?? "未配置服务商"}</small>
                 </span>
               </button>
             );

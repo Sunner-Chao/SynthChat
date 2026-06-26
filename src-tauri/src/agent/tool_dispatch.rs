@@ -1632,8 +1632,8 @@ pub(super) async fn execute_recovery_internal_tool(
         | "retaindb_ingest_session"
         | "retaindb_agent_model"
         | "retaindb_seed_agent" => external_memory_provider_tool(tool_name, &payload),
-        "skills_list" => skills_list_tool(store, &payload),
-        "skill_view" => skill_view_tool(store, &payload),
+        "skills_list" => skills_list_tool(store, agent, &payload),
+        "skill_view" => skill_view_tool(store, agent, &payload),
         "skill_manage" => {
             if skill_manage_action_mutates_files(&payload) {
                 automatic_mutation_checkpoint(store, run_id, tool_name, &payload)?;

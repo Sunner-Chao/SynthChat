@@ -3483,9 +3483,7 @@ pub(super) fn selected_provider_id<'a>(
     persona: &'a Persona,
     agent: &'a AgentDefinition,
 ) -> Option<&'a str> {
-    if agent_llm_pair_should_win(persona, agent) {
-        Some(agent.llm_provider.as_str())
-    } else if !persona.llm_provider.trim().is_empty() {
+    if !persona.llm_provider.trim().is_empty() {
         Some(persona.llm_provider.as_str())
     } else if !agent.llm_provider.trim().is_empty() {
         Some(agent.llm_provider.as_str())
@@ -3496,11 +3494,6 @@ pub(super) fn selected_provider_id<'a>(
 
 pub(super) fn effective_llm_persona(persona: &Persona, agent: &AgentDefinition) -> Persona {
     let mut effective = persona.clone();
-    if agent_llm_pair_should_win(persona, agent) {
-        effective.llm_provider = agent.llm_provider.clone();
-        effective.llm_model = agent.llm_model.clone();
-        return effective;
-    }
     if effective.llm_provider.trim().is_empty() && !agent.llm_provider.trim().is_empty() {
         effective.llm_provider = agent.llm_provider.clone();
     }
@@ -3508,12 +3501,6 @@ pub(super) fn effective_llm_persona(persona: &Persona, agent: &AgentDefinition) 
         effective.llm_model = agent.llm_model.clone();
     }
     effective
-}
-
-fn agent_llm_pair_should_win(persona: &Persona, agent: &AgentDefinition) -> bool {
-    !agent.llm_provider.trim().is_empty()
-        && !agent.llm_model.trim().is_empty()
-        && persona.llm_model.trim().is_empty()
 }
 
 pub(super) fn select_llm_provider<'a>(
@@ -3812,9 +3799,7 @@ pub(super) fn format_model_control_reply(
     } else {
         provider.model.trim()
     };
-    let persona_note = if agent_llm_pair_should_win(persona, agent) {
-        "\n- note: agent provider/model 成对优先，避免路由错配。"
-    } else if !persona.llm_provider.trim().is_empty() || !persona.llm_model.trim().is_empty() {
+    let persona_note = if !persona.llm_provider.trim().is_empty() || !persona.llm_model.trim().is_empty() {
         "\n- note: 当前 persona 有 LLM 覆盖，优先级高于 agent。"
     } else {
         ""
