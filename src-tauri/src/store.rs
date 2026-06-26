@@ -2026,6 +2026,79 @@ mod tests {
     }
 
     #[test]
+    fn merge_conversation_messages_by_id_keeps_concurrent_append() {
+        let dir = std::env::temp_dir().join(format!(
+            "synthchat-message-merge-race-{}",
+            new_id("state")
+        ));
+        let path = dir.join("state.json");
+        let store = AppStore::new(path).unwrap();
+        let persona = store.persona(None).unwrap();
+        let conversation = store
+            .create_conversation(Some("message merge".into()), Some(persona.id.clone()))
+            .unwrap();
+
+        let user = store
+            .append_message(ChatMessage::new(
+                conversation.id.clone(),
+                "user",
+                "desktop seed".into(),
+                "desktop",
+            ))
+            .unwrap();
+        let assistant = store
+            .append_message(ChatMessage::new(
+                conversation.id.clone(),
+                "assistant",
+                "old answer".into(),
+                "desktop-agent",
+            ))
+            .unwrap();
+
+        let mut cleaned = assistant.clone();
+        cleaned.content = "cleaned answer".into();
+        cleaned.provider_data = Some(json!({"responses": {"messageItems": []}}));
+
+        let concurrent = store
+            .append_message(ChatMessage::new(
+                conversation.id.clone(),
+                "user",
+                "wechat hello".into(),
+                "wechat",
+            ))
+            .unwrap();
+
+        let merged = store
+            .merge_conversation_messages_by_id(&conversation.id, &[cleaned.clone()])
+            .unwrap();
+
+        assert_eq!(merged.len(), 3);
+        assert_eq!(
+            merged
+                .iter()
+                .find(|message| message.id == user.id)
+                .unwrap()
+                .content,
+            "desktop seed"
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .find(|message| message.id == assistant.id)
+                .unwrap()
+                .content,
+            "cleaned answer"
+        );
+        assert!(merged.iter().any(|message| message.id == concurrent.id));
+        assert_eq!(
+            store.conversation(&conversation.id).unwrap().last_message,
+            "wechat hello"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn active_run_timeout_marks_hermes_resume_pending() {
         let dir = std::env::temp_dir().join(format!(
             "synthchat-run-resume-pending-timeout-test-{}",
@@ -9169,6 +9242,25 @@ impl AppStore {
 
             self.persist(s)?;
             Ok(messages)
+        })
+    }
+
+    pub fn merge_conversation_messages_by_id(
+        &self,
+        conversation_id: &str,
+        messages: &[ChatMessage],
+    ) -> AppResult<Vec<ChatMessage>> {
+        self.with_state(|s| {
+            let merged = {
+                let existing = s.messages.entry(conversation_id.to_string()).or_default();
+                merge_messages_by_id(existing, messages);
+                existing.clone()
+            };
+            if let Some(conv) = s.conversations.iter_mut().find(|c| c.id == conversation_id) {
+                refresh_conversation_preview_from_messages(conv, &merged);
+            }
+            self.persist(s)?;
+            Ok(merged)
         })
     }
 

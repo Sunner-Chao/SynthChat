@@ -186,9 +186,15 @@ fn recover_invalid_encrypted_content_for_retry(
 ) -> AppResult<Option<String>> {
     let in_memory = recover_reasoning_replay_text_for_retry(history, kind)?;
     let mut persisted = store.messages(conversation_id, None)?;
+    let persisted_before = persisted.clone();
     let persisted_note = recover_reasoning_replay_text_for_retry(&mut persisted, kind)?;
     if persisted_note.is_some() {
-        store.replace_conversation_messages(conversation_id, persisted)?;
+        persist_recovered_messages_for_retry(
+            store,
+            conversation_id,
+            &persisted_before,
+            &persisted,
+        )?;
     }
     Ok(combine_recovery_notes(in_memory, persisted_note))
 }
@@ -201,11 +207,58 @@ fn recover_image_payloads_for_retry_persisted(
 ) -> AppResult<Option<String>> {
     let in_memory = recover_image_payloads_for_retry(history, kind)?;
     let mut persisted = store.messages(conversation_id, None)?;
+    let persisted_before = persisted.clone();
     let persisted_note = recover_image_payloads_for_retry(&mut persisted, kind)?;
     if persisted_note.is_some() {
-        store.replace_conversation_messages(conversation_id, persisted)?;
+        persist_recovered_messages_for_retry(
+            store,
+            conversation_id,
+            &persisted_before,
+            &persisted,
+        )?;
     }
     Ok(combine_recovery_notes(in_memory, persisted_note))
+}
+
+pub(super) fn persist_recovered_messages_for_retry(
+    store: &AppStore,
+    conversation_id: &str,
+    before: &[ChatMessage],
+    after: &[ChatMessage],
+) -> AppResult<()> {
+    let changed = changed_messages_for_retry_persist(before, after);
+    if changed.is_empty() {
+        return Ok(());
+    }
+    store.merge_conversation_messages_by_id(conversation_id, &changed)?;
+    Ok(())
+}
+
+fn changed_messages_for_retry_persist(before: &[ChatMessage], after: &[ChatMessage]) -> Vec<ChatMessage> {
+    let before_by_id = before
+        .iter()
+        .map(|message| (message.id.as_str(), message))
+        .collect::<HashMap<_, _>>();
+    after
+        .iter()
+        .filter(|message| {
+            before_by_id
+                .get(message.id.as_str())
+                .is_some_and(|original| !chat_message_persisted_eq(original, message))
+        })
+        .cloned()
+        .collect()
+}
+
+fn chat_message_persisted_eq(left: &ChatMessage, right: &ChatMessage) -> bool {
+    left.id == right.id
+        && left.conversation_id == right.conversation_id
+        && left.role == right.role
+        && left.content == right.content
+        && left.created_at == right.created_at
+        && left.source == right.source
+        && left.account_id == right.account_id
+        && left.provider_data == right.provider_data
 }
 
 fn combine_recovery_notes(left: Option<String>, right: Option<String>) -> Option<String> {

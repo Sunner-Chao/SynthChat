@@ -6620,6 +6620,79 @@ fn invalid_encrypted_content_recovery_persists_provider_data_cleanup() {
 }
 
 #[test]
+fn invalid_encrypted_content_recovery_merge_keeps_concurrent_append() {
+    let dir = std::env::temp_dir().join(format!(
+        "synthchat-invalid-encrypted-merge-race-{}",
+        new_id("test")
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let store = AppStore::new(dir.join("state.json")).unwrap();
+    let persona = store.persona(None).unwrap();
+    let conversation = store
+        .create_conversation(Some("Encrypted Merge".into()), Some(persona.id.clone()))
+        .unwrap();
+    let mut assistant = ChatMessage::new(
+        conversation.id.clone(),
+        "assistant",
+        "answer\ncodex_reasoning_items: [secret]".into(),
+        "desktop-agent",
+    );
+    assistant.provider_data = Some(json!({
+        "responses": {
+            "reasoningItems": [{
+                "type": "reasoning",
+                "encrypted_content": "sealed",
+                "_issuerKind": "codex_backend"
+            }],
+            "messageItems": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "answer"}]
+            }]
+        },
+        "openai": {
+            "reasoning_content": "hidden chain"
+        }
+    }));
+    let assistant = store.append_message(assistant).unwrap();
+
+    let snapshot = store.messages(&conversation.id, None).unwrap();
+    let concurrent = store
+        .append_message(ChatMessage::new(
+            conversation.id.clone(),
+            "user",
+            "wechat hello".into(),
+            "wechat",
+        ))
+        .unwrap();
+
+    let mut cleaned = snapshot.clone();
+    let note = recover_reasoning_replay_text_for_retry(&mut cleaned, "invalid_encrypted_content")
+        .unwrap()
+        .unwrap();
+    assert!(note.contains("Recovered invalid_encrypted_content"));
+    persist_recovered_messages_for_retry(&store, &conversation.id, &snapshot, &cleaned).unwrap();
+
+    let saved = store.messages(&conversation.id, None).unwrap();
+    assert_eq!(saved.len(), 2);
+    let cleaned_assistant = saved.iter().find(|message| message.id == assistant.id).unwrap();
+    assert_eq!(cleaned_assistant.content, "answer");
+    assert!(cleaned_assistant
+        .provider_data
+        .as_ref()
+        .unwrap()
+        .pointer("/responses/reasoningItems")
+        .is_none());
+    assert!(saved.iter().any(|message| message.id == concurrent.id));
+    assert_eq!(
+        store.conversation(&conversation.id).unwrap().last_message,
+        "wechat hello"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn llm_context_recovery_compacts_history_for_retry() {
     let dir =
         std::env::temp_dir().join(format!("synthchat-llm-context-recovery-{}", new_id("test")));
