@@ -9925,6 +9925,11 @@ select:focus-visible {
   pointer-events: none;
 }
 
+.live2d-pet-shell.is-orb .live2d-pet-frame {
+  opacity: 0;
+  pointer-events: none;
+}
+
 .live2d-pet-frame {
   position: absolute;
   inset: 0;
@@ -9932,6 +9937,96 @@ select:focus-visible {
   height: 100%;
   border: 0;
   background: transparent;
+}
+
+.pet-pokeball-orb {
+  position: absolute;
+  inset: 0;
+  width: 84px;
+  height: 84px;
+  margin: auto;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 31% 24%, rgba(255, 255, 255, 0.92), rgba(255, 255, 255, 0) 24%),
+    linear-gradient(180deg, #ff6b7b 0 16%, #ef4444 16% calc(50% - 4px), #111827 calc(50% - 4px) calc(50% + 4px), #f8fafc calc(50% + 4px) 100%);
+  box-shadow:
+    0 16px 34px rgba(15, 23, 42, 0.28),
+    inset 0 6px 10px rgba(255, 255, 255, 0.4),
+    inset 0 -10px 14px rgba(15, 23, 42, 0.12);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.pet-pokeball-orb:active {
+  cursor: grabbing;
+  transform: scale(0.98);
+}
+
+.pet-pokeball-orb::before {
+  content: "";
+  position: absolute;
+  left: 16px;
+  top: 10px;
+  width: 28px;
+  height: 13px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.56);
+  transform: rotate(-24deg);
+}
+
+.pet-pokeball-orb::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  border: 2px solid rgba(15, 23, 42, 0.26);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.26),
+    inset 0 -1px 0 rgba(15, 23, 42, 0.14);
+  pointer-events: none;
+}
+
+.pet-pokeball-orb span {
+  pointer-events: none;
+}
+
+.pet-pokeball-top {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: calc(50% - 4px);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0) 35%);
+}
+
+.pet-pokeball-band {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(50% - 4px);
+  height: 8px;
+  background: #111827;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.18);
+}
+
+.pet-pokeball-button {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background:
+    radial-gradient(circle at 35% 35%, #ffffff, #e2e8f0 72%);
+  border: 6px solid #111827;
+  box-shadow:
+    inset 0 0 0 2px rgba(148, 163, 184, 0.5),
+    0 2px 5px rgba(15, 23, 42, 0.2);
+  transform: translate(-50%, -50%);
 }
 
 .pet-speech-area {
@@ -10450,8 +10545,8 @@ select:focus-visible {
 .pet-input-shell {
   position: absolute;
   z-index: 8;
-  left: 12px;
-  right: 12px;
+  left: 24px;
+  right: 24px;
   bottom: 10px;
   display: grid;
   gap: 8px;

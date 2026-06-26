@@ -52,6 +52,8 @@ const PET_WINDOW_WIDTH: f64 = 760.0;
 const PET_WINDOW_HEIGHT: f64 = 560.0;
 const PET_MODEL_WINDOW_WIDTH: f64 = 340.0;
 const PET_MODEL_WINDOW_HEIGHT: f64 = 440.0;
+const PET_ORB_WINDOW_WIDTH: f64 = 84.0;
+const PET_ORB_WINDOW_HEIGHT: f64 = 84.0;
 const PET_DOCK_WINDOW_WIDTH: f64 = 48.0;
 const PET_DOCK_WINDOW_HEIGHT: f64 = 108.0;
 const PET_WINDOW_SAFE_MARGIN: i32 = 16;
@@ -3541,6 +3543,7 @@ fn asset_url(path: String) -> String {
 fn pet_window_target_size(mode: &str) -> PhysicalSize<u32> {
     match mode {
         "model" => PhysicalSize::new(PET_MODEL_WINDOW_WIDTH as u32, PET_MODEL_WINDOW_HEIGHT as u32),
+        "orb" => PhysicalSize::new(PET_ORB_WINDOW_WIDTH as u32, PET_ORB_WINDOW_HEIGHT as u32),
         "dock" => PhysicalSize::new(PET_DOCK_WINDOW_WIDTH as u32, PET_DOCK_WINDOW_HEIGHT as u32),
         _ => PhysicalSize::new(PET_WINDOW_WIDTH as u32, PET_WINDOW_HEIGHT as u32),
     }
@@ -3586,7 +3589,7 @@ fn place_pet_window_for_mode(
         let monitor_size = monitor.size();
         let mut x = current_center_x - size.width as i32 / 2;
         let y = current_center_y - size.height as i32 / 2;
-        if mode == "dock" {
+        if mode == "dock" || mode == "orb" {
             x = match dock_edge.unwrap_or(PetDockEdge::Right) {
                 PetDockEdge::Left => origin.x,
                 PetDockEdge::Right => origin.x + monitor_size.width as i32 - size.width as i32,
@@ -3821,6 +3824,9 @@ fn pet_window_action(app: AppHandle, action: String, edge: Option<String>) -> Ap
         "dock" => {
             place_pet_window_for_mode(&window, "dock", PetDockEdge::from_option(edge.as_deref()))?;
         }
+        "orb" => {
+            place_pet_window_for_mode(&window, "orb", PetDockEdge::from_option(edge.as_deref()))?;
+        }
         "undock" => {
             place_pet_window_for_mode(&window, "model", None)?;
         }
@@ -3838,24 +3844,48 @@ fn cursor_position(app: AppHandle) -> AppResult<Value> {
         .cursor_position()
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
     let window = app.get_webview_window(PET_WINDOW_LABEL);
-    let (window_x, window_y, window_width, window_height) = if let Some(window) = window {
+    let (window_x, window_y, window_width, window_height, screen_x, screen_y, screen_width, screen_height) = if let Some(window) = window {
         let position = window
             .outer_position()
             .map_err(|error| AppError::BadRequest(error.to_string()))?;
         let size = window
-            .inner_size()
+            .outer_size()
             .map_err(|error| AppError::BadRequest(error.to_string()))?;
-        (position.x, position.y, size.width, size.height)
+        let monitor = window
+            .current_monitor()
+            .map_err(|error| AppError::BadRequest(error.to_string()))?;
+        let (screen_x, screen_y, screen_width, screen_height) = monitor
+            .map(|monitor| {
+                (
+                    monitor.position().x,
+                    monitor.position().y,
+                    monitor.size().width,
+                    monitor.size().height,
+                )
+            })
+            .unwrap_or((0, 0, 0, 0));
+        (
+            position.x,
+            position.y,
+            size.width,
+            size.height,
+            screen_x,
+            screen_y,
+            screen_width,
+            screen_height,
+        )
     } else {
-        (0, 0, 0, 0)
+        (0, 0, 0, 0, 0, 0, 0, 0)
     };
     Ok(json!({
         "x": cursor.x,
         "y": cursor.y,
         "screenX": cursor.x,
         "screenY": cursor.y,
-        "screenWidth": 0,
-        "screenHeight": 0,
+        "screenWidth": screen_width,
+        "screenHeight": screen_height,
+        "screenXOrigin": screen_x,
+        "screenYOrigin": screen_y,
         "clientX": cursor.x - window_x as f64,
         "clientY": cursor.y - window_y as f64,
         "windowWidth": window_width,

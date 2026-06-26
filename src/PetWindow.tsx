@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { Palette, SendHorizontal } from "lucide-react";
@@ -24,6 +24,9 @@ const PET_GLOBAL_LOOK_IDLE_MS = 3000;
 const DEFAULT_PET_ASSISTANT_CLOUD_DURATION_SECONDS = 10;
 const MIN_PET_ASSISTANT_CLOUD_DURATION_SECONDS = 1;
 const MAX_PET_ASSISTANT_CLOUD_DURATION_SECONDS = 120;
+const PET_EDGE_SNAP_THRESHOLD_PX = 64;
+const PET_EDGE_POINTER_THRESHOLD_PX = 96;
+const PET_ORB_CLICK_MOVE_TOLERANCE_PX = 5;
 
 const AVAILABLE_MODELS = [
   { id: "tororo", name: "Tororo", path: "/pet/model/Tororo/tororo.model3.json", greeting: "Tororo 到啦。" },
@@ -98,6 +101,10 @@ type PetCursorPosition = {
   y?: number;
   screenX?: number;
   screenY?: number;
+  screenWidth?: number;
+  screenHeight?: number;
+  screenXOrigin?: number;
+  screenYOrigin?: number;
   clientX?: number;
   clientY?: number;
   windowWidth?: number;
@@ -110,6 +117,9 @@ type PetDragPoint = {
   screenX: number;
   screenY: number;
 };
+
+type PetDockEdge = "left" | "right";
+type PetWindowMode = "model" | "orb";
 
 function formatCloudText(text: string) {
   const normalized = text
@@ -271,7 +281,7 @@ function assistantCloudPayload(message: ChatMessage | null | undefined) {
   const signature = [
     message.id,
     text,
-    ...attachments.map(attachmentIdentity).sort()
+    ...attachments.map(attachmentIdentity).sort((a, b) => a.localeCompare(b, "zh-CN"))
   ].join("\n");
   return { text, attachments, signature };
 }
@@ -303,11 +313,17 @@ export function PetWindow() {
   const pendingModelLoadRef = useRef<{ model: PetModel; force: boolean } | null>(null);
   const modelBoundsRef = useRef<PetModelBounds | null>(null);
   const modelDragActiveRef = useRef(false);
+  const modelDragMovedRef = useRef(false);
   const modelDragTokenRef = useRef(0);
   const modelDragStartReadyRef = useRef(false);
   const modelDragLatestPointRef = useRef<PetDragPoint | null>(null);
   const modelDragMoveFrameRef = useRef<number | null>(null);
   const modelDragMoveInFlightRef = useRef(false);
+  const orbDragActiveRef = useRef(false);
+  const orbDragMovedRef = useRef(false);
+  const orbDragStartPointRef = useRef<PetDragPoint | null>(null);
+  const dockEdgeRef = useRef<PetDockEdge>("right");
+  const petWindowModeRef = useRef<PetWindowMode>("model");
   const modelLoadedRef = useRef(false);
   const ignoreCursorEventsRef = useRef(false);
   const sendingRef = useRef(false);
@@ -338,11 +354,13 @@ export function PetWindow() {
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [cloudBubble, setCloudBubble] = useState<PetCloudBubble | null>(null);
   const [showInput, setShowInput] = useState(true);
+  const [petWindowMode, setPetWindowMode] = useState<PetWindowMode>("model");
+  const [dockEdge, setDockEdge] = useState<PetDockEdge>("right");
 
   useEffect(() => {
     document.body.classList.add("pet-window-body");
     document.documentElement.classList.add("pet-window-html");
-    void petWindowAction("expand");
+    void setPetWindowModeState("model");
     return () => {
       document.body.classList.remove("pet-window-body");
       document.documentElement.classList.remove("pet-window-html");
@@ -559,6 +577,10 @@ export function PetWindow() {
   useEffect(() => {
     const timer = window.setInterval(() => {
       if (!modelLoadedRef.current) return;
+      if (petWindowModeRef.current === "orb") {
+        void syncPetPointerPassthrough(false);
+        return;
+      }
       void invoke<PetCursorPosition>("cursor_position").then((position) => {
         const point = normalizeCursorPosition(position);
         if (!point) return;
@@ -650,17 +672,22 @@ export function PetWindow() {
         return;
       }
       if (message.type === "model_drag_start") {
+        if (petWindowModeRef.current === "orb") return;
         showCloud("带我换个位置吗？我会跟上。", "active", 2200);
         void startModelDrag(message.screenX, message.screenY);
         return;
       }
       if (message.type === "model_drag_move") {
+        if (petWindowModeRef.current === "orb") return;
         void moveModelDrag(message.screenX, message.screenY);
         return;
       }
       if (message.type === "model_drag_end") {
-        stopModelDrag();
-        showCloud("我先停在这里。", "soft", 2000);
+        void finishModelDrag(message.screenX, message.screenY);
+        return;
+      }
+      if (message.type === "toggle_main_window") {
+        void toggleMainWindow();
         return;
       }
       if (message.type === "tap") {
@@ -946,11 +973,39 @@ export function PetWindow() {
     loadModel(model, true);
   }
 
-  async function petWindowAction(action: "expand" | "model" | "drag") {
+  async function petWindowAction(action: "expand" | "model" | "drag" | "orb" | "undock", edge: PetDockEdge | null = null) {
     try {
-      await invoke("pet_window_action", { action, edge: null });
+      await invoke("pet_window_action", { action, edge });
     } catch (error) {
       console.error("pet window action failed:", error);
+    }
+  }
+
+  async function setPetWindowModeState(mode: PetWindowMode, edge: PetDockEdge = dockEdgeRef.current) {
+    petWindowModeRef.current = mode;
+    setPetWindowMode(mode);
+    dockEdgeRef.current = edge;
+    setDockEdge(edge);
+    if (mode === "orb") {
+      clearInputHideTimer();
+      showInputRef.current = false;
+      setShowInput(false);
+      setModelMenuOpen(false);
+      modelMenuOpenRef.current = false;
+      setCloudBubble(null);
+      await syncPetPointerPassthrough(false);
+      await petWindowAction("orb", edge);
+      return;
+    }
+    await syncPetPointerPassthrough(false);
+    await petWindowAction("model");
+  }
+
+  async function toggleMainWindow() {
+    try {
+      await invoke("toggle_main_window");
+    } catch (error) {
+      console.error("toggle main window failed:", error);
     }
   }
 
@@ -1083,6 +1138,7 @@ export function PetWindow() {
     if (modelDragActiveRef.current) return;
     const dragToken = ++modelDragTokenRef.current;
     modelDragActiveRef.current = true;
+    modelDragMovedRef.current = false;
     modelDragStartReadyRef.current = false;
     modelDragLatestPointRef.current = { screenX, screenY };
     try {
@@ -1105,7 +1161,51 @@ export function PetWindow() {
   function moveModelDrag(screenX?: number, screenY?: number) {
     if (typeof screenX !== "number" || typeof screenY !== "number") return;
     if (!modelDragActiveRef.current) return;
+    modelDragMovedRef.current = true;
     queueModelDragMove(screenX, screenY);
+  }
+
+  async function finishModelDrag(screenX?: number, screenY?: number) {
+    const latest = modelDragLatestPointRef.current;
+    const endPoint = typeof screenX === "number" && typeof screenY === "number"
+      ? { screenX, screenY }
+      : latest;
+    stopModelDrag();
+    const edge = await detectDockEdge(endPoint);
+    if (edge) {
+      await setPetWindowModeState("orb", edge);
+      return;
+    }
+    showCloud("我先停在这里。", "soft", 2000);
+  }
+
+  async function detectDockEdge(point: PetDragPoint | null): Promise<PetDockEdge | null> {
+    try {
+      const position = await invoke<PetCursorPosition>("cursor_position");
+      const originX = typeof position.screenXOrigin === "number" ? position.screenXOrigin : 0;
+      const screenWidth = typeof position.screenWidth === "number" && position.screenWidth > 0
+        ? position.screenWidth
+        : window.screen.width;
+      const screenRight = originX + screenWidth;
+      const windowX = typeof position.windowScreenX === "number" ? position.windowScreenX : Number.NaN;
+      const windowWidth = typeof position.windowWidth === "number" && position.windowWidth > 0
+        ? position.windowWidth
+        : Number.NaN;
+      const pointerX = point?.screenX
+        ?? (typeof position.screenX === "number" ? position.screenX : position.x);
+
+      const windowNearLeft = Number.isFinite(windowX) && windowX <= originX + PET_EDGE_SNAP_THRESHOLD_PX;
+      const windowNearRight = Number.isFinite(windowX) && Number.isFinite(windowWidth)
+        && windowX + windowWidth >= screenRight - PET_EDGE_SNAP_THRESHOLD_PX;
+      const pointerNearLeft = typeof pointerX === "number" && pointerX <= originX + PET_EDGE_POINTER_THRESHOLD_PX;
+      const pointerNearRight = typeof pointerX === "number" && pointerX >= screenRight - PET_EDGE_POINTER_THRESHOLD_PX;
+
+      if (windowNearLeft || pointerNearLeft) return "left";
+      if (windowNearRight || pointerNearRight) return "right";
+    } catch (error) {
+      console.error("pet edge detect failed:", error);
+    }
+    return null;
   }
 
   function queueModelDragMove(screenX: number, screenY: number) {
@@ -1161,6 +1261,58 @@ export function PetWindow() {
     resetModelDragState();
     void invoke("pet_window_drag", { action: "end" }).catch((error) => {
       console.error("pet drag end failed:", error);
+    });
+  }
+
+  function startOrbDrag(event: ReactPointerEvent<HTMLButtonElement>) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    orbDragActiveRef.current = true;
+    orbDragMovedRef.current = false;
+    orbDragStartPointRef.current = { screenX: event.screenX, screenY: event.screenY };
+    void invoke("pet_window_drag", { action: "start", screenX: event.screenX, screenY: event.screenY }).catch((error) => {
+      orbDragActiveRef.current = false;
+      orbDragStartPointRef.current = null;
+      console.error("pet orb drag start failed:", error);
+    });
+  }
+
+  function moveOrbDrag(event: ReactPointerEvent<HTMLButtonElement>) {
+    if (!orbDragActiveRef.current) return;
+    const start = orbDragStartPointRef.current;
+    if (
+      start
+      && Math.hypot(event.screenX - start.screenX, event.screenY - start.screenY) > PET_ORB_CLICK_MOVE_TOLERANCE_PX
+    ) {
+      orbDragMovedRef.current = true;
+    }
+    void invoke("pet_window_drag", { action: "move", screenX: event.screenX, screenY: event.screenY }).catch((error) => {
+      console.error("pet orb drag move failed:", error);
+    });
+  }
+
+  function finishOrbDrag(event: ReactPointerEvent<HTMLButtonElement>) {
+    if (!orbDragActiveRef.current) return;
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+    orbDragActiveRef.current = false;
+    orbDragStartPointRef.current = null;
+    void invoke("pet_window_drag", { action: "end" }).catch((error) => {
+      console.error("pet orb drag end failed:", error);
+    });
+    if (!orbDragMovedRef.current) {
+      void setPetWindowModeState("model");
+      window.setTimeout(() => showCloud("我回来啦。", "happy", 2200), 120);
+    }
+  }
+
+  function cancelOrbDrag() {
+    if (!orbDragActiveRef.current) return;
+    orbDragActiveRef.current = false;
+    orbDragMovedRef.current = false;
+    orbDragStartPointRef.current = null;
+    void invoke("pet_window_drag", { action: "end" }).catch((error) => {
+      console.error("pet orb drag cancel failed:", error);
     });
   }
 
@@ -1248,7 +1400,7 @@ export function PetWindow() {
   }
 
   return (
-    <main className={`live2d-pet-shell${cloudBubble ? " is-speaking" : ""}`}>
+    <main className={`live2d-pet-shell${cloudBubble ? " is-speaking" : ""}${petWindowMode === "orb" ? " is-orb" : ""}`}>
       <iframe
         className="live2d-pet-frame"
         ref={frameRef}
@@ -1256,6 +1408,25 @@ export function PetWindow() {
         title="SynthPet Live2D"
       />
 
+      {petWindowMode === "orb" ? (
+        <button
+          className={`pet-pokeball-orb is-${dockEdge}`}
+          type="button"
+          aria-label="唤出桌宠"
+          title="唤出桌宠"
+          onPointerDown={startOrbDrag}
+          onPointerMove={moveOrbDrag}
+          onPointerUp={finishOrbDrag}
+          onPointerCancel={cancelOrbDrag}
+          onLostPointerCapture={cancelOrbDrag}
+        >
+          <span className="pet-pokeball-top" aria-hidden="true" />
+          <span className="pet-pokeball-band" aria-hidden="true" />
+          <span className="pet-pokeball-button" aria-hidden="true" />
+        </button>
+      ) : null}
+
+      {petWindowMode !== "orb" ? (
       <section className={`pet-speech-area${cloudBubble ? " has-bubble" : ""}`} aria-live="polite">
         {cloudBubble ? (
           <section
@@ -1287,7 +1458,9 @@ export function PetWindow() {
           </section>
         ) : null}
       </section>
+      ) : null}
 
+      {petWindowMode !== "orb" ? (
       <section
         className={`pet-input-shell${showInput ? "" : " is-hidden"}${modelMenuOpen ? " is-menu-open" : ""}`}
         ref={inputShellRef}
@@ -1358,6 +1531,7 @@ export function PetWindow() {
           </div>
         ) : null}
       </section>
+      ) : null}
     </main>
   );
 }

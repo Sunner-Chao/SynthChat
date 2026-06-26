@@ -2141,8 +2141,9 @@ fn validate_parsed_web_url(parsed: &reqwest::Url, policy: &WebsitePolicy) -> App
     let port = parsed
         .port_or_known_default()
         .ok_or_else(|| AppError::BadRequest("URL port could not be resolved".into()))?;
+    let host_is_ip_literal = host.parse::<IpAddr>().is_ok();
     for ip in resolve_web_host_ips(&host, port)? {
-        if blocked_web_ip(ip) {
+        if blocked_web_ip(ip) && !allowed_web_dns_resolution_ip(ip, host_is_ip_literal) {
             return Err(AppError::BadRequest(format!(
                 "blocked private/internal URL resolution: {host} -> {ip}"
             )));
@@ -2397,6 +2398,26 @@ fn blocked_web_ip(ip: IpAddr) -> bool {
                 || ip.is_unicast_link_local()
                 || ip.is_multicast()
         }
+    }
+}
+
+fn allowed_web_dns_resolution_ip(ip: IpAddr, host_is_ip_literal: bool) -> bool {
+    if host_is_ip_literal {
+        return false;
+    }
+    is_proxy_fake_ip(ip)
+}
+
+fn is_proxy_fake_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            // TUN/fake-ip proxies commonly synthesize public hostnames into
+            // 198.18.0.0/15. Treat it as routable only for DNS results, not
+            // when users pass the IP literal directly.
+            octets[0] == 198 && matches!(octets[1], 18 | 19)
+        }
+        IpAddr::V6(_) => false,
     }
 }
 
@@ -2657,6 +2678,20 @@ mod tests {
     fn validate_web_url_blocks_private_dns_resolution() {
         assert!(validate_web_url("http://localhost/").is_err());
         assert!(validate_web_url("http://localhost.localhost/").is_err());
+    }
+
+    #[test]
+    fn proxy_fake_ip_policy_allows_dns_results_only() {
+        assert!(allowed_web_dns_resolution_ip(
+            "198.18.0.206".parse().unwrap(),
+            false
+        ));
+        assert!(!allowed_web_dns_resolution_ip(
+            "198.18.0.206".parse().unwrap(),
+            true
+        ));
+        assert!(blocked_web_ip("198.18.0.206".parse().unwrap()));
+        assert!(blocked_web_host_literal("198.18.0.206"));
     }
 
     #[test]

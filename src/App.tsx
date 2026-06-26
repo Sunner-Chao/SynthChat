@@ -305,10 +305,13 @@ export function App() {
       if (
         payload.conversationId
         && payload.message
-        && payload.message.role === "assistant"
         && (payload.type === "assistant_message" || payload.type === "new_message")
         && isVisibleChatEventMessage(payload.message)
       ) {
+        if (payload.message.role === "user" && messageSource === "desktop") {
+          // Desktop sends its own user messages and handles optimistic UI locally.
+          return;
+        }
         const state = useAppStore.getState();
         const shouldMarkUnread =
           payload.conversationId !== state.activeConversationId
@@ -371,16 +374,7 @@ export function App() {
       const payload = event.payload;
       handleAgentRunEvent(payload);
       // Processing visibility is owned by the authoritative turn_started /
-      // turn_finished lifecycle (see synthchat-chat-event handler). Here we only
-      // reinforce the running state for long multi-run turns; we never clear it,
-      // so an individual run completing can't prematurely hide the thinking UI
-      // while the hub turn is still finalizing (e.g. dispatching the reply).
-      if (payload.conversationId) {
-        const running = !["completed", "failed", "aborted"].includes(payload.state);
-        if (running) {
-          setConversationProcessing(payload.conversationId, true);
-        }
-      }
+      // turn_finished lifecycle (see synthchat-chat-event handler).
       if (payload.message) {
         upsertIncomingMessage(payload.message);
       }

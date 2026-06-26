@@ -31,6 +31,8 @@ let dragStartScreenY = 0;
 let tapTimer = null;
 let pendingDragMove = null;
 let dragMoveFrame = null;
+let lastDragScreenX = null;
+let lastDragScreenY = null;
 
 const MODEL_HIT_PADDING = 28;
 const MODEL_DRAG_DELAY_MS = 240;
@@ -114,15 +116,23 @@ function layoutModel() {
     reportModelBounds();
 }
 
-function finishModelDrag() {
+function finishModelDrag(screenX, screenY) {
     const wasDragging = draggingModel;
+    const endScreenX = typeof screenX === "number" ? screenX : lastDragScreenX;
+    const endScreenY = typeof screenY === "number" ? screenY : lastDragScreenY;
     activePointerId = null;
     draggingModel = false;
     clearPendingDragMove();
     clearModelDragTimer();
     if (wasDragging) {
-        postMessageToHost({ type: "model_drag_end" });
+        postMessageToHost({
+            type: "model_drag_end",
+            screenX: endScreenX,
+            screenY: endScreenY
+        });
     }
+    lastDragScreenX = null;
+    lastDragScreenY = null;
 }
 
 function clearPendingDragMove() {
@@ -134,6 +144,8 @@ function clearPendingDragMove() {
 }
 
 function queueModelDragMove(screenX, screenY) {
+    lastDragScreenX = screenX;
+    lastDragScreenY = screenY;
     pendingDragMove = { screenX, screenY };
     if (dragMoveFrame !== null) return;
     dragMoveFrame = window.requestAnimationFrame(() => {
@@ -301,7 +313,7 @@ canvas.addEventListener("dblclick", (event) => {
         window.clearTimeout(tapTimer);
         tapTimer = null;
     }
-    postMessageToHost({ type: "poke", areas: ["model"] });
+    postMessageToHost({ type: "toggle_main_window", areas: ["model"] });
 });
 
 canvas.addEventListener("pointermove", (event) => {
@@ -326,6 +338,8 @@ canvas.addEventListener("pointerdown", (event) => {
     activePointerId = event.pointerId;
     dragStartScreenX = event.screenX;
     dragStartScreenY = event.screenY;
+    lastDragScreenX = event.screenX;
+    lastDragScreenY = event.screenY;
     canvas.setPointerCapture?.(event.pointerId);
     setModelHover(true);
     clearModelDragTimer();
@@ -346,7 +360,7 @@ canvas.addEventListener("pointerup", (event) => {
     if (activePointerId !== null && activePointerId !== event.pointerId) return;
     canvas.releasePointerCapture?.(event.pointerId);
     const wasPendingTap = modelDragPending && !draggingModel && pointInModelBounds(event.clientX, event.clientY);
-    finishModelDrag();
+    finishModelDrag(event.screenX, event.screenY);
     if (wasPendingTap) {
         if (tapTimer !== null) window.clearTimeout(tapTimer);
         tapTimer = window.setTimeout(() => {

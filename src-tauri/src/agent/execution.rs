@@ -411,8 +411,8 @@ async fn execute_code_with_local_python_rpc(
         };
     server_task.abort();
     let _ = fs::remove_dir_all(&scratch);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = decode_terminal_output(&output.stdout);
+    let stderr = decode_terminal_output(&output.stderr);
     let stdout = execute_code_sanitize_output(&stdout);
     let stderr = execute_code_sanitize_output(&stderr);
     Ok(format!(
@@ -2060,8 +2060,8 @@ print(json.dumps({"ok": True, "results": rows}, ensure_ascii=False))
             });
         }
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = decode_terminal_output(&output.stdout);
+    let stderr = decode_terminal_output(&output.stderr);
     let parsed = serde_json::from_str::<Value>(stdout.trim()).unwrap_or_else(|_| {
         serde_json::json!({
             "ok": false,
@@ -3596,8 +3596,8 @@ asyncio.run(main())
     let output = tokio::time::timeout(Duration::from_secs(180), child.wait_with_output())
         .await
         .map_err(|_| AppError::BadRequest("Modal background process start timed out".into()))??;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = decode_terminal_output(&output.stdout);
+    let stderr = decode_terminal_output(&output.stderr);
     let parsed = serde_json::from_str::<Value>(stdout.trim()).ok();
     let ok = parsed
         .as_ref()
@@ -4341,8 +4341,8 @@ else:
     let output = tokio::time::timeout(Duration::from_secs(120), child.wait_with_output())
         .await
         .map_err(|_| AppError::BadRequest("Daytona background process start timed out".into()))??;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = decode_terminal_output(&output.stdout);
+    let stderr = decode_terminal_output(&output.stderr);
     let parsed = serde_json::from_str::<Value>(stdout.trim()).ok();
     let ok = parsed
         .as_ref()
@@ -5482,6 +5482,123 @@ async fn run_shell_command(
     .await
 }
 
+pub(super) fn decode_terminal_output(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+    if let Some(text) = decode_utf16_terminal_output(bytes) {
+        return text;
+    }
+    decode_platform_terminal_output(bytes)
+}
+
+fn decode_utf16_terminal_output(bytes: &[u8]) -> Option<String> {
+    let (bytes, little_endian) = if bytes.starts_with(&[0xff, 0xfe]) {
+        (&bytes[2..], true)
+    } else if bytes.starts_with(&[0xfe, 0xff]) {
+        (&bytes[2..], false)
+    } else if bytes.len() >= 4 && bytes.iter().skip(1).step_by(2).take(16).filter(|byte| **byte == 0).count() >= 4 {
+        (bytes, true)
+    } else {
+        return None;
+    };
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let units = bytes
+        .chunks_exact(2)
+        .map(|chunk| {
+            if little_endian {
+                u16::from_le_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            }
+        })
+        .collect::<Vec<_>>();
+    Some(String::from_utf16_lossy(&units))
+}
+
+#[cfg(not(windows))]
+fn decode_platform_terminal_output(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(windows)]
+fn decode_platform_terminal_output(bytes: &[u8]) -> String {
+    use windows_sys::Win32::Globalization::{GetACP, GetOEMCP};
+
+    unsafe {
+        for code_page in [GetACP(), GetOEMCP()] {
+            if let Some(decoded) = decode_windows_code_page(bytes, code_page) {
+                return decoded;
+            }
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(windows)]
+unsafe fn decode_windows_code_page(bytes: &[u8], code_page: u32) -> Option<String> {
+    use windows_sys::Win32::Globalization::MultiByteToWideChar;
+
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    let input_len = i32::try_from(bytes.len()).ok()?;
+    let wide_len = MultiByteToWideChar(
+        code_page,
+        0,
+        bytes.as_ptr(),
+        input_len,
+        std::ptr::null_mut(),
+        0,
+    );
+    if wide_len <= 0 {
+        return None;
+    }
+    let mut wide = vec![0u16; wide_len as usize];
+    let written = MultiByteToWideChar(
+        code_page,
+        0,
+        bytes.as_ptr(),
+        input_len,
+        wide.as_mut_ptr(),
+        wide_len,
+    );
+    if written <= 0 {
+        return None;
+    }
+    wide.truncate(written as usize);
+    Some(String::from_utf16_lossy(&wide))
+}
+
+#[cfg(all(test, windows))]
+mod terminal_output_decode_tests {
+    use super::{decode_terminal_output, decode_utf16_terminal_output, decode_windows_code_page};
+
+    #[test]
+    fn decodes_gbk_terminal_output() {
+        let text = unsafe { decode_windows_code_page(&[0xd6, 0xd0, 0xce, 0xc4], 936) };
+        assert_eq!(text.as_deref(), Some("中文"));
+    }
+
+    #[test]
+    fn terminal_output_decodes_gbk_filename_bytes() {
+        let bytes = b"C:\\Users\\33908\\Desktop\\2026\xc4\xea6\xd4\xc222\xc8\xd5\xc8\xc8\xb5\xe3\xd0\xc2\xce\xc5\xd5\xaa\xd2\xaa.txt\r\n";
+        let text = decode_terminal_output(bytes);
+        assert!(text.contains("2026年6月22日热点新闻摘要.txt"), "{text}");
+    }
+
+    #[test]
+    fn terminal_output_decodes_utf16le_bytes() {
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in "中文路径".encode_utf16() {
+            bytes.extend(unit.to_le_bytes());
+        }
+        assert_eq!(decode_utf16_terminal_output(&bytes).as_deref(), Some("中文路径"));
+    }
+}
+
 async fn run_shell_command_unchecked(
     store: &AppStore,
     run_id: &str,
@@ -5510,8 +5627,8 @@ async fn run_shell_command_unchecked(
         }
     }
     let output = wait_for_shell_output_interruptible(store, run_id, timeout_seconds, child).await?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = decode_terminal_output(&output.stdout);
+    let stderr = decode_terminal_output(&output.stderr);
     let stdout = run_transform_terminal_output_hooks(
         store,
         run_id,
