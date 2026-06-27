@@ -166,6 +166,12 @@ struct WechatInboundMedia {
     label: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct WechatInboundExtras {
+    pub raw_message: Option<Value>,
+    pub attachments: Vec<Value>,
+}
+
 pub fn data_path(name: &str) -> AppResult<PathBuf> {
     let base = crate::state_path()
         .parent()
@@ -697,8 +703,36 @@ fn extension_for_image_mime(mime: &str) -> &'static str {
         "image/jpeg" => "jpg",
         "image/gif" => "gif",
         "image/webp" => "webp",
+        "image/bmp" => "bmp",
         _ => "png",
     }
+}
+
+fn extension_for_mime(mime: &str) -> Option<&'static str> {
+    if mime.starts_with("image/") {
+        return Some(extension_for_image_mime(mime));
+    }
+    match mime {
+        "application/pdf" => Some("pdf"),
+        "text/plain" => Some("txt"),
+        "application/json" => Some("json"),
+        "application/zip" => Some("zip"),
+        "audio/mpeg" => Some("mp3"),
+        "audio/wav" => Some("wav"),
+        "audio/amr" => Some("amr"),
+        "audio/ogg" => Some("ogg"),
+        _ => None,
+    }
+}
+
+fn file_name_with_mime_extension(file_name: &str, mime_type: &str) -> String {
+    let clean = safe_media_file_name(file_name, "wechat-file");
+    if Path::new(&clean).extension().is_some() {
+        return clean;
+    }
+    extension_for_mime(mime_type)
+        .map(|extension| format!("{clean}.{extension}"))
+        .unwrap_or(clean)
 }
 
 fn mime_from_file_name(file_name: &str) -> String {
@@ -712,6 +746,7 @@ fn mime_from_file_name(file_name: &str) -> String {
         Some("jpg" | "jpeg") => "image/jpeg".to_string(),
         Some("gif") => "image/gif".to_string(),
         Some("webp") => "image/webp".to_string(),
+        Some("bmp") => "image/bmp".to_string(),
         Some("pdf") => "application/pdf".to_string(),
         Some("txt" | "md" | "csv" | "log") => "text/plain".to_string(),
         Some("json") => "application/json".to_string(),
@@ -1673,7 +1708,7 @@ fn save_wechat_attachment(
     label: String,
 ) -> AppResult<WechatInboundMedia> {
     let id = new_id("wechat_attachment");
-    let clean_name = safe_media_file_name(&file_name, "wechat-file");
+    let clean_name = file_name_with_mime_extension(&file_name, &mime_type);
     let path = attachment_dir(store)?.join(format!("{id}-{clean_name}"));
     fs::write(&path, bytes)?;
     Ok(WechatInboundMedia {
@@ -1682,6 +1717,322 @@ fn save_wechat_attachment(
         mime_type,
         label,
     })
+}
+
+fn media_label_from_value(value: &Value, fallback: &str) -> String {
+    first_value_string(
+        value,
+        &[
+            &["fileName"],
+            &["file_name"],
+            &["filename"],
+            &["name"],
+            &["label"],
+            &["title"],
+            &["displayName"],
+            &["display_name"],
+            &["originalName"],
+            &["original_name"],
+        ],
+    )
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+    .unwrap_or_else(|| fallback.to_string())
+}
+
+fn media_mime_from_value(value: &Value, label: &str) -> String {
+    if let Some(mime) = first_value_string(
+        value,
+        &[
+            &["mimeType"],
+            &["mime_type"],
+            &["contentType"],
+            &["content_type"],
+            &["mediaType"],
+            &["media_type"],
+            &["type"],
+        ],
+    )
+    .map(|value| value.trim().to_string())
+    .filter(|value| value.contains('/'))
+    {
+        return mime;
+    }
+    let from_label = mime_from_file_name(label);
+    if from_label != "application/octet-stream" {
+        return from_label;
+    }
+    first_value_string(
+        value,
+        &[
+            &["dataUrl"],
+            &["data_url"],
+            &["base64"],
+            &["data"],
+            &["content"],
+        ],
+    )
+    .and_then(|data| {
+        let (bytes, detected_mime) = if data.trim_start().starts_with("data:") {
+            decode_data_url_payload(&data)?
+        } else {
+            let bytes = general_purpose::STANDARD.decode(data.trim()).ok()?;
+            (bytes, String::new())
+        };
+        if detected_mime.contains('/') && detected_mime != "application/octet-stream" {
+            return Some(detected_mime);
+        }
+        detect_wechat_image_mime(&bytes, Path::new(label))
+            .ok()
+            .map(str::to_string)
+    })
+    .unwrap_or_else(|| "application/octet-stream".to_string())
+}
+
+fn detect_local_media_mime(path: &Path, fallback_label: &str) -> String {
+    let from_name = mime_from_file_name(
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(fallback_label),
+    );
+    if from_name != "application/octet-stream" {
+        return from_name;
+    }
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| detect_wechat_image_mime(&bytes, path).ok().map(str::to_string))
+        .unwrap_or_else(|| "application/octet-stream".to_string())
+}
+
+fn decode_data_url_payload(value: &str) -> Option<(Vec<u8>, String)> {
+    let trimmed = value.trim();
+    let (meta, payload) = trimmed.split_once(',')?;
+    if !meta.starts_with("data:") || !meta.contains(";base64") {
+        return None;
+    }
+    let mime = meta
+        .trim_start_matches("data:")
+        .split(';')
+        .next()
+        .filter(|mime| !mime.trim().is_empty())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let bytes = general_purpose::STANDARD.decode(payload.trim()).ok()?;
+    Some((bytes, mime))
+}
+
+fn attachment_value_to_saved_media(store: &AppStore, value: &Value) -> Option<WechatInboundMedia> {
+    if value.is_null() {
+        return None;
+    }
+    if let Some(text) = value.as_str().map(str::trim).filter(|value| !value.is_empty()) {
+        if text.starts_with("data:") {
+            let (bytes, mime_type) = decode_data_url_payload(text)?;
+            let label = file_name_with_mime_extension(&format!("wechat-{}", new_id("media")), &mime_type);
+            return save_wechat_attachment(store, label.clone(), bytes, mime_type, label).ok();
+        }
+        let source_path = PathBuf::from(text);
+        if !source_path.is_file() {
+            return None;
+        }
+        let label = attachment_file_name_for_path(text);
+        let bytes = fs::read(&source_path).ok()?;
+        let mime_type = detect_local_media_mime(&source_path, &label);
+        return save_wechat_attachment(store, label.clone(), bytes, mime_type, label).ok();
+    }
+    if let Some(path) = first_value_string(
+        value,
+        &[
+            &["path"],
+            &["filePath"],
+            &["file_path"],
+            &["localPath"],
+            &["local_path"],
+            &["sourcePath"],
+            &["source_path"],
+            &["tempPath"],
+            &["temp_path"],
+            &["thumbPath"],
+            &["thumb_path"],
+        ],
+    )
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+    {
+        let label = media_label_from_value(value, &attachment_file_name_for_path(&path));
+        let source_path = PathBuf::from(&path);
+        if !source_path.is_file() {
+            return None;
+        }
+        let bytes = fs::read(&source_path).ok()?;
+        let configured_mime = media_mime_from_value(value, &label);
+        let mime_type = if configured_mime == "application/octet-stream" {
+            detect_local_media_mime(&source_path, &label)
+        } else {
+            configured_mime
+        };
+        return save_wechat_attachment(store, label.clone(), bytes, mime_type, label).ok();
+    }
+    let label = media_label_from_value(value, "wechat-image");
+    let data = first_value_string(
+        value,
+        &[
+            &["dataUrl"],
+            &["data_url"],
+            &["base64"],
+            &["data"],
+            &["content"],
+        ],
+    )?;
+    let (bytes, detected_mime) = if data.trim_start().starts_with("data:") {
+        decode_data_url_payload(&data)?
+    } else {
+        let bytes = general_purpose::STANDARD.decode(data.trim()).ok()?;
+        let mime = media_mime_from_value(value, &label);
+        (bytes, mime)
+    };
+    let mime_type = media_mime_from_value(value, &label);
+    let mime_type = if mime_type == "application/octet-stream" {
+        detected_mime
+    } else {
+        mime_type
+    };
+    save_wechat_attachment(store, label.clone(), bytes, mime_type, label).ok()
+}
+
+fn collect_extra_attachment_values(value: &Value, output: &mut Vec<Value>, depth: usize) {
+    if depth > 16 {
+        return;
+    }
+    if attachment_value_to_saved_media_candidate(value) {
+        output.push(value.clone());
+    }
+    match value {
+        Value::Object(map) => {
+            for key in [
+                "attachments",
+                "attachmentContexts",
+                "attachment_contexts",
+                "mediaFiles",
+                "media_files",
+                "files",
+                "images",
+                "imageFiles",
+                "image_files",
+                "fileList",
+                "file_list",
+            ] {
+                if let Some(child) = map.get(key) {
+                    collect_extra_attachment_values(child, output, depth + 1);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_extra_attachment_values(item, output, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn attachment_value_to_saved_media_candidate(value: &Value) -> bool {
+    if value.as_str().is_some_and(|text| {
+        let trimmed = text.trim();
+        trimmed.starts_with("data:image/")
+            || trimmed.starts_with("data:application/")
+            || PathBuf::from(trimmed).is_file()
+    }) {
+        return true;
+    }
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let has_path = [
+        "path",
+        "filePath",
+        "file_path",
+        "localPath",
+        "local_path",
+        "sourcePath",
+        "source_path",
+        "tempPath",
+        "temp_path",
+        "thumbPath",
+        "thumb_path",
+    ]
+    .iter()
+    .any(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|text| !text.is_empty() && PathBuf::from(text).is_file())
+    });
+    let has_inline_data = ["dataUrl", "data_url", "base64", "base64Data", "base64_data"]
+        .iter()
+        .any(|key| {
+            object
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|text| text.starts_with("data:") || looks_like_base64_media(text))
+    });
+    has_path || has_inline_data
+}
+
+fn looks_like_base64_media(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.len() > 64
+        && trimmed.len() % 4 == 0
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '='))
+}
+
+fn raw_wechat_message_has_media(raw_msg: &Value) -> bool {
+    let has_item_media = raw_msg
+        .get("item_list")
+        .or_else(|| raw_msg.get("itemList"))
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                matches!(
+                    item.get("type").and_then(Value::as_i64).unwrap_or_default(),
+                    2 | WECHAT_FILE_ITEM_TYPE | WECHAT_VOICE_ITEM_TYPE
+                ) || item.get("image_item").is_some()
+                    || item.get("imageItem").is_some()
+                    || item.get("file_item").is_some()
+                    || item.get("fileItem").is_some()
+                    || item.get("voice_item").is_some()
+                    || item.get("voiceItem").is_some()
+            })
+        });
+    if has_item_media {
+        return true;
+    }
+    let mut extras = Vec::new();
+    collect_extra_attachment_values(raw_msg, &mut extras, 0);
+    !extras.is_empty()
+}
+
+fn attachment_file_name_for_path(path: &str) -> String {
+    PathBuf::from(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "wechat-file".to_string())
+}
+
+fn media_from_extra_attachments(store: &AppStore, attachments: &[Value]) -> Vec<WechatInboundMedia> {
+    let mut media = Vec::new();
+    for attachment in attachments {
+        if let Some(item) = attachment_value_to_saved_media(store, attachment) {
+            media.push(item);
+        }
+    }
+    media
 }
 
 async fn extract_and_save_wechat_media(
@@ -1829,6 +2180,27 @@ async fn extract_and_save_wechat_media(
         }
     }
     saved
+}
+
+async fn extract_and_save_wechat_media_with_extras(
+    store: &AppStore,
+    account: &AccountConfig,
+    raw_msg: Option<&Value>,
+    attachments: &[Value],
+) -> Vec<WechatInboundMedia> {
+    let mut media = Vec::new();
+    if let Some(raw_msg) = raw_msg {
+        media.extend(extract_and_save_wechat_media(store, account, raw_msg).await);
+        let mut raw_attachments = Vec::new();
+        collect_extra_attachment_values(raw_msg, &mut raw_attachments, 0);
+        media.extend(media_from_extra_attachments(store, &raw_attachments));
+    }
+    media.extend(media_from_extra_attachments(store, attachments));
+    let mut seen = std::collections::HashSet::new();
+    media
+        .into_iter()
+        .filter(|item| seen.insert(format!("{}::{}", item.path, item.mime_type)))
+        .collect()
 }
 
 fn append_media_contexts(content: &str, media: &[WechatInboundMedia]) -> String {
@@ -2562,8 +2934,7 @@ pub async fn wechat_poll_once(
             continue;
         };
         let text = extract_wechat_text(&raw_msg).unwrap_or_default();
-        let media = extract_and_save_wechat_media(store, &account, &raw_msg).await;
-        if text.trim().is_empty() && media.is_empty() {
+        if text.trim().is_empty() && !raw_wechat_message_has_media(&raw_msg) {
             eprintln!(
                 "SynthChat wechat poll skipped empty message: account={} user={}",
                 account_id, user_id
@@ -2571,15 +2942,18 @@ pub async fn wechat_poll_once(
             skipped_count += 1;
             continue;
         }
-        let content = append_media_contexts(&text, &media);
         let context_token = extract_wechat_context_token(&raw_msg);
-        let result = wechat_inbound_text(
+        let result = wechat_inbound_text_with_extras(
             store,
             app,
             account_id.clone(),
             user_id.clone(),
-            content.clone(),
+            text,
             context_token,
+            WechatInboundExtras {
+                raw_message: Some(raw_msg),
+                attachments: Vec::new(),
+            },
         )
         .await?;
         eprintln!(
@@ -2588,7 +2962,17 @@ pub async fn wechat_poll_once(
         );
         processed.push(WechatProcessedInbound {
             user_id,
-            text: content,
+            text: result
+                .messages
+                .iter()
+                .filter_map(|message| {
+                    (message.get("role").and_then(Value::as_str) == Some("user"))
+                        .then(|| message.get("content").and_then(Value::as_str))
+                        .flatten()
+                })
+                .last()
+                .unwrap_or_default()
+                .to_string(),
             conversation_id: result
                 .messages
                 .iter()
@@ -2677,10 +3061,38 @@ pub async fn wechat_inbound_text(
     text: String,
     context_token: Option<String>,
 ) -> AppResult<WechatInboundResult> {
-    let content = text.trim().to_string();
-    if content.is_empty() {
-        return Err(AppError::BadRequest("message text is required".into()));
-    }
+    wechat_inbound_text_with_extras(
+        store,
+        app,
+        account_id,
+        user_id,
+        text,
+        context_token,
+        WechatInboundExtras::default(),
+    )
+    .await
+}
+
+pub async fn wechat_inbound_text_with_extras(
+    store: &AppStore,
+    app: &AppHandle,
+    account_id: String,
+    user_id: String,
+    text: String,
+    context_token: Option<String>,
+    extras: WechatInboundExtras,
+) -> AppResult<WechatInboundResult> {
+    let content = if text.trim().is_empty() {
+        extras
+            .raw_message
+            .as_ref()
+            .and_then(extract_wechat_text)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    } else {
+        text.trim().to_string()
+    };
     let accounts = list_accounts()?;
     let account = accounts
         .iter()
@@ -2696,6 +3108,17 @@ pub async fn wechat_inbound_text(
     let persona = store.persona(Some(account.linked_persona.as_str()))?;
     let conversation_id =
         find_or_create_wechat_conversation(store, &account.linked_persona, &account.id)?;
+    let media = extract_and_save_wechat_media_with_extras(
+        store,
+        &account,
+        extras.raw_message.as_ref(),
+        &extras.attachments,
+    )
+    .await;
+    let content = append_media_contexts(&content, &media);
+    if content.trim().is_empty() {
+        return Err(AppError::BadRequest("message text or media is required".into()));
+    }
     emit_wechat_processing(app, &conversation_id, &persona.id, true);
     let turn_started_at = now_iso();
     let messages_result = run_wechat_chat_turn(
@@ -3164,6 +3587,54 @@ mod tests {
         assert!(content.contains("[media attached: \"D:\\tmp\\report.txt\" (text/plain)]"));
         assert!(content.contains("\"type\":\"attachment\""));
         assert!(content.contains("\"fileName\":\"report.txt\""));
+    }
+
+    #[test]
+    fn extra_attachment_data_url_enters_wechat_media_contexts() {
+        let dir = std::env::temp_dir().join(format!("synthchat-wechat-extra-{}", new_id("case")));
+        fs::create_dir_all(&dir).unwrap();
+        let store = AppStore::new(dir.join("state.json")).unwrap();
+        let attachment = json!({
+            "id": "att-image",
+            "fileName": "photo.png",
+            "mimeType": "image/png",
+            "dataUrl": "data:image/png;base64,iVBORw0KGgo="
+        });
+        let media = media_from_extra_attachments(&store, &[attachment]);
+        assert_eq!(media.len(), 1);
+        let content = append_media_contexts("看图", &media);
+        assert!(content.contains("[media attached:"));
+        assert!(content.contains("image/png"));
+        assert!(content.contains("\"type\":\"attachment\""));
+        assert!(content.contains("\"fileName\":\"photo.png\""));
+        assert!(PathBuf::from(&media[0].path).is_file());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn extra_attachment_local_path_is_copied_into_attachment_cache() {
+        let dir = std::env::temp_dir().join(format!("synthchat-wechat-local-extra-{}", new_id("case")));
+        let external = dir.join("incoming");
+        fs::create_dir_all(&external).unwrap();
+        let source = external.join("photo");
+        fs::write(&source, b"\x89PNG\r\n\x1a\nimage").unwrap();
+        let store = AppStore::new(dir.join("state.json")).unwrap();
+        let media = media_from_extra_attachments(
+            &store,
+            &[json!({
+                "id": "local-image",
+                "fileName": "photo",
+                "path": source.to_string_lossy(),
+            })],
+        );
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].mime_type, "image/png");
+        let saved_path = PathBuf::from(&media[0].path);
+        assert!(saved_path.is_file());
+        assert!(saved_path.starts_with(store.data_dir().join("attachments")));
+        assert_ne!(saved_path, source);
+        assert!(saved_path.extension().and_then(|value| value.to_str()).is_some());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

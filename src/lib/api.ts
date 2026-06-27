@@ -928,8 +928,8 @@ export const api: Record<string, any> = {
   checkWechatQrStatus: (qrcode: string, baseUrl?: string) =>
     call<WechatQrStatusResult>("check_wechat_qr_status", { qrcode, baseUrl: baseUrl || null }, () => ({ status: "idle", raw: null })),
   listWechatLinks: () => call<WechatLinkSummary[]>("list_wechat_links", {}, () => []),
-  wechatInboundText: (accountId: string, userId: string, text: string, contextToken?: string) =>
-    call<WechatInboundResult>("wechat_inbound_text", { accountId, userId, text, contextToken: contextToken || null }, () => ({ messages: [], delivered: false, deliveryError: "wechat runtime unavailable" })),
+  wechatInboundText: (accountId: string, userId: string, text: string, contextToken?: string, rawMessage?: unknown, attachments?: unknown[]) =>
+    call<WechatInboundResult>("wechat_inbound_text", { accountId, userId, text, contextToken: contextToken || null, rawMessage: rawMessage ?? null, attachments: attachments ?? null }, () => ({ messages: [], delivered: false, deliveryError: "wechat runtime unavailable" })),
   wechatPollOnce: (accountId: string, timeoutSeconds?: number) =>
     call<WechatPollResult>("wechat_poll_once", { accountId, timeoutSeconds: timeoutSeconds ?? null }, () => ({ account: null as unknown as AccountConfig, processed: [], receivedCount: 0, skippedCount: 0, updatedBuffer: false, raw: null })),
   openai: {},

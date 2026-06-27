@@ -1143,14 +1143,20 @@ async fn wechat_inbound_text(
     user_id: String,
     text: String,
     context_token: Option<String>,
+    raw_message: Option<serde_json::Value>,
+    attachments: Option<Vec<serde_json::Value>>,
 ) -> AppResult<wechat_settings::WechatInboundResult> {
-    wechat_settings::wechat_inbound_text(
+    wechat_settings::wechat_inbound_text_with_extras(
         &store,
         &app,
         account_id,
         user_id,
         text,
         context_token,
+        wechat_settings::WechatInboundExtras {
+            raw_message,
+            attachments: attachments.unwrap_or_default(),
+        },
     )
     .await
 }

@@ -1708,6 +1708,7 @@ fn llm_api_response_hook_payload(
 struct ImageAttachmentPart {
     file_name: String,
     mime_type: String,
+    path: PathBuf,
     data_url: String,
     base64_data: String,
 }
@@ -1719,26 +1720,21 @@ fn history_with_native_image_attachments(
     history: &[ChatMessage],
     user_content: &str,
 ) -> Vec<ChatMessage> {
+    let prepared_history = history_with_current_user_content(history, user_content);
     let mut effective_provider = provider.clone();
     if !persona.llm_model.trim().is_empty() {
         effective_provider.model = persona.llm_model.trim().to_string();
     }
     let caps = model_catalog::provider_model_capabilities(&effective_provider);
     if !caps.supports_vision {
-        return history.to_vec();
+        return prepared_history;
     }
     let attachment_root = store.data_dir().join("attachments");
-    let last_user_index = history.iter().rposition(|message| message.role == "user");
-    history
-        .iter()
-        .enumerate()
-        .map(|(index, message)| {
+    prepared_history
+        .into_iter()
+        .map(|message| {
             if message.role != "user" {
-                return message.clone();
-            }
-            let mut message = message.clone();
-            if Some(index) == last_user_index && !user_content.trim().is_empty() {
-                message.content = user_content.to_string();
+                return message;
             }
             let attachments = image_attachments_from_message(&message, &attachment_root);
             if attachments.is_empty() {
@@ -1749,44 +1745,125 @@ fn history_with_native_image_attachments(
         .collect()
 }
 
+fn history_with_current_user_content(history: &[ChatMessage], user_content: &str) -> Vec<ChatMessage> {
+    let Some(last_user_index) = history.iter().rposition(|message| message.role == "user") else {
+        return history.to_vec();
+    };
+    if user_content.trim().is_empty() {
+        return history.to_vec();
+    }
+    history
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let mut message = message.clone();
+            if index == last_user_index {
+                message.content = user_content.to_string();
+            }
+            message
+        })
+        .collect()
+}
+
 fn image_attachments_from_message(message: &ChatMessage, attachment_root: &PathBuf) -> Vec<ImageAttachmentPart> {
     let root = attachment_root
         .canonicalize()
         .unwrap_or_else(|_| attachment_root.to_path_buf());
-    message
-        .content
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if !trimmed.starts_with('{') || !trimmed.contains("\"attachment\"") {
-                return None;
+    let mut attachments = Vec::new();
+    let mut seen = HashSet::<String>::new();
+    for line in message.content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') || !trimmed.contains("\"attachment\"") {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            push_image_attachment_part(&value, &root, &mut seen, &mut attachments);
+        }
+        if attachments.len() >= 6 {
+            return attachments;
+        }
+    }
+    if let Some(provider_data) = message.provider_data.as_ref() {
+        for key in [
+            "attachments",
+            "attachmentContexts",
+            "attachment_contexts",
+            "mediaFiles",
+            "media_files",
+        ] {
+            match provider_data.get(key) {
+                Some(Value::Array(items)) => {
+                    for item in items {
+                        push_image_attachment_part(item, &root, &mut seen, &mut attachments);
+                        if attachments.len() >= 6 {
+                            return attachments;
+                        }
+                    }
+                }
+                Some(item) => {
+                    push_image_attachment_part(item, &root, &mut seen, &mut attachments);
+                    if attachments.len() >= 6 {
+                        return attachments;
+                    }
+                }
+                None => {}
             }
-            let value = serde_json::from_str::<Value>(trimmed).ok()?;
-            if value.get("type").and_then(Value::as_str) != Some("attachment") {
-                return None;
-            }
-            image_attachment_part_from_value(&value, &root)
-        })
-        .take(6)
-        .collect()
+        }
+    }
+    attachments
+}
+
+fn push_image_attachment_part(
+    value: &Value,
+    attachment_root: &PathBuf,
+    seen: &mut HashSet<String>,
+    attachments: &mut Vec<ImageAttachmentPart>,
+) {
+    let Some(part) = image_attachment_part_from_value(value, attachment_root) else {
+        return;
+    };
+    let key = format!("{}::{}", part.path.display(), part.mime_type);
+    if seen.insert(key) {
+        attachments.push(part);
+    }
 }
 
 fn image_attachment_part_from_value(value: &Value, attachment_root: &PathBuf) -> Option<ImageAttachmentPart> {
+    if value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| !matches!(kind, "attachment" | "image" | "file"))
+    {
+        return None;
+    }
     let mime_type = value
         .get("mimeType")
         .or_else(|| value.get("mime_type"))
+        .or_else(|| value.get("contentType"))
+        .or_else(|| value.get("content_type"))
         .and_then(Value::as_str)
         .unwrap_or("application/octet-stream")
         .trim();
-    if !mime_type.to_ascii_lowercase().starts_with("image/") {
-        return None;
-    }
-    let path_text = value.get("path").and_then(Value::as_str)?.trim();
+    let path_text = value
+        .get("path")
+        .or_else(|| value.get("filePath"))
+        .or_else(|| value.get("file_path"))
+        .or_else(|| value.get("localPath"))
+        .or_else(|| value.get("local_path"))
+        .or_else(|| value.get("sourcePath"))
+        .or_else(|| value.get("source_path"))
+        .or_else(|| value.get("tempPath"))
+        .or_else(|| value.get("temp_path"))
+        .or_else(|| value.get("thumbPath"))
+        .or_else(|| value.get("thumb_path"))
+        .and_then(Value::as_str)?
+        .trim();
     let path = PathBuf::from(path_text);
     let canonical = path.canonicalize().ok()?;
     if !canonical.starts_with(attachment_root) || !canonical.is_file() {
         return None;
     }
+    let mime_type = normalized_image_mime(mime_type, &canonical)?;
     let metadata = fs::metadata(&canonical).ok()?;
     if metadata.len() == 0 || metadata.len() > 20 * 1024 * 1024 {
         return None;
@@ -1794,7 +1871,6 @@ fn image_attachment_part_from_value(value: &Value, attachment_root: &PathBuf) ->
     let bytes = fs::read(&canonical).ok()?;
     use base64::Engine as _;
     let base64_data = base64::engine::general_purpose::STANDARD.encode(bytes);
-    let mime_type = normalized_image_mime(mime_type, &canonical);
     let data_url = format!("data:{mime_type};base64,{base64_data}");
     let file_name = value
         .get("fileName")
@@ -1808,28 +1884,31 @@ fn image_attachment_part_from_value(value: &Value, attachment_root: &PathBuf) ->
     Some(ImageAttachmentPart {
         file_name,
         mime_type,
+        path: canonical,
         data_url,
         base64_data,
     })
 }
 
-fn normalized_image_mime(mime_type: &str, path: &PathBuf) -> String {
+fn normalized_image_mime(mime_type: &str, path: &PathBuf) -> Option<String> {
     let lower = mime_type.trim().to_ascii_lowercase();
     if lower.starts_with("image/") && lower != "image/jpg" {
-        return lower;
+        return Some(lower);
     }
     match path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_ascii_lowercase()) {
-        Some(ext) if ext == "jpg" || ext == "jpeg" => "image/jpeg".into(),
-        Some(ext) if ext == "webp" => "image/webp".into(),
-        Some(ext) if ext == "gif" => "image/gif".into(),
-        Some(ext) if ext == "bmp" => "image/bmp".into(),
-        _ => "image/png".into(),
+        Some(ext) if ext == "jpg" || ext == "jpeg" => Some("image/jpeg".into()),
+        Some(ext) if ext == "webp" => Some("image/webp".into()),
+        Some(ext) if ext == "gif" => Some("image/gif".into()),
+        Some(ext) if ext == "bmp" => Some("image/bmp".into()),
+        Some(ext) if ext == "png" => Some("image/png".into()),
+        _ => None,
     }
 }
 
 fn message_with_native_image_parts(message: &ChatMessage, attachments: &[ImageAttachmentPart]) -> ChatMessage {
     let mut next = message.clone();
-    let text = message.content.trim();
+    let cleaned_text = sanitize_native_image_text(&message.content);
+    let text = cleaned_text.trim();
     let mut openai_content = Vec::new();
     let mut responses_content = Vec::new();
     let mut anthropic_content = Vec::new();
@@ -1892,6 +1971,23 @@ fn message_with_native_image_parts(message: &ChatMessage, attachments: &[ImageAt
     );
     next.provider_data = Some(Value::Object(root));
     next
+}
+
+fn sanitize_native_image_text(content: &str) -> String {
+    content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.starts_with('{') && trimmed.contains("\"attachment\""))
+                && !trimmed.contains("[media attached:")
+                && !trimmed
+                    .get(..6)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("MEDIA:"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 fn merge_provider_data_object(root: &mut Map<String, Value>, key: &str, value: Value) {

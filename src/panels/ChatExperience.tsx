@@ -2890,7 +2890,7 @@ const MarkdownLite = memo(function MarkdownLite({ text, onImageClick, streaming,
   return (
     <>
       {segments.map((seg, i) => {
-        if (seg.kind === "image" && isImagePath(seg.path)) {
+        if (seg.kind === "image") {
           return <InlineImage key={i} path={seg.path} onClick={handleClick} />;
         }
         if (seg.kind === "file") {

@@ -35,6 +35,222 @@ fn turn_source_label(request: &SendChatRequest) -> String {
         .to_string()
 }
 
+#[derive(Debug, Clone)]
+struct AttachmentMetadata {
+    id: String,
+    file_name: String,
+    mime_type: String,
+    path: String,
+    file_size: Option<u64>,
+}
+
+fn attachment_mime_from_path(path: &str) -> String {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png".into(),
+        Some("jpg" | "jpeg") => "image/jpeg".into(),
+        Some("gif") => "image/gif".into(),
+        Some("webp") => "image/webp".into(),
+        Some("bmp") => "image/bmp".into(),
+        Some("svg") => "image/svg+xml".into(),
+        Some("pdf") => "application/pdf".into(),
+        Some("txt" | "md" | "csv" | "log") => "text/plain".into(),
+        Some("json") => "application/json".into(),
+        _ => "application/octet-stream".into(),
+    }
+}
+
+fn attachment_file_name(path: &str, fallback: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn attachment_record_to_metadata(value: &Value) -> Option<AttachmentMetadata> {
+    if value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| !matches!(kind, "attachment" | "image" | "file"))
+    {
+        return None;
+    }
+    let path = value
+        .get("path")
+        .or_else(|| value.get("filePath"))
+        .or_else(|| value.get("file_path"))
+        .or_else(|| value.get("localPath"))
+        .or_else(|| value.get("local_path"))
+        .or_else(|| value.get("sourcePath"))
+        .or_else(|| value.get("source_path"))
+        .or_else(|| value.get("tempPath"))
+        .or_else(|| value.get("temp_path"))
+        .or_else(|| value.get("thumbPath"))
+        .or_else(|| value.get("thumb_path"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())?
+        .to_string();
+    let mime_type = value
+        .get("mimeType")
+        .or_else(|| value.get("mime_type"))
+        .or_else(|| value.get("contentType"))
+        .or_else(|| value.get("content_type"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|mime| !mime.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| attachment_mime_from_path(&path));
+    if !mime_type.to_ascii_lowercase().starts_with("image/") {
+        return None;
+    }
+    let file_name = value
+        .get("fileName")
+        .or_else(|| value.get("file_name"))
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| attachment_file_name(&path, "image"));
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| file_name.clone());
+    let file_size = value
+        .get("fileSize")
+        .or_else(|| value.get("file_size"))
+        .or_else(|| value.get("size"))
+        .and_then(Value::as_u64);
+    Some(AttachmentMetadata {
+        id,
+        file_name,
+        mime_type,
+        path,
+        file_size,
+    })
+}
+
+fn collect_attachment_metadata(content: &str, provider_data: Option<&Value>) -> Vec<AttachmentMetadata> {
+    let mut attachments = Vec::<AttachmentMetadata>::new();
+    let mut seen = HashSet::<String>::new();
+    let mut push = |attachment: AttachmentMetadata| {
+        let key = format!(
+            "{}::{}::{}",
+            attachment.path, attachment.file_name, attachment.mime_type
+        );
+        if seen.insert(key) {
+            attachments.push(attachment);
+        }
+    };
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') || !trimmed.contains("\"attachment\"") {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            if let Some(attachment) = attachment_record_to_metadata(&value) {
+                push(attachment);
+            }
+        }
+    }
+    if let Some(data) = provider_data {
+        for key in ["attachments", "attachmentContexts", "attachment_contexts", "mediaFiles", "media_files"] {
+            match data.get(key) {
+                Some(Value::Array(items)) => {
+                    for item in items {
+                        if let Some(attachment) = attachment_record_to_metadata(item) {
+                            push(attachment);
+                        }
+                    }
+                }
+                Some(item) => {
+                    if let Some(attachment) = attachment_record_to_metadata(item) {
+                        push(attachment);
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    attachments
+}
+
+fn attachment_identity(value: &Value) -> String {
+    let path = value
+        .get("path")
+        .or_else(|| value.get("filePath"))
+        .or_else(|| value.get("file_path"))
+        .or_else(|| value.get("localPath"))
+        .or_else(|| value.get("local_path"))
+        .or_else(|| value.get("sourcePath"))
+        .or_else(|| value.get("source_path"))
+        .or_else(|| value.get("tempPath"))
+        .or_else(|| value.get("temp_path"))
+        .or_else(|| value.get("thumbPath"))
+        .or_else(|| value.get("thumb_path"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let file_name = value
+        .get("fileName")
+        .or_else(|| value.get("file_name"))
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mime_type = value
+        .get("mimeType")
+        .or_else(|| value.get("mime_type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    format!("{path}::{file_name}::{mime_type}")
+}
+
+fn provider_data_with_attachment_metadata(content: &str, provider_data: Option<Value>) -> Option<Value> {
+    let attachments = collect_attachment_metadata(content, provider_data.as_ref());
+    if attachments.is_empty() {
+        return provider_data;
+    }
+    let mut root = match provider_data {
+        Some(Value::Object(object)) => object,
+        Some(value) => {
+            let mut object = serde_json::Map::new();
+            object.insert("originalProviderData".into(), value);
+            object
+        }
+        None => serde_json::Map::new(),
+    };
+    let mut values = root
+        .get("attachments")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut seen = values.iter().map(attachment_identity).collect::<HashSet<_>>();
+    for attachment in attachments {
+        let mut value = json!({
+            "type": "attachment",
+            "id": attachment.id,
+            "path": attachment.path,
+            "fileName": attachment.file_name,
+            "mimeType": attachment.mime_type,
+        });
+        if let Some(file_size) = attachment.file_size {
+            value["fileSize"] = json!(file_size);
+        }
+        if seen.insert(attachment_identity(&value)) {
+            values.push(value);
+        }
+    }
+    root.insert("attachments".into(), Value::Array(values));
+    Some(Value::Object(root))
+}
+
 pub async fn run_chat_turn(
     store: &AppStore,
     request: SendChatRequest,
@@ -246,7 +462,8 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
             .filter(|source| !source.is_empty())
             .unwrap_or("desktop"),
     );
-    user_message.provider_data = request.provider_data.clone();
+    user_message.provider_data =
+        provider_data_with_attachment_metadata(&request.content, request.provider_data.clone());
     let user = store.append_message(user_message)?;
     let silent_user_message = user.source == "proactive-internal";
     if let Some(app) = app.filter(|_| !silent_user_message) {
