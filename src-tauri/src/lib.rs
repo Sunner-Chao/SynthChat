@@ -37,7 +37,8 @@ use store::AppStore;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
-    App, AppHandle, DragDropEvent, Emitter, Manager, PhysicalPosition, PhysicalSize, State,
+    App, AppHandle, DragDropEvent, Emitter, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
+    State,
     WebviewUrl,
     WebviewWindowBuilder, WindowEvent,
 };
@@ -4135,15 +4136,12 @@ fn asset_url(path: String) -> String {
     path
 }
 
-fn pet_window_target_size(mode: &str) -> PhysicalSize<u32> {
+fn pet_window_target_size(mode: &str) -> LogicalSize<f64> {
     match mode {
-        "model" => PhysicalSize::new(
-            PET_MODEL_WINDOW_WIDTH as u32,
-            PET_MODEL_WINDOW_HEIGHT as u32,
-        ),
-        "orb" => PhysicalSize::new(PET_ORB_WINDOW_WIDTH as u32, PET_ORB_WINDOW_HEIGHT as u32),
-        "dock" => PhysicalSize::new(PET_DOCK_WINDOW_WIDTH as u32, PET_DOCK_WINDOW_HEIGHT as u32),
-        _ => PhysicalSize::new(PET_WINDOW_WIDTH as u32, PET_WINDOW_HEIGHT as u32),
+        "model" => LogicalSize::new(PET_MODEL_WINDOW_WIDTH, PET_MODEL_WINDOW_HEIGHT),
+        "orb" => LogicalSize::new(PET_ORB_WINDOW_WIDTH, PET_ORB_WINDOW_HEIGHT),
+        "dock" => LogicalSize::new(PET_DOCK_WINDOW_WIDTH, PET_DOCK_WINDOW_HEIGHT),
+        _ => LogicalSize::new(PET_WINDOW_WIDTH, PET_WINDOW_HEIGHT),
     }
 }
 
@@ -4173,6 +4171,10 @@ fn place_pet_window_for_mode(
     dock_edge: Option<PetDockEdge>,
 ) -> AppResult<()> {
     let size = pet_window_target_size(mode);
+    let scale_factor = window
+        .scale_factor()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let physical_size = size.to_physical::<u32>(scale_factor);
     let current_position = window
         .outer_position()
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
@@ -4190,15 +4192,24 @@ fn place_pet_window_for_mode(
     {
         let origin = monitor.position();
         let monitor_size = monitor.size();
-        let mut x = current_center_x - size.width as i32 / 2;
-        let y = current_bottom_y - size.height as i32;
+        let mut x = current_center_x - physical_size.width as i32 / 2;
+        let y = current_bottom_y - physical_size.height as i32;
         if mode == "dock" || mode == "orb" {
             x = match dock_edge.unwrap_or(PetDockEdge::Right) {
                 PetDockEdge::Left => origin.x,
-                PetDockEdge::Right => origin.x + monitor_size.width as i32 - size.width as i32,
+                PetDockEdge::Right => {
+                    origin.x + monitor_size.width as i32 - physical_size.width as i32
+                }
             };
         }
-        let next = clamp_pet_window_position(x, y, size.width, size.height, origin, monitor_size);
+        let next = clamp_pet_window_position(
+            x,
+            y,
+            physical_size.width,
+            physical_size.height,
+            origin,
+            monitor_size,
+        );
         let _ = window.set_position(next);
     }
     Ok(())
