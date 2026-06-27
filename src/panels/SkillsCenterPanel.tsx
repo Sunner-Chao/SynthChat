@@ -1,13 +1,14 @@
 import React, { useState, useEffect } from "react";
-import { Wand2, Download, Trash2, CheckCircle2, PackageSearch, Layers, ExternalLink, Settings2, Loader2, Sparkles, ChevronRight, UserSquare2 } from "lucide-react";
+import { Wand2, Download, CheckCircle2, PackageSearch, Layers, ExternalLink, Settings2, Loader2, Sparkles, ChevronRight, UserSquare2 } from "lucide-react";
+import { api } from "../lib/api";
 import { useAppStore } from "../lib/store";
-import { EnhancedSkillSummary, MarketplaceSkill } from "../lib/types";
 
 export function SkillsCenterPanel() {
   const { 
     skills, marketplaceSkills, 
     refreshSkills, refreshMarketplaceSkills, 
     installMarketplaceSkill, 
+    installExternalSkillUrl,
     goBack,
     skillsPanelMode, setSkillsPanelMode,
     focusedAgentId, setFocusedAgentId,
@@ -17,8 +18,25 @@ export function SkillsCenterPanel() {
   const [activeTab, setActiveTab] = useState<"installed" | "marketplace">("installed");
   const [searchQuery, setSearchQuery] = useState("");
   const [installingId, setInstallingId] = useState<string | null>(null);
+  const [installLocalPath, setInstallLocalPath] = useState("");
+  const [installUrl, setInstallUrl] = useState("");
+  const [installName, setInstallName] = useState("");
+  const [installCategory, setInstallCategory] = useState("");
+  const [installForce, setInstallForce] = useState(false);
+  const [installNotice, setInstallNotice] = useState("");
+  const [localEnabledOverride, setLocalEnabledOverride] = useState<Record<string, string[]>>({});
+  const [localRuntimeOverride, setLocalRuntimeOverride] = useState<Record<string, boolean>>({});
+  const [pendingLocalSkillIds, setPendingLocalSkillIds] = useState<Set<string>>(() => new Set());
+  const [runtimePending, setRuntimePending] = useState(false);
 
-  const focusedAgent = agents.find(a => a.id === focusedAgentId) || agents[0];
+  const focusedAgent = agents.find(a => a.id === focusedAgentId) || agents.find(a => a.isDefault) || agents[0];
+  const focusedInstallAgentId = focusedAgent?.id || focusedAgentId || undefined;
+  const focusedAgentEnabledSkills = focusedAgent
+    ? localEnabledOverride[focusedAgent.id] ?? focusedAgent.enabledSkills ?? []
+    : [];
+  const focusedAgentSkillsRuntime = focusedAgent
+    ? localRuntimeOverride[focusedAgent.id] ?? focusedAgent.skillsEnabled
+    : false;
 
   useEffect(() => {
     if (skillsPanelMode === "local") {
@@ -34,8 +52,8 @@ export function SkillsCenterPanel() {
   }, [focusedAgentId, marketplaceSkills.length, refreshMarketplaceSkills, refreshSkills, refreshSkillsForAgent, skillsPanelMode]);
 
   useEffect(() => {
-    if (!focusedAgentId && agents[0]) {
-      setFocusedAgentId(agents[0].id);
+    if ((!focusedAgentId || !agents.some((agent) => agent.id === focusedAgentId)) && agents.length > 0) {
+      setFocusedAgentId((agents.find((agent) => agent.isDefault) ?? agents[0]).id);
     }
   }, [agents, focusedAgentId, setFocusedAgentId]);
 
@@ -53,33 +71,119 @@ export function SkillsCenterPanel() {
     }
   };
 
+  const handleInstallExternalPath = async () => {
+    const sourcePath = installLocalPath.trim();
+    if (!sourcePath) return;
+    setInstallingId("__local__");
+    setInstallNotice("");
+    try {
+      await api.installExternalSkillFile(
+        sourcePath,
+        installName.trim() || undefined,
+        installCategory.trim() || undefined,
+        focusedInstallAgentId,
+        installForce
+      );
+      setInstallNotice("已从本地文件/目录安装");
+      setInstallLocalPath("");
+      setInstallName("");
+      await refreshAgents();
+      if (focusedInstallAgentId) {
+        await refreshSkillsForAgent(focusedInstallAgentId);
+      } else {
+        await refreshSkills();
+      }
+    } catch (error) {
+      setInstallNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setInstallingId(null);
+    }
+  };
+
+  const handleInstallExternalUrl = async () => {
+    const url = installUrl.trim();
+    if (!url) return;
+    setInstallingId("__url__");
+    setInstallNotice("");
+    try {
+      await installExternalSkillUrl(
+        url,
+        installName.trim() || undefined,
+        installCategory.trim() || undefined,
+        focusedInstallAgentId,
+        installForce
+      );
+      setInstallNotice("已从 URL 安装");
+      setInstallUrl("");
+      setInstallName("");
+      await refreshAgents();
+      if (focusedInstallAgentId) {
+        await refreshSkillsForAgent(focusedInstallAgentId);
+      } else {
+        await refreshSkills();
+      }
+    } catch (error) {
+      setInstallNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setInstallingId(null);
+    }
+  };
+
   const toggleLocalSkill = async (skillId: string, enabled: boolean) => {
     if (!focusedAgent) return;
-    const currentEnabled = focusedAgent.enabledSkills || [];
+    const currentEnabled = focusedAgentEnabledSkills;
     const newEnabled = enabled
       ? Array.from(new Set([...currentEnabled, skillId]))
       : currentEnabled.filter(id => id !== skillId);
 
-    const saved = await saveAgent({
-      ...focusedAgent,
-      enabledSkills: newEnabled,
-      skillsEnabled: enabled ? true : focusedAgent.skillsEnabled
-    });
+    setLocalEnabledOverride((current) => ({ ...current, [focusedAgent.id]: newEnabled }));
+    if (enabled) setLocalRuntimeOverride((current) => ({ ...current, [focusedAgent.id]: true }));
+    setPendingLocalSkillIds((current) => new Set(current).add(skillId));
+    try {
+      const saved = await saveAgent({
+        ...focusedAgent,
+        enabledSkills: newEnabled,
+        skillsEnabled: enabled ? true : focusedAgentSkillsRuntime
+      });
 
-    setFocusedAgentId(saved.id);
-    await refreshAgents();
-    await refreshSkillsForAgent(saved.id);
+      setFocusedAgentId(saved.id);
+      setLocalEnabledOverride((current) => ({ ...current, [saved.id]: saved.enabledSkills ?? [] }));
+      setLocalRuntimeOverride((current) => ({ ...current, [saved.id]: saved.skillsEnabled }));
+      await refreshSkillsForAgent(saved.id);
+    } catch (error) {
+      setLocalEnabledOverride((current) => ({ ...current, [focusedAgent.id]: focusedAgent.enabledSkills ?? [] }));
+      setLocalRuntimeOverride((current) => ({ ...current, [focusedAgent.id]: focusedAgent.skillsEnabled }));
+      console.error(error);
+      alert(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPendingLocalSkillIds((current) => {
+        const next = new Set(current);
+        next.delete(skillId);
+        return next;
+      });
+    }
   };
 
   const toggleLocalRuntime = async () => {
     if (!focusedAgent) return;
-    const saved = await saveAgent({
-      ...focusedAgent,
-      skillsEnabled: !focusedAgent.skillsEnabled
-    });
-    setFocusedAgentId(saved.id);
-    await refreshAgents();
-    await refreshSkillsForAgent(saved.id);
+    const nextRuntime = !focusedAgentSkillsRuntime;
+    setRuntimePending(true);
+    setLocalRuntimeOverride((current) => ({ ...current, [focusedAgent.id]: nextRuntime }));
+    try {
+      const saved = await saveAgent({
+        ...focusedAgent,
+        skillsEnabled: nextRuntime
+      });
+      setFocusedAgentId(saved.id);
+      setLocalRuntimeOverride((current) => ({ ...current, [saved.id]: saved.skillsEnabled }));
+      await refreshSkillsForAgent(saved.id);
+    } catch (error) {
+      setLocalRuntimeOverride((current) => ({ ...current, [focusedAgent.id]: focusedAgent.skillsEnabled }));
+      console.error(error);
+      alert(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRuntimePending(false);
+    }
   };
 
   const filteredInstalled = skills.filter(s => 
@@ -91,7 +195,7 @@ export function SkillsCenterPanel() {
     s.name.toLowerCase().includes(searchQuery.toLowerCase()) || 
     s.description.toLowerCase().includes(searchQuery.toLowerCase())
   );
-  const localEnabledCount = skills.filter(skill => skill.enabled).length;
+  const localEnabledCount = focusedAgentEnabledSkills.filter(skillId => skills.some(skill => skill.id === skillId)).length;
 
   return (
     <section className="primary-panel embedded-panel settings-form mcp-console" style={{ display: "flex", flexDirection: "column", height: "100%", padding: 0 }}>
@@ -141,6 +245,56 @@ export function SkillsCenterPanel() {
         
         {skillsPanelMode === "global" ? (
           <>
+            <div className="skill-config-panel" style={{ margin: "0 0 16px 0" }}>
+              <div className="card-header" style={{ marginBottom: 12 }}>
+                <Download size={15} /> 安装 Skill
+              </div>
+              <div className="settings-form">
+                <div className="form-row">
+                  <label>本地路径</label>
+                  <input
+                    value={installLocalPath}
+                    onChange={(event) => setInstallLocalPath(event.target.value)}
+                    onKeyDown={(event) => { if (event.key === "Enter") void handleInstallExternalPath(); }}
+                    placeholder="D:\\path\\to\\skill 或 D:\\path\\to\\SKILL.md"
+                  />
+                </div>
+                <div className="form-row">
+                  <label>公开 URL</label>
+                  <input
+                    value={installUrl}
+                    onChange={(event) => setInstallUrl(event.target.value)}
+                    onKeyDown={(event) => { if (event.key === "Enter") void handleInstallExternalUrl(); }}
+                    placeholder="https://example.com/SKILL.md 或 https://www.skills.sh/owner/repo/skill"
+                  />
+                </div>
+                <div className="agent-form-row">
+                  <div className="agent-field">
+                    <label>名称</label>
+                    <input value={installName} onChange={(event) => setInstallName(event.target.value)} placeholder="留空使用 frontmatter" />
+                  </div>
+                  <div className="agent-field">
+                    <label>分类</label>
+                    <input value={installCategory} onChange={(event) => setInstallCategory(event.target.value)} placeholder="例如 media / research / coding" />
+                  </div>
+                </div>
+                <label className="checkbox-row">
+                  <input type="checkbox" checked={installForce} onChange={(event) => setInstallForce(event.target.checked)} />
+                  <span>允许覆盖审计阻断或同名 skill</span>
+                </label>
+                <div className="inline-actions">
+                  <button className="btn-primary beautiful-btn-primary" onClick={handleInstallExternalPath} disabled={installingId !== null || !installLocalPath.trim()} type="button">
+                    <Download size={14} /> 本地导入
+                  </button>
+                  <button className="btn-primary beautiful-btn-primary" onClick={handleInstallExternalUrl} disabled={installingId !== null || !installUrl.trim()} type="button">
+                    <ExternalLink size={14} /> URL 安装
+                  </button>
+                </div>
+                <p className="form-hint">离线导入会复制到应用数据目录；URL 安装支持 raw SKILL.md，也支持 skills.sh 的具体技能页，不能直接填 skills.sh 首页。</p>
+                {installNotice ? <p className="form-hint">{installNotice}</p> : null}
+              </div>
+            </div>
+
             <div style={{ display: "flex", gap: "12px", marginBottom: "20px", borderBottom: "1px solid var(--divider)", paddingBottom: "12px" }}>
               <button 
                 className={activeTab === "installed" ? "btn-primary" : "btn-secondary"} 
@@ -291,11 +445,11 @@ export function SkillsCenterPanel() {
                       <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
                         <strong style={{ fontSize: "0.9rem", color: "var(--text-1)" }}>Skills Runtime</strong>
                         <small style={{ color: "var(--text-3)" }}>
-                          {focusedAgent.skillsEnabled ? "已开启，勾选的技能会参与当前智能体的技能加载。" : "当前已关闭；仅勾选列表还不算真正启用。"}
+                          {focusedAgentSkillsRuntime ? "已开启，勾选的技能会参与当前智能体的技能加载。" : "当前已关闭；仅勾选列表还不算真正启用。"}
                         </small>
                       </div>
-                      <button className={focusedAgent.skillsEnabled ? "btn-primary beautiful-btn-primary" : "btn-secondary"} onClick={() => void toggleLocalRuntime()} type="button">
-                        {focusedAgent.skillsEnabled ? "已开启" : "开启 Runtime"}
+                      <button className={focusedAgentSkillsRuntime ? "btn-primary beautiful-btn-primary" : "btn-secondary"} disabled={runtimePending} onClick={() => void toggleLocalRuntime()} type="button">
+                        {focusedAgentSkillsRuntime ? "已开启" : "开启 Runtime"}
                       </button>
                     </div>
                     
@@ -310,11 +464,16 @@ export function SkillsCenterPanel() {
                     ) : (
                       <div style={{ padding: "16px", display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: "12px", background: "var(--surface-1)" }}>
                         {filteredInstalled.map((skill) => {
-                          const isLocalEnabled = skill.enabled;
+                          const isLocalEnabled = focusedAgentEnabledSkills.includes(skill.id);
                           return (
-                            <label 
+                            <div
                               key={skill.id} 
                               className={`agent-toggle-item beautiful-row ${isLocalEnabled ? "active" : ""}`} 
+                              onClick={() => {
+                                if (!pendingLocalSkillIds.has(skill.id)) {
+                                  void toggleLocalSkill(skill.id, !isLocalEnabled);
+                                }
+                              }}
                               style={{ 
                                 cursor: "pointer", 
                                 display: "flex", 
@@ -330,7 +489,7 @@ export function SkillsCenterPanel() {
                                   <div style={{ fontWeight: 500, fontSize: "0.9rem", color: isLocalEnabled ? "var(--primary)" : "var(--text-1)", textOverflow: "ellipsis", whiteSpace: "nowrap", overflow: "hidden" }}>{skill.name}</div>
                                   <div style={{ fontSize: "0.75rem", color: "var(--text-3)", textOverflow: "ellipsis", whiteSpace: "nowrap", overflow: "hidden" }}>
                                     {skill.description}
-                                    {!focusedAgent.skillsEnabled && (focusedAgent.enabledSkills?.includes(skill.id) ?? false) ? " · Runtime 未开启" : ""}
+                                    {!focusedAgentSkillsRuntime && isLocalEnabled ? " · Runtime 未开启" : ""}
                                   </div>
                                 </div>
                               </div>
@@ -338,10 +497,12 @@ export function SkillsCenterPanel() {
                                 type="checkbox" 
                                 className="beautiful-checkbox"
                                 checked={isLocalEnabled} 
-                                onChange={e => toggleLocalSkill(skill.id, e.target.checked)} 
+                                disabled={pendingLocalSkillIds.has(skill.id)}
+                                onClick={(event) => event.stopPropagation()}
+                                onChange={e => void toggleLocalSkill(skill.id, e.target.checked)}
                                 style={{ marginLeft: "12px", flexShrink: 0 }} 
                               />
-                            </label>
+                            </div>
                           );
                         })}
                       </div>

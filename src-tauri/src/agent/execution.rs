@@ -205,21 +205,15 @@ pub(super) async fn terminal_tool(
 }
 
 pub(super) fn terminal_background_requested(payload: &Value) -> bool {
-    payload
-        .get("background")
-        .or_else(|| payload.get("backgroundProcess"))
-        .or_else(|| payload.get("background_process"))
-        .or_else(|| payload.get("bg"))
-        .and_then(Value::as_bool)
+    value_bool_like(payload, &["background", "backgroundProcess", "background_process", "bg"])
         .unwrap_or(false)
 }
 
 pub(super) fn terminal_timeout_seconds(payload: &Value) -> AppResult<u64> {
-    let explicit_timeout = payload
-        .get("timeoutSeconds")
-        .or_else(|| payload.get("timeout"));
+    let explicit_timeout =
+        value_u64_like(payload, &["timeoutSeconds", "timeout"]);
     let max_foreground = env_u64("TERMINAL_MAX_FOREGROUND_TIMEOUT", 600).max(1);
-    if let Some(timeout) = explicit_timeout.and_then(Value::as_u64) {
+    if let Some(timeout) = explicit_timeout {
         if terminal_background_requested(payload) {
             return Ok(timeout.max(1));
         }
@@ -2406,8 +2400,8 @@ fn run_version_probe(executable: &str, args: &[&str], timeout_seconds: u64) -> V
         match child.try_wait() {
             Ok(Some(_)) => match child.wait_with_output() {
                 Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = decode_terminal_output(&output.stdout);
+                    let stderr = decode_terminal_output(&output.stderr);
                     return serde_json::json!({
                         "ok": output.status.success(),
                         "exitCode": output.status.code().unwrap_or(-1),
@@ -2792,10 +2786,10 @@ async fn start_ssh_managed_process(
     if !output.status.success() {
         return Err(AppError::BadRequest(format!(
             "SSH background process start failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            decode_terminal_output(&output.stderr).trim()
         )));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = decode_terminal_output(&output.stdout);
     let pid = stdout
         .split_whitespace()
         .find_map(|token| token.parse::<u32>().ok())
@@ -2995,10 +2989,10 @@ async fn start_docker_managed_process(
     if !output.status.success() {
         return Err(AppError::BadRequest(format!(
             "Docker background process start failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            decode_terminal_output(&output.stderr).trim()
         )));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = decode_terminal_output(&output.stdout);
     let pid = stdout
         .split_whitespace()
         .find_map(|token| token.parse::<u32>().ok())
@@ -3189,7 +3183,7 @@ async fn start_singularity_managed_process(
     if !instance_output.status.success() {
         return Err(AppError::BadRequest(format!(
             "Singularity instance start failed: {}",
-            String::from_utf8_lossy(&instance_output.stderr).trim()
+            decode_terminal_output(&instance_output.stderr).trim()
         )));
     }
 
@@ -3229,10 +3223,10 @@ async fn start_singularity_managed_process(
             .output();
         return Err(AppError::BadRequest(format!(
             "Singularity background process start failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            decode_terminal_output(&output.stderr).trim()
         )));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = decode_terminal_output(&output.stdout);
     let pid = stdout
         .split_whitespace()
         .find_map(|token| token.parse::<u32>().ok())
@@ -4659,25 +4653,9 @@ pub(super) struct ProcessNotificationOptions {
 }
 
 pub(super) fn process_notification_options(payload: &Value) -> ProcessNotificationOptions {
-    let notify_on_complete = payload
-        .get("notifyOnComplete")
-        .or_else(|| payload.get("notify_on_complete"))
-        .and_then(Value::as_bool)
+    let notify_on_complete = value_bool_like(payload, &["notifyOnComplete", "notify_on_complete"])
         .unwrap_or(false);
-    let mut watch_patterns = payload
-        .get("watchPatterns")
-        .or_else(|| payload.get("watch_patterns"))
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let mut watch_patterns = value_string_list_like(payload, &["watchPatterns", "watch_patterns"]);
     let conflict_note = if notify_on_complete && !watch_patterns.is_empty() {
         watch_patterns.clear();
         Some(
@@ -4692,6 +4670,91 @@ pub(super) fn process_notification_options(payload: &Value) -> ProcessNotificati
         watch_patterns,
         conflict_note,
     }
+}
+
+fn value_bool_like(payload: &Value, keys: &[&str]) -> Option<bool> {
+    for key in keys {
+        let Some(value) = payload.get(*key) else {
+            continue;
+        };
+        if let Some(flag) = value.as_bool() {
+            return Some(flag);
+        }
+        if let Some(text) = value.as_str() {
+            let normalized = text.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "true" | "1" | "yes" | "y" | "on" => return Some(true),
+                "false" | "0" | "no" | "n" | "off" => return Some(false),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn value_u64_like(payload: &Value, keys: &[&str]) -> Option<u64> {
+    for key in keys {
+        let Some(value) = payload.get(*key) else {
+            continue;
+        };
+        if let Some(number) = value.as_u64() {
+            return Some(number);
+        }
+        if let Some(text) = value.as_str() {
+            if let Ok(number) = text.trim().parse::<u64>() {
+                return Some(number);
+            }
+        }
+    }
+    None
+}
+
+fn value_string_list_like(payload: &Value, keys: &[&str]) -> Vec<String> {
+    for key in keys {
+        let Some(value) = payload.get(*key) else {
+            continue;
+        };
+        if let Some(items) = value.as_array() {
+            return items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(ToString::to_string)
+                .collect();
+        }
+        if let Some(text) = value.as_str() {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(trimmed) {
+                let parsed = items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                if !parsed.is_empty() {
+                    return parsed;
+                }
+            }
+            let fallback = trimmed
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(|ch: char| matches!(ch, ',' | ';' | '\n' | '\r' | '\t'))
+                .map(str::trim)
+                .map(|item| item.trim_matches('"').trim_matches('\'').trim())
+                .filter(|item| !item.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            if !fallback.is_empty() {
+                return fallback;
+            }
+        }
+    }
+    Vec::new()
 }
 
 #[derive(Clone)]
@@ -5270,7 +5333,7 @@ fn command_vec_output_lines_for_watcher(command: &[String]) -> Option<Vec<String
         return None;
     }
     Some(
-        String::from_utf8_lossy(&output.stdout)
+        decode_terminal_output(&output.stdout)
             .lines()
             .map(str::to_string)
             .collect(),
@@ -5482,7 +5545,7 @@ async fn run_shell_command(
     .await
 }
 
-pub(super) fn decode_terminal_output(bytes: &[u8]) -> String {
+pub(crate) fn decode_terminal_output(bytes: &[u8]) -> String {
     if let Ok(text) = std::str::from_utf8(bytes) {
         return text.to_string();
     }
@@ -5694,8 +5757,8 @@ async fn run_shell_command_with_cwd_capture(
         }
     }
     let output = wait_for_shell_output_interruptible(store, run_id, timeout_seconds, child).await?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = decode_terminal_output(&output.stdout);
+    let stderr = decode_terminal_output(&output.stderr);
     let (stdout, next_cwd) = extract_cwd_marker(&stdout, &marker);
     let stdout = run_transform_terminal_output_hooks(
         store,
@@ -6360,8 +6423,8 @@ async fn run_ssh_terminal_command(
             )));
         }
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = decode_terminal_output(&output.stdout);
+    let stderr = decode_terminal_output(&output.stderr);
     let (stdout, session_note) =
         update_ssh_session_cwd(marker.as_deref(), session_id.as_deref(), &stdout);
     let sync_back_note =
@@ -6647,8 +6710,8 @@ finally:
             )));
         }
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = decode_terminal_output(&output.stdout);
+    let stderr = decode_terminal_output(&output.stderr);
     let parsed = serde_json::from_str::<Value>(stdout.trim()).ok();
     let ok = parsed
         .as_ref()
@@ -6990,8 +7053,8 @@ asyncio.run(main())
             )));
         }
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = decode_terminal_output(&output.stdout);
+    let stderr = decode_terminal_output(&output.stderr);
     let parsed = serde_json::from_str::<Value>(stdout.trim()).ok();
     let ok = parsed
         .as_ref()
@@ -7409,14 +7472,14 @@ fn sync_ssh_remote_files(
             scp_remote_target_path(&remote_path)
         ));
         let output = hidden_std_command_output(&scp, &args)?;
-        if !output.status.success() {
-            return Err(AppError::BadRequest(format!(
-                "ssh sync scp failed for {} -> {}: {}",
-                host_path.display(),
-                remote_path,
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
+    if !output.status.success() {
+        return Err(AppError::BadRequest(format!(
+            "ssh sync scp failed for {} -> {}: {}",
+            host_path.display(),
+            remote_path,
+            decode_terminal_output(&output.stderr)
+        )));
+    }
         uploaded += 1;
     }
     set_ssh_synced_paths(&sync_key, current_remote_paths);
@@ -7509,7 +7572,7 @@ fn sync_ssh_remote_files_back(
                     "ssh sync-back scp failed for {} -> {}: {}",
                     remote_path,
                     host_path.display(),
-                    String::from_utf8_lossy(&output.stderr)
+                    decode_terminal_output(&output.stderr)
                 )));
             }
             let result =
@@ -7574,7 +7637,7 @@ fn ssh_bulk_download_and_apply_sync_back(
         if !output.status.success() {
             return Err(AppError::BadRequest(format!(
                 "ssh sync-back tar download failed for {remote_base}: {}",
-                String::from_utf8_lossy(&output.stderr)
+                decode_terminal_output(&output.stderr)
             )));
         }
         let output = hidden_std_command_spawn(&tar)
@@ -7586,7 +7649,7 @@ fn ssh_bulk_download_and_apply_sync_back(
         if !output.status.success() {
             return Err(AppError::BadRequest(format!(
                 "ssh sync-back tar extract failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                decode_terminal_output(&output.stderr)
             )));
         }
         let mut stats = SshSyncBackStats::default();
@@ -7720,7 +7783,7 @@ fn ssh_mkdir_path(
     if !output.status.success() {
         return Err(AppError::BadRequest(format!(
             "ssh sync mkdir failed for {remote_path}: {}",
-            String::from_utf8_lossy(&output.stderr)
+            decode_terminal_output(&output.stderr)
         )));
     }
     Ok(())
@@ -7789,13 +7852,13 @@ fn ssh_bulk_upload_tar(
         if !tar_output.status.success() {
             return Err(AppError::BadRequest(format!(
                 "ssh sync tar create failed: {}",
-                String::from_utf8_lossy(&tar_output.stderr)
+                decode_terminal_output(&tar_output.stderr)
             )));
         }
         if !ssh_output.status.success() {
             return Err(AppError::BadRequest(format!(
                 "ssh sync tar extract failed: {}",
-                String::from_utf8_lossy(&ssh_output.stderr)
+                decode_terminal_output(&ssh_output.stderr)
             )));
         }
         Ok(staged)
@@ -7912,7 +7975,7 @@ fn ssh_delete_remote_paths(
     if !output.status.success() {
         return Err(AppError::BadRequest(format!(
             "ssh sync delete failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            decode_terminal_output(&output.stderr)
         )));
     }
     Ok(())
@@ -8226,8 +8289,8 @@ async fn run_singularity_terminal_command(
             )));
         }
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = decode_terminal_output(&output.stdout);
+    let stderr = decode_terminal_output(&output.stderr);
     let (stdout, session_note) = update_docker_session_cwd(
         marker.as_deref(),
         session_id.as_deref(),
@@ -8359,8 +8422,8 @@ async fn run_docker_terminal_command(
             )));
         }
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = decode_terminal_output(&output.stdout);
+    let stderr = decode_terminal_output(&output.stderr);
     let (stdout, session_note) = update_docker_session_cwd(
         marker.as_deref(),
         session_id.as_deref(),
@@ -8546,8 +8609,8 @@ fn host_user_spec() -> Option<String> {
         if !uid.status.success() || !gid.status.success() {
             return None;
         }
-        let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
-        let gid = String::from_utf8_lossy(&gid.stdout).trim().to_string();
+        let uid = decode_terminal_output(&uid.stdout).trim().to_string();
+        let gid = decode_terminal_output(&gid.stdout).trim().to_string();
         if uid.is_empty() || gid.is_empty() {
             None
         } else {
@@ -8569,7 +8632,7 @@ fn docker_image_uses_init_entrypoint(docker: &str, image: &str) -> bool {
     )
     .ok()
     .filter(|output| output.status.success())
-    .map(|output| docker_entrypoint_uses_init(&String::from_utf8_lossy(&output.stdout)))
+    .map(|output| docker_entrypoint_uses_init(&decode_terminal_output(&output.stdout)))
     .unwrap_or(false)
 }
 
@@ -8627,7 +8690,7 @@ fn docker_storage_opt_supported(docker: &str) -> bool {
         hidden_std_command_output(docker, ["info", "--format", "{{.Driver}}"])
             .ok()
             .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "overlay2")
+            .map(|output| decode_terminal_output(&output.stdout).trim() == "overlay2")
             .unwrap_or(false)
     }
 }
@@ -8878,10 +8941,10 @@ fn ensure_docker_terminal_container(
     if !output.status.success() {
         return Err(AppError::BadRequest(format!(
             "failed to start docker terminal container: {}",
-            String::from_utf8_lossy(&output.stderr)
+            decode_terminal_output(&output.stderr)
         )));
     }
-    let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let container_id = decode_terminal_output(&output.stdout).trim().to_string();
     if container_id.is_empty() {
         return Err(AppError::BadRequest(
             "failed to start docker terminal container: empty container id".into(),
@@ -8915,7 +8978,7 @@ fn find_docker_terminal_container(docker: &str, key: &str, running_only: bool) -
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| {
-            String::from_utf8_lossy(&output.stdout)
+            decode_terminal_output(&output.stdout)
                 .lines()
                 .map(str::trim)
                 .find(|line| !line.is_empty())
@@ -8938,7 +9001,7 @@ fn docker_container_id_by_name(docker: &str, name: &str) -> Option<String> {
     .ok()
     .filter(|output| output.status.success())
     .and_then(|output| {
-        String::from_utf8_lossy(&output.stdout)
+        decode_terminal_output(&output.stdout)
             .lines()
             .map(str::trim)
             .find(|line| !line.is_empty())
@@ -8986,7 +9049,7 @@ fn maybe_reap_docker_orphans(docker: &str) -> usize {
     if !output.status.success() {
         return 0;
     }
-    count_pruned_docker_containers(&String::from_utf8_lossy(&output.stdout))
+    count_pruned_docker_containers(&decode_terminal_output(&output.stdout))
 }
 
 fn count_pruned_docker_containers(stdout: &str) -> usize {
@@ -9073,7 +9136,7 @@ fn docker_container_running(docker: &str, container_id: &str) -> bool {
     )
     .ok()
     .filter(|output| output.status.success())
-    .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
+    .map(|output| decode_terminal_output(&output.stdout).trim() == "true")
     .unwrap_or(false)
 }
 
@@ -9140,7 +9203,7 @@ fn cleanup_all_labeled_docker_terminal_containers(docker: &str) -> usize {
     if !output.status.success() {
         return 0;
     }
-    let ids = String::from_utf8_lossy(&output.stdout)
+    let ids = decode_terminal_output(&output.stdout)
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())

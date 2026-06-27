@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { PlugZap, Plus, Trash2, Edit3, Server, Command, Globe, ChevronRight, Settings2, UserSquare2 } from "lucide-react";
 import { useAppStore } from "../lib/store";
-import { McpServer, AgentDefinition } from "../lib/types";
+import { McpServer } from "../lib/types";
 
 export function McpExtensionPanel() {
   const { 
@@ -13,12 +13,18 @@ export function McpExtensionPanel() {
   
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftServer, setDraftServer] = useState<Partial<McpServer>>({});
+  const [pendingGlobalIds, setPendingGlobalIds] = useState<Set<string>>(() => new Set());
+  const [localEnabledOverride, setLocalEnabledOverride] = useState<Record<string, string[]>>({});
+  const [pendingLocalIds, setPendingLocalIds] = useState<Set<string>>(() => new Set());
 
-  const focusedAgent = agents.find(a => a.id === focusedAgentId) || agents[0];
+  const focusedAgent = agents.find(a => a.id === focusedAgentId) || agents.find(a => a.isDefault) || agents[0];
+  const focusedAgentEnabledMcp = focusedAgent
+    ? localEnabledOverride[focusedAgent.id] ?? focusedAgent.enabledMcpServers ?? []
+    : [];
 
   useEffect(() => {
-    if (!focusedAgentId && agents[0]) {
-      setFocusedAgentId(agents[0].id);
+    if ((!focusedAgentId || !agents.some((agent) => agent.id === focusedAgentId)) && agents.length > 0) {
+      setFocusedAgentId((agents.find((agent) => agent.isDefault) ?? agents[0]).id);
     }
   }, [agents, focusedAgentId, setFocusedAgentId]);
 
@@ -58,20 +64,47 @@ export function McpExtensionPanel() {
 
   const toggleEnableGlobal = async (id: string, enabled: boolean) => {
     const newServers = mcpServers.map(s => s.id === id ? { ...s, enabled } : s);
-    await saveMcpServers(newServers);
+    setPendingGlobalIds((current) => new Set(current).add(id));
+    try {
+      await saveMcpServers(newServers);
+    } catch (error) {
+      console.error(error);
+      alert(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPendingGlobalIds((current) => {
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      });
+    }
   };
 
   const toggleLocalMcp = async (serverId: string, enabled: boolean) => {
     if (!focusedAgent) return;
-    const currentEnabled = focusedAgent.enabledMcpServers || [];
+    const currentEnabled = focusedAgentEnabledMcp;
     const newEnabled = enabled 
-      ? [...currentEnabled, serverId]
+      ? Array.from(new Set([...currentEnabled, serverId]))
       : currentEnabled.filter(id => id !== serverId);
-    
-    await saveAgent({
-      ...focusedAgent,
-      enabledMcpServers: newEnabled
-    });
+
+    setLocalEnabledOverride((current) => ({ ...current, [focusedAgent.id]: newEnabled }));
+    setPendingLocalIds((current) => new Set(current).add(serverId));
+    try {
+      const saved = await saveAgent({
+        ...focusedAgent,
+        enabledMcpServers: newEnabled
+      });
+      setLocalEnabledOverride((current) => ({ ...current, [saved.id]: saved.enabledMcpServers ?? [] }));
+    } catch (error) {
+      setLocalEnabledOverride((current) => ({ ...current, [focusedAgent.id]: focusedAgent.enabledMcpServers ?? [] }));
+      console.error(error);
+      alert(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPendingLocalIds((current) => {
+        const next = new Set(current);
+        next.delete(serverId);
+        return next;
+      });
+    }
   };
 
   return (
@@ -143,7 +176,7 @@ export function McpExtensionPanel() {
                       <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
                         <label style={{ display: "flex", alignItems: "center", gap: "6px", cursor: "pointer", fontSize: "0.85rem", color: "var(--text-2)" }}>
                           主开关
-                          <input type="checkbox" className="beautiful-checkbox" checked={server.enabled} onChange={e => toggleEnableGlobal(server.id, e.target.checked)} />
+                          <input type="checkbox" className="beautiful-checkbox" checked={server.enabled} disabled={pendingGlobalIds.has(server.id)} onChange={e => toggleEnableGlobal(server.id, e.target.checked)} />
                         </label>
                         <button className="icon-btn" onClick={() => { setDraftServer(server); setEditingId(server.id); }} title="编辑">
                           <Edit3 size={15} />
@@ -277,7 +310,7 @@ export function McpExtensionPanel() {
                   <div className="card beautiful-card" style={{ flex: 1 }}>
                     <div className="card-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                       <span>为 <strong>{focusedAgent.name}</strong> 启用 MCP 服务</span>
-                      <small style={{ fontWeight: "normal", color: "var(--text-3)" }}>{focusedAgent.enabledMcpServers?.length || 0} / {mcpServers.length} 已启用</small>
+                      <small style={{ fontWeight: "normal", color: "var(--text-3)" }}>{focusedAgentEnabledMcp.length || 0} / {mcpServers.length} 已启用</small>
                     </div>
                     {mcpServers.length === 0 ? (
                       <div style={{ padding: "32px", textAlign: "center", color: "var(--text-3)" }}>
@@ -286,12 +319,17 @@ export function McpExtensionPanel() {
                     ) : (
                       <div style={{ padding: "0" }}>
                         {mcpServers.map((server, index) => {
-                          const isLocalEnabled = focusedAgent.enabledMcpServers?.includes(server.id) ?? false;
+                          const isLocalEnabled = focusedAgentEnabledMcp.includes(server.id);
                           const isGlobalEnabled = server.enabled;
                           return (
-                            <label 
+                            <div
                               key={server.id} 
-                              className="adapter-row" 
+                              className={`adapter-row ${isLocalEnabled ? "active" : ""}`}
+                              onClick={() => {
+                                if (isGlobalEnabled && !pendingLocalIds.has(server.id)) {
+                                  void toggleLocalMcp(server.id, !isLocalEnabled);
+                                }
+                              }}
                               style={{ 
                                 cursor: isGlobalEnabled ? "pointer" : "not-allowed", 
                                 padding: "16px 20px", 
@@ -313,10 +351,11 @@ export function McpExtensionPanel() {
                                 type="checkbox" 
                                 className="beautiful-checkbox"
                                 checked={isLocalEnabled} 
-                                disabled={!isGlobalEnabled}
-                                onChange={e => toggleLocalMcp(server.id, e.target.checked)} 
+                                disabled={!isGlobalEnabled || pendingLocalIds.has(server.id)}
+                                onClick={(event) => event.stopPropagation()}
+                                onChange={e => void toggleLocalMcp(server.id, e.target.checked)}
                               />
-                            </label>
+                            </div>
                           );
                         })}
                       </div>

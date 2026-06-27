@@ -270,6 +270,17 @@ function normalizeFocusedAgentId(agents: AgentDefinition[], preferred?: string |
   return agents.find((agent) => agent.isDefault)?.id ?? agents[0]?.id ?? null;
 }
 
+function upsertAgentPreservingOrder(agents: AgentDefinition[], agent: AgentDefinition) {
+  const existingIndex = agents.findIndex((item) => item.id === agent.id);
+  const normalized = agent.isDefault
+    ? agents.map((item) => item.id === agent.id ? item : { ...item, isDefault: false })
+    : agents;
+  if (existingIndex >= 0) {
+    return normalized.map((item, index) => index === existingIndex ? agent : item);
+  }
+  return [...normalized, agent];
+}
+
 function sameMessages(left: ChatMessage[], right: ChatMessage[]) {
   return left.length === right.length && left.every((item, index) => {
     const other = right[index];
@@ -1204,8 +1215,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ mcpServers });
   },
   saveMcpServers: async (mcpServers) => {
-    await api.saveMcpServers(mcpServers);
+    const previous = get().mcpServers;
     set({ mcpServers });
+    try {
+      await api.saveMcpServers(mcpServers);
+    } catch (error) {
+      set({ mcpServers: previous });
+      throw error;
+    }
   },
   refreshCapabilityAdapters: async () => {
     const capabilityAdapters = await api.listCapabilityAdapters();
@@ -1422,13 +1439,35 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
   },
   saveAgent: async (agent) => {
-    const saved = await api.saveAgent(agent);
-    set((state) => ({
-      agents: [saved, ...state.agents.filter((item) => item.id !== saved.id)]
-        .sort((a, b) => (b.isDefault ? 1 : 0) - (a.isDefault ? 1 : 0)),
-      focusedAgentId: saved.id
-    }));
-    return saved;
+    const optimisticId = agent.id.trim();
+    if (optimisticId) {
+      set((state) => ({
+        agents: upsertAgentPreservingOrder(state.agents, agent),
+        focusedAgentId: optimisticId
+      }));
+    }
+    try {
+      const saved = await api.saveAgent(agent);
+      set((state) => ({
+        agents: upsertAgentPreservingOrder(
+          optimisticId
+            ? state.agents
+            : state.agents.filter((item) => item.id.trim() !== "" || item.name !== agent.name || item.createdAt !== agent.createdAt),
+          saved
+        ),
+        focusedAgentId: saved.id
+      }));
+      return saved;
+    } catch (error) {
+      const agents = await api.listAgents().catch(() => null);
+      if (agents) {
+        set((state) => ({
+          agents,
+          focusedAgentId: normalizeFocusedAgentId(agents, state.focusedAgentId)
+        }));
+      }
+      throw error;
+    }
   },
   deleteAgent: async (id) => {
     await api.deleteAgent(id);

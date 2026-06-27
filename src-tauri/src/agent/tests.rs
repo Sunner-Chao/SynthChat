@@ -756,12 +756,35 @@ fn process_start_warns_about_silent_background_jobs() {
     }))
     .is_none());
 
+    assert!(execution::terminal_background_requested(&json!({
+        "command": "npm run dev",
+        "background": "True"
+    })));
+    assert!(execution::silent_background_process_hint(&json!({
+        "action": "start",
+        "command": "npm run dev",
+        "notify_on_complete": "true"
+    }))
+    .is_none());
+
     let watch = execution::process_notification_options(&json!({
         "watchPatterns": ["ready", "", " ERROR "]
     }));
     assert!(!watch.notify_on_complete);
     assert_eq!(watch.watch_patterns, vec!["ready", "ERROR"]);
     assert!(watch.conflict_note.is_none());
+
+    let stringified_watch = execution::process_notification_options(&json!({
+        "watchPatterns": "[\"ready\", \"started\", \"\"]",
+        "notifyOnComplete": "false"
+    }));
+    assert_eq!(stringified_watch.watch_patterns, vec!["ready", "started"]);
+    assert!(!stringified_watch.notify_on_complete);
+
+    let loose_watch = execution::process_notification_options(&json!({
+        "watch_patterns": "ready, started ; done"
+    }));
+    assert_eq!(loose_watch.watch_patterns, vec!["ready", "started", "done"]);
 
     let notify_wins = execution::process_notification_options(&json!({
         "notifyOnComplete": true,
@@ -774,6 +797,16 @@ fn process_start_warns_about_silent_background_jobs() {
         .as_deref()
         .unwrap_or_default()
         .contains("watchPatterns ignored"));
+
+    assert_eq!(
+        execution::terminal_timeout_seconds(&json!({
+            "command": "long task",
+            "timeout": "9999",
+            "background": "true"
+        }))
+        .unwrap(),
+        9999
+    );
 }
 
 #[test]

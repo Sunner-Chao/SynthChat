@@ -19,6 +19,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
     error::{AppError, AppResult},
+    agent::decode_terminal_output,
     models::{
         new_id, now_iso, AgentCheckpointRecord, AgentDefinition, AgentQueuedRequest,
         AgentRunRecord, AgentTodoItem, AppConfig, BrowserProvider, CapabilityAdapter, ChatMessage,
@@ -2856,12 +2857,13 @@ fn host_pid_alive(pid: u32) -> bool {
         if !output.status.success() {
             return false;
         }
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = decode_terminal_output(&output.stdout);
+        let stdout = stdout.as_str();
         let pid_string = pid.to_string();
-        stdout.lines().any(|line| {
+        stdout.lines().any(|line: &str| {
             line.split(',')
                 .nth(1)
-                .is_some_and(|field| field.trim_matches('"') == pid_string)
+                .is_some_and(|field: &str| field.trim_matches('"') == pid_string)
         })
     }
     #[cfg(not(windows))]
@@ -2941,7 +2943,7 @@ fn command_vec_output_lines(command: &[String]) -> Option<Vec<String>> {
         return None;
     }
     Some(
-        String::from_utf8_lossy(&output.stdout)
+        decode_terminal_output(&output.stdout)
             .lines()
             .map(str::to_string)
             .collect(),
@@ -6585,7 +6587,7 @@ fn tool_event_provider_call_id(event: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-fn mark_agent_run_aborted(run: &mut AgentRunRecord, now: &str, summary: &str) {
+fn mark_agent_run_aborted(run: &mut AgentRunRecord, now: &str, summary: &str) -> Vec<Value> {
     run.checkpoints.push(AgentCheckpointRecord {
         checkpoint_id: new_id("ckpt"),
         run_id: run.run_id.clone(),
@@ -6600,11 +6602,12 @@ fn mark_agent_run_aborted(run: &mut AgentRunRecord, now: &str, summary: &str) {
     run.error = Some(summary.to_string());
     run.updated_at = now.to_string();
     run.completed_at = Some(now.to_string());
-    close_running_tool_events(run, "canceled", "运行已取消");
+    close_running_tool_events(run, "canceled", "运行已取消")
 }
 
-fn close_running_tool_events(run: &mut AgentRunRecord, status: &str, summary: &str) -> usize {
-    let mut closed = 0usize;
+fn close_running_tool_events(run: &mut AgentRunRecord, status: &str, summary: &str) -> Vec<Value> {
+    let mut closed_events = Vec::new();
+    let run_state = run.state.clone();
     for event in &mut run.tool_events {
         if event.get("status").and_then(Value::as_str) != Some("running") {
             continue;
@@ -6614,16 +6617,16 @@ fn close_running_tool_events(run: &mut AgentRunRecord, status: &str, summary: &s
             object.insert("ok".into(), Value::Bool(false));
             object.insert("summary".into(), Value::String(summary.into()));
             object.insert("error".into(), Value::String(summary.into()));
-            object.insert("closedByRunState".into(), Value::String(run.state.clone()));
+            object.insert("closedByRunState".into(), Value::String(run_state.clone()));
         }
-        closed += 1;
+        closed_events.push(event.clone());
     }
-    closed
+    closed_events
 }
 
-fn close_terminal_tool_events(run: &mut AgentRunRecord) {
+fn close_terminal_tool_events(run: &mut AgentRunRecord) -> Vec<Value> {
     if !matches!(run.state.as_str(), "completed" | "failed" | "aborted") {
-        return;
+        return Vec::new();
     }
     let summary = match run.state.as_str() {
         "completed" => "运行已完成",
@@ -6631,7 +6634,13 @@ fn close_terminal_tool_events(run: &mut AgentRunRecord) {
         "aborted" => "运行已取消",
         _ => "运行已结束",
     };
-    close_running_tool_events(run, "canceled", summary);
+    close_running_tool_events(run, "canceled", summary)
+}
+
+fn sync_closed_running_tool_messages(messages: &mut [ChatMessage], closed_events: &[Value]) {
+    for event in closed_events {
+        replace_matching_tool_event_messages(messages, event);
+    }
 }
 
 impl AppStore {
@@ -9147,7 +9156,7 @@ impl AppStore {
                 return Ok(None);
             };
 
-            if let Some(run) = s.agent_runs.get_mut(run_index) {
+            let closed_tool_update = if let Some(run) = s.agent_runs.get_mut(run_index) {
                 replace_run_tool_event_with_completed(run, &deliverable.event);
                 run.checkpoints.push(AgentCheckpointRecord {
                     checkpoint_id: new_id("ckpt"),
@@ -9177,7 +9186,17 @@ impl AppStore {
                 run.updated_at = now.clone();
                 run.last_activity_at = Some(now.clone());
                 run.last_activity_desc = Some("附件已补到回复".into());
-                close_running_tool_events(run, "canceled", "运行已完成");
+                let closed_events = close_running_tool_events(run, "canceled", "运行已完成");
+                Some((run.conversation_id.clone(), closed_events))
+            } else {
+                None
+            };
+            if let Some((conversation_id, closed_events)) = closed_tool_update {
+                if !closed_events.is_empty() {
+                    if let Some(messages) = s.messages.get_mut(&conversation_id) {
+                        sync_closed_running_tool_messages(messages, &closed_events);
+                    }
+                }
             }
             mark_hermes_session_resume_resolved_in_state(
                 s,
@@ -10740,6 +10759,7 @@ impl AppStore {
             let mut expired = false;
             let recovered = normalize_stale_landed_write_file_runs(s);
             let mut expired_conversations = HashSet::new();
+            let mut closed_tool_messages: Vec<(String, Vec<Value>)> = Vec::new();
             for run in s.agent_runs.iter_mut().filter(|run| {
                 run.parent_run_id.is_none()
                     && matches!(
@@ -10775,9 +10795,19 @@ impl AppStore {
                     run.error = Some(summary);
                     run.updated_at = completed_at.clone();
                     run.completed_at = Some(completed_at);
-                    close_running_tool_events(run, "canceled", "运行已超时");
-                    expired_conversations.insert(run.conversation_id.clone());
+                    let closed_events = close_running_tool_events(run, "canceled", "运行已超时");
+                    let conversation_id = run.conversation_id.clone();
+                    closed_tool_messages.push((conversation_id.clone(), closed_events));
+                    expired_conversations.insert(conversation_id);
                     expired = true;
+                }
+            }
+            for (conversation_id, closed_events) in closed_tool_messages {
+                if closed_events.is_empty() {
+                    continue;
+                }
+                if let Some(messages) = s.messages.get_mut(&conversation_id) {
+                    sync_closed_running_tool_messages(messages, &closed_events);
                 }
             }
             for conversation_id in expired_conversations {
@@ -10814,6 +10844,7 @@ impl AppStore {
             let mut expired = false;
             let recovered = normalize_stale_landed_write_file_runs(s);
             let mut expired_conversations = HashSet::new();
+            let mut closed_tool_messages: Vec<(String, Vec<Value>)> = Vec::new();
             for run in s.agent_runs.iter_mut().filter(|run| {
                 run.conversation_id == conversation_id
                     && run.parent_run_id.is_none()
@@ -10850,9 +10881,19 @@ impl AppStore {
                     run.error = Some(summary);
                     run.updated_at = completed_at.clone();
                     run.completed_at = Some(completed_at);
-                    close_running_tool_events(run, "canceled", "运行已超时");
-                    expired_conversations.insert(run.conversation_id.clone());
+                    let closed_events = close_running_tool_events(run, "canceled", "运行已超时");
+                    let run_conversation_id = run.conversation_id.clone();
+                    closed_tool_messages.push((run_conversation_id.clone(), closed_events));
+                    expired_conversations.insert(run_conversation_id);
                     expired = true;
+                }
+            }
+            for (run_conversation_id, closed_events) in closed_tool_messages {
+                if closed_events.is_empty() {
+                    continue;
+                }
+                if let Some(messages) = s.messages.get_mut(&run_conversation_id) {
+                    sync_closed_running_tool_messages(messages, &closed_events);
                 }
             }
             for conversation_id in expired_conversations {
@@ -10887,7 +10928,12 @@ impl AppStore {
                     run.pending_steers = existing.pending_steers.clone();
                 }
             }
-            close_terminal_tool_events(&mut run);
+            let closed_events = close_terminal_tool_events(&mut run);
+            if !closed_events.is_empty() {
+                if let Some(messages) = s.messages.get_mut(&run.conversation_id) {
+                    sync_closed_running_tool_messages(messages, &closed_events);
+                }
+            }
             s.agent_runs.retain(|r| r.run_id != run.run_id);
             s.agent_runs.insert(0, run.clone());
             let max = s.config.chat.max_stored_agent_runs.max(50);
@@ -10957,17 +11003,26 @@ impl AppStore {
                 .iter()
                 .position(|run| run.run_id == run_id)
                 .ok_or_else(|| AppError::NotFound(format!("agent run {run_id}")))?;
-            let run = &mut s.agent_runs[run_index];
-            if matches!(run.state.as_str(), "completed" | "failed" | "aborted") {
-                return Ok(run.clone());
-            }
             let now = now_iso();
             let summary = reason
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "Agent run aborted by user.".into());
-            mark_agent_run_aborted(run, &now, &summary);
+            let (conversation_id, closed_events) = {
+                let run = &mut s.agent_runs[run_index];
+                if matches!(run.state.as_str(), "completed" | "failed" | "aborted") {
+                    return Ok(run.clone());
+                }
+                let closed_events = mark_agent_run_aborted(run, &now, &summary);
+                (run.conversation_id.clone(), closed_events)
+            };
+            if !closed_events.is_empty() {
+                if let Some(messages) = s.messages.get_mut(&conversation_id) {
+                    sync_closed_running_tool_messages(messages, &closed_events);
+                }
+            }
             let saved = s.agent_runs[run_index].clone();
             let mut aborted_parent_ids = std::collections::HashSet::from([run_id.to_string()]);
+            let mut child_message_updates: Vec<(String, Vec<Value>)> = Vec::new();
             loop {
                 let mut changed = false;
                 for child in s.agent_runs.iter_mut() {
@@ -10980,12 +11035,22 @@ impl AppStore {
                         continue;
                     }
                     let child_summary = format!("Parent agent run aborted: {summary}");
-                    mark_agent_run_aborted(child, &now, &child_summary);
+                    let child_conversation_id = child.conversation_id.clone();
+                    let child_closed_events = mark_agent_run_aborted(child, &now, &child_summary);
+                    child_message_updates.push((child_conversation_id, child_closed_events));
                     aborted_parent_ids.insert(child.run_id.clone());
                     changed = true;
                 }
                 if !changed {
                     break;
+                }
+            }
+            for (conversation_id, closed_events) in child_message_updates {
+                if closed_events.is_empty() {
+                    continue;
+                }
+                if let Some(messages) = s.messages.get_mut(&conversation_id) {
+                    sync_closed_running_tool_messages(messages, &closed_events);
                 }
             }
             self.persist(s)?;

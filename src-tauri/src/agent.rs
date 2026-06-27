@@ -112,6 +112,7 @@ mod diagnostics;
 mod env_probe;
 #[path = "agent/execution.rs"]
 mod execution;
+pub(crate) use execution::decode_terminal_output;
 #[path = "agent/file_tools.rs"]
 mod file_tools;
 #[path = "agent/goal_judge.rs"]
