@@ -32,6 +32,7 @@ const PET_ORB_CLICK_MOVE_TOLERANCE_PX = 5;
 const PET_VISION_INTERVAL_STORAGE_KEY = "synthchat.pet.visionIntervalSeconds";
 const DEFAULT_PET_VISION_INTERVAL_SECONDS = 60;
 const MIN_PET_VISION_INTERVAL_SECONDS = 30;
+const PET_VISION_BUSY_STATES = new Set(["started", "running", "pendingApproval", "needsClarification"]);
 
 const AVAILABLE_MODELS = [
   { id: "tororo", name: "Tororo", path: "/pet/model/Tororo/tororo.model3.json", greeting: "Tororo 到啦。", headX: 0.5, headY: 0.24, tailGap: 28 },
@@ -473,63 +474,74 @@ export function PetWindow() {
   const [visionEnabled, setVisionEnabled] = useState(false);
   const [visionIntervalSeconds, setVisionIntervalSeconds] = useState(readStoredPetVisionIntervalSeconds);
   const visionIntervalMs = clampPetVisionIntervalSeconds(visionIntervalSeconds) * 1000;
+  const visionTickInFlightRef = useRef(false);
+  const visionLastStartedAtRef = useRef(0);
 
   useEffect(() => {
     void invoke("set_pet_vision_active", { active: visionEnabled }).catch((error) => {
       console.warn("pet vision active state sync failed:", error);
     });
     if (!visionEnabled) return;
-    let intervalId: number;
-    let isCapturing = false;
+    let intervalId: number | null = null;
+    let stopped = false;
 
     async function tick() {
-      if (isCapturing) return;
-      isCapturing = true;
+      const now = Date.now();
+      if (visionTickInFlightRef.current || now - visionLastStartedAtRef.current < visionIntervalMs - 500) {
+        return;
+      }
+      visionTickInFlightRef.current = true;
+      visionLastStartedAtRef.current = now;
       try {
+        const context = await resolvePetSendContext();
+        if (stopped || !context.conversationId || !context.personaId) return;
+        if (await petVisionShouldSkipTurn(context.conversationId)) return;
+
         const dataUrl = await invoke<string>("capture_screen_base64");
+        if (stopped) return;
         const { mimeType, bytes } = decodePetVisionDataUrl(dataUrl);
         const saved = await api.uploadChatAttachment(
           petVisionFileName(),
           mimeType,
           Array.from(bytes)
         );
+        if (stopped) return;
         const attachment = {
           fileName: saved.fileName,
           path: saved.path,
           mimeType: saved.mimeType
         };
-        const context = await resolvePetSendContext();
-        if (context.conversationId && context.personaId) {
-          const previousAssistantState = assistantMirrorState(context.conversationId);
-          const messages = await api.sendChatMessage({
-            conversationId: context.conversationId,
-            personaId: context.personaId,
-            agentId: context.agentId,
-            content: buildPetVisionContent(attachment),
-            providerData: {
-              source: "pet-vision",
-              attachments: [attachment],
-              silent: true
-            }
-          });
-          const assistant = latestAssistantMessage(messages)
-            ?? await waitForAssistantReply(context.conversationId, previousAssistantState);
-          if (assistant) {
-            showAssistantCloud(assistant, context.conversationId);
+        const previousAssistantState = assistantMirrorState(context.conversationId);
+        const messages = await api.sendChatMessage({
+          conversationId: context.conversationId,
+          personaId: context.personaId,
+          agentId: context.agentId,
+          content: buildPetVisionContent(attachment),
+          providerData: {
+            source: "pet-vision",
+            attachments: [attachment],
+            silent: true
           }
+        });
+        if (stopped || !messages.length) return;
+        const assistant = latestAssistantMessage(messages)
+          ?? await waitForAssistantReply(context.conversationId, previousAssistantState);
+        if (!stopped && assistant) {
+          showAssistantCloud(assistant, context.conversationId);
         }
       } catch (err) {
         console.error("vision error:", err);
-        showCloud("视觉感知暂时看不到屏幕。", "error", 3200);
+        if (!stopped) showCloud("视觉感知暂时看不到屏幕。", "error", 3200);
       } finally {
-        isCapturing = false;
+        visionTickInFlightRef.current = false;
       }
     }
 
     void tick();
     intervalId = window.setInterval(tick, visionIntervalMs);
     return () => {
-      window.clearInterval(intervalId);
+      stopped = true;
+      if (intervalId !== null) window.clearInterval(intervalId);
       void invoke("set_pet_vision_active", { active: false }).catch((error) => {
         console.warn("pet vision active state cleanup failed:", error);
       });
@@ -1377,6 +1389,28 @@ export function PetWindow() {
       personaName: persona?.name ?? context?.personaName ?? null,
       agentId: validAgentId(created.agentId ?? context?.agentId ?? null)
     };
+  }
+
+  async function petVisionShouldSkipTurn(conversationId: string) {
+    try {
+      const [runs, queue] = await Promise.all([
+        api.listAgentRuns(),
+        api.listAgentQueue()
+      ]);
+      const activeRun = runs.some((run) =>
+        run.conversationId === conversationId
+        && !run.parentRunId
+        && PET_VISION_BUSY_STATES.has(run.state)
+      );
+      if (activeRun) return true;
+      return queue.some((item) =>
+        item.conversationId === conversationId
+        && (item.status === "pending" || item.status === "running")
+      );
+    } catch (error) {
+      console.warn("pet vision busy check failed:", error);
+      return true;
+    }
   }
 
   async function waitForAssistantReply(

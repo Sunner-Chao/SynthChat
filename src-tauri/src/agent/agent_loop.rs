@@ -11,8 +11,8 @@ use tauri::{AppHandle, Emitter};
 use crate::{
     error::AppResult,
     models::{
-        AgentCheckpointRecord, AgentDefinition, AgentRunPhaseRecord, AgentRunRecord, ChatMessage,
-        Conversation, Persona, SendChatRequest,
+        AgentCheckpointRecord, AgentDefinition, AgentQueuedRequest, AgentRunPhaseRecord,
+        AgentRunRecord, ChatMessage, Conversation, Persona, SendChatRequest,
     },
     skills as skill_library,
     store::AppStore,
@@ -50,6 +50,24 @@ fn is_pet_vision_request(request: &SendChatRequest) -> bool {
 
 fn is_pet_vision_silent_request(request: &SendChatRequest) -> bool {
     is_pet_vision_request(request) && request_provider_data_bool(request, "silent")
+}
+
+fn is_pet_vision_silent_provider_data(source: &str, provider_data: Option<&Value>) -> bool {
+    let source = source.trim();
+    let provider_source = provider_data
+        .and_then(|data| data.get("source"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let silent = provider_data
+        .and_then(|data| data.get("silent"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    (source == "pet-vision" || provider_source == "pet-vision") && silent
+}
+
+fn is_pet_vision_silent_queue_item(item: &AgentQueuedRequest) -> bool {
+    is_pet_vision_silent_provider_data(&item.source, item.provider_data.as_ref())
 }
 
 fn mark_message_visible_for_pet_vision(message: &mut ChatMessage) {
@@ -535,6 +553,9 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         clarification_response_context_for_turn(store, &conversation.id, &request.content)?
             .unwrap_or_else(|| request.content.clone())
     };
+    if silent_pet_vision && store.active_agent_run_for_conversation(&conversation.id)?.is_some() {
+        return Ok(Vec::new());
+    }
     if let Some(messages) = handle_busy_conversation_input_for_request(
         store,
         &conversation,
@@ -2130,6 +2151,25 @@ pub(crate) async fn drain_queued_requests_for_conversation(
     let mut count = 0usize;
     while let Some(item) = store.claim_next_agent_request(conversation_id)? {
         emit_agent_queue_event(app, "claimed", Some(&item), Some(conversation_id));
+        if is_pet_vision_silent_queue_item(&item) {
+            let completed = store
+                .complete_agent_queue_item(
+                    &item.id,
+                    "canceled",
+                    Some("Skipped stale pet vision capture while draining queue.".into()),
+                )?
+                .unwrap_or_else(|| {
+                    let mut fallback = item.clone();
+                    fallback.status = "canceled".into();
+                    fallback.error =
+                        Some("Skipped stale pet vision capture while draining queue.".into());
+                    fallback.updated_at = now_iso();
+                    fallback.completed_at = Some(now_iso());
+                    fallback
+                });
+            emit_agent_queue_event(app, &completed.status, Some(&completed), Some(conversation_id));
+            continue;
+        }
         let request = SendChatRequest {
             conversation_id: Some(item.conversation_id.clone()),
             persona_id: Some(item.persona_id.clone()),
