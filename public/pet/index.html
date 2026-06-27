@@ -16,6 +16,17 @@
 
       body {
         user-select: none;
+        --pet-grab-cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='48' height='48' viewBox='0 0 48 48'%3E%3Cfilter id='s' x='-20%25' y='-20%25' width='140%25' height='140%25'%3E%3CfeDropShadow dx='0' dy='2' stdDeviation='2' flood-color='%23000000' flood-opacity='.28'/%3E%3C/filter%3E%3Cpath filter='url(%23s)' d='M16.4 23.4V12.2a3.1 3.1 0 0 1 6.2 0v8.5h.9V8.9a3.15 3.15 0 0 1 6.3 0v11.8h.9v-9.6a3.05 3.05 0 0 1 6.1 0v11.2h.8v-6.9a2.9 2.9 0 0 1 5.8 0v12.7c0 8.3-5.6 13.9-14.1 13.9h-4.7c-4.5 0-8-1.8-10.6-5.1L7.2 27.8a3.25 3.25 0 0 1 5.2-3.9l4 5.2z' fill='%23fff7ef'/%3E%3Cpath d='M16.4 23.4V12.2a3.1 3.1 0 0 1 6.2 0v8.5h.9V8.9a3.15 3.15 0 0 1 6.3 0v11.8h.9v-9.6a3.05 3.05 0 0 1 6.1 0v11.2h.8v-6.9a2.9 2.9 0 0 1 5.8 0v12.7c0 8.3-5.6 13.9-14.1 13.9h-4.7c-4.5 0-8-1.8-10.6-5.1L7.2 27.8a3.25 3.25 0 0 1 5.2-3.9l4 5.2z' fill='none' stroke='%232b2b2b' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") 18 16, grab;
+        --pet-grabbing-cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='48' height='48' viewBox='0 0 48 48'%3E%3Cfilter id='s' x='-20%25' y='-20%25' width='140%25' height='140%25'%3E%3CfeDropShadow dx='0' dy='2' stdDeviation='2' flood-color='%23000000' flood-opacity='.3'/%3E%3C/filter%3E%3Cpath filter='url(%23s)' d='M12.2 23.3v-5.9a3.15 3.15 0 0 1 6.3 0v4.7h.9V11.8a3.1 3.1 0 0 1 6.2 0v10.3h.9v-9.2a3.05 3.05 0 0 1 6.1 0v9.2h.8v-6.4a2.95 2.95 0 0 1 5.9 0v12.7c0 8.1-5.4 13.6-13.7 13.6h-3.8c-5.1 0-8.8-2.1-11.4-6.3l-4.1-6.8a3.3 3.3 0 0 1 5.5-3.7l4.4 5.7z' fill='%23fff7ef'/%3E%3Cpath d='M12.2 23.3v-5.9a3.15 3.15 0 0 1 6.3 0v4.7h.9V11.8a3.1 3.1 0 0 1 6.2 0v10.3h.9v-9.2a3.05 3.05 0 0 1 6.1 0v9.2h.8v-6.4a2.95 2.95 0 0 1 5.9 0v12.7c0 8.1-5.4 13.6-13.7 13.6h-3.8c-5.1 0-8.8-2.1-11.4-6.3l-4.1-6.8a3.3 3.3 0 0 1 5.5-3.7l4.4 5.7z' fill='none' stroke='%232b2b2b' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") 17 15, grabbing;
+      }
+
+      body.model-hover,
+      body.model-pressing {
+        cursor: var(--pet-grab-cursor);
+      }
+
+      body.model-dragging {
+        cursor: var(--pet-grabbing-cursor);
       }
 
       #canvas {
@@ -33,6 +44,6 @@
     <script src="./lib/live2d.min.js"></script>
     <script src="./lib/live2dcubismcore.min.js"></script>
     <script src="./lib/pixi-live2d-display.min.js"></script>
-    <script src="./pet.js?v=20260626-hiyori-cloud-v2"></script>
+    <script src="./pet.js?v=20260627-touch-feedback-v6"></script>
   </body>
 </html>

@@ -33,6 +33,12 @@ const PET_VISION_INTERVAL_STORAGE_KEY = "synthchat.pet.visionIntervalSeconds";
 const DEFAULT_PET_VISION_INTERVAL_SECONDS = 60;
 const MIN_PET_VISION_INTERVAL_SECONDS = 30;
 const PET_VISION_BUSY_STATES = new Set(["started", "running", "pendingApproval", "needsClarification"]);
+const PET_MODEL_DRAG_SMOOTHING = 0.48;
+const PET_MODEL_INERTIA_MIN_SPEED = 0.1;
+const PET_MODEL_INERTIA_MAX_DISTANCE = 180;
+const PET_MODEL_INERTIA_DURATION_MS = 680;
+const PET_MODEL_INERTIA_DISTANCE_MULTIPLIER = 300;
+const PET_MODEL_INERTIA_REBOUND_PX = 14;
 
 const AVAILABLE_MODELS = [
   { id: "tororo", name: "Tororo", path: "/pet/model/Tororo/tororo.model3.json", greeting: "Tororo 到啦。", headX: 0.5, headY: 0.24, tailGap: 28 },
@@ -58,6 +64,8 @@ type PetMessage = {
   type?: string;
   text?: string;
   message?: string;
+  area?: string;
+  areas?: string[];
   url?: string;
   screenX?: number;
   screenY?: number;
@@ -144,8 +152,15 @@ type PetDragPoint = {
   screenY: number;
 };
 
+type PetDragInertiaSnapshot = {
+  moved: boolean;
+  velocity: { x: number; y: number };
+  from: PetDragPoint | null;
+};
+
 type PetDockEdge = "left" | "right";
 type PetWindowMode = "model" | "orb";
+type PetBehaviorName = "idle" | "thinking" | "happy" | "stretch" | "error" | "curious" | "shy" | "sleepy" | "wave" | "nod" | "proud" | "listening" | "surprise";
 
 type PetAssistantMirrorState = {
   messageId: string;
@@ -358,12 +373,13 @@ function stripToolDirectiveBlocks(content: string) {
   return content.slice(0, match.index).trimEnd();
 }
 
-function touchCloudText(count: number) {
-  const variants = [
-    "我在哦。",
-    "有什么想问的，直接在下面说就好。",
-    "我会在这里看着当前对话。"
-  ];
+function touchAreaCloudText(area: string | undefined, count: number) {
+  const normalized = (area ?? "").toLowerCase();
+  const variants = normalized === "head"
+    ? ["摸摸头收到。", "这样会把头发弄乱啦。", "嗯，我在认真听。"]
+    : normalized === "body" || normalized === "belly"
+      ? ["哎呀，戳到我了。", "我会站稳一点。", "别闹，我还在看着当前对话呢。"]
+      : ["我在哦。", "有什么想问的，直接在下面说就好。", "我会在这里看着当前对话。"];
   return variants[Math.max(0, count - 1) % variants.length];
 }
 
@@ -441,6 +457,10 @@ export function PetWindow() {
   const modelDragTokenRef = useRef(0);
   const modelDragStartReadyRef = useRef(false);
   const modelDragLatestPointRef = useRef<PetDragPoint | null>(null);
+  const modelDragSmoothedPointRef = useRef<PetDragPoint | null>(null);
+  const modelDragVelocityRef = useRef({ x: 0, y: 0 });
+  const modelDragLastSampleRef = useRef<{ point: PetDragPoint; at: number } | null>(null);
+  const modelDragInertiaFrameRef = useRef<number | null>(null);
   const modelDragMoveFrameRef = useRef<number | null>(null);
   const modelDragMoveInFlightRef = useRef(false);
   const orbDragActiveRef = useRef(false);
@@ -927,6 +947,7 @@ export function PetWindow() {
         && (payload.state === "failed" || payload.state === "aborted")
       ) {
         showCloud("任务没有完成。", "error", 3200);
+        playPetBehavior("error");
       }
     }).then((handler) => {
       unlisten = handler;
@@ -1055,17 +1076,18 @@ export function PetWindow() {
         const now = Date.now();
         pokeCountRef.current = now - lastPokeAtRef.current < 2500 ? pokeCountRef.current + 1 : 1;
         lastPokeAtRef.current = now;
-        showCloud(touchCloudText(pokeCountRef.current), "soft", 2600);
+        showCloud(touchAreaCloudText(message.area, pokeCountRef.current), "soft", 2600);
         inputRef.current?.focus();
         return;
       }
       if (message.type === "poke") {
-        showCloud("我在旁边，需要时叫我就好。", "active", 3000);
+        showCloud(touchAreaCloudText(message.area ?? message.areas?.[0], 1), "active", 3000);
         inputRef.current?.focus();
         return;
       }
       if (message.type === "error") {
         showCloud(message.message ?? "模型加载失败。", "error", 3600);
+        playPetBehavior("error");
       }
     };
     window.addEventListener("message", onMessage as EventListener);
@@ -1080,6 +1102,24 @@ export function PetWindow() {
       "*"
     );
     return true;
+  }
+
+  function playPetBehavior(name: PetBehaviorName, options?: Record<string, unknown>) {
+    if (!modelLoadedRef.current) return false;
+    return postToPet({ type: "behavior", name, options });
+  }
+
+  function behaviorForAssistantText(text: string): PetBehaviorName {
+    const value = text.trim();
+    const lower = value.toLowerCase();
+    if (/失败|错误|抱歉|不能|无法|异常|报错|bad request|error|failed|sorry/.test(lower)) return "error";
+    if (/真的吗|为什么|怎么|如何|是否|\?|？/.test(value)) return "curious";
+    if (/完成|成功|好了|可以了|没问题|太好了|nice|done|success/.test(lower)) return "proud";
+    if (/谢谢|感谢|喜欢|开心|哈哈|嘿嘿|嘻嘻|thank/.test(lower)) return "happy";
+    if (/你好|早上好|晚上好|hello|hi\b/.test(lower)) return "wave";
+    if (value.length > 260) return "stretch";
+    if (value.length < 18) return "shy";
+    return Math.random() < 0.18 ? "curious" : "happy";
   }
 
   function flushPendingModelLoad() {
@@ -1297,9 +1337,10 @@ export function PetWindow() {
     if (!assistantChangedSinceMirror(conversationId, message, payload.signature)) return;
     rememberAssistantMirror(conversationId, message, payload.signature);
     showCloud(payload.text, "active", durationMs, payload.attachments.length ? payload.attachments : undefined);
-    if (modelLoadedRef.current) {
-      postToPet({ type: "expression", id: "开心" });
-    }
+    const behavior = behaviorForAssistantText(payload.text);
+    playPetBehavior(behavior, {
+      durationMs: behavior === "stretch" ? 2300 : behavior === "error" ? 1300 : 1650
+    });
   }
 
   async function refreshLatestAssistant(conversationId: string, showChanged = true) {
@@ -1543,9 +1584,7 @@ export function PetWindow() {
     setModelMenuOpen(false);
     sendingRef.current = true;
     setSending(true);
-    if (modelLoadedRef.current) {
-      postToPet({ type: "expression", id: "闭眼" });
-    }
+    playPetBehavior("thinking");
 
     try {
       const context = await resolvePetSendContext();
@@ -1566,12 +1605,14 @@ export function PetWindow() {
         showAssistantCloud(assistant, context.conversationId);
       } else {
         showCloud("处理中...", "soft", 2600);
+        playPetBehavior("thinking", { durationMs: 1600 });
       }
     } catch (error) {
       console.error("pet send failed:", error);
       setInput((current) => current.trim() ? current : text);
       setComposerAttachments((current) => current.length > 0 ? current : submittedAttachments);
       showCloud("发送失败。", "error", 3600);
+      playPetBehavior("error");
     } finally {
       sendingRef.current = false;
       setSending(false);
@@ -1760,6 +1801,10 @@ export function PetWindow() {
     modelDragMovedRef.current = false;
     modelDragStartReadyRef.current = false;
     modelDragLatestPointRef.current = { screenX, screenY };
+    modelDragSmoothedPointRef.current = { screenX, screenY };
+    modelDragVelocityRef.current = { x: 0, y: 0 };
+    modelDragLastSampleRef.current = { point: { screenX, screenY }, at: performance.now() };
+    cancelModelDragInertia();
     try {
       await invoke("pet_window_drag", { action: "start", screenX, screenY });
       if (dragToken !== modelDragTokenRef.current || !modelDragActiveRef.current) {
@@ -1781,6 +1826,7 @@ export function PetWindow() {
     if (typeof screenX !== "number" || typeof screenY !== "number") return;
     if (!modelDragActiveRef.current) return;
     modelDragMovedRef.current = true;
+    sampleModelDragVelocity(screenX, screenY);
     queueModelDragMove(screenX, screenY);
   }
 
@@ -1789,12 +1835,24 @@ export function PetWindow() {
     const endPoint = typeof screenX === "number" && typeof screenY === "number"
       ? { screenX, screenY }
       : latest;
-    stopModelDrag();
+    const inertiaSnapshot = {
+      moved: modelDragMovedRef.current,
+      velocity: { ...modelDragVelocityRef.current },
+      from: modelDragSmoothedPointRef.current ?? endPoint
+    };
+    const wasActive = modelDragActiveRef.current;
+    resetModelDragState();
+    if (wasActive) {
+      await invoke("pet_window_drag", { action: "end" }).catch((error) => {
+        console.error("pet drag end failed:", error);
+      });
+    }
     const edge = await detectDockEdge(endPoint);
     if (edge) {
       await setPetWindowModeState("orb", edge);
       return;
     }
+    startModelDragInertia(endPoint, inertiaSnapshot);
     showCloud("我先停在这里。", "soft", 2000);
   }
 
@@ -1842,9 +1900,10 @@ export function PetWindow() {
     if (!modelDragActiveRef.current || !modelDragStartReadyRef.current || modelDragMoveInFlightRef.current) return;
     const point = modelDragLatestPointRef.current;
     if (!point) return;
+    const smoothed = nextSmoothedModelDragPoint(point);
     modelDragMoveInFlightRef.current = true;
     try {
-      await invoke("pet_window_drag", { action: "move", screenX: point.screenX, screenY: point.screenY });
+      await invoke("pet_window_drag", { action: "move", screenX: smoothed.screenX, screenY: smoothed.screenY });
     } catch (error) {
       console.error("pet drag move failed:", error);
       stopModelDrag();
@@ -1857,10 +1916,89 @@ export function PetWindow() {
     if (
       modelDragActiveRef.current
       && latest
-      && (latest.screenX !== point.screenX || latest.screenY !== point.screenY)
+      && (Math.abs(latest.screenX - smoothed.screenX) > 0.5 || Math.abs(latest.screenY - smoothed.screenY) > 0.5)
     ) {
       queueModelDragMove(latest.screenX, latest.screenY);
     }
+  }
+
+  function sampleModelDragVelocity(screenX: number, screenY: number) {
+    const now = performance.now();
+    const previous = modelDragLastSampleRef.current;
+    if (previous) {
+      const elapsed = Math.max(16, now - previous.at);
+      const vx = (screenX - previous.point.screenX) / elapsed;
+      const vy = (screenY - previous.point.screenY) / elapsed;
+      modelDragVelocityRef.current = {
+        x: modelDragVelocityRef.current.x * 0.55 + vx * 0.45,
+        y: modelDragVelocityRef.current.y * 0.55 + vy * 0.45
+      };
+    }
+    modelDragLastSampleRef.current = { point: { screenX, screenY }, at: now };
+  }
+
+  function nextSmoothedModelDragPoint(target: PetDragPoint): PetDragPoint {
+    const current = modelDragSmoothedPointRef.current ?? target;
+    const next = {
+      screenX: current.screenX + (target.screenX - current.screenX) * PET_MODEL_DRAG_SMOOTHING,
+      screenY: current.screenY + (target.screenY - current.screenY) * PET_MODEL_DRAG_SMOOTHING
+    };
+    modelDragSmoothedPointRef.current = next;
+    return next;
+  }
+
+  function cancelModelDragInertia() {
+    if (modelDragInertiaFrameRef.current !== null) {
+      window.cancelAnimationFrame(modelDragInertiaFrameRef.current);
+      modelDragInertiaFrameRef.current = null;
+    }
+  }
+
+  function startModelDragInertia(endPoint: PetDragPoint | null, snapshot: PetDragInertiaSnapshot) {
+    if (!endPoint || !snapshot.moved || !snapshot.from) return;
+    const velocity = snapshot.velocity;
+    const speed = Math.hypot(velocity.x, velocity.y);
+    if (speed < PET_MODEL_INERTIA_MIN_SPEED) return;
+    const distance = Math.min(PET_MODEL_INERTIA_MAX_DISTANCE, speed * PET_MODEL_INERTIA_DISTANCE_MULTIPLIER);
+    const unitX = velocity.x / speed;
+    const unitY = velocity.y / speed;
+    const from = snapshot.from;
+    const startAt = performance.now();
+    const inertiaToken = modelDragTokenRef.current;
+    cancelModelDragInertia();
+    void invoke("pet_window_drag", { action: "start", screenX: from.screenX, screenY: from.screenY }).then(() => {
+      if (inertiaToken !== modelDragTokenRef.current || modelDragActiveRef.current) {
+        void invoke("pet_window_drag", { action: "end" }).catch(() => undefined);
+        return;
+      }
+      const tick = () => {
+        if (inertiaToken !== modelDragTokenRef.current || modelDragActiveRef.current) {
+          modelDragInertiaFrameRef.current = null;
+          void invoke("pet_window_drag", { action: "end" }).catch(() => undefined);
+          return;
+        }
+        const elapsed = performance.now() - startAt;
+        const progress = Math.min(1, elapsed / PET_MODEL_INERTIA_DURATION_MS);
+        const ease = 1 - Math.pow(1 - progress, 3.2);
+        const reboundProgress = progress > 0.68 ? (progress - 0.68) / 0.32 : 0;
+        const rebound = Math.sin(reboundProgress * Math.PI) * PET_MODEL_INERTIA_REBOUND_PX * (1 - progress);
+        const next = {
+          screenX: from.screenX + unitX * (distance * ease - rebound),
+          screenY: from.screenY + unitY * (distance * ease - rebound * 0.72)
+        };
+        void invoke("pet_window_drag", { action: "move", screenX: next.screenX, screenY: next.screenY });
+        if (progress < 1) {
+          modelDragInertiaFrameRef.current = window.requestAnimationFrame(tick);
+        } else {
+          modelDragInertiaFrameRef.current = null;
+          void invoke("pet_window_drag", { action: "end" });
+        }
+      };
+      modelDragInertiaFrameRef.current = window.requestAnimationFrame(tick);
+    }).catch((error) => {
+      console.error("pet drag inertia failed:", error);
+      void invoke("pet_window_drag", { action: "end" }).catch(() => undefined);
+    });
   }
 
   function resetModelDragState() {
@@ -1868,6 +2006,9 @@ export function PetWindow() {
     modelDragActiveRef.current = false;
     modelDragStartReadyRef.current = false;
     modelDragLatestPointRef.current = null;
+    modelDragSmoothedPointRef.current = null;
+    modelDragLastSampleRef.current = null;
+    modelDragVelocityRef.current = { x: 0, y: 0 };
     modelDragMoveInFlightRef.current = false;
     if (modelDragMoveFrameRef.current !== null) {
       window.cancelAnimationFrame(modelDragMoveFrameRef.current);
@@ -2040,7 +2181,7 @@ export function PetWindow() {
       <iframe
         className="live2d-pet-frame"
         ref={frameRef}
-        src="/pet/index.html?v=20260626-hiyori-cloud-v2"
+        src="/pet/index.html?v=20260627-touch-feedback-v6"
         title="SynthPet Live2D"
       />
 
