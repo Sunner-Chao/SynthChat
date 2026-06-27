@@ -43,7 +43,9 @@ let activeBehavior = null;
 let idleBehaviorTimer = null;
 let modelParameterIds = new Set();
 let modelExpressionNames = new Set();
+let modelMotionGroups = new Map();
 let ambientStartedAt = performance.now();
+let behaviorDebugSerial = 0;
 
 const MODEL_HIT_PADDING = 28;
 const MODEL_DRAG_DELAY_MS = 240;
@@ -60,6 +62,16 @@ const IDLE_BEHAVIOR_JITTER_MS = 8500;
 const PARAMETER_OVERLAY_WEIGHT = 0.78;
 const AMBIENT_OVERLAY_WEIGHT = 0.26;
 const DRAG_OVERLAY_WEIGHT = 0.84;
+const ADDITIVE_PARAM_PREFIXES = [
+    "ParamAngle",
+    "ParamBodyAngle",
+    "ParamHair",
+    "ParamShoulder",
+    "ParamArm",
+    "ParamHand",
+    "ParamLeg"
+];
+const ADDITIVE_PARAM_IDS = new Set(["ParamEyeBallX", "ParamEyeBallY"]);
 
 let loadingModelKey = null;
 let loadedModelUrl = null;
@@ -138,10 +150,38 @@ function focusScreenPoint(clientX, clientY, instant = false) {
     model.focus(clientX, clientY, instant);
 }
 
+function getModelSettings() {
+    return model?.internalModel?.settings ?? null;
+}
+
+function getModelMotions() {
+    const settings = getModelSettings();
+    return (
+        settings?.FileReferences?.Motions ??
+        settings?.motions ??
+        settings?.definitions?.FileReferences?.Motions ??
+        settings?.json?.FileReferences?.Motions ??
+        settings?._json?.FileReferences?.Motions ??
+        {}
+    );
+}
+
+function getModelExpressions() {
+    const settings = getModelSettings();
+    return (
+        settings?.FileReferences?.Expressions ??
+        settings?.expressions ??
+        settings?.json?.FileReferences?.Expressions ??
+        settings?._json?.FileReferences?.Expressions ??
+        []
+    );
+}
+
 function refreshModelCapabilities() {
     const coreModel = model?.internalModel?.coreModel;
     modelParameterIds = new Set();
     modelExpressionNames = new Set();
+    modelMotionGroups = new Map();
     const ids = coreModel?._parameterIds ?? coreModel?.getModel?.()?.parameters?.ids;
     if (ids && typeof ids.length === "number") {
         for (let index = 0; index < ids.length; index += 1) {
@@ -149,17 +189,32 @@ function refreshModelCapabilities() {
             if (typeof id === "string" && id) modelParameterIds.add(id);
         }
     }
-    const expressions =
-        model?.internalModel?.settings?.FileReferences?.Expressions ??
-        model?.internalModel?.settings?.expressions ??
-        model?.internalModel?.settings?.json?.FileReferences?.Expressions ??
-        model?.internalModel?.settings?._json?.FileReferences?.Expressions;
+    const expressions = getModelExpressions();
     if (Array.isArray(expressions)) {
         for (const expression of expressions) {
             const name = expression?.Name ?? expression?.name;
             if (typeof name === "string" && name.trim()) modelExpressionNames.add(name.trim());
         }
     }
+    const motions = getModelMotions();
+    for (const [group, entries] of Object.entries(motions)) {
+        if (!Array.isArray(entries)) continue;
+        modelMotionGroups.set(group, entries);
+    }
+    postMessageToHost({
+        type: "model_capabilities",
+        parameterCount: modelParameterIds.size,
+        motionGroups: Array.from(modelMotionGroups.entries()).map(([group, entries]) => ({
+            group,
+            count: entries.length,
+            names: entries
+                .map((entry) => entry?.Name ?? entry?.name ?? entry?.File ?? entry?.file)
+                .filter((name) => typeof name === "string")
+                .slice(0, 6)
+        })),
+        expressions: Array.from(modelExpressionNames),
+        sampleParams: Array.from(modelParameterIds).slice(0, 28)
+    });
 }
 
 function hasLive2DParam(paramId) {
@@ -187,11 +242,38 @@ function setLive2DParam(paramId, value, weight = 1) {
     return false;
 }
 
+function addLive2DParam(paramId, value, weight = 1) {
+    if (!hasLive2DParam(paramId)) return false;
+    const coreModel = model?.internalModel?.coreModel;
+    if (!coreModel) return false;
+    try {
+        if (typeof coreModel.addParameterValueById === "function") {
+            coreModel.addParameterValueById(paramId, value, weight);
+            return true;
+        }
+        if (typeof coreModel.getParameterValueById === "function" && typeof coreModel.setParameterValueById === "function") {
+            coreModel.setParameterValueById(paramId, coreModel.getParameterValueById(paramId) + value * weight);
+            return true;
+        }
+    } catch {
+        return false;
+    }
+    return false;
+}
+
+function isAdditiveParam(paramId) {
+    return ADDITIVE_PARAM_IDS.has(paramId) || ADDITIVE_PARAM_PREFIXES.some((prefix) => paramId.startsWith(prefix));
+}
+
 function applyParameterPose(params, weight = 0.5) {
     if (!params || typeof params !== "object") return;
     for (const [paramId, value] of Object.entries(params)) {
         if (typeof value === "number" && hasLive2DParam(paramId)) {
-            setLive2DParam(paramId, value, weight);
+            if (isAdditiveParam(paramId)) {
+                addLive2DParam(paramId, value, weight);
+            } else {
+                setLive2DParam(paramId, value, weight);
+            }
         }
     }
 }
@@ -306,6 +388,21 @@ function applyFrameOverlay() {
     applyParameterPose(pose, PARAMETER_OVERLAY_WEIGHT);
 }
 
+function installModelOverlay(nextModel) {
+    const internal = nextModel?.internalModel;
+    if (!internal || internal.__synthchatOverlayInstalled) return;
+    const originalUpdate = internal.update;
+    if (typeof originalUpdate !== "function") return;
+    internal.update = function patchedSynthChatUpdate(deltaTime, elapsedTime) {
+        const result = originalUpdate.call(this, deltaTime, elapsedTime);
+        if (model === nextModel && nextModel.internalModel === internal) {
+            applyFrameOverlay();
+        }
+        return result;
+    };
+    internal.__synthchatOverlayInstalled = true;
+}
+
 function dragPhysicsPose(rawX, rawY) {
     const swayX = Math.max(-38, Math.min(38, rawX));
     const swayY = Math.max(-26, Math.min(26, rawY));
@@ -374,7 +471,10 @@ function semanticTouchAreaFromPoint(clientX, clientY, nativeAreas = []) {
     if (!model) return "model";
     const bounds = model.getBounds();
     const relativeY = bounds.height > 0 ? (clientY - bounds.y) / bounds.height : 1;
-    if (relativeY >= 0 && relativeY <= TOUCH_HEAD_RATIO) return "head";
+    const relativeX = bounds.width > 0 ? (clientX - bounds.x) / bounds.width : 0.5;
+    const inHeadBand = relativeY >= 0 && relativeY <= TOUCH_HEAD_RATIO + 0.12;
+    const nearCenter = relativeX >= 0.22 && relativeX <= 0.78;
+    if (inHeadBand && nearCenter) return "head";
     if (normalizedAreas.some((area) => area.includes("body") || area.includes("belly"))) return "body";
     return "body";
 }
@@ -399,14 +499,7 @@ async function touchInfoAtPoint(clientX, clientY) {
 }
 
 function motionGroupCount(group) {
-    const settings = model?.internalModel?.settings;
-    const motions =
-        settings?.FileReferences?.Motions ??
-        settings?.motions ??
-        settings?.definitions?.FileReferences?.Motions ??
-        settings?.json?.FileReferences?.Motions ??
-        settings?._json?.FileReferences?.Motions;
-    const groupMotions = motions?.[group];
+    const groupMotions = modelMotionGroups.get(group) ?? getModelMotions()?.[group];
     return Array.isArray(groupMotions) ? groupMotions.length : null;
 }
 
@@ -417,11 +510,71 @@ function tryPlayMotion(group, index = 0) {
     const safeIndex = count !== null ? Math.min(index, count - 1) : index;
     try {
         model.motion(group, safeIndex, PIXI.live2d.MotionPriority.FORCE);
+        postMessageToHost({ type: "motion_debug", group, index: safeIndex });
         return true;
     } catch (error) {
         console.warn("Live2D motion failed:", group, safeIndex, error);
         return false;
     }
+}
+
+function normalizeMotionText(value) {
+    return String(value ?? "")
+        .toLowerCase()
+        .replace(/[\s_\-./\\]+/g, "");
+}
+
+function motionEntryText(group, entry, index) {
+    return normalizeMotionText([
+        group,
+        entry?.Name,
+        entry?.name,
+        entry?.File,
+        entry?.file,
+        index
+    ].filter(Boolean).join(" "));
+}
+
+function motionKeywordScore(text, keywords, fallbackScore = 0) {
+    let score = fallbackScore;
+    for (const keyword of keywords) {
+        const normalized = normalizeMotionText(keyword);
+        if (normalized && text.includes(normalized)) score += 10;
+    }
+    return score;
+}
+
+function rankedMotionCandidates(keywords, options = {}) {
+    const includeIdle = Boolean(options.includeIdle);
+    const preferNonIdle = Boolean(options.preferNonIdle);
+    const candidates = [];
+    for (const [group, entries] of modelMotionGroups.entries()) {
+        const groupText = normalizeMotionText(group);
+        const idleLike = groupText.includes("idle") || groupText.includes("待机");
+        if (!includeIdle && idleLike) continue;
+        entries.forEach((entry, index) => {
+            const text = motionEntryText(group, entry, index);
+            let score = motionKeywordScore(text, keywords, 0);
+            if (idleLike) score -= preferNonIdle ? 10 : 2;
+            if (!idleLike && preferNonIdle) score += 4;
+            if (text.includes("tap") || text.includes("touch") || text.includes("flick") || text.includes("点击") || text.includes("触摸")) score += 8;
+            if (text.includes("idle") || text.includes("待机")) score += includeIdle ? 1 : -8;
+            candidates.push({ group, index, score });
+        });
+    }
+    candidates.sort((left, right) => right.score - left.score);
+    return candidates.map(({ group, index }) => [group, index]);
+}
+
+function firstAvailableMotionFromGroups(groups) {
+    const candidates = [];
+    for (const group of groups) {
+        const count = motionGroupCount(group);
+        if (count && count > 0) {
+            candidates.push([group, Math.floor(Math.random() * count)]);
+        }
+    }
+    return candidates;
 }
 
 function motionCandidatesForArea(area) {
@@ -432,13 +585,17 @@ function motionCandidatesForArea(area) {
             ["TapHead", 0],
             ["TapBody", tapBodyCount && tapBodyCount > 1 ? 1 : 0],
             ["Tap", 0],
-            ["Idle", 0]
+            ...rankedMotionCandidates(["head", "taphead", "touchhead", "flickup", "摸头", "头", "帽檐", "害羞", "开心"], { preferNonIdle: true }),
+            ["Idle", 0],
+            ...rankedMotionCandidates(["idle", "待机"], { includeIdle: true })
         ];
     }
     return [
         ["TapBody", tapBodyCount && tapBodyCount > 0 ? Math.floor(Math.random() * tapBodyCount) : 0],
         ["Tap", tapCount && tapCount > 0 ? Math.floor(Math.random() * tapCount) : 0],
-        ["Idle", 0]
+        ...rankedMotionCandidates(["body", "tapbody", "touch", "tap", "flick", "身体", "摆手", "摇晃"], { preferNonIdle: true }),
+        ["Idle", 0],
+        ...rankedMotionCandidates(["idle", "待机"], { includeIdle: true })
     ];
 }
 
@@ -446,7 +603,10 @@ function playTouchMotion(area) {
     for (const [group, index] of motionCandidatesForArea(area)) {
         if (tryPlayMotion(group, index)) return;
     }
-    tryPlayMotion("TapBody", 0);
+    const fallback = firstAvailableMotionFromGroups(["TapBody", "Tap", "FlickUp", "Flick", "FlickDown", "Idle"]);
+    for (const [group, index] of fallback) {
+        if (tryPlayMotion(group, index)) return;
+    }
 }
 
 function randomMotion(group) {
@@ -499,30 +659,30 @@ function expressionCandidatesForBehavior(name) {
 function motionCandidatesForBehavior(name) {
     const normalized = typeof name === "string" ? name : "idle";
     if (normalized === "thinking") {
-        return [["Idle", 0], ["TapBody", 0]];
+        return [["Idle", 0], ...rankedMotionCandidates(["thinking", "idle", "待机", "思考"], { includeIdle: true }), ["TapBody", 0]];
     }
     if (normalized === "happy") {
-        return [["TapBody", 0], ["FlickUp", 0], ["Flick", 0], ["Idle", 0]];
+        return [["TapBody", 0], ["FlickUp", 0], ["Flick", 0], ...rankedMotionCandidates(["happy", "smile", "touch", "开心", "害羞", "摆手"], { preferNonIdle: true }), ["Idle", 0]];
     }
     if (normalized === "wave" || normalized === "proud") {
-        return [["TapBody", 2], ["TapBody", 0], ["FlickUp", 0], ["Idle", 0]];
+        return [["TapBody", 2], ["TapBody", 0], ["FlickUp", 0], ...rankedMotionCandidates(["wave", "hello", "greet", "帽檐", "打招呼", "摆手"], { preferNonIdle: true }), ["Idle", 0]];
     }
     if (normalized === "curious" || normalized === "listening" || normalized === "shy") {
-        return [["TapBody", 1], ["Idle", 1], ["TapBody", 0], ["Idle", 0]];
+        return [["TapBody", 1], ["Idle", 1], ...rankedMotionCandidates(["curious", "listen", "shy", "害羞", "不好意思", "摇晃"], { preferNonIdle: true, includeIdle: true }), ["TapBody", 0], ["Idle", 0]];
     }
     if (normalized === "stretch") {
-        return [["Idle", 1], ["TapBody", 1], ["FlickUp", 0], ["Idle", 0]];
+        return [["Idle", 1], ["TapBody", 1], ["FlickUp", 0], ...rankedMotionCandidates(["stretch", "idle", "待机", "伸展"], { includeIdle: true }), ["Idle", 0]];
     }
     if (normalized === "error") {
-        return [["FlickDown", 0], ["TapBody", 0], ["Flick", 0], ["Idle", 0]];
+        return [["FlickDown", 0], ["TapBody", 0], ["Flick", 0], ...rankedMotionCandidates(["angry", "sad", "surprise", "生气", "惊讶", "委屈"], { preferNonIdle: true }), ["Idle", 0]];
     }
     if (normalized === "sleepy") {
-        return [["Idle", 2], ["Idle", 0], ["TapBody", 0]];
+        return [["Idle", 2], ...rankedMotionCandidates(["sleep", "idle", "闭眼", "待机"], { includeIdle: true }), ["Idle", 0], ["TapBody", 0]];
     }
     if (normalized === "surprise") {
-        return [["TapBody", 0], ["FlickUp", 0], ["Idle", 0]];
+        return [["TapBody", 0], ["FlickUp", 0], ...rankedMotionCandidates(["surprise", "flick", "惊讶", "繁星"], { preferNonIdle: true }), ["Idle", 0]];
     }
-    return [["Idle", null], ["TapBody", 0]];
+    return [["Idle", null], ...rankedMotionCandidates(["idle", "touch", "待机"], { includeIdle: true }), ["TapBody", 0]];
 }
 
 function playBehaviorMotion(name) {
@@ -732,7 +892,17 @@ function playBehavior(name = "idle", options = {}) {
     activeBehavior = { name, options, duration };
     behaviorStartedAt = performance.now();
     tryExpression(expressionCandidatesForBehavior(name));
-    playBehaviorMotion(name);
+    const playedMotion = playBehaviorMotion(name);
+    postMessageToHost({
+        type: "behavior_debug",
+        id: ++behaviorDebugSerial,
+        name,
+        duration,
+        playedMotion,
+        parameterCount: modelParameterIds.size,
+        motionGroups: Array.from(modelMotionGroups.keys()),
+        expressionCount: modelExpressionNames.size
+    });
 }
 
 function modelLayoutMetrics() {
@@ -763,10 +933,6 @@ function layoutModel() {
     model.position.set(metrics.width * 0.5, metrics.topInset + metrics.height * MODEL_VERTICAL_ANCHOR_RATIO);
     reportModelBounds();
 }
-
-app.ticker.add(() => {
-    applyFrameOverlay();
-});
 
 function finishModelDrag(screenX, screenY) {
     const wasDragging = draggingModel;
@@ -909,11 +1075,13 @@ async function loadModel(url = DEFAULT_MODEL_URL, options = {}) {
                 }
 
                 refreshModelCapabilities();
+                installModelOverlay(model);
                 ambientStartedAt = performance.now();
                 layoutModel();
                 model.interactive = true;
                 reportModelBounds();
-                window.setTimeout(() => playBehavior("wave", { durationMs: 1700 }), 120);
+                window.setTimeout(() => playBehavior("wave", { durationMs: 2300 }), 120);
+                window.setTimeout(() => playBehavior("curious", { durationMs: 1600 }), 2600);
                 scheduleIdleBehavior();
 
                 postMessageToHost({ type: "loaded", url: modelUrl });

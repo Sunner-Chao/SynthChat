@@ -73,6 +73,16 @@ type PetMessage = {
   y?: number;
   width?: number;
   height?: number;
+  group?: string;
+  index?: number;
+  name?: string;
+  duration?: number;
+  playedMotion?: boolean;
+  parameterCount?: number;
+  expressionCount?: number;
+  motionGroups?: unknown;
+  expressions?: unknown;
+  sampleParams?: unknown;
 };
 
 type NativeFileDropPayload = {
@@ -570,10 +580,6 @@ export function PetWindow() {
 
   useEffect(() => {
     const clamped = clampPetVisionIntervalSeconds(visionIntervalSeconds);
-    if (clamped !== visionIntervalSeconds) {
-      setVisionIntervalSeconds(clamped);
-      return;
-    }
     try {
       window.localStorage.setItem(PET_VISION_INTERVAL_STORAGE_KEY, String(clamped));
     } catch {
@@ -1035,6 +1041,14 @@ export function PetWindow() {
           initialGreetingShownRef.current = true;
           window.setTimeout(() => showCloud(selectedModel.greeting, "happy", 2400), 120);
         }
+        return;
+      }
+      if (message.type === "model_capabilities") {
+        console.info("[SynthChat Pet] Live2D capabilities", message);
+        return;
+      }
+      if (message.type === "behavior_debug" || message.type === "motion_debug") {
+        console.info("[SynthChat Pet] Live2D behavior", message);
         return;
       }
       if (message.type === "model_hover" || message.type === "model_bounds") {
@@ -1683,7 +1697,7 @@ export function PetWindow() {
   function pointNearModel(clientX: number, clientY: number) {
     const bounds = modelBoundsRef.current;
     if (!bounds) return false;
-    const padding = 48;
+    const padding = Math.max(72, Math.min(140, Math.max(bounds.width, bounds.height) * 0.16));
     return (
       clientX >= bounds.x - padding
       && clientX <= bounds.x + bounds.width + padding
@@ -1699,6 +1713,14 @@ export function PetWindow() {
 
     const cssWidth = Math.max(1, window.innerWidth);
     const cssHeight = Math.max(1, window.innerHeight);
+    if (
+      rawClientX >= -cssWidth * 0.2
+      && rawClientX <= cssWidth * 1.2
+      && rawClientY >= -cssHeight * 0.2
+      && rawClientY <= cssHeight * 1.2
+    ) {
+      return { clientX: rawClientX, clientY: rawClientY };
+    }
     const scaleX = typeof position.windowWidth === "number" && position.windowWidth > 0
       ? position.windowWidth / cssWidth
       : window.devicePixelRatio;
@@ -1706,10 +1728,29 @@ export function PetWindow() {
       ? position.windowHeight / cssHeight
       : window.devicePixelRatio;
 
-    return {
+    const normalized = {
       clientX: scaleX > 1.01 ? rawClientX / scaleX : rawClientX,
       clientY: scaleY > 1.01 ? rawClientY / scaleY : rawClientY
     };
+    if (
+      normalized.clientX >= -cssWidth * 0.4
+      && normalized.clientX <= cssWidth * 1.4
+      && normalized.clientY >= -cssHeight * 0.4
+      && normalized.clientY <= cssHeight * 1.4
+    ) {
+      return normalized;
+    }
+    const windowX = typeof position.windowScreenX === "number" ? position.windowScreenX : Number.NaN;
+    const windowY = typeof position.windowScreenY === "number" ? position.windowScreenY : Number.NaN;
+    const screenX = typeof position.screenX === "number" ? position.screenX : position.x;
+    const screenY = typeof position.screenY === "number" ? position.screenY : position.y;
+    if (Number.isFinite(windowX) && Number.isFinite(windowY) && typeof screenX === "number" && typeof screenY === "number") {
+      return {
+        clientX: screenX - windowX,
+        clientY: screenY - windowY
+      };
+    }
+    return normalized;
   }
 
   async function updateGlobalLook() {
@@ -2181,7 +2222,7 @@ export function PetWindow() {
       <iframe
         className="live2d-pet-frame"
         ref={frameRef}
-        src="/pet/index.html?v=20260627-touch-feedback-v6"
+        src="/pet/index.html?v=20260627-touch-feedback-v7"
         title="SynthPet Live2D"
       />
 
@@ -2387,3 +2428,4 @@ export function PetWindow() {
     </main>
   );
 }
+
