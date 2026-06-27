@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
-import { Palette, SendHorizontal } from "lucide-react";
+import { FileText, Loader2, Palette, SendHorizontal, X } from "lucide-react";
 import { api, convertFileSrc } from "./lib/api";
-import type { AgentRunEvent, ChatMessage, Conversation, EmojiGroup, Persona } from "./lib/types";
+import type { AgentRunEvent, ChatAttachment, ChatMessage, Conversation, EmojiGroup, Persona } from "./lib/types";
 import {
   PET_ACTIVE_CONTEXT_EVENT,
   PET_ACTIVE_CONTEXT_STORAGE_KEY,
@@ -79,6 +79,12 @@ type PetAttachment = {
   fileName: string;
   path: string;
   mimeType?: string;
+};
+
+type PetComposerAttachment = ChatAttachment & {
+  preview: string | null;
+  status: "ready" | "staging" | "error";
+  error?: string;
 };
 
 type PetAttachmentRender = PetAttachment & {
@@ -404,6 +410,8 @@ export function PetWindow() {
   const [showInput, setShowInput] = useState(true);
   const [petWindowMode, setPetWindowMode] = useState<PetWindowMode>("model");
   const [dockEdge, setDockEdge] = useState<PetDockEdge>("right");
+  const [composerAttachments, setComposerAttachments] = useState<PetComposerAttachment[]>([]);
+  const [inputDragActive, setInputDragActive] = useState(false);
 
   const renderedCloudAttachments = useMemo(() => {
     const attachments = cloudBubble?.attachments ?? [];
@@ -1084,10 +1092,70 @@ export function PetWindow() {
     return null;
   }
 
+  async function stagePetFiles(files: FileList | File[]) {
+    const list = Array.from(files);
+    if (list.length === 0) return;
+    revealInput();
+    for (const file of list) {
+      const temporaryId = crypto.randomUUID();
+      const preview = file.type.startsWith("image/") ? URL.createObjectURL(file) : null;
+      setComposerAttachments((current) => [...current, {
+        id: temporaryId,
+        fileName: file.name,
+        mimeType: file.type || "application/octet-stream",
+        fileSize: file.size,
+        path: "",
+        preview,
+        status: "staging"
+      }]);
+      try {
+        const buffer = await file.arrayBuffer();
+        const saved = await api.uploadChatAttachment(
+          file.name,
+          file.type || "application/octet-stream",
+          Array.from(new Uint8Array(buffer))
+        );
+        setComposerAttachments((current) => current.map((item) => (
+          item.id === temporaryId ? { ...saved, preview, status: "ready" } : item
+        )));
+      } catch (error) {
+        setComposerAttachments((current) => current.map((item) => (
+          item.id === temporaryId ? { ...item, status: "error", error: String(error) } : item
+        )));
+      }
+    }
+  }
+
+  function removePetAttachment(id: string) {
+    setComposerAttachments((current) => current.filter((item) => item.id !== id));
+  }
+
+  function buildPetOutboundContent(text: string, readyAttachments: PetComposerAttachment[]) {
+    const attachmentMarkers = readyAttachments
+      .map((file) => `[media attached: "${file.path}" (${file.mimeType || "application/octet-stream"})] ${file.fileName}`)
+      .join("\n");
+    const attachmentContext = readyAttachments
+      .map((file) => JSON.stringify({
+        type: "attachment",
+        id: file.id,
+        fileName: file.fileName,
+        mimeType: file.mimeType || "application/octet-stream",
+        fileSize: file.fileSize,
+        path: file.path,
+        recommendedTool: file.mimeType?.startsWith("image/") ? "vision_analyze" : undefined
+      }))
+      .join("\n");
+    return [text, attachmentMarkers, attachmentContext].filter(Boolean).join("\n\n");
+  }
+
   async function handleSubmit() {
     const text = input.trim();
-    if (!text || sendingRef.current) return;
+    const readyAttachments = composerAttachments.filter((item) => item.status === "ready");
+    const hasStagingAttachment = composerAttachments.some((item) => item.status === "staging");
+    if (((!text && readyAttachments.length === 0) || hasStagingAttachment) || sendingRef.current) return;
+    const submittedAttachments = composerAttachments;
     setInput("");
+    setComposerAttachments([]);
     setModelMenuOpen(false);
     sendingRef.current = true;
     setSending(true);
@@ -1103,7 +1171,7 @@ export function PetWindow() {
         conversationId: context.conversationId,
         personaId: context.personaId,
         agentId: context.agentId,
-        content: text,
+        content: buildPetOutboundContent(text, readyAttachments),
         providerData: {
           source: "pet"
         }
@@ -1117,6 +1185,8 @@ export function PetWindow() {
       }
     } catch (error) {
       console.error("pet send failed:", error);
+      setInput((current) => current.trim() ? current : text);
+      setComposerAttachments((current) => current.length > 0 ? current : submittedAttachments);
       showCloud("发送失败。", "error", 3600);
     } finally {
       sendingRef.current = false;
@@ -1661,10 +1731,24 @@ export function PetWindow() {
 
       {petWindowMode !== "orb" ? (
       <section
-        className={`pet-input-shell${showInput ? "" : " is-hidden"}${modelMenuOpen ? " is-menu-open" : ""}`}
+        className={`pet-input-shell${showInput ? "" : " is-hidden"}${modelMenuOpen ? " is-menu-open" : ""}${inputDragActive ? " is-dragging" : ""}`}
         ref={inputShellRef}
         aria-label="桌宠输入"
         onFocusCapture={revealInput}
+        onDragEnter={(event) => {
+          event.preventDefault();
+          revealInput();
+          setInputDragActive(true);
+        }}
+        onDragOver={(event) => event.preventDefault()}
+        onDragLeave={(event) => {
+          if (event.currentTarget === event.target) setInputDragActive(false);
+        }}
+        onDrop={(event) => {
+          event.preventDefault();
+          setInputDragActive(false);
+          void stagePetFiles(event.dataTransfer.files);
+        }}
         onMouseEnter={revealInput}
         onMouseLeave={scheduleInputHide}
         onPointerDown={() => {
@@ -1705,7 +1789,11 @@ export function PetWindow() {
           />
           <button
             className="pet-input-send-button"
-            disabled={!input.trim() || sending}
+            disabled={
+              sending
+              || composerAttachments.some((item) => item.status === "staging")
+              || (!input.trim() && composerAttachments.every((item) => item.status !== "ready"))
+            }
             onClick={() => void handleSubmit()}
             title="发送"
             type="button"
@@ -1714,6 +1802,21 @@ export function PetWindow() {
             <SendHorizontal size={16} strokeWidth={2.5} aria-hidden="true" />
           </button>
         </div>
+        {composerAttachments.length > 0 ? (
+          <div className="pet-input-attachment-row">
+            {composerAttachments.map((file) => (
+              <div className={`pet-input-attachment ${file.status}`} key={file.id}>
+                {file.preview ? <img src={file.preview} alt={file.fileName} /> : <FileText size={14} />}
+                <span>{file.fileName}</span>
+                {file.status === "staging" ? <Loader2 className="spin" size={12} /> : null}
+                {file.status === "error" ? <small>{file.error || "上传失败"}</small> : null}
+                <button onClick={() => removePetAttachment(file.id)} title="移除附件" type="button">
+                  <X size={11} />
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : null}
         {modelMenuOpen ? (
           <div className="pet-input-model-menu" ref={modelMenuRef} role="menu">
             {AVAILABLE_MODELS.map((model) => (

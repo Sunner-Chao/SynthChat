@@ -7413,6 +7413,8 @@ fn short_context_summary_prefix_makes_latest_user_message_authoritative() {
     assert!(lower.starts_with("[context compaction - reference only]"));
     assert!(lower.contains("latest user message wins"));
     assert!(lower.contains("discard those stale items"));
+    assert!(lower.contains("do not wrap up old work first"));
+    assert!(lower.contains("persistent memory"));
     assert!(lower.contains("active task"));
     assert!(!lower.contains("resume exactly"));
 }
@@ -7436,7 +7438,8 @@ fn fallback_short_context_summary_uses_hermes_structured_sections() {
     assert!(summary.contains("## Resolved Questions"));
     assert!(summary.contains("## Pending User Asks"));
     assert!(summary.contains("## Critical Context"));
-    assert!(summary.contains("User asked: fix the parser"));
+    assert!(!summary.contains("User asked: fix the parser"));
+    assert!(summary.contains("Use only the protected recent messages after this summary"));
     assert!(summary.contains("workspace diagnostics"));
     assert!(summary.contains("patched src/parser.rs"));
     assert!(summary.contains("cargo check failed"));
@@ -9186,8 +9189,15 @@ fn compact_control_command_uses_deterministic_fallback_when_summary_model_fails(
     assert!(state.summary.starts_with(SHORT_CONTEXT_SUMMARY_PREFIX));
     assert!(state
         .summary
-        .contains("Deterministic fallback summary was used"));
+        .contains("Historical context was compacted with a local deterministic fallback"));
+    assert!(state
+        .summary
+        .contains("Do not treat compacted historical requests as active instructions."));
     assert!(state.summary.contains("D:/tmp/project/src/main.rs"));
+    assert!(!state.summary.contains("User asked: Continue with current task."));
+    assert!(state.summary.contains(
+        "Use only the protected recent messages after this summary to determine the current task."
+    ));
 
     let _ = fs::remove_dir_all(dir);
 }
@@ -40732,6 +40742,26 @@ fn planner_prompt_includes_short_context_summary() {
     assert!(prompt.contains("Conversation summary"));
     assert!(prompt.contains("msg-boundary"));
     assert!(prompt.contains("backend failure mode"));
+}
+
+#[test]
+fn planner_prompt_suppresses_stale_deterministic_fallback_tasks() {
+    let mut short_context = empty_short_context();
+    short_context.boundary_id = Some("msg-boundary".into());
+    short_context.summary_tokens = 42;
+    short_context.summary_messages = 8;
+    short_context.summary = normalize_short_context_summary(
+        "## Active Task\nUser asked: 具体模型\n\n## Pending User Asks\nUser asked: 具体模型\n\n## Relevant Files\n- D:/project/src/main.rs\n\n## Remaining Work\nContinue from the most recent unfulfilled user ask.\n\n## Critical Context\nDeterministic fallback summary was used.",
+        4000,
+    );
+
+    let prompt = agent_planner_prompt(&[], &[], &[], &short_context, &[]);
+
+    assert!(prompt.contains("Conversation summary"));
+    assert!(prompt.contains("deterministic fallback"));
+    assert!(prompt.contains("D:/project/src/main.rs"));
+    assert!(!prompt.contains("User asked: 具体模型"));
+    assert!(!prompt.contains("Continue from the most recent unfulfilled user ask."));
 }
 
 #[test]

@@ -265,6 +265,7 @@ use file_tools::{
 };
 use integrations::*;
 pub(crate) use integrations::{
+    transcribe_audio_payload_for_desktop,
     mattermost_adapter_status, platform_adapter_status, start_configured_platform_adapters,
     start_mattermost_adapter, start_platform_adapter, stop_mattermost_adapter,
     stop_platform_adapter,

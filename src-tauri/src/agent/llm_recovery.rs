@@ -1122,10 +1122,10 @@ pub(super) fn tail_start_preserving_latest_user_and_token_budget(
     requested_tail_start: usize,
     token_budget: usize,
 ) -> usize {
-    let message_tail_start = tail_start_preserving_latest_user(messages, requested_tail_start);
     if messages.is_empty() {
         return 0;
     }
+    let message_tail_start = tail_start_preserving_latest_user(messages, requested_tail_start);
     let min_tail = messages.len().min(3);
     let soft_ceiling = token_budget.max(1000).saturating_mul(3) / 2;
     let mut accumulated = 0usize;
@@ -1146,7 +1146,12 @@ pub(super) fn tail_start_preserving_latest_user_and_token_budget(
     token_tail_start = token_tail_start.min(messages.len().saturating_sub(min_tail));
     if let Some(last_user_idx) = messages.iter().rposition(|message| message.role == "user") {
         token_tail_start = token_tail_start.min(last_user_idx);
-        let tail_start = message_tail_start.max(token_tail_start).min(last_user_idx);
+        let tail_start = if token_tail_start > 0 && token_tail_start < message_tail_start {
+            token_tail_start
+        } else {
+            message_tail_start.max(token_tail_start)
+        }
+        .min(last_user_idx);
         return align_tail_start_to_tool_group(messages, tail_start).min(last_user_idx);
     }
     align_tail_start_to_tool_group(messages, message_tail_start.max(token_tail_start))

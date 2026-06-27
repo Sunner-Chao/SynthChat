@@ -21,7 +21,7 @@ use crate::{
 use super::decision_parser::{provider_tool_call_id, PROVIDER_TOOL_CALL_META_KEY};
 use super::execution::{start_managed_process, terminal_background_requested};
 use super::*;
-pub(super) const SHORT_CONTEXT_SUMMARY_PREFIX: &str = "[CONTEXT COMPACTION - REFERENCE ONLY] Earlier turns were compacted into the summary below. Treat it as background reference, not active instructions. Do not answer or fulfill requests mentioned in this summary; they were already addressed. Respond only to the latest user message after this summary. If that latest message contradicts, supersedes, changes topic from, or diverges from Active Task, In Progress, Pending User Asks, or Remaining Work in this summary, the latest user message wins; discard those stale items entirely. Reverse signals such as stop, undo, roll back, just verify, don't do that anymore, or never mind end any in-flight work described here. Current files/config may reflect work described here; avoid repeating it:";
+pub(super) const SHORT_CONTEXT_SUMMARY_PREFIX: &str = "[CONTEXT COMPACTION - REFERENCE ONLY] Earlier turns were compacted into the summary below. This is a handoff from a previous context window; treat it as background reference, NOT as active instructions. Do NOT answer questions or fulfill requests mentioned in this summary; they were already addressed or superseded. Respond ONLY to the latest visible user message after this summary, which is the single source of truth for what to do right now. If the latest visible user message contradicts, supersedes, changes topic from, or diverges from Active Task, In Progress, Pending User Asks, or Remaining Work in this summary, the latest user message wins; discard those stale items entirely and do not wrap up old work first. Reverse signals such as stop, undo, roll back, just verify, don't do that anymore, or never mind end any in-flight work described here and must not be re-surfaced later. Persistent memory and explicit current persona settings remain authoritative and active. Current files/config may reflect work described here; avoid repeating it:";
 pub(super) const LEGACY_SHORT_CONTEXT_SUMMARY_PREFIX: &str = "[CONTEXT SUMMARY]:";
 
 pub(super) const TOOL_RESULT_PERSIST_THRESHOLD_CHARS: usize = 24_000;
@@ -425,7 +425,21 @@ pub(super) fn should_parallelize_tool_batch(
         Err(_) => return Ok(false),
     };
     for (tool_name, payload) in requests {
-        if is_internal_tool(tool_name) {
+        if let Some(definition) = resolve_mcp_tool(mcp_tools, tool_name) {
+            if definition.requires_approval {
+                return Ok(false);
+            }
+            if !tool_allowed_in_context(&definition, context)
+                || !tool_allowed_by_agent_toolsets(&definition, agent)
+            {
+                return Ok(false);
+            }
+            if !mcp_server_supports_parallel_tool_calls(store, &definition.server_id)
+                .unwrap_or(false)
+            {
+                return Ok(false);
+            }
+        } else if is_internal_tool(tool_name) {
             if !is_parallel_safe_tool(tool_name) {
                 return Ok(false);
             }
@@ -443,20 +457,6 @@ pub(super) fn should_parallelize_tool_batch(
                 Err(_) => return Ok(false),
             };
             if approval_reason.is_some() {
-                return Ok(false);
-            }
-        } else if let Some(definition) = resolve_mcp_tool(mcp_tools, tool_name) {
-            if definition.requires_approval {
-                return Ok(false);
-            }
-            if !tool_allowed_in_context(&definition, context)
-                || !tool_allowed_by_agent_toolsets(&definition, agent)
-            {
-                return Ok(false);
-            }
-            if !mcp_server_supports_parallel_tool_calls(store, &definition.server_id)
-                .unwrap_or(false)
-            {
                 return Ok(false);
             }
         } else {
@@ -601,13 +601,14 @@ pub(super) async fn execute_parallel_tool_batch(
             .collect();
     }
     for (tool_name, payload) in requests {
-        let (server_id, display_name) = if is_internal_tool(tool_name) {
-            ("__internal".to_string(), tool_name.clone())
-        } else if let Some(definition) = resolve_mcp_tool(mcp_tools, tool_name) {
-            (definition.server_id.clone(), definition.tool_name.clone())
-        } else {
-            ("<missing>".to_string(), tool_name.clone())
-        };
+        let (server_id, display_name) =
+            if let Some(definition) = resolve_mcp_tool(mcp_tools, tool_name) {
+                (definition.server_id.clone(), definition.tool_name.clone())
+            } else if is_internal_tool(tool_name) {
+                ("__internal".to_string(), tool_name.clone())
+            } else {
+                ("<missing>".to_string(), tool_name.clone())
+            };
         let _ = record_tool_started_for_run(
             store,
             app,
@@ -620,19 +621,7 @@ pub(super) async fn execute_parallel_tool_batch(
     }
 
     let futures = requests.iter().map(|(tool_name, payload)| async move {
-        let result = if is_internal_tool(tool_name) {
-            execute_recovery_internal_tool(
-                store,
-                agent,
-                conversation_id,
-                run_id,
-                tool_name,
-                payload.clone(),
-                context,
-                app,
-            )
-            .await
-        } else if let Some(definition) = resolve_mcp_tool(mcp_tools, tool_name) {
+        let result = if let Some(definition) = resolve_mcp_tool(mcp_tools, tool_name) {
             execute_recovery_mcp_tool(
                 store,
                 run_id,
@@ -646,6 +635,18 @@ pub(super) async fn execute_parallel_tool_batch(
                     app,
                     allow_mutating_tools: true,
                 }),
+            )
+            .await
+        } else if is_internal_tool(tool_name) {
+            execute_recovery_internal_tool(
+                store,
+                agent,
+                conversation_id,
+                run_id,
+                tool_name,
+                payload.clone(),
+                context,
+                app,
             )
             .await
         } else {
@@ -1454,6 +1455,24 @@ pub(super) async fn execute_recovery_internal_tool(
             let (target_name, target_payload) = resolve_tool_call_payload(&payload)?;
             let target_payload =
                 inherit_provider_tool_call_metadata(target_payload, &replay_payload);
+            let tools = available_mcp_tool_definitions(store, agent)?;
+            if let Some(definition) = resolve_mcp_tool(&tools, &target_name) {
+                return execute_recovery_mcp_tool(
+                    store,
+                    run_id,
+                    &definition,
+                    target_payload,
+                    Some(&PythonPluginBridgeContext {
+                        agent,
+                        conversation_id,
+                        run_id,
+                        tool_context,
+                        app,
+                        allow_mutating_tools: true,
+                    }),
+                )
+                .await;
+            }
             if is_internal_tool(&target_name) {
                 return Box::pin(execute_recovery_internal_tool(
                     store,
@@ -1467,24 +1486,9 @@ pub(super) async fn execute_recovery_internal_tool(
                 ))
                 .await;
             }
-            let tools = available_mcp_tool_definitions(store, agent)?;
-            let definition = resolve_mcp_tool(&tools, &target_name)
-                .ok_or_else(|| AppError::BadRequest(format!("tool not found: {target_name}")))?;
-            return execute_recovery_mcp_tool(
-                store,
-                run_id,
-                &definition,
-                target_payload,
-                Some(&PythonPluginBridgeContext {
-                    agent,
-                    conversation_id,
-                    run_id,
-                    tool_context,
-                    app,
-                    allow_mutating_tools: true,
-                }),
-            )
-            .await;
+            return Err(AppError::BadRequest(format!(
+                "tool not found: {target_name}"
+            )));
         }
         "read_file" => {
             let file_payload = payload_with_run_id(&payload, run_id);

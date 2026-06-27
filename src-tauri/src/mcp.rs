@@ -2290,7 +2290,7 @@ fn mcp_keepalive_config(raw: &Value) -> Option<McpKeepaliveConfig> {
             &["session", "keep_alive"],
         ],
     )
-    .unwrap_or_else(|| mcp_persistent_session_enabled(raw));
+    .unwrap_or_else(|| mcp_persistent_session_enabled(raw) || mcp_is_playwright_stdio(raw));
     if !enabled {
         return None;
     }
@@ -2701,14 +2701,7 @@ pub async fn call_tool(
             circuit_error.clone().or_else(|| filter_error.clone()),
             None,
         ),
-        Some(Ok(Ok(raw))) => (
-            true,
-            false,
-            mcp_tool_stdout_value(&raw, Some(&store.data_dir().join("mcp-media"))),
-            String::new(),
-            None,
-            Some(raw),
-        ),
+        Some(Ok(Ok(raw))) => mcp_tool_success_tuple(&raw, &store.data_dir().join("mcp-media")),
         Some(Ok(Err(error))) => {
             let error_text = error.to_string();
             if mcp_error_needs_reauth(&error_text)
@@ -2727,14 +2720,9 @@ pub async fn call_tool(
                 )
                 .await
                 {
-                    Ok(Ok(raw)) => (
-                        true,
-                        false,
-                        mcp_tool_stdout_value(&raw, Some(&store.data_dir().join("mcp-media"))),
-                        String::new(),
-                        None,
-                        Some(raw),
-                    ),
+                    Ok(Ok(raw)) => {
+                        mcp_tool_success_tuple(&raw, &store.data_dir().join("mcp-media"))
+                    }
                     Ok(Err(retry_error)) => {
                         let retry_text = retry_error.to_string();
                         let retry_text = if mcp_error_needs_reauth(&retry_text) {
@@ -2842,6 +2830,35 @@ pub async fn call_tool(
         stderr,
         error,
     })
+}
+
+fn mcp_tool_success_tuple(
+    raw: &Value,
+    media_dir: &Path,
+) -> (bool, bool, String, String, Option<String>, Option<Value>) {
+    let stdout = mcp_tool_stdout_value(raw, Some(media_dir));
+    let is_error = raw.get("isError").and_then(Value::as_bool).unwrap_or(false)
+        || raw
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if !is_error {
+        return (true, false, stdout, String::new(), None, Some(raw.clone()));
+    }
+    let error = raw
+        .get("error")
+        .and_then(Value::as_str)
+        .or_else(|| raw.get("message").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| stdout.clone());
+    (
+        false,
+        false,
+        String::new(),
+        error.clone(),
+        Some(error),
+        Some(raw.clone()),
+    )
 }
 
 async fn call_tool_once(
@@ -4203,7 +4220,7 @@ fn mcp_command_candidate_names(command: &str, env: &HashMap<String, String>) -> 
         .find(|(key, _)| key.eq_ignore_ascii_case("PATHEXT"))
         .map(|(_, value)| value.as_str())
         .unwrap_or(".COM;.EXE;.BAT;.CMD");
-    let mut names = vec![command.to_string()];
+    let mut names = Vec::new();
     for extension in pathext.split(';') {
         let extension = extension.trim();
         if extension.is_empty() {
@@ -4212,6 +4229,7 @@ fn mcp_command_candidate_names(command: &str, env: &HashMap<String, String>) -> 
         names.push(format!("{command}{extension}"));
         names.push(format!("{command}{}", extension.to_ascii_lowercase()));
     }
+    names.push(command.to_string());
     names
 }
 
@@ -5280,7 +5298,28 @@ fn mcp_persistent_session_enabled(raw: &Value) -> bool {
             &["session", "persistent"],
         ],
     )
-    .unwrap_or(false)
+    .unwrap_or_else(|| mcp_is_playwright_stdio(raw))
+}
+
+fn mcp_is_playwright_stdio(raw: &Value) -> bool {
+    let command = raw
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(command.as_str(), "npx" | "npx.cmd" | "npx.exe") {
+        return false;
+    }
+    raw.get("args")
+        .and_then(Value::as_array)
+        .is_some_and(|args| {
+            args.iter().any(|arg| {
+                arg.as_str()
+                    .map(str::trim)
+                    .is_some_and(|arg| arg.starts_with("@playwright/mcp"))
+            })
+        })
 }
 
 fn mcp_persistent_session_status(server_id: &str, raw: &Value) -> Value {

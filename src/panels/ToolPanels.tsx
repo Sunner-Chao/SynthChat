@@ -3838,10 +3838,10 @@ export function SkillsPanel() {
                     value={installUrl}
                     onChange={(e) => setInstallUrl(e.target.value)}
                     onKeyDown={(e) => { if (e.key === "Enter") void handleInstallExternalUrl(); }}
-                    placeholder="https://www.skills.sh/owner/repo/skill 或 https://example.com/SKILL.md"
+                    placeholder="GitHub blob/tree、raw SKILL.md 或 skills.sh 具体技能页"
                   />
                 </div>
-                <p className="form-hint">支持 raw `SKILL.md` 直链，也支持 `skills.sh` 的具体技能详情页；首页或目录页不能直接安装。</p>
+                <p className="form-hint">支持 GitHub blob/tree 页面、raw `SKILL.md` 直链、`skills.sh` 具体技能详情页；首页或目录页不能直接安装。</p>
                 <div className="form-row">
                   <label>名称</label>
                   <input value={installName} onChange={(e) => setInstallName(e.target.value)} placeholder="留空使用 frontmatter" />

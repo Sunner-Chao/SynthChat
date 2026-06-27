@@ -43,6 +43,25 @@ export function McpExtensionPanel() {
     setEditingId(newId);
   };
 
+  const handleAddPlaywright = () => {
+    const newId = `playwright-${Date.now()}`;
+    setDraftServer({
+      id: newId,
+      name: "Playwright MCP",
+      transport: "stdio",
+      command: "npx",
+      args: ["-y", "@playwright/mcp@latest"],
+      protocol: "mcpJsonRpc",
+      enabled: true,
+      timeoutSeconds: 120,
+      persistentSession: true,
+      keepAlive: true,
+      keepAliveIntervalSeconds: 300,
+      keepAliveTimeoutSeconds: 30
+    });
+    setEditingId(newId);
+  };
+
   const handleSaveGlobal = async () => {
     if (!draftServer.id) return;
     let newServers = [...mcpServers];
@@ -152,6 +171,9 @@ export function McpExtensionPanel() {
                 <button className="btn-primary beautiful-btn-primary" onClick={handleAdd}>
                   <Plus size={16} style={{ marginRight: 6 }} /> 添加第一个服务
                 </button>
+                <button className="btn-secondary" onClick={handleAddPlaywright} style={{ marginLeft: 8 }}>
+                  <Command size={16} style={{ marginRight: 6 }} /> Playwright
+                </button>
               </div>
             ) : (
               <div className="card-list">
@@ -160,7 +182,10 @@ export function McpExtensionPanel() {
                     <h3 style={{ margin: 0, fontSize: "1rem", color: "var(--text-1)" }}>全局已安装的服务 (Global Servers)</h3>
                     <small style={{ color: "var(--text-3)" }}>这些服务对所有智能体可见，但需在局部配置中为每个智能体单独勾选启用。</small>
                   </div>
-                  <button className="btn-secondary" onClick={handleAdd}><Plus size={15} style={{ marginRight: 4 }}/> 添加服务</button>
+                  <div className="inline-actions">
+                    <button className="btn-secondary" onClick={handleAddPlaywright}><Command size={15} style={{ marginRight: 4 }}/> Playwright</button>
+                    <button className="btn-secondary" onClick={handleAdd}><Plus size={15} style={{ marginRight: 4 }}/> 添加服务</button>
+                  </div>
                 </div>
                 
                 {mcpServers.map(server => (

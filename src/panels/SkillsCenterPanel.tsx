@@ -265,7 +265,7 @@ export function SkillsCenterPanel() {
                     value={installUrl}
                     onChange={(event) => setInstallUrl(event.target.value)}
                     onKeyDown={(event) => { if (event.key === "Enter") void handleInstallExternalUrl(); }}
-                    placeholder="https://example.com/SKILL.md 或 https://www.skills.sh/owner/repo/skill"
+                    placeholder="GitHub blob/tree、raw SKILL.md 或 skills.sh 具体技能页"
                   />
                 </div>
                 <div className="agent-form-row">
@@ -290,7 +290,7 @@ export function SkillsCenterPanel() {
                     <ExternalLink size={14} /> URL 安装
                   </button>
                 </div>
-                <p className="form-hint">离线导入会复制到应用数据目录；URL 安装支持 raw SKILL.md，也支持 skills.sh 的具体技能页，不能直接填 skills.sh 首页。</p>
+                <p className="form-hint">离线导入会复制到应用数据目录；URL 安装支持 GitHub blob/tree 页面、raw SKILL.md、skills.sh 具体技能页，不能直接填 skills.sh 首页。</p>
                 {installNotice ? <p className="form-hint">{installNotice}</p> : null}
               </div>
             </div>

@@ -1044,6 +1044,9 @@ export interface McpServer {
   timeoutSeconds: number;
   supportsParallelToolCalls?: boolean;
   persistentSession?: boolean;
+  keepAlive?: boolean;
+  keepAliveIntervalSeconds?: number;
+  keepAliveTimeoutSeconds?: number;
 }
 
 export interface CapabilityAdapter {

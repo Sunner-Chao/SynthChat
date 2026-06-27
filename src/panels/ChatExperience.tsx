@@ -17,6 +17,8 @@ import {
   Layers,
   Loader2,
   MessageSquareText,
+  Mic,
+  MicOff,
   Network,
   PanelRightClose,
   PanelRightOpen,
@@ -29,6 +31,7 @@ import {
   Settings2,
   Sparkles,
   Square,
+  Terminal,
   Trash2,
   Wrench,
   Zap,
@@ -45,6 +48,22 @@ type ComposerAttachment = ChatAttachment & {
   status: "ready" | "staging" | "error";
   error?: string;
 };
+
+type VoiceInputState = "idle" | "listening" | "recording" | "transcribing";
+
+type SpeechRecognitionLike = {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  onresult: ((event: unknown) => void) | null;
+  onerror: ((event: unknown) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+};
+
+type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
 
 type ArtifactTarget = {
   path: string;
@@ -853,11 +872,15 @@ export const ChatExperience = memo(function ChatExperience() {
   const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
   const [pickerEmojiGroups, setPickerEmojiGroups] = useState(emojiGroups);
   const [dragActive, setDragActive] = useState(false);
+  const [voiceInputState, setVoiceInputState] = useState<VoiceInputState>("idle");
+  const [voiceSupported, setVoiceSupported] = useState(true);
   const [previewTarget, setPreviewTarget] = useState<ArtifactTarget | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const imageInputRef = useRef<HTMLInputElement>(null);
+  const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const voiceChunksRef = useRef<Blob[]>([]);
   const sendingRef = useRef(false);
   const [isNearBottom, setIsNearBottom] = useState(true);
   const [unreadCount, setUnreadCount] = useState(0);
@@ -1681,6 +1704,145 @@ export const ChatExperience = memo(function ChatExperience() {
     setAttachments((current) => current.filter((item) => item.id !== id));
   };
 
+  const appendVoiceTranscript = useCallback((text: string) => {
+    const transcript = text.trim();
+    if (!transcript) return;
+    setDraft((current) => {
+      const prefix = current.trimEnd();
+      return prefix ? `${prefix}\n${transcript}` : transcript;
+    });
+    setComposerError(null);
+  }, []);
+
+  const blobToDataUrl = useCallback((blob: Blob) => new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        resolve(reader.result);
+      } else {
+        reject(new Error("语音数据读取失败"));
+      }
+    };
+    reader.onerror = () => reject(reader.error ?? new Error("语音数据读取失败"));
+    reader.readAsDataURL(blob);
+  }), []);
+
+  const transcribeRecordedVoice = useCallback(async (blob: Blob) => {
+    if (blob.size === 0) {
+      setComposerError("没有录到语音内容。");
+      return;
+    }
+    setVoiceInputState("transcribing");
+    try {
+      const dataUrl = await blobToDataUrl(blob);
+      const result = await api.transcribeChatAudio(dataUrl, blob.type || "audio/webm");
+      const transcript = String(result?.transcript ?? "").trim();
+      if (transcript) {
+        appendVoiceTranscript(transcript);
+      } else {
+        setComposerError("没有识别到语音内容。");
+      }
+    } catch (error) {
+      setComposerError(composerErrorText(error));
+    } finally {
+      setVoiceInputState("idle");
+    }
+  }, [appendVoiceTranscript, blobToDataUrl]);
+
+  const stopVoiceInput = useCallback(() => {
+    const recognition = speechRecognitionRef.current;
+    if (recognition) {
+      recognition.stop();
+      return;
+    }
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
+    }
+  }, []);
+
+  const startRecordedVoiceInput = useCallback(async () => {
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setVoiceSupported(false);
+      setComposerError("当前 WebView 不支持语音输入。");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      voiceChunksRef.current = [];
+      mediaRecorderRef.current = recorder;
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) voiceChunksRef.current.push(event.data);
+      };
+      recorder.onerror = () => {
+        stream.getTracks().forEach((track) => track.stop());
+        mediaRecorderRef.current = null;
+        setVoiceInputState("idle");
+        setComposerError("语音录制失败。");
+      };
+      recorder.onstop = () => {
+        stream.getTracks().forEach((track) => track.stop());
+        mediaRecorderRef.current = null;
+        const blob = new Blob(voiceChunksRef.current, { type: recorder.mimeType || "audio/webm" });
+        voiceChunksRef.current = [];
+        void transcribeRecordedVoice(blob);
+      };
+      recorder.start();
+      setVoiceInputState("recording");
+      setComposerError(null);
+    } catch (error) {
+      setVoiceInputState("idle");
+      setComposerError(composerErrorText(error));
+    }
+  }, [transcribeRecordedVoice]);
+
+  const toggleVoiceInput = useCallback(() => {
+    if (voiceInputState !== "idle") {
+      stopVoiceInput();
+      return;
+    }
+    const SpeechRecognitionCtor = (
+      (window as unknown as { SpeechRecognition?: SpeechRecognitionConstructor }).SpeechRecognition
+      ?? (window as unknown as { webkitSpeechRecognition?: SpeechRecognitionConstructor }).webkitSpeechRecognition
+    );
+    if (SpeechRecognitionCtor) {
+      try {
+        const recognition = new SpeechRecognitionCtor();
+        speechRecognitionRef.current = recognition;
+        recognition.lang = "zh-CN";
+        recognition.continuous = false;
+        recognition.interimResults = false;
+        recognition.onresult = (event: unknown) => {
+          const results = (event as { results?: ArrayLike<ArrayLike<{ transcript?: string }>> }).results;
+          const transcript = results
+            ? Array.from(results)
+                .map((result) => result[0]?.transcript ?? "")
+                .join("")
+            : "";
+          appendVoiceTranscript(transcript);
+        };
+        recognition.onerror = () => {
+          speechRecognitionRef.current = null;
+          setVoiceInputState("idle");
+          void startRecordedVoiceInput();
+        };
+        recognition.onend = () => {
+          speechRecognitionRef.current = null;
+          setVoiceInputState((current) => current === "listening" ? "idle" : current);
+        };
+        recognition.start();
+        setVoiceInputState("listening");
+        setComposerError(null);
+        setVoiceSupported(true);
+        return;
+      } catch {
+        speechRecognitionRef.current = null;
+      }
+    }
+    void startRecordedVoiceInput();
+  }, [appendVoiceTranscript, startRecordedVoiceInput, stopVoiceInput, voiceInputState]);
+
   const switchAgentModel = async (key: string) => {
     if (!key) return;
     const option = modelOptions.find((item) => item.key === key);
@@ -2312,21 +2474,31 @@ export const ChatExperience = memo(function ChatExperience() {
           </aside>
         </div>
 
-        <footer className="claw-composer">
+        <footer
+          className={`claw-composer${dragActive ? " dragging" : ""}`}
+          onDragEnter={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            setDragActive(true);
+          }}
+          onDragOver={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onDragLeave={(event) => {
+            event.stopPropagation();
+            if (event.currentTarget === event.target) setDragActive(false);
+          }}
+          onDrop={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            setDragActive(false);
+            void stageFiles(event.dataTransfer.files);
+          }}
+        >
           <input
             ref={fileInputRef}
             multiple
-            type="file"
-            onChange={(event) => {
-              if (event.currentTarget.files) void stageFiles(event.currentTarget.files);
-              event.currentTarget.value = "";
-            }}
-            hidden
-          />
-          <input
-            ref={imageInputRef}
-            multiple
-            accept="image/*"
             type="file"
             onChange={(event) => {
               if (event.currentTarget.files) void stageFiles(event.currentTarget.files);
@@ -2398,11 +2570,17 @@ export const ChatExperience = memo(function ChatExperience() {
             placeholder={agentReady ? "描述任务，Enter 发送，Shift+Enter 换行..." : "请先在 Agents / MCP / Skills 中启用运行时配置..."}
           />
           </div>
+          <button
+            className={`claw-attach-button${voiceInputState !== "idle" ? " is-recording" : ""}`}
+            disabled={voiceInputState === "transcribing" || (!voiceSupported && voiceInputState === "idle")}
+            onClick={toggleVoiceInput}
+            title={voiceInputState === "idle" ? "语音输入" : voiceInputState === "transcribing" ? "正在识别语音" : "停止语音输入"}
+            type="button"
+          >
+            {voiceInputState === "idle" ? <Mic size={17} /> : voiceInputState === "transcribing" ? <Loader2 className="spin" size={17} /> : <MicOff size={17} />}
+          </button>
           <button className="claw-attach-button" onClick={() => setEmojiPickerOpen((open) => !open)} title="表情" type="button">
             <Smile size={17} />
-          </button>
-          <button className="claw-attach-button" onClick={() => imageInputRef.current?.click()} title="发送图片" type="button">
-            <ImageIcon size={17} />
           </button>
           <button className="claw-attach-button" onClick={() => fileInputRef.current?.click()} title="发送文件" type="button">
             <Paperclip size={17} />
@@ -2912,6 +3090,76 @@ function toolEventPathBadge(event: ToolEvent): { label: string; tone: "neutral" 
   return { label: "未提供状态", tone: "neutral" };
 }
 
+type TerminalOutputParts = {
+  cwd?: string;
+  exitCode?: number;
+  command?: string;
+  stdout?: string;
+  stderr?: string;
+  raw?: string;
+};
+
+function rawObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function rawString(value: unknown) {
+  return typeof value === "string" && value.trim() ? value.trim() : "";
+}
+
+function rawNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && /^-?\d+$/.test(value.trim())) return Number(value.trim());
+  return undefined;
+}
+
+function parseTerminalOutput(value: string): TerminalOutputParts {
+  const text = value.trim();
+  if (!text) return {};
+  const match = text.match(/(?:^|\n)cwd:\s*(.*?)\n(?:(?:transport|backend|target|sandbox|mode|sync|sessionCwd|image):.*?\n)*exitCode:\s*(-?\d+|unknown)\nstdout:\n([\s\S]*?)\nstderr:\n([\s\S]*)$/);
+  if (!match) return {};
+  const exitCode = match[2] === "unknown" ? undefined : Number(match[2]);
+  return {
+    cwd: match[1]?.trim() || undefined,
+    exitCode: Number.isFinite(exitCode) ? exitCode : undefined,
+    stdout: match[3]?.trimEnd() || "",
+    stderr: match[4]?.trimEnd() || "",
+    raw: text
+  };
+}
+
+function toolEventPayload(event: ToolEvent): Record<string, unknown> {
+  const raw = rawObject(event.raw);
+  return rawObject(raw.payload);
+}
+
+function firstTerminalParts(...items: TerminalOutputParts[]): TerminalOutputParts {
+  return items.find((item) => Boolean(item.raw)) ?? {};
+}
+
+function parseInlineTerminalCommand(value: string): TerminalOutputParts {
+  const text = value.trim();
+  if (!text) return {};
+  const match = text.match(/^([\s\S]*?)\s+[·-]\s+exit\s+(-?\d+)\s*$/i);
+  if (!match) return {};
+  const command = match[1]?.trim() || "";
+  if (!command) return {};
+  return {
+    command,
+    exitCode: Number(match[2]),
+    raw: command
+  };
+}
+
+function terminalCommandLabel(command: string) {
+  const first = command.trim().split(/\s+/)[0] || "terminal";
+  if (/yt-dlp(?:\.exe)?$/i.test(first)) return "yt-dlp 下载";
+  if (/npx(?:\.cmd|\.exe)?$/i.test(first)) return "npx";
+  if (/powershell(?:\.exe)?$/i.test(first) || /pwsh(?:\.exe)?$/i.test(first)) return "PowerShell";
+  if (/cmd(?:\.exe)?$/i.test(first)) return "cmd";
+  return first;
+}
+
 const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
   const [expanded, setExpanded] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -2919,16 +3167,46 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
   const canOpen = Boolean(event.path && event.exists);
   const isToolImage = canOpen && (event.eventType === "screenshot" || event.eventType === "image" || Boolean(event.mimeType?.startsWith("image/")));
   const isRunning = event.status === "running";
-  const isFailed = !isRunning && (!event.ok || Boolean(event.error));
   const reauthInfo = toolEventReauthInfo(event);
   const summaryText = event.summary?.trim() ?? "";
   const bodyText = event.text?.trim() ?? "";
   const errorText = event.error?.trim() ?? "";
+  const payload = toolEventPayload(event);
+  const bodyTerminalParts = parseTerminalOutput(bodyText);
+  const summaryTerminalParts = parseTerminalOutput(summaryText);
+  const errorTerminalParts = parseTerminalOutput(errorText);
+  const inlineTerminalParts = firstTerminalParts(
+    parseInlineTerminalCommand(bodyText),
+    parseInlineTerminalCommand(summaryText),
+    parseInlineTerminalCommand(errorText)
+  );
+  const terminalParts = firstTerminalParts(bodyTerminalParts, summaryTerminalParts, errorTerminalParts, inlineTerminalParts);
+  const commandText = rawString(payload.command) || terminalParts.command || "";
+  const payloadCwd = rawString(payload.cwd) || rawString(payload.workdir);
+  const terminalExitCode = rawNumber(payload.exitCode) ?? terminalParts.exitCode;
+  const terminalCwd = payloadCwd || terminalParts.cwd || "";
+  const terminalStdout = terminalParts.stdout?.trim() ?? "";
+  const terminalStderr = terminalParts.stderr?.trim() ?? "";
+  const terminalFallbackOutput = terminalParts.raw && !terminalStdout && !terminalStderr && terminalParts.raw !== commandText ? terminalParts.raw : "";
+  const isTerminalTool = event.toolName === "terminal" || Boolean(commandText || terminalParts.cwd || terminalParts.exitCode !== undefined);
+  const isFailed = !isRunning && (!event.ok || Boolean(event.error) || (typeof terminalExitCode === "number" && terminalExitCode !== 0));
+  const cardTitle = isTerminalTool
+    ? `终端命令${commandText ? ` · ${terminalCommandLabel(commandText)}` : ""}`
+    : event.title || `${event.serverId}.${event.toolName}`;
+  const displaySummary = isTerminalTool && commandText
+    ? (isFailed ? "命令执行失败，展开查看命令、工作目录和输出。" : "命令执行完成，展开查看命令、工作目录和输出。")
+    : summaryText;
   const pathBadge = toolEventPathBadge(event);
   const elapsedLabel = toolEventElapsedLabel(event, nowMs, fallbackStartedAtMsRef.current);
-  const duplicateBody = Boolean(summaryText && bodyText && normalizeToolDetailText(summaryText) === normalizeToolDetailText(bodyText));
-  const duplicateError = Boolean(errorText && (normalizeToolDetailText(errorText) === normalizeToolDetailText(summaryText) || normalizeToolDetailText(errorText) === normalizeToolDetailText(bodyText)));
-  const hasDetails = Boolean(summaryText || event.path || isToolImage || canOpen || (bodyText && !duplicateBody) || (errorText && !duplicateError) || reauthInfo);
+  const duplicateBody = Boolean(displaySummary && bodyText && normalizeToolDetailText(displaySummary) === normalizeToolDetailText(bodyText));
+  const duplicateError = Boolean(errorText && (normalizeToolDetailText(errorText) === normalizeToolDetailText(displaySummary) || normalizeToolDetailText(errorText) === normalizeToolDetailText(bodyText)));
+  const hasTerminalDetails = Boolean(commandText || terminalCwd || terminalStdout || terminalStderr || terminalFallbackOutput || terminalExitCode !== undefined);
+  const hasDetails = Boolean(displaySummary || event.path || isToolImage || canOpen || (bodyText && !duplicateBody) || (errorText && !duplicateError) || reauthInfo || hasTerminalDetails);
+  const statusMeta = [
+    eventStatusLabel(event),
+    typeof terminalExitCode === "number" ? `exit ${terminalExitCode}` : "",
+    elapsedLabel
+  ].filter(Boolean).join(" · ");
 
   useEffect(() => {
     if (!isRunning) return;
@@ -2946,9 +3224,9 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
           tabIndex={hasDetails ? 0 : undefined}
           onKeyDown={(e) => { if (hasDetails && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); setExpanded((v) => !v); } }}
         >
-          <Wrench size={15} />
-          <strong>{event.title || `${event.serverId}.${event.toolName}`}</strong>
-          <small>{eventStatusLabel(event)} · {elapsedLabel}</small>
+          {isTerminalTool ? <Terminal size={15} /> : <Wrench size={15} />}
+          <strong>{cardTitle}</strong>
+          <small>{statusMeta}</small>
           {hasDetails ? (
             <span className={`claw-tool-chevron${expanded ? " claw-tool-chevron--open" : ""}`}>
               <ChevronRight size={14} />
@@ -2957,7 +3235,26 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
         </div>
         <div className={`claw-tool-body${expanded ? " claw-tool-body--open" : ""}`}>
           <div className="claw-tool-body-inner">
-            {summaryText ? <p>{summaryText}</p> : null}
+            {displaySummary ? <p>{displaySummary}</p> : null}
+            {isTerminalTool && commandText ? (
+              <div className="claw-tool-command">
+                <div className="claw-tool-command-head">
+                  <Code2 size={14} />
+                  <span>command</span>
+                  {typeof terminalExitCode === "number" ? (
+                    <span className={`claw-tool-path-badge claw-tool-path-badge--${terminalExitCode === 0 ? "success" : "danger"}`}>exit {terminalExitCode}</span>
+                  ) : null}
+                </div>
+                <code>{commandText}</code>
+              </div>
+            ) : null}
+            {isTerminalTool && terminalCwd ? (
+              <div className="claw-tool-path">
+                <FileText size={14} />
+                <code>{terminalCwd}</code>
+                <span>cwd</span>
+              </div>
+            ) : null}
             {event.path ? (
               <div className="claw-tool-path">
                 <FileText size={14} />
@@ -2974,7 +3271,25 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
                 <button onClick={() => void api.revealLocalFile(event.path || "")} type="button"><FolderOpen size={13} />定位</button>
               </div>
             ) : null}
-            {bodyText && !duplicateBody ? <pre>{previewText(bodyText, DEFAULT_MESSAGE_PREVIEW_CHARS)}</pre> : null}
+            {isTerminalTool && terminalStdout ? (
+              <div className="claw-tool-output">
+                <span>stdout</span>
+                <pre>{previewText(terminalStdout, DEFAULT_MESSAGE_PREVIEW_CHARS)}</pre>
+              </div>
+            ) : null}
+            {isTerminalTool && terminalStderr ? (
+              <div className="claw-tool-output claw-tool-output--stderr">
+                <span>stderr</span>
+                <pre>{previewText(terminalStderr, DEFAULT_MESSAGE_PREVIEW_CHARS)}</pre>
+              </div>
+            ) : null}
+            {isTerminalTool && terminalFallbackOutput ? (
+              <div className={`claw-tool-output${isFailed ? " claw-tool-output--stderr" : ""}`}>
+                <span>output</span>
+                <pre>{previewText(terminalFallbackOutput, DEFAULT_MESSAGE_PREVIEW_CHARS)}</pre>
+              </div>
+            ) : null}
+            {bodyText && !duplicateBody && !isTerminalTool ? <pre>{previewText(bodyText, DEFAULT_MESSAGE_PREVIEW_CHARS)}</pre> : null}
             {errorText && !duplicateError ? <p className="claw-error-text">{errorText}</p> : null}
             {reauthInfo ? (
               <div className="claw-tool-path">

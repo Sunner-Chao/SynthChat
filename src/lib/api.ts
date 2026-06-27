@@ -735,6 +735,8 @@ export const api: Record<string, any> = {
     summaryTokens: 0,
     summaryMessages: 0
   })),
+  transcribeChatAudio: (dataUrl: string, mimeType?: string): Promise<{ ok: boolean; transcript: string; provider?: unknown; providerId?: unknown; mimeType?: string }> =>
+    call("transcribe_chat_audio", { dataUrl, mimeType }, () => ({ ok: false, transcript: "" })),
   getMessageContent: async (messageId: string) => messageId,
   assetUrl: convertFileSrc,
   convertFileSrc,

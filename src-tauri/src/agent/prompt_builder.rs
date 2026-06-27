@@ -516,11 +516,54 @@ fn render_short_context_block(short_context: &ShortContextState) -> String {
     if short_context.summary.trim().is_empty() {
         return "No compacted conversation summary is available.".into();
     }
+    let summary = prompt_safe_short_context_summary(short_context.summary.trim());
     format!(
         "boundaryMessageId: {}\nsummaryMessages: {}\nsummaryTokens: {}\n{}",
         short_context.boundary_id.as_deref().unwrap_or("<none>"),
         short_context.summary_messages,
         short_context.summary_tokens,
-        truncate_for_prompt(short_context.summary.trim(), 2000)
+        truncate_for_prompt(&summary, 2000)
     )
+}
+
+fn prompt_safe_short_context_summary(summary: &str) -> String {
+    let lower = summary.to_ascii_lowercase();
+    if !lower.contains("deterministic fallback") {
+        return summary.to_string();
+    }
+    let mut lines = vec![
+        "[CONTEXT COMPACTION - REFERENCE ONLY] Earlier turns were compacted by a deterministic fallback summary. The fallback's active-task fields are suppressed because they may be stale.".to_string(),
+        "## Active Task".to_string(),
+        "None recoverable from deterministic fallback. Use only the latest visible user message and current repository/session state.".to_string(),
+        "## Pending User Asks".to_string(),
+        "None recoverable from deterministic fallback.".to_string(),
+        "## Remaining Work".to_string(),
+        "Determine remaining work from the latest visible user message; do not infer active work from compacted historical requests.".to_string(),
+    ];
+    let relevant_files = extract_summary_section(summary, "## Relevant Files")
+        .map(|section| {
+            section
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim();
+                    trimmed.starts_with("- ") && !trimmed.contains("User asked:")
+                })
+                .take(8)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|section| !section.trim().is_empty())
+        .unwrap_or_else(|| "None safely recoverable.".into());
+    lines.push("## Relevant Files".into());
+    lines.push(relevant_files);
+    lines.push("## Critical Context".into());
+    lines.push("Existing deterministic fallback summaries may contain stale requests such as old Active Task, In Progress, or Pending User Asks entries; ignore those fields.".into());
+    lines.join("\n")
+}
+
+fn extract_summary_section<'a>(summary: &'a str, heading: &str) -> Option<&'a str> {
+    let start = summary.find(heading)?;
+    let rest = &summary[start + heading.len()..];
+    let end = rest.find("\n## ").unwrap_or(rest.len());
+    Some(rest[..end].trim())
 }

@@ -22120,6 +22120,13 @@ async fn api_server_handle_audio_transcribe(
     api_server_transcribe_audio_payload(store, &body).await
 }
 
+pub(crate) async fn transcribe_audio_payload_for_desktop(
+    store: &AppStore,
+    body: &Value,
+) -> AppResult<Value> {
+    api_server_transcribe_audio_payload(store, body).await
+}
+
 async fn api_server_transcribe_audio_payload(store: &AppStore, body: &Value) -> AppResult<Value> {
     use base64::Engine;
 

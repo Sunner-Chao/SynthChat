@@ -984,12 +984,6 @@ pub(super) fn fallback_short_context_summary(
 
 fn build_deterministic_fallback_summary(previous_summary: &str, transcript: &str) -> String {
     let turns = parse_summary_transcript_turns(transcript);
-    let user_asks = turns
-        .iter()
-        .filter(|turn| turn.role == "user")
-        .map(|turn| compact_fallback_turn(&turn.content, 900))
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>();
     let assistant_actions = turns
         .iter()
         .filter(|turn| turn.role == "assistant")
@@ -1029,7 +1023,7 @@ fn build_deterministic_fallback_summary(previous_summary: &str, transcript: &str
     let last_dropped_turns = turns
         .iter()
         .rev()
-        .take(8)
+        .take(5)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -1041,19 +1035,18 @@ fn build_deterministic_fallback_summary(previous_summary: &str, transcript: &str
             )
         })
         .collect::<Vec<_>>();
-    let active_task = user_asks
-        .last()
-        .map(|ask| format!("User asked: {ask}"))
-        .unwrap_or_else(|| "Unknown from deterministic fallback.".into());
     let mut completed = Vec::new();
     for item in assistant_actions.iter().chain(tool_actions.iter()).take(12) {
         completed.push(format!("{}. {}", completed.len() + 1, item));
     }
 
     let mut parts = Vec::new();
-    parts.push(format!("## Active Task\n{active_task}"));
     parts.push(
-        "## Goal\nRecovered from a deterministic fallback because the LLM context summarizer was unavailable. Continue from the protected recent messages after this summary and verify current file/system state for exact details."
+        "## Active Task\nNone recoverable from deterministic fallback. Use only the protected recent messages after this summary to determine the current task."
+            .into(),
+    );
+    parts.push(
+        "## Goal\nHistorical context was compacted with a local deterministic fallback because the LLM summarizer was unavailable. Treat this block as background only."
             .into(),
     );
     parts.push(
@@ -1075,22 +1068,28 @@ fn build_deterministic_fallback_summary(previous_summary: &str, transcript: &str
                 .into(),
         );
     }
-    parts.push(format!("## In Progress\n{active_task}"));
+    parts.push(
+        "## In Progress\nNone recoverable from deterministic fallback. Do not resume old requests from compacted turns unless the latest user message explicitly asks for them."
+            .into(),
+    );
     parts.push(format!("## Blocked\n{}", bullets_or_none(&blockers, 5)));
     parts.push("## Key Decisions\nNone recoverable from deterministic fallback.".into());
     parts.push("## Resolved Questions\nNone recoverable from deterministic fallback.".into());
-    parts.push(format!("## Pending User Asks\n{active_task}"));
+    parts.push(
+        "## Pending User Asks\nNone recoverable from deterministic fallback. The next response must answer the latest visible user message, not these compacted historical turns."
+            .into(),
+    );
     parts.push(format!(
         "## Relevant Files\n{}",
         bullets_or_none(&relevant_files, 12)
     ));
     parts.push(
-        "## Remaining Work\nContinue from the most recent unfulfilled user ask and protected tail messages. Verify state with tools before making claims."
+        "## Remaining Work\nDetermine remaining work from the latest visible user message and current repository/session state. Do not infer active work from compacted historical requests."
             .into(),
     );
     parts.push(format!(
         "## Last Dropped Turns\n{}",
-        bullets_or_none(&last_dropped_turns, 8)
+        bullets_or_none(&last_dropped_turns, 5)
     ));
     parts.push(format!(
         "## Critical Context\n- Deterministic fallback summary for {} compacted turn(s); information may be incomplete.\n- Verify current files, processes, and test results before relying on omitted details.",

@@ -2917,6 +2917,21 @@ async fn fetch_skill_url(url: &str) -> AppResult<String> {
     let parsed = reqwest::Url::parse(trimmed)
         .map_err(|error| AppError::BadRequest(format!("invalid skill url: {error}")))?;
     let client = skill_http_client()?;
+    if let Some(raw_url) = github_blob_skill_raw_url(&parsed) {
+        let raw = fetch_text_url(
+            &client,
+            &raw_url,
+            "fetch GitHub skill content",
+            "read GitHub skill content",
+        )
+        .await?;
+        if looks_like_html_document(&raw) {
+            return Err(AppError::BadRequest(
+                "GitHub skill URL resolved to an HTML page; please use a blob/tree URL that points to SKILL.md or its containing directory".into(),
+            ));
+        }
+        return Ok(raw);
+    }
     let raw = fetch_text_url(&client, trimmed, "fetch skill url", "read skill url").await?;
     if is_skills_sh_host(&parsed) {
         return resolve_skills_sh_skill_url(&client, &parsed, &raw).await;
@@ -2981,6 +2996,51 @@ fn is_skills_sh_host(url: &reqwest::Url) -> bool {
         url.host_str().map(|host| host.to_ascii_lowercase()),
         Some(host) if host == "skills.sh" || host == "www.skills.sh"
     )
+}
+
+fn is_github_host(url: &reqwest::Url) -> bool {
+    matches!(
+        url.host_str().map(|host| host.to_ascii_lowercase()),
+        Some(host) if host == "github.com" || host == "www.github.com"
+    )
+}
+
+fn github_blob_skill_raw_url(url: &reqwest::Url) -> Option<String> {
+    if !is_github_host(url) {
+        return None;
+    }
+    let segments = url
+        .path_segments()
+        .map(|items| {
+            items
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let owner = *segments.first()?;
+    let repo = *segments.get(1)?;
+    let mode = *segments.get(2)?;
+    if owner.is_empty() || repo.is_empty() || !matches!(mode, "blob" | "tree") {
+        return None;
+    }
+    let branch = *segments.get(3)?;
+    let mut skill_path = segments.get(4..)?.join("/");
+    if skill_path.is_empty() {
+        return None;
+    }
+    if mode == "tree" && !skill_path.to_ascii_lowercase().ends_with("/skill.md") {
+        skill_path = format!("{}/SKILL.md", skill_path.trim_end_matches('/'));
+    }
+    if !skill_path.to_ascii_lowercase().ends_with("/skill.md")
+        && !skill_path.eq_ignore_ascii_case("SKILL.md")
+    {
+        return None;
+    }
+    Some(format!(
+        "https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{}",
+        skill_path.trim_start_matches('/')
+    ))
 }
 
 fn normalize_skill_lookup_token(value: &str) -> String {
@@ -3391,6 +3451,24 @@ fn get_short_context_state(
     conversation_id: String,
 ) -> AppResult<models::ShortContextState> {
     store.short_context(&conversation_id)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn transcribe_chat_audio(
+    store: State<'_, AppStore>,
+    data_url: String,
+    mime_type: Option<String>,
+) -> AppResult<Value> {
+    let mut payload = json!({
+        "dataUrl": data_url,
+    });
+    if let Some(mime_type) = mime_type
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        payload["mimeType"] = json!(mime_type);
+    }
+    agent::transcribe_audio_payload_for_desktop(&store, &payload).await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -4621,6 +4699,7 @@ pub fn run() {
             save_themes,
             get_token_usage_stats,
             get_short_context_state,
+            transcribe_chat_audio,
             upload_chat_attachment,
             environment_check,
             empty_list,
@@ -4886,6 +4965,25 @@ mod tests {
             .contains("must be a JSON object"));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn github_skill_raw_url_is_derived_from_blob_and_tree_urls() {
+        let blob = reqwest::Url::parse(
+            "https://github.com/owner/repo/blob/main/skills/demo/SKILL.md",
+        )
+        .unwrap();
+        assert_eq!(
+            github_blob_skill_raw_url(&blob).as_deref(),
+            Some("https://raw.githubusercontent.com/owner/repo/main/skills/demo/SKILL.md")
+        );
+
+        let tree = reqwest::Url::parse("https://github.com/owner/repo/tree/main/skills/demo")
+            .unwrap();
+        assert_eq!(
+            github_blob_skill_raw_url(&tree).as_deref(),
+            Some("https://raw.githubusercontent.com/owner/repo/main/skills/demo/SKILL.md")
+        );
     }
 
     #[test]
