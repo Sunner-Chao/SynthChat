@@ -27,6 +27,7 @@ import { filterSkillsByQuery } from "../lib/skillSearch";
 import { useAppStore, consumePendingSettingsView } from "../lib/store";
 import type {
   AccountConfig,
+  AppSection,
   AgentConfig,
   AgentDefinition,
   BrowserProvider,
@@ -339,7 +340,12 @@ export function SettingsPanel() {
     setMcpPanelMode
   } = useAppStore();
   const [view, setView] = useState<SettingsView>("menu");
+  const [menuAppVersion, setMenuAppVersion] = useState("v1.0.0");
   const focusedAgent = agents.find((agent) => agent.id === focusedAgentId) ?? agents.find((agent) => agent.isDefault) ?? agents[0] ?? null;
+
+  useEffect(() => {
+    void getVersion().then((v) => setMenuAppVersion(`v${v}`)).catch(() => {});
+  }, []);
 
   // Read pendingSettingsView once on mount (before paint)
   useLayoutEffect(() => {
@@ -368,15 +374,12 @@ export function SettingsPanel() {
   };
 
   if (view !== "menu") {
+    const goBackToMenu = () => setView("menu");
     return (
       <section className="simple-page">
-        <div className="subpage-bar">
-          <button className="icon-only-btn" onClick={() => setView("menu")} type="button" title="返回">
-            <ChevronRight size={19} style={{ transform: "rotate(180deg)" }} />
-          </button>
-        </div>
         {view === "profile" ? (
           <ProfileSettings
+            onBack={goBackToMenu}
             clearAvatar={clearProfileAvatar}
             profile={profile}
             saveProfile={saveProfile}
@@ -384,60 +387,57 @@ export function SettingsPanel() {
           />
         ) : null}
         {view === "accounts" ? (
-          <AccountsSettings accounts={accounts} personas={personas} refreshAccounts={refreshAccounts} saveAccounts={saveAccounts} />
+          <AccountsSettings onBack={goBackToMenu} accounts={accounts} personas={personas} refreshAccounts={refreshAccounts} saveAccounts={saveAccounts} />
         ) : null}
         {view === "providers" ? (
-          <ProviderSettings providers={llmProviders} saveProviders={saveLlmProviders} />
+          <ProviderSettings onBack={goBackToMenu} providers={llmProviders} saveProviders={saveLlmProviders} />
         ) : null}
         {view === "imageProviders" ? (
-          <ImageProviderSettings providers={imageProviders} saveProviders={saveImageProviders} />
+          <ImageProviderSettings onBack={goBackToMenu} providers={imageProviders} saveProviders={saveImageProviders} />
         ) : null}
         {view === "videoProviders" ? (
-          <VideoProviderSettings providers={videoProviders} saveProviders={saveVideoProviders} />
+          <VideoProviderSettings onBack={goBackToMenu} providers={videoProviders} saveProviders={saveVideoProviders} />
         ) : null}
         {view === "searchProviders" ? (
-          <SearchProviderSettings providers={searchProviders} saveProviders={saveSearchProviders} />
+          <SearchProviderSettings onBack={goBackToMenu} providers={searchProviders} saveProviders={saveSearchProviders} />
         ) : null}
         {view === "visionProviders" ? (
-          <VisionProviderSettings providers={visionProviders} saveProviders={saveVisionProviders} />
+          <VisionProviderSettings onBack={goBackToMenu} providers={visionProviders} saveProviders={saveVisionProviders} />
         ) : null}
         {view === "browserProviders" ? (
-          <BrowserProviderSettings providers={browserProviders} saveProviders={saveBrowserProviders} />
+          <BrowserProviderSettings onBack={goBackToMenu} providers={browserProviders} saveProviders={saveBrowserProviders} />
         ) : null}
         {view === "videoSummary" ? (
-          <VideoSummarySettings config={config.videoSummary ?? defaultVideoSummaryConfig()} onSave={(patch) => saveConfig({ ...config, videoSummary: { ...(config.videoSummary ?? defaultVideoSummaryConfig()), ...patch } })} />
+          <VideoSummarySettings onBack={goBackToMenu} config={config.videoSummary ?? defaultVideoSummaryConfig()} onSave={(patch) => saveConfig({ ...config, videoSummary: { ...(config.videoSummary ?? defaultVideoSummaryConfig()), ...patch } })} />
         ) : null}
         {view === "chat" ? (
-          <ChatSettings config={config.chat} llmProviders={llmProviders} onSave={saveChat} />
+          <ChatSettings onBack={goBackToMenu} config={config.chat} llmProviders={llmProviders} onSave={saveChat} />
         ) : null}
         {view === "reply" ? (
-          <ReplySettings config={config.reply} onSave={saveReply} />
+          <ReplySettings onBack={goBackToMenu} config={config.reply} onSave={saveReply} />
         ) : null}
         {view === "theme" ? (
-          <ThemeSettings importThemeCss={importThemeCss} saveThemes={saveThemes} themes={themes} />
+          <ThemeSettings onBack={goBackToMenu} importThemeCss={importThemeCss} saveThemes={saveThemes} themes={themes} />
         ) : null}
         {view === "emoji" ? (
-          <EmojiSettings groups={emojiGroups} saveGroups={saveEmojiGroups} uploadImage={uploadEmojiImage} />
+          <EmojiSettings onBack={goBackToMenu} groups={emojiGroups} saveGroups={saveEmojiGroups} uploadImage={uploadEmojiImage} />
         ) : null}
-        {view === "agent" && agentConfig ? (
-          <AgentSettings
-            config={agentConfig}
+        {view === "agent" ? (
+          <AgentSettingsRedirect
             agents={agents}
-            installBuiltinSkills={installBuiltinSkills}
-            refreshSkills={refreshSkills}
-            saveConfig={saveAgentConfig}
-            skills={skills}
-            servers={mcpServers}
+            serversCount={mcpServers.length}
+            setSection={setSection}
+            skillsCount={skills.length}
           />
         ) : null}
         {view === "network" ? (
-          <NetworkSettings config={config.web} weather={config.weather} onSave={saveWeb} onSaveWeather={(patch) => saveConfig({ ...config, weather: { ...config.weather, ...patch } })} />
+          <NetworkSettings onBack={goBackToMenu} config={config.web} weather={config.weather} onSave={saveWeb} onSaveWeather={(patch) => saveConfig({ ...config, weather: { ...config.weather, ...patch } })} />
         ) : null}
         {view === "about" ? (
-          <AboutSettings setView={setView} />
+          <AboutSettings onBack={goBackToMenu} setView={setView} />
         ) : null}
         {view === "privacy" ? (
-          <InfoDocument
+          <InfoDocument onBack={goBackToMenu}
             title="隐私说明及设置"
             body={[
               "SynthChat 原版包含匿名使用统计开关，用于判断版本使用情况和功能优先级。",
@@ -447,7 +447,7 @@ export function SettingsPanel() {
           />
         ) : null}
         {view === "statement" ? (
-          <InfoDocument
+          <InfoDocument onBack={goBackToMenu}
             title="软件声明"
             body={[
               "SynthChat 兼容 SillyTavern 角色卡和世界书格式，是为了方便迁移已有创作。",
@@ -466,7 +466,7 @@ export function SettingsPanel() {
         <Avatar name={profile.name} src={profile.avatarPath ? api.assetUrl(profile.avatarPath) : ""} />
         <div className="info">
           <div className="app-name">{profile.name}</div>
-          <div className="version">SynthChat v0.1.8</div>
+          <div className="version">SynthChat {menuAppVersion}</div>
         </div>
         <ChevronRight size={18} />
       </button>
@@ -576,6 +576,58 @@ function settingsTitle(view: SettingsView) {
     statement: "软件声明"
   };
   return titles[view];
+}
+
+function AgentSettingsRedirect({
+  agents,
+  serversCount,
+  setSection,
+  skillsCount
+}: {
+  agents: AgentDefinition[];
+  serversCount: number;
+  setSection: (section: AppSection, settingsView?: string) => void;
+  skillsCount: number;
+}) {
+  const enabledAgents = agents.filter((agent) => agent.enabled).length;
+  const defaultAgent = agents.find((agent) => agent.isDefault) ?? agents[0] ?? null;
+  return (
+    <div className="primary-panel embedded-panel" style={{ padding: 0 }}>
+      <div className="agent-settings-hero">
+        <div className="agent-settings-hero-info">
+          <span className="agent-settings-hero-icon"><Bot size={26} /></span>
+          <div className="agent-settings-hero-text">
+            <strong>Agent 配置</strong>
+            <small>{enabledAgents}/{agents.length} 个启用 · {skillsCount} 个 Skills · {serversCount} 个 MCP 服务</small>
+          </div>
+        </div>
+        <button className="btn-primary" type="button" onClick={() => setSection("agents")} style={{ fontSize: 13, padding: "8px 18px", width: "auto", minWidth: "auto", marginLeft: "auto", flexShrink: 0 }}>
+          打开 Agent 管理
+        </button>
+      </div>
+      <div className="agent-settings-section">
+        <div className="agent-settings-section-title">
+          <Sparkles size={16} /><strong>统一配置位置</strong>
+        </div>
+        <p className="form-hint">
+          Agent 管理页负责模型 fallback、MCP/Skills、Shell 权限和子 Agent 限制；最大工具迭代由通讯录/角色编辑里的工具策略主导。
+        </p>
+        <div className="agent-summary-grid" style={{ marginTop: 12 }}>
+          {defaultAgent ? (
+            <div className="agent-summary-item">
+              <span className="agent-summary-icon indigo"><Bot size={18} /></span>
+              <div className="agent-summary-text">
+                <strong style={{ fontSize: 14 }}>{defaultAgent.name}{defaultAgent.isDefault ? " ★" : ""}</strong>
+                <small>Agent fallback 预算：{defaultAgent.maxToolIterations ?? 90} 次；实际以角色工具策略为准</small>
+              </div>
+            </div>
+          ) : (
+            <p className="form-hint">暂无 Agent，请先创建一个。</p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function AgentSettings({
@@ -706,7 +758,7 @@ function AgentSettings({
       {/* Limits */}
       <div className="agent-settings-section">
         <div className="agent-settings-section-title">
-          <RefreshCw size={16} /><strong>运行限制</strong>
+          <RefreshCw size={16} /><strong>Agent 调度限制</strong>
         </div>
         <div className="agent-form-row">
           <div className="agent-field">
@@ -716,10 +768,6 @@ function AgentSettings({
           <div className="agent-field">
             <label>最大子层级</label>
             <input min={1} max={4} type="number" value={draft.maxSubagentDepth ?? 1} onChange={(event) => setDraft((current) => ({ ...current, maxSubagentDepth: Number(event.target.value) }))} />
-          </div>
-          <div className="agent-field">
-            <label>工具循环上限</label>
-            <input min={1} max={120} type="number" value={draft.maxToolIterations} onChange={(event) => setDraft((current) => ({ ...current, maxToolIterations: Number(event.target.value) }))} />
           </div>
         </div>
         <div className="agent-form-row single" style={{ marginTop: 12 }}>
@@ -794,12 +842,23 @@ function AgentSettings({
   );
 }
 
+function BackBtn({ onBack }: { onBack?: () => void }) {
+  if (!onBack) return null;
+  return (
+    <button className="icon-only-btn" onClick={onBack} title="返回" type="button">
+      <ChevronRight size={19} style={{ transform: "rotate(180deg)" }} />
+    </button>
+  );
+}
+
 function ProfileSettings({
+  onBack,
   profile,
   saveProfile,
   uploadAvatar,
   clearAvatar
 }: {
+  onBack?: () => void;
   profile: ProfileConfig;
   saveProfile: (profile: ProfileConfig) => Promise<void>;
   uploadAvatar: (file: File) => Promise<void>;
@@ -816,6 +875,7 @@ function ProfileSettings({
   return (
     <div className="primary-panel embedded-panel">
       <div className="panel-title action-title">
+        <BackBtn onBack={onBack} />
         <div className="panel-title-text"><span>Profile</span><strong>个人资料</strong></div>
       </div>
       <div className="card" style={{ margin: "0 16px 12px" }}>
@@ -848,11 +908,13 @@ function ProfileSettings({
 }
 
 function AccountsSettings({
+  onBack,
   accounts,
   personas,
   refreshAccounts,
   saveAccounts
 }: {
+  onBack?: () => void;
   accounts: AccountConfig[];
   personas: Persona[];
   refreshAccounts: () => Promise<void>;
@@ -1038,8 +1100,8 @@ function AccountsSettings({
     return (
       <div className="primary-panel embedded-panel">
         <div className="panel-title action-title">
-          <div className="panel-title-text"><span>Account</span><strong>账号详情</strong></div>
           <button className="icon-only-btn" onClick={() => setDetailId("")} title="返回" type="button"><ChevronRight size={19} style={{ transform: "rotate(180deg)" }} /></button>
+          <div className="panel-title-text"><span>Account</span><strong>账号详情</strong></div>
         </div>
         <div className="card" style={{ margin: "0 16px 12px" }}>
           <div className="card-header">基本信息</div>
@@ -1088,6 +1150,7 @@ function AccountsSettings({
   return (
     <div className="primary-panel embedded-panel">
       <div className="panel-title action-title">
+        <BackBtn onBack={onBack} />
         <div className="panel-title-text"><span>Accounts</span><strong>微信账号</strong></div>
         <button className="icon-only-btn" onClick={() => void startQr()} title="添加账号" type="button" disabled={busy}><Plus size={19} /></button>
       </div>
@@ -1181,9 +1244,11 @@ function AccountsSettings({
 }
 
 function ProviderSettings({
+  onBack,
   providers,
   saveProviders
 }: {
+  onBack?: () => void;
   providers: LlmProvider[];
   saveProviders: (providers: LlmProvider[]) => Promise<void>;
 }) {
@@ -1303,6 +1368,7 @@ function ProviderSettings({
   return (
     <div className="primary-panel embedded-panel">
       <div className="panel-title action-title">
+        <BackBtn onBack={onBack} />
         <div className="panel-title-text"><span>Providers</span><strong>对话服务商</strong></div>
         <button className="icon-only-btn" onClick={() => setShowTypeSheet(true)} title="添加对话服务商" type="button"><Plus size={19} /></button>
       </div>
@@ -1385,7 +1451,7 @@ function ProviderSettings({
         )
       ) : draft ? (
           <div className="settings-form provider-card">
-            <div className="panel-title action-title"><div className="panel-title-text"><span>Edit</span><strong>{draft.name}</strong></div><button onClick={() => void saveDraft()} type="button">完成</button></div>
+            <div className="panel-title action-title"><button className="icon-only-btn" onClick={() => { setSelectedId(""); setDraft(null); }} title="返回" type="button"><ChevronRight size={19} style={{ transform: "rotate(180deg)" }} /></button><div className="panel-title-text"><span>Edit</span><strong>{draft.name}</strong></div><button onClick={() => void saveDraft()} type="button">完成</button></div>
             <label className="checkbox-row"><input checked={draft.enabled} onChange={(event) => setDraft((d) => d ? { ...d, enabled: event.target.checked } : d)} type="checkbox" />启用当前服务商</label>
             <label>名称<input value={draft.name} onChange={(event) => setDraft((d) => d ? { ...d, name: event.target.value } : d)} /></label>
             <label>类型<select value={draft.providerType ?? "openai_compatible"} onChange={(event) => setDraft((d) => d ? { ...d, providerType: event.target.value } : d)}>
@@ -1544,9 +1610,11 @@ function ProviderSettings({
 }
 
 function ImageProviderSettings({
+  onBack,
   providers,
   saveProviders
 }: {
+  onBack?: () => void;
   providers: ImageProvider[];
   saveProviders: (providers: ImageProvider[]) => Promise<void>;
 }) {
@@ -1615,6 +1683,7 @@ function ImageProviderSettings({
   return (
     <div className="primary-panel embedded-panel">
       <div className="panel-title action-title">
+        <BackBtn onBack={onBack} />
         <div className="panel-title-text"><span>Image</span><strong>生图服务商</strong></div>
         <button className="icon-only-btn" onClick={() => setShowTypeSheet(true)} title="添加生图服务商" type="button"><Plus size={19} /></button>
       </div>
@@ -1659,7 +1728,7 @@ function ImageProviderSettings({
         )
       ) : draft ? (
           <div className="settings-form provider-card">
-            <div className="panel-title action-title"><div className="panel-title-text"><span>Edit</span><strong>{draft.name}</strong></div><button onClick={() => void saveDraft()} type="button">完成</button></div>
+            <div className="panel-title action-title"><button className="icon-only-btn" onClick={() => { setSelectedId(""); setDraft(null); }} title="返回" type="button"><ChevronRight size={19} style={{ transform: "rotate(180deg)" }} /></button><div className="panel-title-text"><span>Edit</span><strong>{draft.name}</strong></div><button onClick={() => void saveDraft()} type="button">完成</button></div>
             <label className="checkbox-row"><input checked={draft.enabled} onChange={(event) => setDraft((d) => d ? { ...d, enabled: event.target.checked } : d)} type="checkbox" />启用当前服务商</label>
             <label>名称<input value={draft.name} onChange={(event) => setDraft((d) => d ? { ...d, name: event.target.value } : d)} /></label>
             <label>类型<select value={draft.providerType} onChange={(event) => setDraft((d) => d ? { ...d, providerType: event.target.value } : d)}><option value="openai_image">OpenAI Image</option><option value="gemini_image">Gemini Image</option><option value="novelai">NovelAI</option></select></label>
@@ -1695,9 +1764,11 @@ function ImageProviderSettings({
 }
 
 function VideoProviderSettings({
+  onBack,
   providers,
   saveProviders
 }: {
+  onBack?: () => void;
   providers: VideoProvider[];
   saveProviders: (providers: VideoProvider[]) => Promise<void>;
 }) {
@@ -1766,6 +1837,7 @@ function VideoProviderSettings({
   return (
     <div className="primary-panel embedded-panel">
       <div className="panel-title action-title">
+        <BackBtn onBack={onBack} />
         <div className="panel-title-text"><span>Video</span><strong>视频生成服务商</strong></div>
         <button className="icon-only-btn" onClick={() => void add()} title="添加视频生成服务商" type="button"><Plus size={19} /></button>
       </div>
@@ -1804,7 +1876,7 @@ function VideoProviderSettings({
         )
       ) : draft ? (
         <div className="settings-form provider-card">
-          <div className="panel-title action-title"><div className="panel-title-text"><span>Edit</span><strong>{draft.name}</strong></div><button onClick={() => void saveDraft()} type="button">完成</button></div>
+          <div className="panel-title action-title"><button className="icon-only-btn" onClick={() => { setSelectedId(""); setDraft(null); }} title="返回" type="button"><ChevronRight size={19} style={{ transform: "rotate(180deg)" }} /></button><div className="panel-title-text"><span>Edit</span><strong>{draft.name}</strong></div><button onClick={() => void saveDraft()} type="button">完成</button></div>
           <label className="checkbox-row"><input checked={draft.enabled} onChange={(event) => setDraft((item) => item ? { ...item, enabled: event.target.checked } : item)} type="checkbox" />启用当前服务商</label>
           <label>名称<input value={draft.name} onChange={(event) => setDraft((item) => item ? { ...item, name: event.target.value } : item)} /></label>
           <div className="two-column">
@@ -1841,9 +1913,11 @@ function VideoProviderSettings({
 }
 
 function SearchProviderSettings({
+  onBack,
   providers,
   saveProviders
 }: {
+  onBack?: () => void;
   providers: SearchProvider[];
   saveProviders: (providers: SearchProvider[]) => Promise<void>;
 }) {
@@ -1935,6 +2009,7 @@ function SearchProviderSettings({
   return (
     <div className="primary-panel embedded-panel">
       <div className="panel-title action-title">
+        <BackBtn onBack={onBack} />
         <div className="panel-title-text"><span>Search</span><strong>搜索服务</strong></div>
         <button className="icon-only-btn" onClick={() => void add()} title="添加搜索服务" type="button"><Plus size={19} /></button>
       </div>
@@ -1979,7 +2054,7 @@ function SearchProviderSettings({
         )
       ) : draft ? (
         <div className="settings-form provider-card">
-          <div className="panel-title action-title"><div className="panel-title-text"><span>Edit</span><strong>{draft.name}</strong></div><button onClick={() => void saveDraft()} type="button">完成</button></div>
+          <div className="panel-title action-title"><button className="icon-only-btn" onClick={() => { setSelectedId(""); setDraft(null); }} title="返回" type="button"><ChevronRight size={19} style={{ transform: "rotate(180deg)" }} /></button><div className="panel-title-text"><span>Edit</span><strong>{draft.name}</strong></div><button onClick={() => void saveDraft()} type="button">完成</button></div>
           <label className="checkbox-row"><input checked={draft.enabled} onChange={(event) => setDraft((item) => item ? { ...item, enabled: event.target.checked } : item)} type="checkbox" />启用当前搜索服务</label>
           <label>名称<input value={draft.name} onChange={(event) => setDraft((item) => item ? { ...item, name: event.target.value } : item)} /></label>
           <label>类型<select value={draft.providerType} onChange={(event) => updateProviderType(event.target.value)}>
@@ -2003,9 +2078,11 @@ function SearchProviderSettings({
 }
 
 function VisionProviderSettings({
+  onBack,
   providers,
   saveProviders
 }: {
+  onBack?: () => void;
   providers: VisionProvider[];
   saveProviders: (providers: VisionProvider[]) => Promise<void>;
 }) {
@@ -2070,6 +2147,7 @@ function VisionProviderSettings({
   return (
     <div className="primary-panel embedded-panel">
       <div className="panel-title action-title">
+        <BackBtn onBack={onBack} />
         <div className="panel-title-text"><span>Vision</span><strong>识图服务</strong></div>
         <button className="icon-only-btn" onClick={() => setShowTypeSheet(true)} title="添加识图服务" type="button"><Plus size={19} /></button>
       </div>
@@ -2114,7 +2192,7 @@ function VisionProviderSettings({
         )
       ) : draft ? (
         <div className="settings-form provider-card">
-          <div className="panel-title action-title"><div className="panel-title-text"><span>Edit</span><strong>{draft.name}</strong></div><button onClick={() => void saveDraft()} type="button">完成</button></div>
+          <div className="panel-title action-title"><button className="icon-only-btn" onClick={() => { setSelectedId(""); setDraft(null); }} title="返回" type="button"><ChevronRight size={19} style={{ transform: "rotate(180deg)" }} /></button><div className="panel-title-text"><span>Edit</span><strong>{draft.name}</strong></div><button onClick={() => void saveDraft()} type="button">完成</button></div>
           <label className="checkbox-row"><input checked={draft.enabled} onChange={(event) => setDraft((item) => item ? { ...item, enabled: event.target.checked } : item)} type="checkbox" />启用当前识图服务</label>
           <label>名称<input value={draft.name} onChange={(event) => setDraft((item) => item ? { ...item, name: event.target.value } : item)} /></label>
           <label>类型<select value={draft.providerType} onChange={(event) => setDraft((item) => item ? { ...item, providerType: event.target.value } : item)}>
@@ -2179,9 +2257,11 @@ function browserProviderDefaults(providerType: string): Omit<BrowserProvider, "i
 }
 
 function BrowserProviderSettings({
+  onBack,
   providers,
   saveProviders
 }: {
+  onBack?: () => void;
   providers: BrowserProvider[];
   saveProviders: (providers: BrowserProvider[]) => Promise<void>;
 }) {
@@ -2240,6 +2320,7 @@ function BrowserProviderSettings({
   return (
     <div className="primary-panel embedded-panel">
       <div className="panel-title action-title">
+        <BackBtn onBack={onBack} />
         <div className="panel-title-text"><span>Browser</span><strong>浏览器服务</strong></div>
         <button className="icon-only-btn" onClick={() => setShowTypeSheet(true)} title="添加浏览器服务" type="button"><Plus size={19} /></button>
       </div>
@@ -2284,7 +2365,7 @@ function BrowserProviderSettings({
         )
       ) : draft ? (
         <div className="settings-form provider-card">
-          <div className="panel-title action-title"><div className="panel-title-text"><span>Edit</span><strong>{draft.name}</strong></div><button onClick={() => void saveDraft()} type="button">完成</button></div>
+          <div className="panel-title action-title"><button className="icon-only-btn" onClick={() => { setSelectedId(""); setDraft(null); }} title="返回" type="button"><ChevronRight size={19} style={{ transform: "rotate(180deg)" }} /></button><div className="panel-title-text"><span>Edit</span><strong>{draft.name}</strong></div><button onClick={() => void saveDraft()} type="button">完成</button></div>
           <label className="checkbox-row"><input checked={draft.enabled} onChange={(event) => setDraft((item) => item ? { ...item, enabled: event.target.checked } : item)} type="checkbox" />启用当前浏览器服务</label>
           <label>名称<input value={draft.name} onChange={(event) => setDraft((item) => item ? { ...item, name: event.target.value } : item)} /></label>
           <label>类型<select value={draft.providerType} onChange={(event) => updateProviderType(event.target.value)}>
@@ -2340,9 +2421,11 @@ function defaultVideoSummaryConfig(): VideoSummaryConfig {
 }
 
 function VideoSummarySettings({
+  onBack,
   config,
   onSave
 }: {
+  onBack?: () => void;
   config: VideoSummaryConfig;
   onSave: (patch: Partial<VideoSummaryConfig>) => Promise<void>;
 }) {
@@ -2356,8 +2439,9 @@ function VideoSummarySettings({
   return (
     <div className="primary-panel embedded-panel">
       <div className="panel-title action-title">
+        <BackBtn onBack={onBack} />
         <div className="panel-title-text"><span>Video</span><strong>视频总结</strong></div>
-        <button onClick={save} type="button">保存</button>
+        <button className="btn-primary" onClick={save} type="button">保存</button>
       </div>
       <div className="settings-form provider-card">
         <label className="checkbox-row">
@@ -2459,10 +2543,12 @@ function VideoSummarySettings({
 }
 
 function ChatSettings({
+  onBack,
   config,
   llmProviders,
   onSave
 }: {
+  onBack?: () => void;
   config: ChatConfig;
   llmProviders: LlmProvider[];
   onSave: (patch: Partial<ChatConfig>) => Promise<void>;
@@ -2732,8 +2818,9 @@ function ChatSettings({
   return (
     <div className="primary-panel embedded-panel">
       <div className="panel-title action-title">
+        <BackBtn onBack={onBack} />
         <div className="panel-title-text"><span>Chat</span><strong>对话设置</strong></div>
-        <button onClick={save} type="button">保存</button>
+        <button className="btn-primary" onClick={save} type="button">保存</button>
       </div>
       <div className="card" style={{ margin: "0 16px 12px" }}>
         <div className="card-header">消息队列</div>
@@ -3011,7 +3098,7 @@ function ChatSettings({
                 }}
                 placeholder="server.tool、server.* 或 *"
               />
-              <button className="btn-secondary" onClick={() => void addTrustedToolPattern()} type="button">
+              <button className="btn-primary" onClick={() => void addTrustedToolPattern()} type="button">
                 添加
               </button>
             </div>
@@ -3047,7 +3134,7 @@ function ChatSettings({
                 }}
                 placeholder='例如 npm run build 或 git status*'
               />
-              <button className="btn-secondary" onClick={addTrustedCommandPattern} type="button">
+              <button className="btn-primary" onClick={addTrustedCommandPattern} type="button">
                 添加
               </button>
             </div>
@@ -3340,9 +3427,11 @@ function ChatSettings({
 }
 
 function ReplySettings({
+  onBack,
   config,
   onSave
 }: {
+  onBack?: () => void;
   config: {
     typingDelayEnabled?: boolean;
     typingSpeed: number;
@@ -3381,8 +3470,9 @@ function ReplySettings({
   return (
     <div className="primary-panel embedded-panel">
       <div className="panel-title action-title">
+        <BackBtn onBack={onBack} />
         <div className="panel-title-text"><span>Reply</span><strong>回复设置</strong></div>
-        <button onClick={save} type="button">保存</button>
+        <button className="btn-primary" onClick={save} type="button">保存</button>
       </div>
       <div className="card" style={{ margin: "0 16px 12px" }}>
         <div className="card-header">回复拆分</div>
@@ -3488,10 +3578,12 @@ function ReplySettings({
 }
 
 function ThemeSettings({
+  onBack,
   themes,
   importThemeCss,
   saveThemes
 }: {
+  onBack?: () => void;
   themes: ThemeConfig[];
   importThemeCss: (file: File) => Promise<void>;
   saveThemes: (themes: ThemeConfig[]) => Promise<void>;
@@ -3513,7 +3605,7 @@ function ThemeSettings({
   };
   return (
     <div className="primary-panel embedded-panel">
-      <div className="panel-title action-title"><div className="panel-title-text"><span>Theme</span><strong>主题</strong></div><button onClick={add} type="button"><Plus size={15} />新建</button></div>
+      <div className="panel-title action-title"><BackBtn onBack={onBack} /><div className="panel-title-text"><span>Theme</span><strong>主题</strong></div><button onClick={add} type="button"><Plus size={15} />新建</button></div>
       <input accept=".css,text/css" className="hidden-input" onChange={onThemeFile} ref={themeInput} type="file" />
       <div className="card" style={{ margin: "0 16px 12px" }}>
         <div className="card-header">外观模式</div>
@@ -3557,10 +3649,12 @@ function ThemeSettings({
 }
 
 function EmojiSettings({
+  onBack,
   groups,
   saveGroups,
   uploadImage
 }: {
+  onBack?: () => void;
   groups: EmojiGroup[];
   saveGroups: (groups: EmojiGroup[]) => Promise<void>;
   uploadImage: (groupId: string, emotion: string, file: File) => Promise<void>;
@@ -3626,7 +3720,7 @@ function EmojiSettings({
   };
   return (
     <div className="primary-panel embedded-panel">
-      <div className="panel-title action-title"><div className="panel-title-text"><span>Emoji</span><strong>表情包管理</strong></div><button onClick={addGroup} type="button"><Plus size={15} />新建分组</button></div>
+      <div className="panel-title action-title"><BackBtn onBack={onBack} /><div className="panel-title-text"><span>Emoji</span><strong>表情包管理</strong></div><button className="btn-primary" onClick={addGroup} type="button"><Plus size={15} />新建分组</button></div>
       <input accept="image/*" className="hidden-input" multiple onChange={onFile} ref={fileInput} type="file" />
       {groups.length === 0 ? (
         <div className="empty-state compact">
@@ -3657,8 +3751,8 @@ function EmojiSettings({
                       <div className="emoji-emotion-head">
                         <strong>{emotion}</strong>
                         <span>{images.length} 张</span>
-                        <button onClick={() => { setUploadGroupId(group.id); setUploadEmotion(emotion); fileInput.current?.click(); }} type="button">上传</button>
-                        <button onClick={() => void renameEmotion(group.id, emotion)} type="button">重命名</button>
+                        <button className="btn-secondary-outline-sm" onClick={() => { setUploadGroupId(group.id); setUploadEmotion(emotion); fileInput.current?.click(); }} type="button">上传</button>
+                        <button className="btn-secondary-outline-sm" onClick={() => void renameEmotion(group.id, emotion)} type="button">重命名</button>
                         <button className="btn-danger-outline-sm" onClick={() => void deleteEmotion(group.id, emotion)} type="button">删除</button>
                       </div>
                       <div className="emoji-image-grid">
@@ -3666,8 +3760,8 @@ function EmojiSettings({
                           <div className="emoji-image-item" key={path}>
                             <img src={api.assetUrl(path)} alt={path.split(/[\\/]/).pop() || emotion} />
                             <div>
-                              <button onClick={() => void renameImage(group.id, emotion, path)} type="button">改名</button>
-                              <button onClick={() => void deleteImage(group.id, emotion, path)} type="button">删除</button>
+                              <button className="btn-secondary-outline-sm" onClick={() => void renameImage(group.id, emotion, path)} type="button">改名</button>
+                              <button className="btn-danger-outline-sm" onClick={() => void deleteImage(group.id, emotion, path)} type="button">删除</button>
                             </div>
                           </div>
                         ))}
@@ -3685,11 +3779,13 @@ function EmojiSettings({
 }
 
 function NetworkSettings({
+  onBack,
   config,
   weather,
   onSave,
   onSaveWeather
 }: {
+  onBack?: () => void;
   config: { port: number; password: string; publicEnabled: boolean; publicPort: number; publicSecret: string };
   weather: { qweatherApiKey: string; qweatherApiHost: string; defaultLocation: string; timeoutSeconds: number };
   onSave: (patch: Partial<typeof config>) => Promise<void>;
@@ -3711,7 +3807,7 @@ function NetworkSettings({
   };
   return (
     <div className="primary-panel embedded-panel">
-      <div className="panel-title action-title"><div className="panel-title-text"><span>Network</span><strong>网络设置</strong></div><button onClick={save} type="button">保存</button></div>
+      <div className="panel-title action-title"><BackBtn onBack={onBack} /><div className="panel-title-text"><span>Network</span><strong>网络设置</strong></div><button className="btn-primary" onClick={save} type="button">保存</button></div>
       <div className="settings-form">
         <label>本地端口<input min={1} type="number" value={draft.port} onChange={(event) => setDraft((d) => ({ ...d, port: Number(event.target.value) }))} /></label>
         <label>公网访问密码<input type="password" value={draft.password} onChange={(event) => setDraft((d) => ({ ...d, password: event.target.value }))} placeholder="8位以上，含大小写字母和数字" /></label>
@@ -3770,7 +3866,7 @@ function NetworkSettings({
   );
 }
 
-function AboutSettings({ setView }: { setView: (view: SettingsView) => void }) {
+function AboutSettings({ onBack, setView }: { onBack?: () => void; setView: (view: SettingsView) => void }) {
   const [appVersion, setAppVersion] = useState("V1.0.0");
   const [manifestUrl, setManifestUrl] = useState(readUpdateManifestUrl);
   const [updateStatus, setUpdateStatus] = useState("未检查");
@@ -3838,39 +3934,77 @@ function AboutSettings({ setView }: { setView: (view: SettingsView) => void }) {
 
   return (
     <div className="primary-panel embedded-panel about-panel">
-      <div className="brand-mark about-logo"><Sparkles size={28} /></div>
-      <h2>SynthChat</h2>
-      <p>{appVersion} · 智能 AI 聊天机器人</p>
-      <div className="menu-card flat-card">
-        <div className="settings-form" style={{ padding: "12px 12px 8px" }}>
-          <label style={{ display: "grid", gap: 6 }}>
-            <span>更新源地址</span>
-            <input value={manifestUrl} onChange={(event) => setManifestUrl(event.target.value)} placeholder="GitHub Releases API 或 update.json 地址" />
-          </label>
-          <div className="form-actions" style={{ marginTop: 8 }}>
-            <button className="btn-secondary" onClick={saveManifestUrl} type="button">保存更新源</button>
-            <button className="btn-primary" onClick={() => void checkUpdates()} disabled={checking} type="button">
-              {checking ? "检查中..." : "检查更新"}
-            </button>
-          </div>
-          <div className="form-hint">{updateStatus}{updateDetail ? ` · ${updateDetail}` : ""}</div>
-          {availableUpdate ? (
-            <div className="form-actions" style={{ marginTop: 4 }}>
-              <button className="btn-secondary" onClick={openUpdateUrl} type="button">打开下载页</button>
-            </div>
-          ) : null}
-        </div>
-        <MenuRow icon={Info} label="隐私说明及设置" onClick={() => setView("privacy")} iconColor="neutral" />
-        <MenuRow icon={Info} label="软件声明" onClick={() => setView("statement")} iconColor="neutral" />
+      <div className="panel-title action-title" style={{ width: "100%", marginBottom: 4 }}>
+        <BackBtn onBack={onBack} />
+        <div className="panel-title-text"><span>About</span><strong>关于 SynthChat</strong></div>
       </div>
+      {/* Brand Hero Section */}
+      <div className="about-hero">
+        <div className="brand-mark about-logo"><Sparkles size={32} /></div>
+        <h2>SynthChat</h2>
+        <p className="about-version">{appVersion}</p>
+        <p className="about-subtitle">智能 AI 聊天机器人</p>
+      </div>
+
+      {/* Update Section */}
+      <div className="about-section">
+        <div className="about-section-title">
+          <RefreshCw size={14} />
+          <span>应用更新</span>
+        </div>
+        <div className="menu-card flat-card about-card">
+          <div className="settings-form" style={{ padding: "12px 14px" }}>
+            <label style={{ display: "grid", gap: 4 }}>
+              <span style={{ fontSize: "0.75rem", color: "var(--text-3)", fontWeight: 500 }}>更新源地址</span>
+              <input value={manifestUrl} onChange={(event) => setManifestUrl(event.target.value)} placeholder="GitHub Releases API 或 update.json 地址" style={{ fontSize: 13 }} />
+            </label>
+            <div className="form-actions" style={{ marginTop: 8 }}>
+              <button className="btn-secondary" onClick={saveManifestUrl} type="button">保存更新源</button>
+              <button className="btn-primary" onClick={() => void checkUpdates()} disabled={checking} type="button">
+                {checking ? "检查中..." : "检查更新"}
+              </button>
+            </div>
+            {(updateStatus && updateStatus !== "未检查") && (
+              <div className={`about-update-status ${availableUpdate ? "has-update" : updateStatus === "检查失败" ? "has-error" : "is-latest"}`}>
+                <span className="about-update-status-text">{updateStatus}</span>
+                {updateDetail && <span className="about-update-detail">{updateDetail}</span>}
+              </div>
+            )}
+            {availableUpdate ? (
+              <div className="form-actions" style={{ marginTop: 8 }}>
+                <button className="btn-primary" onClick={openUpdateUrl} type="button" style={{ width: "100%" }}>
+                  下载新版本 {availableUpdate.latestVersion}
+                </button>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      </div>
+
+      {/* Links Section */}
+      <div className="about-section">
+        <div className="about-section-title">
+          <Info size={14} />
+          <span>更多信息</span>
+        </div>
+        <div className="menu-card flat-card about-card">
+          <MenuRow icon={Info} label="隐私说明及设置" onClick={() => setView("privacy")} iconColor="neutral" />
+          <MenuRow icon={Info} label="软件声明" onClick={() => setView("statement")} iconColor="neutral" />
+        </div>
+      </div>
+
+      <p className="about-footer">Made with ❤️</p>
     </div>
   );
 }
 
-function InfoDocument({ title, body }: { title: string; body: string[] }) {
+function InfoDocument({ onBack, title, body }: { onBack?: () => void; title: string; body: string[] }) {
   return (
     <div className="primary-panel embedded-panel">
-      <div className="panel-title"><div className="panel-title-text"><span>Info</span><strong>{title}</strong></div></div>
+      <div className="panel-title action-title">
+        <BackBtn onBack={onBack} />
+        <div className="panel-title-text"><span>Info</span><strong>{title}</strong></div>
+      </div>
       <div className="doc-body">
         {body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
       </div>

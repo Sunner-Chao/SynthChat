@@ -6665,6 +6665,38 @@ fn sync_closed_running_tool_messages(messages: &mut [ChatMessage], closed_events
     }
 }
 
+fn clamp_agent_tool_iterations(value: u32) -> u32 {
+    value.clamp(1, 90)
+}
+
+fn persona_tool_iterations(persona: &Persona) -> u32 {
+    persona
+        .tool_policy
+        .get("maxIterations")
+        .or_else(|| persona.tool_policy.get("max_iterations"))
+        .and_then(|value| {
+            value
+                .as_u64()
+                .map(|number| number as u32)
+                .or_else(|| value.as_f64().map(|number| number.round() as u32))
+                .or_else(|| value.as_str().and_then(|text| text.trim().parse::<u32>().ok()))
+        })
+        .map(clamp_agent_tool_iterations)
+        .unwrap_or(90)
+}
+
+fn set_persona_tool_iterations(persona: &mut Persona, value: u32) {
+    if !persona.tool_policy.is_object() {
+        persona.tool_policy = json!({});
+    }
+    if let Some(object) = persona.tool_policy.as_object_mut() {
+        object.insert(
+            "maxIterations".into(),
+            Value::Number(clamp_agent_tool_iterations(value).into()),
+        );
+    }
+}
+
 impl AppStore {
     pub fn new(path: PathBuf) -> AppResult<Self> {
         let state_existed = path.exists();
@@ -8572,16 +8604,12 @@ impl AppStore {
             persona.agent_id = resolved_agent.id.clone();
             let persona_provider = persona.llm_provider.trim().to_string();
             let persona_model = persona.llm_model.trim().to_string();
-            if !persona_provider.is_empty() || !persona_model.is_empty() {
-                if let Some(agent) = s.agents.iter_mut().find(|agent| agent.id == persona.agent_id) {
-                    if !persona_provider.is_empty() {
-                        agent.llm_provider = persona_provider.clone();
-                    }
-                    if !persona_model.is_empty() {
-                        agent.llm_model = persona_model.clone();
-                    }
-                    agent.updated_at = now_iso();
-                }
+            let persona_max_tool_iterations = persona_tool_iterations(&persona);
+            if let Some(agent) = s.agents.iter_mut().find(|agent| agent.id == persona.agent_id) {
+                agent.llm_provider = persona_provider;
+                agent.llm_model = persona_model;
+                agent.max_tool_iterations = persona_max_tool_iterations;
+                agent.updated_at = now_iso();
             }
             s.personas.retain(|p| p.id != persona.id);
             s.personas.push(persona.clone());
@@ -10699,6 +10727,7 @@ impl AppStore {
                     agent.created_at = current.created_at.clone();
                 }
             }
+            agent.max_tool_iterations = clamp_agent_tool_iterations(agent.max_tool_iterations);
             agent.updated_at = now_iso();
             if agent.created_at.trim().is_empty() {
                 agent.created_at = agent.updated_at.clone();
@@ -10716,6 +10745,13 @@ impl AppStore {
                     if first.id == agent.id {
                         agent.is_default = true;
                     }
+                }
+            }
+            for persona in &mut s.personas {
+                if persona.agent_id == agent.id {
+                    persona.llm_provider = agent.llm_provider.clone();
+                    persona.llm_model = agent.llm_model.clone();
+                    set_persona_tool_iterations(persona, agent.max_tool_iterations);
                 }
             }
             self.persist(s)?;

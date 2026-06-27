@@ -66,6 +66,29 @@ fn is_pet_vision_silent_provider_data(source: &str, provider_data: Option<&Value
     (source == "pet-vision" || provider_source == "pet-vision") && silent
 }
 
+pub(super) fn persona_tool_policy_max_iterations(persona: &Persona) -> Option<u32> {
+    let value = persona
+        .tool_policy
+        .get("maxIterations")
+        .or_else(|| persona.tool_policy.get("max_iterations"))?;
+    if let Some(number) = value.as_u64() {
+        return Some((number as u32).max(1).min(90));
+    }
+    if let Some(number) = value.as_f64().filter(|number| number.is_finite()) {
+        return Some((number.round() as u32).max(1).min(90));
+    }
+    value
+        .as_str()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .map(|number| number.max(1).min(90))
+}
+
+pub(super) fn apply_persona_tool_policy_to_agent(persona: &Persona, agent: &mut AgentDefinition) {
+    if let Some(max_iterations) = persona_tool_policy_max_iterations(persona) {
+        agent.max_tool_iterations = max_iterations;
+    }
+}
+
 fn is_pet_vision_silent_queue_item(item: &AgentQueuedRequest) -> bool {
     is_pet_vision_silent_provider_data(&item.source, item.provider_data.as_ref())
 }
@@ -511,6 +534,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         _ => store.create_conversation(None, request.persona_id.clone())?,
     };
     let (persona, mut agent) = resolve_chat_turn_persona_and_agent(store, &conversation, &request)?;
+    apply_persona_tool_policy_to_agent(&persona, &mut agent);
     apply_acp_session_mcp_scope(store, &conversation, &mut agent)?;
     if let Some(toolsets) = enabled_toolsets {
         agent.enabled_toolsets = toolsets;

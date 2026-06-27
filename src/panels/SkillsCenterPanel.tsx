@@ -295,20 +295,40 @@ export function SkillsCenterPanel() {
               </div>
             </div>
 
-            <div style={{ display: "flex", gap: "12px", marginBottom: "20px", borderBottom: "1px solid var(--divider)", paddingBottom: "12px" }}>
-              <button 
-                className={activeTab === "installed" ? "btn-primary" : "btn-secondary"} 
+            <div style={{ display: "flex", gap: "4px", marginBottom: "20px", borderBottom: "1px solid var(--divider)", paddingBottom: "12px" }}>
+              <button
                 onClick={() => setActiveTab("installed")}
-                style={activeTab !== "installed" ? { background: "transparent", border: "none" } : {}}
+                style={{
+                  flex: 1,
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                  padding: "8px 16px",
+                  border: "none",
+                  borderRadius: "var(--radius-md)",
+                  fontSize: 14, fontWeight: 500,
+                  cursor: "pointer",
+                  transition: "all 0.2s ease",
+                  background: activeTab === "installed" ? "var(--primary)" : "transparent",
+                  color: activeTab === "installed" ? "#fff" : "var(--text-2)",
+                }}
               >
-                <Layers size={15} style={{ marginRight: 6 }}/> 已安装 ({skills.length})
+                <Layers size={15} /> 已安装 ({skills.length})
               </button>
-              <button 
-                className={activeTab === "marketplace" ? "btn-primary" : "btn-secondary"} 
+              <button
                 onClick={() => setActiveTab("marketplace")}
-                style={activeTab !== "marketplace" ? { background: "transparent", border: "none" } : {}}
+                style={{
+                  flex: 1,
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                  padding: "8px 16px",
+                  border: "none",
+                  borderRadius: "var(--radius-md)",
+                  fontSize: 14, fontWeight: 500,
+                  cursor: "pointer",
+                  transition: "all 0.2s ease",
+                  background: activeTab === "marketplace" ? "var(--primary)" : "transparent",
+                  color: activeTab === "marketplace" ? "#fff" : "var(--text-2)",
+                }}
               >
-                <PackageSearch size={15} style={{ marginRight: 6 }}/> 插件市场
+                <PackageSearch size={15} /> 插件市场
               </button>
             </div>
 

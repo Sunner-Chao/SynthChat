@@ -18,9 +18,11 @@ export function McpExtensionPanel() {
   const [pendingLocalIds, setPendingLocalIds] = useState<Set<string>>(() => new Set());
 
   const focusedAgent = agents.find(a => a.id === focusedAgentId) || agents.find(a => a.isDefault) || agents[0];
-  const focusedAgentEnabledMcp = focusedAgent
+  const focusedAgentEnabledMcpRaw = focusedAgent
     ? localEnabledOverride[focusedAgent.id] ?? focusedAgent.enabledMcpServers ?? []
     : [];
+  // Filter out stale refs (server IDs that no longer exist in global mcpServers)
+  const focusedAgentEnabledMcp = focusedAgentEnabledMcpRaw.filter(id => mcpServers.some(s => s.id === id));
 
   useEffect(() => {
     if ((!focusedAgentId || !agents.some((agent) => agent.id === focusedAgentId)) && agents.length > 0) {
@@ -170,9 +172,6 @@ export function McpExtensionPanel() {
                 <p style={{ margin: "0 0 24px 0", color: "var(--text-3)", fontSize: "0.9rem" }}>MCP 允许大模型连接到你的本地系统、外部 API、或企业级工具。</p>
                 <button className="btn-primary beautiful-btn-primary" onClick={handleAdd}>
                   <Plus size={16} style={{ marginRight: 6 }} /> 添加第一个服务
-                </button>
-                <button className="btn-secondary" onClick={handleAddPlaywright} style={{ marginLeft: 8 }}>
-                  <Command size={16} style={{ marginRight: 6 }} /> Playwright
                 </button>
               </div>
             ) : (

@@ -33,7 +33,6 @@ const PET_VISION_INTERVAL_STORAGE_KEY = "synthchat.pet.visionIntervalSeconds";
 const DEFAULT_PET_VISION_INTERVAL_SECONDS = 60;
 const MIN_PET_VISION_INTERVAL_SECONDS = 30;
 const PET_VISION_BUSY_STATES = new Set(["started", "running", "pendingApproval", "needsClarification"]);
-const PET_MODEL_DRAG_SMOOTHING = 0.48;
 const PET_MODEL_INERTIA_MIN_SPEED = 0.1;
 const PET_MODEL_INERTIA_MAX_DISTANCE = 180;
 const PET_MODEL_INERTIA_DURATION_MS = 680;
@@ -467,7 +466,7 @@ export function PetWindow() {
   const modelDragTokenRef = useRef(0);
   const modelDragStartReadyRef = useRef(false);
   const modelDragLatestPointRef = useRef<PetDragPoint | null>(null);
-  const modelDragSmoothedPointRef = useRef<PetDragPoint | null>(null);
+  const modelDragLastMovePointRef = useRef<PetDragPoint | null>(null);
   const modelDragVelocityRef = useRef({ x: 0, y: 0 });
   const modelDragLastSampleRef = useRef<{ point: PetDragPoint; at: number } | null>(null);
   const modelDragInertiaFrameRef = useRef<number | null>(null);
@@ -1842,12 +1841,12 @@ export function PetWindow() {
     modelDragMovedRef.current = false;
     modelDragStartReadyRef.current = false;
     modelDragLatestPointRef.current = { screenX, screenY };
-    modelDragSmoothedPointRef.current = { screenX, screenY };
+    modelDragLastMovePointRef.current = { screenX, screenY };
     modelDragVelocityRef.current = { x: 0, y: 0 };
     modelDragLastSampleRef.current = { point: { screenX, screenY }, at: performance.now() };
     cancelModelDragInertia();
     try {
-      await invoke("pet_window_drag", { action: "start", screenX, screenY });
+      await invoke("pet_window_drag", { action: "start", screenX, screenY, useCursor: true });
       if (dragToken !== modelDragTokenRef.current || !modelDragActiveRef.current) {
         void invoke("pet_window_drag", { action: "end" }).catch((error) => {
           console.error("pet drag stale end failed:", error);
@@ -1879,7 +1878,7 @@ export function PetWindow() {
     const inertiaSnapshot = {
       moved: modelDragMovedRef.current,
       velocity: { ...modelDragVelocityRef.current },
-      from: modelDragSmoothedPointRef.current ?? endPoint
+      from: modelDragLastMovePointRef.current ?? endPoint
     };
     const wasActive = modelDragActiveRef.current;
     resetModelDragState();
@@ -1941,10 +1940,16 @@ export function PetWindow() {
     if (!modelDragActiveRef.current || !modelDragStartReadyRef.current || modelDragMoveInFlightRef.current) return;
     const point = modelDragLatestPointRef.current;
     if (!point) return;
-    const smoothed = nextSmoothedModelDragPoint(point);
+    const movePoint = { ...point };
+    modelDragLastMovePointRef.current = movePoint;
     modelDragMoveInFlightRef.current = true;
     try {
-      await invoke("pet_window_drag", { action: "move", screenX: smoothed.screenX, screenY: smoothed.screenY });
+      await invoke("pet_window_drag", {
+        action: "move",
+        screenX: movePoint.screenX,
+        screenY: movePoint.screenY,
+        useCursor: true
+      });
     } catch (error) {
       console.error("pet drag move failed:", error);
       stopModelDrag();
@@ -1957,7 +1962,7 @@ export function PetWindow() {
     if (
       modelDragActiveRef.current
       && latest
-      && (Math.abs(latest.screenX - smoothed.screenX) > 0.5 || Math.abs(latest.screenY - smoothed.screenY) > 0.5)
+      && (Math.abs(latest.screenX - movePoint.screenX) > 0.5 || Math.abs(latest.screenY - movePoint.screenY) > 0.5)
     ) {
       queueModelDragMove(latest.screenX, latest.screenY);
     }
@@ -1976,16 +1981,6 @@ export function PetWindow() {
       };
     }
     modelDragLastSampleRef.current = { point: { screenX, screenY }, at: now };
-  }
-
-  function nextSmoothedModelDragPoint(target: PetDragPoint): PetDragPoint {
-    const current = modelDragSmoothedPointRef.current ?? target;
-    const next = {
-      screenX: current.screenX + (target.screenX - current.screenX) * PET_MODEL_DRAG_SMOOTHING,
-      screenY: current.screenY + (target.screenY - current.screenY) * PET_MODEL_DRAG_SMOOTHING
-    };
-    modelDragSmoothedPointRef.current = next;
-    return next;
   }
 
   function cancelModelDragInertia() {
@@ -2047,7 +2042,7 @@ export function PetWindow() {
     modelDragActiveRef.current = false;
     modelDragStartReadyRef.current = false;
     modelDragLatestPointRef.current = null;
-    modelDragSmoothedPointRef.current = null;
+    modelDragLastMovePointRef.current = null;
     modelDragLastSampleRef.current = null;
     modelDragVelocityRef.current = { x: 0, y: 0 };
     modelDragMoveInFlightRef.current = false;
@@ -2072,7 +2067,12 @@ export function PetWindow() {
     orbDragActiveRef.current = true;
     orbDragMovedRef.current = false;
     orbDragStartPointRef.current = { screenX: event.screenX, screenY: event.screenY };
-    void invoke("pet_window_drag", { action: "start", screenX: event.screenX, screenY: event.screenY }).catch((error) => {
+    void invoke("pet_window_drag", {
+      action: "start",
+      screenX: event.screenX,
+      screenY: event.screenY,
+      useCursor: true
+    }).catch((error) => {
       orbDragActiveRef.current = false;
       orbDragStartPointRef.current = null;
       console.error("pet orb drag start failed:", error);
@@ -2088,7 +2088,12 @@ export function PetWindow() {
     ) {
       orbDragMovedRef.current = true;
     }
-    void invoke("pet_window_drag", { action: "move", screenX: event.screenX, screenY: event.screenY }).catch((error) => {
+    void invoke("pet_window_drag", {
+      action: "move",
+      screenX: event.screenX,
+      screenY: event.screenY,
+      useCursor: true
+    }).catch((error) => {
       console.error("pet orb drag move failed:", error);
     });
   }

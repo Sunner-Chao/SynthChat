@@ -730,90 +730,72 @@ export function PersonaPanel() {
 
         {tab === "tools" ? (
           <div className="settings-form persona-form">
-            <label className="checkbox-row">
-              <input
-                checked={draft.toolPolicy.enabled}
-                onChange={(event) => setDraft((current) => ({
-                  ...current,
-                  toolPolicy: { ...current.toolPolicy, enabled: event.target.checked }
-                }))}
-                type="checkbox"
-              />
-              允许该角色调用 MCP 工具
-            </label>
-            <div className="two-column">
-              <label>
-                timeout_seconds
+            <div className="card" style={{ margin: "0 0 12px" }}>
+              <div className="card-header">工具调用开关</div>
+              <label className="checkbox-row" style={{ padding: "12px 16px" }}>
                 <input
-                  min={1}
-                  type="number"
-                  value={draft.toolPolicy.timeoutSeconds}
+                  checked={draft.toolPolicy.enabled}
                   onChange={(event) => setDraft((current) => ({
                     ...current,
-                    toolPolicy: { ...current.toolPolicy, timeoutSeconds: Number(event.target.value) }
+                    toolPolicy: { ...current.toolPolicy, enabled: event.target.checked }
                   }))}
+                  type="checkbox"
                 />
+                允许该角色调用 MCP 工具
               </label>
-              <label>
-                max_iterations
-                <input
-                  min={1}
-                  max={64}
-                  type="number"
-                  value={draft.toolPolicy.maxIterations}
-                  onChange={(event) => setDraft((current) => ({
-                    ...current,
-                    toolPolicy: { ...current.toolPolicy, maxIterations: Number(event.target.value) }
-                  }))}
-                />
-              </label>
-              <label>
-                max_failure_replans
-                <input
-                  min={0}
-                  max={32}
-                  type="number"
-                  value={draft.toolPolicy.maxFailureReplans ?? 2}
-                  onChange={(event) => setDraft((current) => ({
-                    ...current,
-                    toolPolicy: { ...current.toolPolicy, maxFailureReplans: Number(event.target.value) }
-                  }))}
-                />
-              </label>
-              <label>
-                retry_count
-                <input
-                  min={0}
-                  max={5}
-                  type="number"
-                  value={draft.toolPolicy.retryCount ?? 1}
-                  onChange={(event) => setDraft((current) => ({
-                    ...current,
-                    toolPolicy: { ...current.toolPolicy, retryCount: Number(event.target.value) }
-                  }))}
-                />
-              </label>
-              <label>
-                retry_backoff_ms
-                <input
-                  min={0}
-                  max={10000}
-                  step={100}
-                  type="number"
-                  value={draft.toolPolicy.retryBackoffMs ?? 300}
-                  onChange={(event) => setDraft((current) => ({
-                    ...current,
-                    toolPolicy: { ...current.toolPolicy, retryBackoffMs: Number(event.target.value) }
-                  }))}
-                />
-              </label>
+              <p className="form-hint" style={{ padding: "0 16px 10px" }}>开启后角色可使用已启用的 MCP 工具；最大迭代作为本角色会话的工具循环预算，并与绑定 Agent 的 fallback 工具迭代双向同步。</p>
             </div>
-            <div className="metric-strip compact">
-              <div><strong>{draft.toolPolicy.enabled ? "开启" : "关闭"}</strong><span>工具调用</span></div>
-              <div><strong>{draft.toolPolicy.timeoutSeconds}s</strong><span>角色级超时</span></div>
-              <div><strong>{draft.toolPolicy.maxIterations}</strong><span>循环上限</span></div>
-              <div><strong>{draft.toolPolicy.maxFailureReplans ?? 2}</strong><span>失败重规划</span></div>
-              <div><strong>{draft.toolPolicy.retryCount ?? 1}</strong><span>工具重试</span></div>
+
+            <div className="card" style={{ margin: "0 0 12px", opacity: draft.toolPolicy.enabled ? 1 : 0.5, pointerEvents: draft.toolPolicy.enabled ? "auto" : "none" }}>
+              <div className="card-header">循环与超时</div>
+              <div className="form-group">
+                <div className="form-row">
+                  <label>单次超时（秒）</label>
+                  <div className="stepper">
+                    <button onClick={() => setDraft((c) => ({ ...c, toolPolicy: { ...c.toolPolicy, timeoutSeconds: Math.max(1, c.toolPolicy.timeoutSeconds - 5) } }))} type="button">−</button>
+                    <span className="stepper-val">{draft.toolPolicy.timeoutSeconds}</span>
+                    <button onClick={() => setDraft((c) => ({ ...c, toolPolicy: { ...c.toolPolicy, timeoutSeconds: c.toolPolicy.timeoutSeconds + 5 } }))} type="button">+</button>
+                  </div>
+                </div>
+                <div className="form-row">
+                  <label>最大迭代次数</label>
+                  <div className="stepper">
+                    <button onClick={() => setDraft((c) => ({ ...c, toolPolicy: { ...c.toolPolicy, maxIterations: Math.max(1, c.toolPolicy.maxIterations - 5) } }))} type="button">−</button>
+                    <span className="stepper-val">{draft.toolPolicy.maxIterations}</span>
+                    <button onClick={() => setDraft((c) => ({ ...c, toolPolicy: { ...c.toolPolicy, maxIterations: Math.min(90, c.toolPolicy.maxIterations + 5) } }))} type="button">+</button>
+                  </div>
+                </div>
+                <div className="form-row">
+                  <label>失败重规划</label>
+                  <div className="stepper">
+                    <button onClick={() => setDraft((c) => ({ ...c, toolPolicy: { ...c.toolPolicy, maxFailureReplans: Math.max(0, (c.toolPolicy.maxFailureReplans ?? 2) - 1) } }))} type="button">−</button>
+                    <span className="stepper-val">{draft.toolPolicy.maxFailureReplans ?? 2}</span>
+                    <button onClick={() => setDraft((c) => ({ ...c, toolPolicy: { ...c.toolPolicy, maxFailureReplans: Math.min(32, (c.toolPolicy.maxFailureReplans ?? 2) + 1) } }))} type="button">+</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="card" style={{ margin: "0 0 12px", opacity: draft.toolPolicy.enabled ? 1 : 0.5, pointerEvents: draft.toolPolicy.enabled ? "auto" : "none" }}>
+              <div className="card-header">重试策略</div>
+              <div className="form-group">
+                <div className="form-row">
+                  <label>重试次数</label>
+                  <div className="stepper">
+                    <button onClick={() => setDraft((c) => ({ ...c, toolPolicy: { ...c.toolPolicy, retryCount: Math.max(0, (c.toolPolicy.retryCount ?? 1) - 1) } }))} type="button">−</button>
+                    <span className="stepper-val">{draft.toolPolicy.retryCount ?? 1}</span>
+                    <button onClick={() => setDraft((c) => ({ ...c, toolPolicy: { ...c.toolPolicy, retryCount: Math.min(5, (c.toolPolicy.retryCount ?? 1) + 1) } }))} type="button">+</button>
+                  </div>
+                </div>
+                <div className="form-row">
+                  <label>退避时间（ms）</label>
+                  <div className="stepper">
+                    <button onClick={() => setDraft((c) => ({ ...c, toolPolicy: { ...c.toolPolicy, retryBackoffMs: Math.max(0, (c.toolPolicy.retryBackoffMs ?? 300) - 100) } }))} type="button">−</button>
+                    <span className="stepper-val">{draft.toolPolicy.retryBackoffMs ?? 300}</span>
+                    <button onClick={() => setDraft((c) => ({ ...c, toolPolicy: { ...c.toolPolicy, retryBackoffMs: Math.min(10000, (c.toolPolicy.retryBackoffMs ?? 300) + 100) } }))} type="button">+</button>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         ) : null}
@@ -927,7 +909,7 @@ function createDraftPersona(): Persona {
     toolPolicy: {
       enabled: true,
       timeoutSeconds: 30,
-      maxIterations: 8,
+      maxIterations: 90,
       maxFailureReplans: 2,
       retryCount: 1,
       retryBackoffMs: 300

@@ -26,6 +26,8 @@ let modelDragTimer = null;
 let modelDragPending = false;
 let activePointerId = null;
 let draggingModel = false;
+let dragOriginScreenX = 0;
+let dragOriginScreenY = 0;
 let dragStartScreenX = 0;
 let dragStartScreenY = 0;
 let tapTimer = null;
@@ -48,7 +50,8 @@ let ambientStartedAt = performance.now();
 let behaviorDebugSerial = 0;
 
 const MODEL_HIT_PADDING = 28;
-const MODEL_DRAG_DELAY_MS = 240;
+const MODEL_DRAG_DELAY_MS = 180;
+const MODEL_DRAG_START_MOVE_PX = 5;
 const MODEL_LAYOUT_BASE_HEIGHT = 440;
 const MODEL_VERTICAL_SCALE_RATIO = 0.74;
 const MODEL_HORIZONTAL_SCALE_RATIO = 0.84;
@@ -991,6 +994,26 @@ function queueModelDragMove(screenX, screenY) {
     });
 }
 
+function startPendingModelDrag(screenX = dragStartScreenX, screenY = dragStartScreenY) {
+    if (!modelDragPending) return false;
+    if (modelDragTimer !== null) {
+        window.clearTimeout(modelDragTimer);
+        modelDragTimer = null;
+    }
+    modelDragPending = false;
+    draggingModel = true;
+    setModelDragging(true);
+    lastDragScreenX = screenX;
+    lastDragScreenY = screenY;
+    lastDragMoveAt = performance.now();
+    postMessageToHost({
+        type: "model_drag_start",
+        screenX,
+        screenY
+    });
+    return true;
+}
+
 function normalizeModelUrl(url) {
     const rawUrl = typeof url === "string" && url.trim() ? url.trim() : DEFAULT_MODEL_URL;
     return rawUrl;
@@ -1164,6 +1187,15 @@ canvas.addEventListener("pointermove", (event) => {
     if (!draggingModel) {
         focusScreenPoint(event.clientX, event.clientY, false);
     }
+    if (modelDragPending && activePointerId === event.pointerId) {
+        dragStartScreenX = event.screenX;
+        dragStartScreenY = event.screenY;
+        if (Math.hypot(event.screenX - dragOriginScreenX, event.screenY - dragOriginScreenY) >= MODEL_DRAG_START_MOVE_PX) {
+            startPendingModelDrag(event.screenX, event.screenY);
+            queueModelDragMove(event.screenX, event.screenY);
+        }
+        return;
+    }
     if (draggingModel && activePointerId === event.pointerId) {
         queueModelDragMove(event.screenX, event.screenY);
     }
@@ -1181,6 +1213,8 @@ canvas.addEventListener("pointerdown", (event) => {
     stopBehaviorAnimation();
     stopReleasePhysics();
     activePointerId = event.pointerId;
+    dragOriginScreenX = event.screenX;
+    dragOriginScreenY = event.screenY;
     dragStartScreenX = event.screenX;
     dragStartScreenY = event.screenY;
     lastDragScreenX = event.screenX;
@@ -1193,14 +1227,7 @@ canvas.addEventListener("pointerdown", (event) => {
     modelDragPending = true;
     modelDragTimer = window.setTimeout(() => {
         if (!modelDragPending || activePointerId !== event.pointerId) return;
-        modelDragPending = false;
-        draggingModel = true;
-        setModelDragging(true);
-        postMessageToHost({
-            type: "model_drag_start",
-            screenX: dragStartScreenX,
-            screenY: dragStartScreenY
-        });
+        startPendingModelDrag(dragStartScreenX, dragStartScreenY);
     }, MODEL_DRAG_DELAY_MS);
 });
 

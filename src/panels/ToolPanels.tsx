@@ -2761,7 +2761,7 @@ export function AgentsPanel() {
       allowShell: true,
       maxSubagents: 4,
       maxSubagentDepth: 1,
-      maxToolIterations: 8,
+      maxToolIterations: 90,
       skillsDir: "",
       enabledSkills: [],
       enabledMcpServers: [],
@@ -3031,9 +3031,9 @@ export function AgentsPanel() {
             <div className="agent-section">
               <div className="agent-section-head"><RefreshCw size={16} /><strong>运行限制</strong></div>
               <div className="agent-form-row">
+                <div className="agent-field"><label>Fallback 最大工具迭代</label><input min={1} max={90} type="number" value={draft.maxToolIterations} onChange={(e) => update("maxToolIterations", Number(e.target.value))} /></div>
                 <div className="agent-field"><label>最大子智能体</label><input min={0} max={20} type="number" value={draft.maxSubagents} onChange={(e) => update("maxSubagents", Number(e.target.value))} /></div>
                 <div className="agent-field"><label>最大子层级</label><input min={1} max={4} type="number" value={draft.maxSubagentDepth ?? 1} onChange={(e) => update("maxSubagentDepth", Number(e.target.value))} /></div>
-                <div className="agent-field"><label>最大工具迭代</label><input min={1} max={120} type="number" value={draft.maxToolIterations} onChange={(e) => update("maxToolIterations", Number(e.target.value))} /></div>
               </div>
             </div>
 

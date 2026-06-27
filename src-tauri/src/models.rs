@@ -396,7 +396,7 @@ fn default_max_tokens() -> u32 {
 }
 
 fn default_tool_policy() -> Value {
-    json!({"enabled": true, "timeoutSeconds": 30, "maxIterations": 8, "maxFailureReplans": 2, "retryCount": 1, "retryBackoffMs": 300})
+    json!({"enabled": true, "timeoutSeconds": 30, "maxIterations": 90, "maxFailureReplans": 2, "retryCount": 1, "retryBackoffMs": 300})
 }
 
 fn default_emoji_send_probability() -> u8 {

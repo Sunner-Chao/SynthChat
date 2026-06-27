@@ -815,7 +815,7 @@ fn save_persona(store: State<'_, AppStore>, mut persona: Persona) -> AppResult<P
     persona.temperature = persona.temperature.clamp(0.0, 2.0);
     persona.max_tokens = persona.max_tokens.clamp(128, 65536);
     normalize_persona_number(&mut persona.tool_policy, "timeoutSeconds", 1.0, 86400.0);
-    normalize_persona_number(&mut persona.tool_policy, "maxIterations", 1.0, 64.0);
+    normalize_persona_number(&mut persona.tool_policy, "maxIterations", 1.0, 90.0);
     normalize_persona_number(&mut persona.tool_policy, "maxFailureReplans", 0.0, 32.0);
     normalize_persona_number(&mut persona.tool_policy, "retryCount", 0.0, 5.0);
     normalize_persona_number(&mut persona.tool_policy, "retryBackoffMs", 0.0, 10000.0);
@@ -2415,7 +2415,7 @@ fn save_agent(store: State<'_, AppStore>, mut agent: AgentDefinition) -> AppResu
     agent.skills_dir = agent.skills_dir.trim().to_string();
     agent.max_subagents = agent.max_subagents.min(32);
     agent.max_subagent_depth = agent.max_subagent_depth.clamp(1, 4);
-    agent.max_tool_iterations = agent.max_tool_iterations.clamp(1, 120);
+    agent.max_tool_iterations = agent.max_tool_iterations.clamp(1, 90);
     let agents = store.agents()?;
     if agents
         .iter()
@@ -4535,6 +4535,25 @@ fn cursor_position(app: AppHandle) -> AppResult<Value> {
     }))
 }
 
+fn pet_window_drag_point(
+    app: &AppHandle,
+    screen_x: Option<f64>,
+    screen_y: Option<f64>,
+    use_cursor: bool,
+    fallback_x: i32,
+    fallback_y: i32,
+) -> (i32, i32) {
+    if use_cursor {
+        if let Ok(cursor) = app.cursor_position() {
+            return (cursor.x.round() as i32, cursor.y.round() as i32);
+        }
+    }
+    (
+        screen_x.unwrap_or(fallback_x as f64).round() as i32,
+        screen_y.unwrap_or(fallback_y as f64).round() as i32,
+    )
+}
+
 #[tauri::command(rename_all = "camelCase")]
 fn pet_window_drag(
     app: AppHandle,
@@ -4542,28 +4561,38 @@ fn pet_window_drag(
     action: String,
     screen_x: Option<f64>,
     screen_y: Option<f64>,
+    use_cursor: Option<bool>,
 ) -> AppResult<()> {
     let Some(window) = app.get_webview_window(PET_WINDOW_LABEL) else {
         return Ok(());
     };
     let mut drag = state.lock().unwrap();
+    let prefer_cursor = use_cursor.unwrap_or(false);
     match action.as_str() {
         "start" => {
             let position = window
                 .outer_position()
                 .map_err(|error| AppError::BadRequest(error.to_string()))?;
+            let (pointer_x, pointer_y) =
+                pet_window_drag_point(&app, screen_x, screen_y, prefer_cursor, 0, 0);
             drag.active = true;
             drag.window_x = position.x;
             drag.window_y = position.y;
-            drag.pointer_x = screen_x.unwrap_or(0.0).round() as i32;
-            drag.pointer_y = screen_y.unwrap_or(0.0).round() as i32;
+            drag.pointer_x = pointer_x;
+            drag.pointer_y = pointer_y;
         }
         "move" => {
             if !drag.active {
                 return Ok(());
             }
-            let x = screen_x.unwrap_or(drag.pointer_x as f64).round() as i32;
-            let y = screen_y.unwrap_or(drag.pointer_y as f64).round() as i32;
+            let (x, y) = pet_window_drag_point(
+                &app,
+                screen_x,
+                screen_y,
+                prefer_cursor,
+                drag.pointer_x,
+                drag.pointer_y,
+            );
             let next_x = drag.window_x + x - drag.pointer_x;
             let next_y = drag.window_y + y - drag.pointer_y;
             window

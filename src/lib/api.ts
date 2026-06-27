@@ -185,7 +185,7 @@ const defaultPersona: Persona = {
   emojiEnabled: true,
   emojiGroup: "default",
   emojiSendProbability: 25,
-  toolPolicy: { enabled: true, timeoutSeconds: 30, maxIterations: 8, maxFailureReplans: 2, retryCount: 1, retryBackoffMs: 300 },
+  toolPolicy: { enabled: true, timeoutSeconds: 30, maxIterations: 90, maxFailureReplans: 2, retryCount: 1, retryBackoffMs: 300 },
   memory: { enabled: true, triggerRounds: 10, maxMemories: 50, includeInPrompt: true },
   proactive: { enabled: false, minIdleHours: 1, maxIdleHours: 3, maxConsecutive: 3, prompt: "", quietHours: { enabled: true, start: "22:00", end: "08:00" } },
   voiceReply: {
@@ -685,7 +685,7 @@ export const api: Record<string, any> = {
     enabledSkills: [],
     maxSubagents: 4,
     maxSubagentDepth: 1,
-    maxToolIterations: 8,
+    maxToolIterations: 90,
     allowShell: true,
     skillsDir: ""
   })),

@@ -1075,6 +1075,11 @@ export const ChatExperience = memo(function ChatExperience() {
   const activeAgent = useMemo(() => {
     return resolvePersonaBoundAgent(activeConversationPersona, agents, activeConversation?.agentId) ?? defaultAgent;
   }, [activeConversation?.agentId, activeConversationPersona, agents, defaultAgent]);
+  const activeToolIterationBudget = activeConversationPersona?.toolPolicy?.maxIterations
+    ?? selectedPersona?.toolPolicy?.maxIterations
+    ?? activeAgent?.maxToolIterations
+    ?? agentConfig?.maxToolIterations
+    ?? "-";
   const activeRun = useMemo(
     () => Object.values(activeAgentRuns).find((run) => run.conversationId === activeConversationId && !run.parentRunId),
     [activeAgentRuns, activeConversationId]
@@ -2357,10 +2362,10 @@ export const ChatExperience = memo(function ChatExperience() {
             <span>Skills</span>
             <strong>{enabledSkillCount}/{skills.length}</strong>
           </button>
-          <button onClick={() => setSection("settings")} type="button">
+          <button onClick={() => setSection("personas")} type="button">
             <Settings2 size={14} />
-            <span>Config</span>
-            <strong>{activeAgent?.maxToolIterations ?? agentConfig?.maxToolIterations ?? "-"}</strong>
+            <span>Policy</span>
+            <strong>{activeToolIterationBudget}</strong>
           </button>
           <button onClick={() => void refreshAgentQueue()} type="button" title="刷新队列">
             <Clock size={14} />

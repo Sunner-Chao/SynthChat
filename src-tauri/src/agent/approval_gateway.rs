@@ -92,7 +92,8 @@ async fn continue_agent_run_after_approval(
     let mut run = store.agent_run(run_id)?;
     let conversation = store.conversation(&run.conversation_id)?;
     let persona = store.persona(Some(&run.persona_id))?;
-    let agent = store.agent(Some(&run.agent_id))?;
+    let mut agent = store.agent(Some(&run.agent_id))?;
+    apply_persona_tool_policy_to_agent(&persona, &mut agent);
     let effective_persona = effective_llm_persona(&persona, &agent);
     let providers = store.provider_candidates(selected_provider_id(&persona, &agent))?;
     let mut history = store.messages(&run.conversation_id, Some(30))?;

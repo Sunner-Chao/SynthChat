@@ -295,6 +295,49 @@ function upsertAgentPreservingOrder(agents: AgentDefinition[], agent: AgentDefin
   return [...normalized, agent];
 }
 
+function sortAgents(agents: AgentDefinition[]) {
+  return agents
+    .slice()
+    .sort((a, b) => (b.isDefault ? 1 : 0) - (a.isDefault ? 1 : 0));
+}
+
+function sortPersonas(personas: Persona[]) {
+  return personas
+    .slice()
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function clampToolIterations(value: number | undefined | null) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 90;
+  return Math.min(90, Math.max(1, Math.round(numeric)));
+}
+
+function boundAgentId(persona: Persona) {
+  return persona.agentId?.trim() ?? "";
+}
+
+function personaWithAgentRuntime(persona: Persona, agent: AgentDefinition): Persona {
+  return {
+    ...persona,
+    llmProvider: agent.llmProvider,
+    llmModel: agent.llmModel,
+    toolPolicy: {
+      ...persona.toolPolicy,
+      maxIterations: clampToolIterations(agent.maxToolIterations)
+    }
+  };
+}
+
+function agentWithPersonaRuntime(agent: AgentDefinition, persona: Persona): AgentDefinition {
+  return {
+    ...agent,
+    llmProvider: persona.llmProvider,
+    llmModel: persona.llmModel,
+    maxToolIterations: clampToolIterations(persona.toolPolicy?.maxIterations)
+  };
+}
+
 function sameMessages(left: ChatMessage[], right: ChatMessage[]) {
   return left.length === right.length && left.every((item, index) => {
     const other = right[index];
@@ -1302,16 +1345,23 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   savePersona: async (persona) => {
     const saved = await api.savePersona(persona);
-    const [agents, conversations] = await Promise.all([
+    const agentId = boundAgentId(saved);
+    if (agentId) {
+      const state = get();
+      const agent = state.agents.find((item) => item.id === agentId)
+        ?? (await api.listAgents()).find((item) => item.id === agentId);
+      if (agent) {
+        await api.saveAgent(agentWithPersonaRuntime(agent, saved));
+      }
+    }
+    const [agents, personas, conversations] = await Promise.all([
       api.listAgents(),
+      api.listPersonas(),
       api.listConversations()
     ]);
     set((state) => ({
-      personas: [saved, ...state.personas.filter((item) => item.id !== saved.id)]
-        .sort((a, b) => a.name.localeCompare(b.name)),
-      agents: agents
-        .slice()
-        .sort((a, b) => (b.isDefault ? 1 : 0) - (a.isDefault ? 1 : 0)),
+      personas: sortPersonas(personas),
+      agents: sortAgents(agents),
       focusedAgentId: normalizeFocusedAgentId(agents, state.focusedAgentId),
       conversations
     }));
@@ -1462,21 +1512,32 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
     try {
       const saved = await api.saveAgent(agent);
+      const personas = get().personas;
+      const boundPersonas = personas.filter((persona) => boundAgentId(persona) === saved.id);
+      if (boundPersonas.length > 0) {
+        await Promise.all(
+          boundPersonas.map((persona) => api.savePersona(personaWithAgentRuntime(persona, saved)))
+        );
+      }
+      const [agents, refreshedPersonas] = await Promise.all([
+        api.listAgents(),
+        api.listPersonas()
+      ]);
       set((state) => ({
-        agents: upsertAgentPreservingOrder(
-          optimisticId
-            ? state.agents
-            : state.agents.filter((item) => item.id.trim() !== "" || item.name !== agent.name || item.createdAt !== agent.createdAt),
-          saved
-        ),
-        focusedAgentId: saved.id
+        agents: sortAgents(agents),
+        personas: sortPersonas(refreshedPersonas),
+        focusedAgentId: normalizeFocusedAgentId(agents, saved.id)
       }));
-      return saved;
+      return agents.find((item) => item.id === saved.id) ?? saved;
     } catch (error) {
-      const agents = await api.listAgents().catch(() => null);
+      const [agents, personas] = await Promise.all([
+        api.listAgents().catch(() => null),
+        api.listPersonas().catch(() => null)
+      ]);
       if (agents) {
         set((state) => ({
           agents,
+          personas: personas ? sortPersonas(personas) : state.personas,
           focusedAgentId: normalizeFocusedAgentId(agents, state.focusedAgentId)
         }));
       }
