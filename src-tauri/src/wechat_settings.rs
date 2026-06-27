@@ -2903,12 +2903,7 @@ pub async fn wechat_poll_once(
         )));
     }
 
-    let mut updated_buffer = false;
-    if let Some(new_buf) = first_value_string(&raw, &[&["get_updates_buf"], &["getUpdatesBuf"]]) {
-        accounts[account_index].get_updates_buf = new_buf;
-        save_accounts(accounts.clone())?;
-        updated_buffer = true;
-    }
+    let next_updates_buf = first_value_string(&raw, &[&["get_updates_buf"], &["getUpdatesBuf"]]);
 
     let msgs = raw
         .get("msgs")
@@ -2987,6 +2982,16 @@ pub async fn wechat_poll_once(
             delivered: result.delivered,
             delivery_error: result.delivery_error,
         });
+    }
+
+    let mut updated_buffer = false;
+    if let Some(new_buf) = next_updates_buf {
+        let mut accounts = list_accounts()?;
+        if let Some(account) = accounts.iter_mut().find(|account| account.id == account_id) {
+            account.get_updates_buf = new_buf;
+            save_accounts(accounts)?;
+            updated_buffer = true;
+        }
     }
 
     let account = list_accounts()?

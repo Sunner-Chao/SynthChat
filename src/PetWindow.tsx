@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { FileText, Loader2, Palette, SendHorizontal, X } from "lucide-react";
-import { api, convertFileSrc } from "./lib/api";
+import { api, convertFileSrc, isTauri } from "./lib/api";
 import type { AgentRunEvent, ChatAttachment, ChatMessage, Conversation, EmojiGroup, Persona } from "./lib/types";
 import {
   PET_ACTIVE_CONTEXT_EVENT,
@@ -59,6 +61,13 @@ type PetMessage = {
   y?: number;
   width?: number;
   height?: number;
+};
+
+type NativeFileDropPayload = {
+  type: "enter" | "over" | "drop" | "leave";
+  paths?: string[];
+  position?: { x: number; y: number };
+  windowLabel?: string;
 };
 
 type PetModelBounds = {
@@ -354,6 +363,17 @@ function touchCloudText(count: number) {
   return variants[Math.max(0, count - 1) % variants.length];
 }
 
+function fileNameFromLocalPath(path: string) {
+  return path.split(/[\\/]/).pop() || "attachment";
+}
+
+function hasFileDragData(dataTransfer: DataTransfer | null) {
+  if (!dataTransfer) return false;
+  if (dataTransfer.files.length > 0) return true;
+  return Array.from(dataTransfer.types).includes("Files")
+    || Array.from(dataTransfer.items).some((item) => item.kind === "file");
+}
+
 export function PetWindow() {
   const frameRef = useRef<HTMLIFrameElement>(null);
   const inputShellRef = useRef<HTMLElement>(null);
@@ -393,6 +413,7 @@ export function PetWindow() {
   const initialGreetingShownRef = useRef(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const hideTimeoutRef = useRef<number | null>(null);
+  const lastNativeDropRef = useRef<{ signature: string; at: number } | null>(null);
   const assistantCloudDurationMsRef = useRef(DEFAULT_PET_ASSISTANT_CLOUD_DURATION_SECONDS * 1000);
   const isNearModelRef = useRef(false);
   const modelMenuOpenRef = useRef(false);
@@ -485,6 +506,85 @@ export function PetWindow() {
   useEffect(() => {
     showInputRef.current = showInput;
   }, [showInput]);
+
+  useEffect(() => {
+    if (petWindowMode !== "model") {
+      setInputDragActive(false);
+      return;
+    }
+    const handleDrag = (event: DragEvent) => {
+      if (!hasFileDragData(event.dataTransfer)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+      if (isPointInsidePetInput(event.clientX, event.clientY)) {
+        revealInput();
+        setInputDragActive(true);
+      } else {
+        setInputDragActive(false);
+      }
+    };
+    const handleDragLeave = (event: DragEvent) => {
+      if (!hasFileDragData(event.dataTransfer)) return;
+      const nextTarget = event.relatedTarget as Node | null;
+      if (nextTarget && inputShellRef.current?.contains(nextTarget)) return;
+      setInputDragActive(false);
+    };
+    const handleDrop = (event: DragEvent) => {
+      if (!hasFileDragData(event.dataTransfer)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setInputDragActive(false);
+      if (!isPointInsidePetInput(event.clientX, event.clientY)) return;
+      if (event.dataTransfer && event.dataTransfer.files.length > 0 && rememberPetDomDrop(event.dataTransfer.files)) {
+        void stagePetFiles(event.dataTransfer.files);
+      }
+    };
+    window.addEventListener("dragenter", handleDrag, true);
+    window.addEventListener("dragover", handleDrag, true);
+    window.addEventListener("dragleave", handleDragLeave, true);
+    window.addEventListener("drop", handleDrop, true);
+    return () => {
+      window.removeEventListener("dragenter", handleDrag, true);
+      window.removeEventListener("dragover", handleDrag, true);
+      window.removeEventListener("dragleave", handleDragLeave, true);
+      window.removeEventListener("drop", handleDrop, true);
+    };
+  }, [petWindowMode]);
+
+  useEffect(() => {
+    if (!isTauri() || petWindowMode !== "model") {
+      setInputDragActive(false);
+      return;
+    }
+    const unlisteners: Array<() => void> = [];
+    let cancelled = false;
+    const attach = (source: string, registration: Promise<() => void>) => {
+      void registration.then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+        } else {
+          unlisteners.push(unlisten);
+        }
+      }).catch((error) => {
+        console.warn(`${source} pet file drop listener unavailable:`, error);
+      });
+    };
+    attach("pet webview native", getCurrentWebview().onDragDropEvent((event) => {
+      handleNativePetFileDrop(event.payload as NativeFileDropPayload);
+    }));
+    attach("pet window native", getCurrentWindow().onDragDropEvent((event) => {
+      handleNativePetFileDrop(event.payload as NativeFileDropPayload);
+    }));
+    attach("pet forwarded", listen<NativeFileDropPayload>("synthchat-file-drop-event", (event) => {
+      if (event.payload.windowLabel && event.payload.windowLabel !== "pet") return;
+      handleNativePetFileDrop(event.payload);
+    }));
+    return () => {
+      cancelled = true;
+      unlisteners.forEach((unlisten) => unlisten());
+    };
+  }, [petWindowMode]);
 
   useEffect(() => {
     let cancelled = false;
@@ -897,6 +997,99 @@ export function PetWindow() {
     }, 800);
   }
 
+  function isPointInsidePetInput(clientX: number, clientY: number) {
+    const rect = inputShellRef.current?.getBoundingClientRect();
+    if (!rect) return true;
+    return clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
+  }
+
+  function isNativePetDropInsideInput(position: NativeFileDropPayload["position"]) {
+    if (!position) return true;
+    const pixelRatio = window.devicePixelRatio || 1;
+    return isPointInsidePetInput(position.x / pixelRatio, position.y / pixelRatio);
+  }
+
+  function rememberPetFileDropSignature(signature: string, windowMs = 1000) {
+    const now = Date.now();
+    const previous = lastNativeDropRef.current;
+    if (previous?.signature === signature && now - previous.at < windowMs) return false;
+    lastNativeDropRef.current = { signature, at: now };
+    return true;
+  }
+
+  function rememberPetPathDrop(paths: string[]) {
+    return rememberPetFileDropSignature(`paths:${paths.slice().sort().join("\n")}`);
+  }
+
+  function rememberPetDomDrop(files: FileList) {
+    const signature = Array.from(files)
+      .map((file) => `${file.name}:${file.size}:${file.lastModified}`)
+      .sort()
+      .join("\n");
+    return rememberPetFileDropSignature(`files:${signature}`, 500);
+  }
+
+  function handleNativePetFileDrop(payload: NativeFileDropPayload) {
+    if (petWindowModeRef.current !== "model") {
+      setInputDragActive(false);
+      return;
+    }
+    if (payload.type === "leave") {
+      setInputDragActive(false);
+      return;
+    }
+    if (!isNativePetDropInsideInput(payload.position)) {
+      setInputDragActive(false);
+      return;
+    }
+    if (payload.type === "enter" || payload.type === "over") {
+      revealInput();
+      setInputDragActive(true);
+      return;
+    }
+    setInputDragActive(false);
+    const paths = (payload.paths ?? []).map((path) => path.trim()).filter(Boolean);
+    if (paths.length === 0) return;
+    if (!rememberPetPathDrop(paths)) return;
+    void stagePetFilePaths(paths);
+  }
+
+  function handlePetFileDragEnter(event: ReactDragEvent<HTMLElement>) {
+    if (!hasFileDragData(event.dataTransfer)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "copy";
+    revealInput();
+    setInputDragActive(true);
+  }
+
+  function handlePetFileDragOver(event: ReactDragEvent<HTMLElement>) {
+    if (!hasFileDragData(event.dataTransfer)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "copy";
+    setInputDragActive(true);
+  }
+
+  function handlePetFileDragLeave(event: ReactDragEvent<HTMLElement>) {
+    if (!hasFileDragData(event.dataTransfer)) return;
+    event.stopPropagation();
+    const nextTarget = event.relatedTarget as Node | null;
+    if (!nextTarget || !event.currentTarget.contains(nextTarget)) {
+      setInputDragActive(false);
+    }
+  }
+
+  function handlePetFileDrop(event: ReactDragEvent<HTMLElement>) {
+    if (!hasFileDragData(event.dataTransfer)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setInputDragActive(false);
+    if (event.dataTransfer.files.length > 0 && rememberPetDomDrop(event.dataTransfer.files)) {
+      void stagePetFiles(event.dataTransfer.files);
+    }
+  }
+
   function toggleModelMenu() {
     revealInput();
     void syncPetPointerPassthrough(false);
@@ -1115,6 +1308,35 @@ export function PetWindow() {
           file.type || "application/octet-stream",
           Array.from(new Uint8Array(buffer))
         );
+        setComposerAttachments((current) => current.map((item) => (
+          item.id === temporaryId ? { ...saved, preview, status: "ready" } : item
+        )));
+      } catch (error) {
+        setComposerAttachments((current) => current.map((item) => (
+          item.id === temporaryId ? { ...item, status: "error", error: String(error) } : item
+        )));
+      }
+    }
+  }
+
+  async function stagePetFilePaths(paths: string[]) {
+    const list = paths.map((path) => path.trim()).filter(Boolean);
+    if (list.length === 0) return;
+    revealInput();
+    for (const path of list) {
+      const temporaryId = crypto.randomUUID();
+      setComposerAttachments((current) => [...current, {
+        id: temporaryId,
+        fileName: fileNameFromLocalPath(path),
+        mimeType: "application/octet-stream",
+        fileSize: 0,
+        path,
+        preview: null,
+        status: "staging"
+      }]);
+      try {
+        const saved = await api.uploadChatAttachmentFromPath(path);
+        const preview = saved.mimeType.startsWith("image/") ? convertFileSrc(saved.path) : null;
         setComposerAttachments((current) => current.map((item) => (
           item.id === temporaryId ? { ...saved, preview, status: "ready" } : item
         )));
@@ -1735,20 +1957,10 @@ export function PetWindow() {
         ref={inputShellRef}
         aria-label="桌宠输入"
         onFocusCapture={revealInput}
-        onDragEnter={(event) => {
-          event.preventDefault();
-          revealInput();
-          setInputDragActive(true);
-        }}
-        onDragOver={(event) => event.preventDefault()}
-        onDragLeave={(event) => {
-          if (event.currentTarget === event.target) setInputDragActive(false);
-        }}
-        onDrop={(event) => {
-          event.preventDefault();
-          setInputDragActive(false);
-          void stagePetFiles(event.dataTransfer.files);
-        }}
+        onDragEnter={handlePetFileDragEnter}
+        onDragOver={handlePetFileDragOver}
+        onDragLeave={handlePetFileDragLeave}
+        onDrop={handlePetFileDrop}
         onMouseEnter={revealInput}
         onMouseLeave={scheduleInputHide}
         onPointerDown={() => {
@@ -1815,6 +2027,15 @@ export function PetWindow() {
                 </button>
               </div>
             ))}
+          </div>
+        ) : null}
+        {inputDragActive ? (
+          <div className="pet-file-drop-overlay" aria-hidden="true">
+            <div className="pet-file-drop-message">
+              <FileText size={18} />
+              <strong>松开即可添加</strong>
+              <span>文件会作为 Pet 消息附件</span>
+            </div>
           </div>
         ) : null}
         {modelMenuOpen ? (

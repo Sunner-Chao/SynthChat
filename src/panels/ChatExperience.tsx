@@ -1,4 +1,7 @@
-import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   AlertCircle,
   Bot,
@@ -37,7 +40,7 @@ import {
   Zap,
   X
 } from "lucide-react";
-import { api } from "../lib/api";
+import { api, isTauri } from "../lib/api";
 import { resolvePersonaAgentBinding, resolvePersonaBoundAgent } from "../lib/personaAgentBinding";
 import { useAppStore } from "../lib/store";
 import type { AgentControlCommand, AgentDefinition, AgentRunPhase, AgentRunRecord, AgentRuntimeEvent, ChatAttachment, ChatMessage, LlmProvider, ManagedProcessEvent, ModelCatalogEntry, ToolEvent, ToolEventEnvelope } from "../lib/types";
@@ -91,8 +94,26 @@ type ConversationScrollMemory = {
   anchorOffset?: number;
 };
 
+type NativeFileDropPayload = {
+  type: "enter" | "over" | "drop" | "leave";
+  paths?: string[];
+  position?: { x: number; y: number };
+  windowLabel?: string;
+};
+
 const conversationScrollPositionCache = new Map<string, ConversationScrollMemory>();
 const RUNNING_TOOL_STARTED_AT = "__runningToolStartedAt";
+
+function fileNameFromLocalPath(path: string) {
+  return path.split(/[\\/]/).pop() || "attachment";
+}
+
+function hasFileDragData(dataTransfer: DataTransfer | null) {
+  if (!dataTransfer) return false;
+  if (dataTransfer.files.length > 0) return true;
+  return Array.from(dataTransfer.types).includes("Files")
+    || Array.from(dataTransfer.items).some((item) => item.kind === "file");
+}
 
 function clampCount(value: number | undefined, fallback: number, min: number, max: number) {
   if (!Number.isFinite(value)) return fallback;
@@ -878,6 +899,10 @@ export const ChatExperience = memo(function ChatExperience() {
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const chatShellRef = useRef<HTMLElement>(null);
+  const chatMainRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLElement>(null);
+  const lastNativeDropRef = useRef<{ signature: string; at: number } | null>(null);
   const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const voiceChunksRef = useRef<Blob[]>([]);
@@ -1700,6 +1725,198 @@ export const ChatExperience = memo(function ChatExperience() {
     }
   }, []);
 
+  const stageFilePaths = useCallback(async (paths: string[]) => {
+    const list = paths.map((path) => path.trim()).filter(Boolean);
+    if (list.length === 0) return;
+    for (const path of list) {
+      const temporaryId = crypto.randomUUID();
+      setAttachments((current) => [...current, {
+        id: temporaryId,
+        fileName: fileNameFromLocalPath(path),
+        mimeType: "application/octet-stream",
+        fileSize: 0,
+        path,
+        preview: null,
+        status: "staging"
+      }]);
+      try {
+        const saved = await api.uploadChatAttachmentFromPath(path);
+        const preview = saved.mimeType.startsWith("image/") ? api.convertFileSrc(saved.path) : null;
+        setAttachments((current) => current.map((item) => item.id === temporaryId ? { ...saved, preview, status: "ready" } : item));
+      } catch (error) {
+        setAttachments((current) => current.map((item) => item.id === temporaryId ? { ...item, status: "error", error: String(error) } : item));
+      }
+    }
+  }, []);
+
+  const handleFileDragEnter = useCallback((event: ReactDragEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "copy";
+    setDragActive(true);
+  }, []);
+
+  const handleFileDragOver = useCallback((event: ReactDragEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "copy";
+    setDragActive(true);
+  }, []);
+
+  const handleFileDragLeave = useCallback((event: ReactDragEvent<HTMLElement>) => {
+    event.stopPropagation();
+    const nextTarget = event.relatedTarget as Node | null;
+    if (!nextTarget || !event.currentTarget.contains(nextTarget)) {
+      setDragActive(false);
+    }
+  }, []);
+
+  const handleFileDrop = useCallback((event: ReactDragEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setDragActive(false);
+    if (event.dataTransfer.files.length > 0) {
+      void stageFiles(event.dataTransfer.files);
+    }
+  }, [stageFiles]);
+
+  const isPointInsideChatDropTarget = useCallback((x: number, y: number) => {
+    return [chatShellRef.current, composerRef.current, chatMainRef.current].some((element) => {
+      if (!element) return false;
+      const rect = element.getBoundingClientRect();
+      return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+    });
+  }, []);
+
+  const isNativeDropInsideChatTarget = useCallback((position: NativeFileDropPayload["position"]) => {
+    if (!position) return true;
+    const pixelRatio = window.devicePixelRatio || 1;
+    return isPointInsideChatDropTarget(position.x / pixelRatio, position.y / pixelRatio);
+  }, [isPointInsideChatDropTarget]);
+
+  const rememberFileDropSignature = useCallback((signature: string, windowMs = 1000) => {
+    const now = Date.now();
+    const previous = lastNativeDropRef.current;
+    if (previous?.signature === signature && now - previous.at < windowMs) return false;
+    lastNativeDropRef.current = { signature, at: now };
+    return true;
+  }, []);
+
+  const rememberPathDrop = useCallback((paths: string[]) => {
+    return rememberFileDropSignature(`paths:${paths.slice().sort().join("\n")}`);
+  }, [rememberFileDropSignature]);
+
+  const rememberDomDrop = useCallback((files: FileList) => {
+    const signature = Array.from(files)
+      .map((file) => `${file.name}:${file.size}:${file.lastModified}`)
+      .sort()
+      .join("\n");
+    return rememberFileDropSignature(`files:${signature}`, 500);
+  }, [rememberFileDropSignature]);
+
+  const handleNativeFileDrop = useCallback((payload: NativeFileDropPayload) => {
+    if (activeSection !== "chat") {
+      setDragActive(false);
+      return;
+    }
+    if (payload.type === "leave") {
+      setDragActive(false);
+      return;
+    }
+    if (!isNativeDropInsideChatTarget(payload.position)) {
+      setDragActive(false);
+      return;
+    }
+    if (payload.type === "enter" || payload.type === "over") {
+      setDragActive(true);
+      return;
+    }
+    setDragActive(false);
+    const paths = (payload.paths ?? []).map((path) => path.trim()).filter(Boolean);
+    if (paths.length === 0) return;
+    if (!rememberPathDrop(paths)) return;
+    void stageFilePaths(paths);
+  }, [activeSection, isNativeDropInsideChatTarget, rememberPathDrop, stageFilePaths]);
+
+  useEffect(() => {
+    if (activeSection !== "chat") {
+      setDragActive(false);
+      return;
+    }
+    const handleDrag = (event: DragEvent) => {
+      if (!hasFileDragData(event.dataTransfer)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+      const inside = isPointInsideChatDropTarget(event.clientX, event.clientY);
+      if (!inside) {
+        setDragActive(false);
+        return;
+      }
+      setDragActive(true);
+    };
+    const handleDragLeave = (event: DragEvent) => {
+      if (!hasFileDragData(event.dataTransfer)) return;
+      const nextTarget = event.relatedTarget as Node | null;
+      if (nextTarget && (chatMainRef.current?.contains(nextTarget) || composerRef.current?.contains(nextTarget))) return;
+      setDragActive(false);
+    };
+    const handleDrop = (event: DragEvent) => {
+      if (!hasFileDragData(event.dataTransfer)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const inside = isPointInsideChatDropTarget(event.clientX, event.clientY);
+      if (!inside) {
+        setDragActive(false);
+        return;
+      }
+      setDragActive(false);
+      if (event.dataTransfer && event.dataTransfer.files.length > 0 && rememberDomDrop(event.dataTransfer.files)) {
+        void stageFiles(event.dataTransfer.files);
+      }
+    };
+    window.addEventListener("dragenter", handleDrag, true);
+    window.addEventListener("dragover", handleDrag, true);
+    window.addEventListener("dragleave", handleDragLeave, true);
+    window.addEventListener("drop", handleDrop, true);
+    return () => {
+      window.removeEventListener("dragenter", handleDrag, true);
+      window.removeEventListener("dragover", handleDrag, true);
+      window.removeEventListener("dragleave", handleDragLeave, true);
+      window.removeEventListener("drop", handleDrop, true);
+    };
+  }, [activeSection, isPointInsideChatDropTarget, rememberDomDrop, stageFiles]);
+
+  useEffect(() => {
+    if (!isTauri() || activeSection !== "chat") {
+      setDragActive(false);
+      return;
+    }
+    const unlisteners: Array<() => void> = [];
+    let cancelled = false;
+    const attach = (source: string, registration: Promise<() => void>) => {
+      void registration.then((handler) => {
+        if (cancelled) {
+          handler();
+        } else {
+          unlisteners.push(handler);
+        }
+      }).catch((error) => {
+        console.warn(`${source} file drop listener unavailable:`, error);
+      });
+    };
+    attach("webview native", getCurrentWebview().onDragDropEvent((event) => handleNativeFileDrop(event.payload as NativeFileDropPayload)));
+    attach("window native", getCurrentWindow().onDragDropEvent((event) => handleNativeFileDrop(event.payload as NativeFileDropPayload)));
+    attach("window forwarded", listen<NativeFileDropPayload>("synthchat-file-drop-event", (event) => {
+      if (event.payload.windowLabel && event.payload.windowLabel !== "main") return;
+      handleNativeFileDrop(event.payload);
+    }));
+    return () => {
+      cancelled = true;
+      unlisteners.forEach((unlisten) => unlisten());
+    };
+  }, [activeSection, handleNativeFileDrop]);
+
   const removeAttachment = (id: string) => {
     setAttachments((current) => current.filter((item) => item.id !== id));
   };
@@ -2069,7 +2286,7 @@ export const ChatExperience = memo(function ChatExperience() {
         </div>
       </aside>
 
-      <article className="claw-chat-main">
+      <article className="claw-chat-main" ref={chatShellRef}>
         <header className="claw-chat-toolbar">
           <div className="claw-toolbar-title">
             <Sparkles size={17} />
@@ -2158,19 +2375,11 @@ export const ChatExperience = memo(function ChatExperience() {
             dragActive ? "dragging" : "",
             executionPanelOpen ? "execution-open" : ""
           ].filter(Boolean).join(" ")}
-          onDragEnter={(event) => {
-            event.preventDefault();
-            setDragActive(true);
-          }}
-          onDragOver={(event) => event.preventDefault()}
-          onDragLeave={(event) => {
-            if (event.currentTarget === event.target) setDragActive(false);
-          }}
-          onDrop={(event) => {
-            event.preventDefault();
-            setDragActive(false);
-            void stageFiles(event.dataTransfer.files);
-          }}
+          ref={chatMainRef}
+          onDragEnter={handleFileDragEnter}
+          onDragOver={handleFileDragOver}
+          onDragLeave={handleFileDragLeave}
+          onDrop={handleFileDrop}
         >
           <div className="claw-message-stream-wrap">
             <div className="claw-message-stream" ref={scrollRef} onScroll={handleScroll}>
@@ -2476,25 +2685,11 @@ export const ChatExperience = memo(function ChatExperience() {
 
         <footer
           className={`claw-composer${dragActive ? " dragging" : ""}`}
-          onDragEnter={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            setDragActive(true);
-          }}
-          onDragOver={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-          }}
-          onDragLeave={(event) => {
-            event.stopPropagation();
-            if (event.currentTarget === event.target) setDragActive(false);
-          }}
-          onDrop={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            setDragActive(false);
-            void stageFiles(event.dataTransfer.files);
-          }}
+          ref={composerRef}
+          onDragEnter={handleFileDragEnter}
+          onDragOver={handleFileDragOver}
+          onDragLeave={handleFileDragLeave}
+          onDrop={handleFileDrop}
         >
           <input
             ref={fileInputRef}
@@ -2594,6 +2789,21 @@ export const ChatExperience = memo(function ChatExperience() {
             {canStopRun ? <Square size={15} fill="currentColor" /> : <SendHorizontal size={17} />}
           </button>
         </footer>
+        {dragActive ? (
+          <div
+            className="claw-file-drop-overlay"
+            onDragEnter={handleFileDragEnter}
+            onDragOver={handleFileDragOver}
+            onDragLeave={handleFileDragLeave}
+            onDrop={handleFileDrop}
+          >
+            <div className="claw-file-drop-message">
+              <Paperclip size={24} />
+              <strong>松开即可添加</strong>
+              <span>文件会作为本轮消息附件上传</span>
+            </div>
+          </div>
+        ) : null}
         {previewTarget ? <ArtifactPreview target={previewTarget} onClose={() => setPreviewTarget(null)} /> : null}
       </article>
     </section>
@@ -2896,9 +3106,7 @@ const MarkdownLite = memo(function MarkdownLite({ text, onImageClick, streaming,
         if (seg.kind === "file") {
           return <InlineFile key={i} path={seg.path} mimeType={seg.mimeType} />;
         }
-        const raw = seg.kind === "image"
-          ? `[media attached: ${seg.path} (${seg.mimeType})]`
-          : seg.value;
+        const raw = seg.value;
         const blocks = raw.split(/\n{2,}/);
         return blocks.map((block, j) => {
           const trimmed = block.trim();
@@ -3203,8 +3411,7 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
   const hasTerminalDetails = Boolean(commandText || terminalCwd || terminalStdout || terminalStderr || terminalFallbackOutput || terminalExitCode !== undefined);
   const hasDetails = Boolean(displaySummary || event.path || isToolImage || canOpen || (bodyText && !duplicateBody) || (errorText && !duplicateError) || reauthInfo || hasTerminalDetails);
   const statusMeta = [
-    eventStatusLabel(event),
-    typeof terminalExitCode === "number" ? `exit ${terminalExitCode}` : "",
+    isRunning ? "执行中..." : isFailed ? "失败" : "成功",
     elapsedLabel
   ].filter(Boolean).join(" · ");
 
@@ -3242,7 +3449,7 @@ const ToolMessage = memo(function ToolMessage({ event }: { event: ToolEvent }) {
                   <Code2 size={14} />
                   <span>command</span>
                   {typeof terminalExitCode === "number" ? (
-                    <span className={`claw-tool-path-badge claw-tool-path-badge--${terminalExitCode === 0 ? "success" : "danger"}`}>exit {terminalExitCode}</span>
+                    <span className={`claw-tool-path-badge claw-tool-path-badge--${terminalExitCode === 0 ? "success" : "danger"}`}>{terminalExitCode === 0 ? "成功" : "失败"}</span>
                   ) : null}
                 </div>
                 <code>{commandText}</code>

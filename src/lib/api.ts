@@ -750,6 +750,13 @@ export const api: Record<string, any> = {
     fileSize: bytes.length,
     path: fileName
   })),
+  uploadChatAttachmentFromPath: (path: string): Promise<ChatAttachment> => call<ChatAttachment>("upload_chat_attachment_from_path", { path }, () => ({
+    id: `att-${Date.now()}`,
+    fileName: path.split(/[\\/]/).pop() || "attachment",
+    mimeType: "application/octet-stream",
+    fileSize: 0,
+    path
+  })),
   listMoments: () => empty(),
   createMoment: (body: string) => pass({ id: `moment-${Date.now()}`, personaId: "default", body, likedBy: [], comments: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }),
   updateMomentText: (_postId: string, body: string) => pass({ id: _postId, personaId: "default", body, likedBy: [], comments: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }),

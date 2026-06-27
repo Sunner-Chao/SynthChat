@@ -1914,7 +1914,16 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         app,
     )
     .await?;
-    spawn_user_queue_drain_after_turn(store, &conversation.id, app);
+    let source_for_queue_drain = request
+        .provider_data
+        .as_ref()
+        .and_then(|data| data.get("source"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if source_for_queue_drain != "proactive-internal" {
+        spawn_user_queue_drain_after_turn(store, &conversation.id, app);
+    }
     maybe_run_background_skill_curator(store, &chat_config)?;
     let saved_completed_run = store.agent_run(&saved_completed_run.run_id)?;
     if let Some(app) = app {
@@ -1974,7 +1983,7 @@ fn spawn_user_queue_drain_after_turn(
     });
 }
 
-async fn drain_queued_requests_for_conversation(
+pub(crate) async fn drain_queued_requests_for_conversation(
     store: &AppStore,
     conversation_id: &str,
     app: Option<&AppHandle>,

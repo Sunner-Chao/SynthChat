@@ -37,7 +37,8 @@ use store::AppStore;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
-    App, AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl,
+    App, AppHandle, DragDropEvent, Emitter, Manager, PhysicalPosition, PhysicalSize, State,
+    WebviewUrl,
     WebviewWindowBuilder, WindowEvent,
 };
 
@@ -1316,6 +1317,15 @@ async fn trigger_proactive_for_persona(
                     "conversationId": conversation_id,
                 }),
             );
+            if let Err(drain_error) =
+                agent::drain_queued_requests_for_conversation(store, &conversation_id, Some(app))
+                    .await
+            {
+                eprintln!(
+                    "SynthChat proactive error queue drain failed: conversation={} error={}",
+                    conversation_id, drain_error
+                );
+            }
             return Err(error);
         }
     };
@@ -1342,6 +1352,14 @@ async fn trigger_proactive_for_persona(
         if let Ok(conversation) = store.conversation(&conversation_id) {
             wechat_settings::dispatch_desktop_reply_to_wechat(&conversation, &assistant.content);
         }
+    }
+    if let Err(error) =
+        agent::drain_queued_requests_for_conversation(store, &conversation_id, Some(app)).await
+    {
+        eprintln!(
+            "SynthChat proactive queue drain failed: conversation={} error={}",
+            conversation_id, error
+        );
     }
     let _ = app.emit(
         "synthchat-chat-event",
@@ -3484,6 +3502,51 @@ fn upload_chat_attachment(
     mime_type: String,
     bytes: Vec<u8>,
 ) -> AppResult<Value> {
+    save_chat_attachment_bytes(&store, file_name, mime_type, bytes)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn upload_chat_attachment_from_path(store: State<'_, AppStore>, path: String) -> AppResult<Value> {
+    let source_path = PathBuf::from(path.trim_matches('"'));
+    let metadata = fs::metadata(&source_path).map_err(|error| {
+        AppError::BadRequest(format!(
+            "attachment source unavailable: {} ({error})",
+            source_path.to_string_lossy()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(AppError::BadRequest(format!(
+            "attachment source is not a file: {}",
+            source_path.to_string_lossy()
+        )));
+    }
+    if metadata.len() > MAX_CHAT_ATTACHMENT_BYTES as u64 {
+        return Err(AppError::BadRequest(format!(
+            "attachment too large: {} bytes",
+            metadata.len()
+        )));
+    }
+    let file_name = source_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment")
+        .to_string();
+    let mime_type = mime_from_attachment_path(&source_path).to_string();
+    let bytes = fs::read(&source_path).map_err(|error| {
+        AppError::BadRequest(format!(
+            "failed to read attachment source {}: {error}",
+            source_path.to_string_lossy()
+        ))
+    })?;
+    save_chat_attachment_bytes(&store, file_name, mime_type, bytes)
+}
+
+fn save_chat_attachment_bytes(
+    store: &AppStore,
+    file_name: String,
+    mime_type: String,
+    bytes: Vec<u8>,
+) -> AppResult<Value> {
     if bytes.len() > MAX_CHAT_ATTACHMENT_BYTES {
         return Err(AppError::BadRequest(format!(
             "attachment too large: {} bytes",
@@ -3503,6 +3566,48 @@ fn upload_chat_attachment(
         "fileSize": bytes.len(),
         "path": path.to_string_lossy().to_string(),
     }))
+}
+
+fn mime_from_attachment_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .trim_start_matches('.')
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "txt" | "md" | "markdown" | "log" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "pdf" => "application/pdf",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "ogg" => "audio/ogg",
+        "flac" => "audio/flac",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "7z" => "application/x-7z-compressed",
+        "rar" => "application/vnd.rar",
+        _ => "application/octet-stream",
+    }
 }
 
 fn sanitize_attachment_file_name(file_name: &str) -> String {
@@ -4090,6 +4195,7 @@ fn ensure_pet_window(app: &AppHandle, focus: bool) -> AppResult<()> {
     .skip_taskbar(true)
     .shadow(false)
     .focused(false)
+    .drag_and_drop(true)
     .build()
     .map_err(|error| AppError::BadRequest(error.to_string()))?;
 
@@ -4431,6 +4537,46 @@ fn reveal_local_file(path: String) -> AppResult<()> {
     Ok(())
 }
 
+fn emit_file_drop_event<R: tauri::Runtime>(window: &tauri::Window<R>, event: &DragDropEvent) {
+    let label = window.label();
+    if label != "main" && label != PET_WINDOW_LABEL {
+        return;
+    }
+    let position_payload = |position: &tauri::PhysicalPosition<f64>| {
+        json!({
+            "x": position.x,
+            "y": position.y,
+        })
+    };
+    let payload = match event {
+        DragDropEvent::Enter { paths, position } => json!({
+            "type": "enter",
+            "paths": paths.iter().map(|path| path.to_string_lossy().to_string()).collect::<Vec<_>>(),
+            "position": position_payload(position),
+            "windowLabel": label,
+        }),
+        DragDropEvent::Over { position } => json!({
+            "type": "over",
+            "paths": [],
+            "position": position_payload(position),
+            "windowLabel": label,
+        }),
+        DragDropEvent::Drop { paths, position } => json!({
+            "type": "drop",
+            "paths": paths.iter().map(|path| path.to_string_lossy().to_string()).collect::<Vec<_>>(),
+            "position": position_payload(position),
+            "windowLabel": label,
+        }),
+        DragDropEvent::Leave => json!({
+            "type": "leave",
+            "paths": [],
+            "windowLabel": label,
+        }),
+        _ => return,
+    };
+    let _ = window.emit("synthchat-file-drop-event", payload);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let runtime = synthchat_multi_thread_runtime("synthchat-tauri-worker")
@@ -4442,12 +4588,14 @@ pub fn run() {
         .manage(store)
         .manage(Mutex::new(PetDragState::default()))
         .on_window_event(|window, event| {
-            if window.label() != "main" {
-                return;
+            if let WindowEvent::DragDrop(drop_event) = event {
+                emit_file_drop_event(window, drop_event);
             }
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
         })
         .setup(|app| {
@@ -4707,6 +4855,7 @@ pub fn run() {
             get_short_context_state,
             transcribe_chat_audio,
             upload_chat_attachment,
+            upload_chat_attachment_from_path,
             environment_check,
             empty_list,
             noop,

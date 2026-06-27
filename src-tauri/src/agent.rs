@@ -187,6 +187,7 @@ use acp_prompt::*;
 use acp_server::acp_server_handle_json_rpc_async_with_sink as acp_server_handle_json_rpc_async_with_sink_inner;
 use acp_server::*;
 use acp_session::*;
+pub(crate) use agent_loop::drain_queued_requests_for_conversation;
 pub use agent_loop::run_chat_turn;
 use agent_loop::*;
 use approval_gateway::*;
