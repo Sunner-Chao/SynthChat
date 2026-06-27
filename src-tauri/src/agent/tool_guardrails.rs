@@ -8,6 +8,7 @@ use crate::models::ChatConfig;
 use super::truncate_for_prompt;
 
 const CONTRACT_FAILURE_REPEAT_LIMIT: u32 = 2;
+const STALE_FILE_MUTATION_REPEAT_LIMIT: u32 = 2;
 
 pub(super) struct ToolLoopGuardrails {
     warnings_enabled: bool,
@@ -22,6 +23,7 @@ pub(super) struct ToolLoopGuardrails {
     same_tool_failures: HashMap<String, u32>,
     contract_failures: HashMap<String, u32>,
     same_tool_contract_failures: HashMap<String, u32>,
+    stale_file_mutation_failures: HashMap<String, u32>,
     no_progress: HashMap<String, (String, u32)>,
 }
 
@@ -40,6 +42,7 @@ impl ToolLoopGuardrails {
             same_tool_failures: HashMap::new(),
             contract_failures: HashMap::new(),
             same_tool_contract_failures: HashMap::new(),
+            stale_file_mutation_failures: HashMap::new(),
             no_progress: HashMap::new(),
         }
     }
@@ -83,6 +86,7 @@ impl ToolLoopGuardrails {
         let failed = failed || classify_tool_failure(tool_name, result).0;
         if failed {
             let contract_failure = tool_contract_failure_detail(tool_name, result);
+            let stale_file_failure = stale_file_mutation_failure_detail(tool_name, result);
             let exact_count = self
                 .exact_failures
                 .entry(signature.clone())
@@ -119,6 +123,20 @@ impl ToolLoopGuardrails {
                 self.contract_failures.remove(&signature);
                 self.same_tool_contract_failures.remove(tool_name);
             }
+            if let Some(stale_file_failure) = stale_file_failure {
+                let stale_count = self
+                    .stale_file_mutation_failures
+                    .entry(tool_name.to_string())
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                if *stale_count >= STALE_FILE_MUTATION_REPEAT_LIMIT {
+                    return Some(ToolGuardrailOutcome::halt(format!(
+                        "Tool loop guardrail stopped {tool_name}: file state stayed stale after {stale_count} failed write attempts. Re-read the target file and pass the latest expectedSha256/expectedModifiedUnixMs, or switch to a scratch/artifact path. Latest error: {stale_file_failure}"
+                    )));
+                }
+            } else {
+                self.stale_file_mutation_failures.remove(tool_name);
+            }
             if self.hard_stop_enabled && *same_count >= self.same_tool_failure_limit {
                 return Some(ToolGuardrailOutcome::halt(format!(
                     "Tool loop guardrail stopped {tool_name}: it failed {same_count} times in this run. Inspect the latest error and choose a different tool path."
@@ -146,6 +164,7 @@ impl ToolLoopGuardrails {
         self.same_tool_failures.remove(tool_name);
         self.contract_failures.remove(&signature);
         self.same_tool_contract_failures.remove(tool_name);
+        self.stale_file_mutation_failures.remove(tool_name);
         if !is_idempotent_tool(tool_name) {
             self.no_progress.remove(&signature);
             return None;
@@ -426,6 +445,24 @@ fn tool_contract_failure_detail(tool_name: &str, result: &str) -> Option<String>
     None
 }
 
+fn stale_file_mutation_failure_detail(tool_name: &str, result: &str) -> Option<String> {
+    if !matches!(
+        tool_name,
+        "write_file" | "patch" | "delete_file" | "move_file"
+    ) {
+        return None;
+    }
+    let text = normalized_error_text(result);
+    if text
+        .to_lowercase()
+        .contains("file registry stale check failed")
+    {
+        Some(text)
+    } else {
+        None
+    }
+}
+
 fn normalized_error_text(result: &str) -> String {
     if let Ok(data) = serde_json::from_str::<Value>(result.trim()) {
         if let Some(error) = data.get("error").and_then(Value::as_str) {
@@ -615,8 +652,8 @@ mod tests {
     use crate::models::ChatConfig;
 
     use super::{
-        classify_tool_failure, is_idempotent_tool, stable_hash, tool_call_signature,
-        tool_contract_failure_detail, ToolLoopGuardrails,
+        classify_tool_failure, is_idempotent_tool, stable_hash, stale_file_mutation_failure_detail,
+        tool_call_signature, tool_contract_failure_detail, ToolLoopGuardrails,
     };
 
     #[test]
@@ -667,6 +704,21 @@ mod tests {
         )
         .is_some());
         assert!(tool_contract_failure_detail("search_files", "Error executing tool").is_none());
+    }
+
+    #[test]
+    fn stale_file_mutation_failure_detection_matches_registry_errors() {
+        assert!(stale_file_mutation_failure_detail(
+            "write_file",
+            r#"{"error":"file registry stale check failed for notes.txt"}"#
+        )
+        .is_some());
+        assert!(stale_file_mutation_failure_detail(
+            "read_file",
+            r#"{"error":"file registry stale check failed for notes.txt"}"#
+        )
+        .is_none());
+        assert!(stale_file_mutation_failure_detail("write_file", r#"{"ok":true}"#).is_none());
     }
 
     #[test]
@@ -824,5 +876,31 @@ mod tests {
             .unwrap();
         assert!(halt.halt);
         assert!(halt.message.contains("required fields are missing"));
+    }
+
+    #[test]
+    fn guardrails_halt_repeated_stale_file_mutation_failures_by_default() {
+        let config = ChatConfig::default();
+        let mut guardrails = ToolLoopGuardrails::new(&config);
+
+        let first = guardrails.after_call(
+            "write_file",
+            &json!({"path": "read_pdf.py", "content": "print(1)"}),
+            r#"{"error":"file registry stale check failed for read_pdf.py"}"#,
+            true,
+        );
+        assert!(first.is_none());
+
+        let halt = guardrails
+            .after_call(
+                "write_file",
+                &json!({"path": "read_pdf.py", "content": "print(2)"}),
+                r#"{"error":"file registry stale check failed for read_pdf.py"}"#,
+                true,
+            )
+            .unwrap();
+        assert!(halt.halt);
+        assert!(halt.message.contains("file state stayed stale"));
+        assert!(halt.message.contains("Re-read the target file"));
     }
 }

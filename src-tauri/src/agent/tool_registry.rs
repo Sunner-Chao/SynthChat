@@ -398,7 +398,7 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
         ),
         (
             "read_file",
-            r#"- read_file: payload {"path":"relative/or/absolute/path","offset":1,"limit":500} reads line-numbered pages and returns sha256/modifiedUnixMs file state; use {"mode":"raw","maxChars":80000} for unnumbered full text or {"mode":"chars","charOffset":0,"charLimit":12000} for character slices."#,
+            r#"- read_file: payload {"path":"relative/or/absolute/path","offset":1,"limit":500} reads line-numbered pages and returns sha256/modifiedUnixMs file state; use {"mode":"raw","maxChars":80000} for unnumbered full text or {"mode":"chars","charOffset":0,"charLimit":12000} for character slices. For local PDF attachments, call read_file first: text-based PDFs are extracted best-effort; if it reports scanned/encrypted/no extractable text, use the ocr-and-documents skill/OCR workflow. For remote PDF URLs, prefer web_extract first."#,
         ),
         (
             "file_state",
@@ -410,7 +410,7 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
         ),
         (
             "write_file",
-            r#"- write_file: payload {"path":"relative/or/absolute/path","content":"complete file content","expectedSha256":"optional sha256 from read_file","expectedModifiedUnixMs":123}. Include expected state when overwriting a file you read."#,
+            r#"- write_file: payload {"path":"relative/or/absolute/path","content":"complete file content","expectedSha256":"optional sha256 from read_file","expectedModifiedUnixMs":123}. Include expected state when overwriting a file you read. Do not write temporary analysis scripts into the project source tree; use execute_code or an artifact/scratch path for one-off experiments."#,
         ),
         (
             "delete_file",
@@ -434,7 +434,7 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
         ),
         (
             "execute_code",
-            r#"- execute_code: payload {"language":"python|javascript|powershell","code":"print('ok')","cwd":".","taskId":"optional session","sessionId":"optional session","timeoutSeconds":60}. Local Python writes a short-lived workspace scratch file and exposes hermes_tools.py over loopback RPC so scripts can call web_search, web_extract, read_file, write_file, search_files, patch, and terminal. With TERMINAL_ENV=docker|ssh|singularity|modal|daytona, Python execute_code ships the script and hermes_tools.py to the selected backend and proxies those same tool calls through Hermes-style file RPC request/response files; non-Python remote languages run through the selected terminal backend using heredoc input so they share backend cwd/session, mounts, sync, timeout, and lifecycle behavior when that backend supports those features."#,
+            r#"- execute_code: payload {"language":"python|javascript|powershell","code":"print('ok')","cwd":".","taskId":"optional session","sessionId":"optional session","timeoutSeconds":60}. Local Python writes a short-lived workspace scratch file and exposes hermes_tools.py over loopback RPC so scripts can call web_search, web_extract, read_file, write_file, search_files, patch, and terminal. Prefer execute_code for throwaway PDF/document probes instead of creating read_pdf.py or similar files in the source tree. With TERMINAL_ENV=docker|ssh|singularity|modal|daytona, Python execute_code ships the script and hermes_tools.py to the selected backend and proxies those same tool calls through Hermes-style file RPC request/response files; non-Python remote languages run through the selected terminal backend using heredoc input so they share backend cwd/session, mounts, sync, timeout, and lifecycle behavior when that backend supports those features."#,
         ),
         (
             "workspace_diagnostics",

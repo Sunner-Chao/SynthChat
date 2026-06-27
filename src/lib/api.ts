@@ -786,6 +786,7 @@ export const api: Record<string, any> = {
       consecutiveCount: 0,
       maxConsecutive: 1,
       inQuietHours: false,
+      petVisionSuspended: false,
       canFire: false,
       blockedReason: "主动消息后端不可用"
     })),

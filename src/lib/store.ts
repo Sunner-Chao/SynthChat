@@ -142,7 +142,21 @@ function limitMessages(messages: ChatMessage[], limit: number) {
   return messages.length > limit ? messages.slice(-limit) : messages;
 }
 
+function messageProviderDataRecord(message: ChatMessage): Record<string, unknown> | null {
+  const value = message.providerData;
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function isSilentPetOnlyMessage(message: ChatMessage) {
+  const providerData = messageProviderDataRecord(message);
+  return providerData?.silent === true
+    && (message.source === "pet-vision" || providerData.source === "pet-vision" || providerData.visibility === "pet-only");
+}
+
 function isVisibleChatMessage(message: ChatMessage) {
+  if (isSilentPetOnlyMessage(message)) return false;
   return !(message.role === "user" && message.source === "proactive-internal");
 }
 

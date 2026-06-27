@@ -1,0 +1,53 @@
+  useEffect(() => {
+    if (!visionEnabled) return;
+    let intervalId: number;
+    let isCapturing = false;
+
+    async function tick() {
+      if (isCapturing) return;
+      isCapturing = true;
+      try {
+        const dataUrl = await invoke<string>("capture_screen_base64");
+        const { mimeType, bytes } = decodePetVisionDataUrl(dataUrl);
+        const saved = await api.uploadChatAttachment(
+          petVisionFileName(),
+          mimeType,
+          Array.from(bytes)
+        );
+        const attachment = {
+          fileName: saved.fileName,
+          path: saved.path,
+          mimeType: saved.mimeType
+        };
+        const context = await resolvePetSendContext();
+        if (context.conversationId && context.personaId) {
+          const previousAssistantState = assistantMirrorState(context.conversationId);
+          const messages = await api.sendChatMessage({
+            conversationId: context.conversationId,
+            personaId: context.personaId,
+            agentId: context.agentId,
+            content: buildPetVisionContent(attachment),
+            providerData: {
+              source: "pet-vision",
+              attachments: [attachment],
+              silent: true
+            }
+          });
+          const assistant = latestAssistantMessage(messages)
+            ?? await waitForAssistantReply(context.conversationId, previousAssistantState);
+          if (assistant) {
+            showAssistantCloud(assistant, context.conversationId);
+          }
+        }
+      } catch (err) {
+        console.error("vision error:", err);
+        showCloud("视觉感知暂时看不到屏幕。", "error", 3200);
+      } finally {
+        isCapturing = false;
+      }
+    }
+
+    void tick();
+    intervalId = window.setInterval(tick, 60000);
+    return () => window.clearInterval(intervalId);
+  }, [visionEnabled]);

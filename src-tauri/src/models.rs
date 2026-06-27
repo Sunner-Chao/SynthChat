@@ -481,6 +481,8 @@ pub struct ProactiveStatus {
     pub consecutive_count: u32,
     pub max_consecutive: u32,
     pub in_quiet_hours: bool,
+    #[serde(default)]
+    pub pet_vision_suspended: bool,
     pub can_fire: bool,
     pub blocked_reason: String,
 }

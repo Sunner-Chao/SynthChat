@@ -73,8 +73,8 @@ pub(super) fn likely_binary(path: &Path) -> bool {
             | "tiff"
             | "tif"
             | "ico"
-            // Hermes allows PDFs through a separate document path. SynthChat's
-            // read_file is UTF-8 text only, so keep PDFs out of text tools here.
+            // Keep PDFs out of automatic text inlining; read_file handles
+            // best-effort PDF text extraction through its document path.
             | "pdf"
             | "mp4"
             | "mov"

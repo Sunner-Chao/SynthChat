@@ -46196,6 +46196,32 @@ fn planner_prompt_exposes_web_extract_tool() {
 }
 
 #[test]
+fn internal_tool_prompt_guides_pdf_document_extraction() {
+    let read_file_line = internal_tool_prompt_lines()
+        .iter()
+        .find(|(name, _)| *name == "read_file")
+        .map(|(_, line)| *line)
+        .unwrap();
+    assert!(read_file_line.contains("local PDF attachments"));
+    assert!(read_file_line.contains("ocr-and-documents"));
+    assert!(read_file_line.contains("remote PDF URLs"));
+
+    let write_file_line = internal_tool_prompt_lines()
+        .iter()
+        .find(|(name, _)| *name == "write_file")
+        .map(|(_, line)| *line)
+        .unwrap();
+    assert!(write_file_line.contains("Do not write temporary analysis scripts"));
+
+    let execute_code_line = internal_tool_prompt_lines()
+        .iter()
+        .find(|(name, _)| *name == "execute_code")
+        .map(|(_, line)| *line)
+        .unwrap();
+    assert!(execute_code_line.contains("throwaway PDF/document probes"));
+}
+
+#[test]
 fn web_extract_helpers_filter_urls_and_readable_text() {
     let urls = web_extract_urls_from_payload(&json!({
         "url": "https://example.com/a",
@@ -54104,6 +54130,29 @@ fn context_reference_injection_refuses_hard_budget_overflow() {
 }
 
 #[test]
+fn context_reference_guides_remote_pdf_urls_to_web_extract() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let dir = std::env::temp_dir().join(format!("synthchat-pdf-url-context-{}", new_id("test")));
+    fs::create_dir_all(&dir).unwrap();
+    let mut agent = AgentDefinition::default();
+    agent.workspace_dir = dir.to_string_lossy().to_string();
+
+    let expanded = runtime
+        .block_on(expand_context_references(
+            &agent,
+            "summarize https://example.com/report.pdf",
+            4000,
+            None,
+        ))
+        .unwrap();
+
+    assert!(expanded.contains("Remote PDF document detected"));
+    assert!(expanded.contains("Use web_extract with this URL first"));
+    assert!(!expanded.contains("fetch failed"));
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn context_reference_expands_uploaded_text_attachments() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let dir = std::env::temp_dir().join(format!("synthchat-attachment-context-{}", new_id("test")));
@@ -54138,6 +54187,124 @@ fn context_reference_expands_uploaded_text_attachments() {
     assert!(expanded.contains("Attachment: notes.txt"));
     assert!(expanded.contains("uploaded notes body"));
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn context_reference_guides_uploaded_pdf_attachments_to_document_workflow() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "synthchat-attachment-pdf-context-{}",
+        new_id("test")
+    ));
+    let attachments = dir.join("attachments");
+    fs::create_dir_all(&attachments).unwrap();
+    let file_path = attachments.join("attachment-1-report.pdf");
+    fs::write(&file_path, b"%PDF-1.4\n%%EOF").unwrap();
+    let mut agent = AgentDefinition::default();
+    agent.workspace_dir = dir.to_string_lossy().to_string();
+    let content = format!(
+        "summarize this upload\n{}",
+        json!({
+            "type": "attachment",
+            "id": "attachment-1",
+            "fileName": "report.pdf",
+            "mimeType": "application/pdf",
+            "fileSize": 14,
+            "path": file_path.to_string_lossy()
+        })
+    );
+
+    let expanded = runtime
+        .block_on(expand_context_references(
+            &agent,
+            &content,
+            4000,
+            Some(&attachments),
+        ))
+        .unwrap();
+
+    assert!(expanded.contains("--- Attached Context ---"));
+    assert!(expanded.contains("Attachment: report.pdf"));
+    assert!(expanded.contains("First call read_file with this exact path"));
+    assert!(expanded.contains("ocr-and-documents workflow"));
+    assert!(expanded.contains("Do not infer contents from the file name"));
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn context_reference_guides_media_marker_pdf_attachments_to_document_workflow() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "synthchat-media-marker-pdf-context-{}",
+        new_id("test")
+    ));
+    let attachments = dir.join("attachments");
+    fs::create_dir_all(&attachments).unwrap();
+    let file_path = attachments.join("attachment-1-report.pdf");
+    fs::write(&file_path, b"%PDF-1.4\n%%EOF").unwrap();
+    let mut agent = AgentDefinition::default();
+    agent.workspace_dir = dir.to_string_lossy().to_string();
+    let content = format!(
+        "summarize this upload\n[media attached: \"{}\" (application/pdf)] report.pdf",
+        file_path.to_string_lossy()
+    );
+
+    let expanded = runtime
+        .block_on(expand_context_references(
+            &agent,
+            &content,
+            4000,
+            Some(&attachments),
+        ))
+        .unwrap();
+
+    assert!(expanded.contains("Attachment: report.pdf"));
+    assert!(expanded.contains("First call read_file with this exact path"));
+    assert!(expanded.contains("ocr-and-documents workflow"));
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn provider_data_attachment_metadata_preserves_pdf_files() {
+    let content = format!(
+        "please inspect this attachment\n{}",
+        json!({
+            "type": "attachment",
+            "id": "pdf-1",
+            "fileName": "report.pdf",
+            "mimeType": "application/pdf",
+            "fileSize": 12345,
+            "path": "C:\\Users\\tester\\report.pdf"
+        })
+    );
+
+    let provider_data =
+        provider_data_with_attachment_metadata(&content, Some(json!({"source": "desktop"})))
+            .unwrap();
+    let attachments = provider_data["attachments"].as_array().unwrap();
+
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0]["type"], "attachment");
+    assert_eq!(attachments[0]["id"], "pdf-1");
+    assert_eq!(attachments[0]["fileName"], "report.pdf");
+    assert_eq!(attachments[0]["mimeType"], "application/pdf");
+    assert_eq!(attachments[0]["fileSize"], 12345);
+    assert_eq!(provider_data["source"], "desktop");
+}
+
+#[test]
+fn provider_data_attachment_metadata_preserves_media_marker_pdf_files() {
+    let content =
+        "please inspect\n[media attached: \"C:\\Users\\tester\\report.pdf\" (application/pdf)] report.pdf";
+
+    let provider_data = provider_data_with_attachment_metadata(content, None).unwrap();
+    let attachments = provider_data["attachments"].as_array().unwrap();
+
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0]["type"], "attachment");
+    assert_eq!(attachments[0]["fileName"], "report.pdf");
+    assert_eq!(attachments[0]["mimeType"], "application/pdf");
+    assert_eq!(attachments[0]["path"], "C:\\Users\\tester\\report.pdf");
 }
 
 #[test]

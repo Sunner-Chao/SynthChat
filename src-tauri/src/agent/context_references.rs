@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::process::Command;
 
 use crate::{
@@ -59,18 +59,26 @@ pub(super) async fn expand_context_references(
     let hard_limit = (context_token_budget.max(1000) / 2).max(1);
     for reference in references.iter().take(12) {
         let expanded = match reference.kind {
-            ContextReferenceKind::Url => match fetch_context_reference_url(&reference.target).await
-            {
-                Ok(text) => Ok(format!(
-                    "URL: {}\n{}",
-                    reference.raw,
-                    wrapped_context_reference_content(
-                        &reference.target,
-                        &truncate_output(&text, 6000)
-                    )
-                )),
-                Err(error) => Err(format!("{}: fetch failed: {error}", reference.raw)),
-            },
+            ContextReferenceKind::Url => {
+                if url_looks_like_pdf(&reference.target) {
+                    Ok(format!(
+                        "URL: {}\nRemote PDF document detected. Use web_extract with this URL first; it is the preferred path for PDF-to-text/markdown extraction from URLs. Only fall back to local PDF/OCR workflows if web_extract fails or the user provides a local file.",
+                        reference.raw
+                    ))
+                } else {
+                    match fetch_context_reference_url(&reference.target).await {
+                        Ok(text) => Ok(format!(
+                            "URL: {}\n{}",
+                            reference.raw,
+                            wrapped_context_reference_content(
+                                &reference.target,
+                                &truncate_output(&text, 6000)
+                            )
+                        )),
+                        Err(error) => Err(format!("{}: fetch failed: {error}", reference.raw)),
+                    }
+                }
+            }
             ContextReferenceKind::File => match read_context_reference_file(&root, reference) {
                 Ok(text) => Ok(format!(
                     "File: {}\n```{}\n{}\n```",
@@ -192,37 +200,103 @@ fn expand_attachment_contexts(
         .lines()
         .filter_map(|line| {
             let trimmed = line.trim();
-            if !trimmed.starts_with('{') || !trimmed.contains("\"attachment\"") {
-                return None;
-            }
-            let value = serde_json::from_str::<Value>(trimmed).ok()?;
-            if value.get("type").and_then(Value::as_str) != Some("attachment") {
-                return None;
-            }
+            let value = attachment_context_value_from_line(trimmed)?;
             Some(expand_single_attachment_context(&value, &root))
         })
         .collect()
+}
+
+fn attachment_context_value_from_line(trimmed: &str) -> Option<Value> {
+    if trimmed.starts_with('{') {
+        let value = serde_json::from_str::<Value>(trimmed).ok()?;
+        if value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| matches!(kind, "attachment" | "file" | "image"))
+        {
+            return Some(value);
+        }
+    }
+    media_attachment_context_from_line(trimmed)
+}
+
+fn media_attachment_context_from_line(trimmed: &str) -> Option<Value> {
+    let rest = trimmed.strip_prefix("[media attached:")?;
+    let (path, rest) = parse_media_attachment_path(rest.trim())?;
+    let rest = rest.trim_start();
+    let (mime_type, label) = if let Some(after_open) = rest.strip_prefix('(') {
+        let (mime, after_close) = after_open.split_once(')')?;
+        (mime.trim(), after_close.trim())
+    } else {
+        ("application/octet-stream", rest)
+    };
+    let label = label
+        .trim_start_matches(']')
+        .trim_end_matches(']')
+        .trim()
+        .trim_matches('"')
+        .trim_matches('`')
+        .trim();
+    let file_name = if label.is_empty() {
+        Path::new(&path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("attachment")
+            .to_string()
+    } else {
+        label.to_string()
+    };
+    Some(json!({
+        "type": "attachment",
+        "id": file_name,
+        "path": path,
+        "fileName": file_name,
+        "mimeType": if mime_type.is_empty() { "application/octet-stream" } else { mime_type },
+    }))
+}
+
+fn parse_media_attachment_path(value: &str) -> Option<(String, &str)> {
+    let value = value.trim_start();
+    let mut chars = value.chars();
+    let first = chars.next()?;
+    if matches!(first, '"' | '\'' | '`') {
+        let end = value[first.len_utf8()..].find(first)? + first.len_utf8();
+        let path = value[first.len_utf8()..end].trim().to_string();
+        let rest = &value[end + first.len_utf8()..];
+        return (!path.is_empty()).then_some((path, rest));
+    }
+    let end = value.find(" (").or_else(|| value.find(']')).unwrap_or(value.len());
+    let path = value[..end].trim().to_string();
+    let rest = &value[end..];
+    (!path.is_empty()).then_some((path, rest))
 }
 
 fn expand_single_attachment_context(
     value: &Value,
     attachment_root: &Path,
 ) -> Result<String, String> {
-    let id = value
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or("attachment");
-    let file_name = value
-        .get("fileName")
-        .and_then(Value::as_str)
-        .unwrap_or("attachment");
-    let mime_type = value
-        .get("mimeType")
-        .and_then(Value::as_str)
-        .unwrap_or("application/octet-stream");
-    let path_text = value
-        .get("path")
-        .and_then(Value::as_str)
+    let id = attachment_string(value, &["id"]).unwrap_or("attachment");
+    let file_name =
+        attachment_string(value, &["fileName", "file_name", "name"]).unwrap_or("attachment");
+    let mime_type = attachment_string(
+        value,
+        &["mimeType", "mime_type", "contentType", "content_type"],
+    )
+    .unwrap_or("application/octet-stream");
+    let path_text = attachment_string(
+        value,
+        &[
+            "path",
+            "filePath",
+            "file_path",
+            "localPath",
+            "local_path",
+            "sourcePath",
+            "source_path",
+            "tempPath",
+            "temp_path",
+        ],
+    )
         .ok_or_else(|| format!("attachment {id}: missing path"))?;
     let path = PathBuf::from(path_text);
     let canonical = path
@@ -247,14 +321,14 @@ fn expand_single_attachment_context(
         canonical.display()
     );
     if likely_binary(&canonical) || !mime_type_is_textual(mime_type) {
-        let advice = if mime_type.to_ascii_lowercase().starts_with("image/") {
+        let advice = if attachment_is_pdf(mime_type, &canonical) {
+            "This is a local PDF attachment. First call read_file with this exact path; SynthChat can extract text from text-based PDFs and returns a clear error for scanned/encrypted PDFs. If read_file reports no extractable text, switch to the ocr-and-documents workflow (pymupdf/marker-pdf/OCR as appropriate). Do not infer contents from the file name, and do not create throwaway PDF scripts inside the source tree."
+        } else if mime_type.to_ascii_lowercase().starts_with("image/") {
             "This image is available to vision-capable chat models as native image input. If the active chat model cannot inspect images directly, use vision_analyze with this path; do not use read_file for image bytes and do not infer its contents from the file name."
         } else {
             "This attachment is binary or non-text. Use a suitable tool such as transcribe_audio/read_file only if applicable; do not infer its contents from the file name."
         };
-        return Ok(format!(
-            "{header}\n{advice}"
-        ));
+        return Ok(format!("{header}\n{advice}"));
     }
     if metadata.len() > 512 * 1024 {
         return Err(format!(
@@ -269,6 +343,28 @@ fn expand_single_attachment_context(
         code_fence_language(&canonical),
         truncate_output(&text, 6000)
     ))
+}
+
+fn attachment_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+fn attachment_is_pdf(mime_type: &str, path: &Path) -> bool {
+    mime_type.eq_ignore_ascii_case("application/pdf")
+        || path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+}
+
+fn url_looks_like_pdf(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .map(|parsed| parsed.path().to_ascii_lowercase().ends_with(".pdf"))
+        .unwrap_or_else(|| url.to_ascii_lowercase().contains(".pdf"))
 }
 
 fn mime_type_is_textual(mime_type: &str) -> bool {

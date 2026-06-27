@@ -75,12 +75,13 @@ pub(super) fn record_tool_event_for_run(
                 terminal_tool_event_summary_for_run_state(&run.state),
             );
         }
-        let tool_message = store.append_message(ChatMessage::new(
+        let tool_message = ChatMessage::new(
             conversation_id.to_string(),
             "tool",
             json!({"type": "toolEvent", "event": event.clone()}).to_string(),
             "desktop-agent-tool",
-        ))?;
+        );
+        let tool_message = store.append_message(tool_message)?;
         if !run_is_terminal {
             run.state = "running".into();
             run.completed_at = None;
@@ -108,12 +109,13 @@ pub(super) fn record_tool_event_for_run(
         if event.status.as_deref() == Some("running") {
             event = tool_canceled_event_from_running(&event, "运行已结束");
         }
-        let _ = store.append_message(ChatMessage::new(
+        let tool_message = ChatMessage::new(
             conversation_id.to_string(),
             "tool",
             json!({"type": "toolEvent", "event": event.clone()}).to_string(),
             "desktop-agent-tool",
-        ))?;
+        );
+        let _ = store.append_message(tool_message)?;
     }
     Ok(())
 }
@@ -273,12 +275,13 @@ pub(super) fn record_tool_started_for_run(
 ) -> AppResult<()> {
     if let Ok(mut run) = store.agent_run(run_id) {
         let event = tool_started_event(run_id, server_id, tool_name, payload);
-        let tool_message = store.append_message(ChatMessage::new(
+        let tool_message = ChatMessage::new(
             run.conversation_id.clone(),
             "tool",
             json!({"type": "toolEvent", "event": event.clone()}).to_string(),
             "desktop-agent-tool",
-        ))?;
+        );
+        let tool_message = store.append_message(tool_message)?;
         run.state = "running".into();
         run.completed_at = None;
         run.touch_activity(format!("tool started: {server_id}.{tool_name}"));

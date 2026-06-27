@@ -35,6 +35,39 @@ fn turn_source_label(request: &SendChatRequest) -> String {
         .to_string()
 }
 
+fn request_provider_data_bool(request: &SendChatRequest, key: &str) -> bool {
+    request
+        .provider_data
+        .as_ref()
+        .and_then(|data| data.get(key))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn is_pet_vision_request(request: &SendChatRequest) -> bool {
+    turn_source_label(request) == "pet-vision"
+}
+
+fn is_pet_vision_silent_request(request: &SendChatRequest) -> bool {
+    is_pet_vision_request(request) && request_provider_data_bool(request, "silent")
+}
+
+fn mark_message_visible_for_pet_vision(message: &mut ChatMessage) {
+    let mut root = match message.provider_data.take() {
+        Some(Value::Object(object)) => object,
+        Some(value) => {
+            let mut object = serde_json::Map::new();
+            object.insert("originalProviderData".into(), value);
+            object
+        }
+        None => serde_json::Map::new(),
+    };
+    root.insert("source".into(), Value::String("pet-vision".into()));
+    root.insert("silent".into(), Value::Bool(false));
+    root.insert("visibility".into(), Value::String("desktop-and-pet".into()));
+    message.provider_data = Some(Value::Object(root));
+}
+
 #[derive(Debug, Clone)]
 struct AttachmentMetadata {
     id: String,
@@ -107,9 +140,6 @@ fn attachment_record_to_metadata(value: &Value) -> Option<AttachmentMetadata> {
         .filter(|mime| !mime.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| attachment_mime_from_path(&path));
-    if !mime_type.to_ascii_lowercase().starts_with("image/") {
-        return None;
-    }
     let file_name = value
         .get("fileName")
         .or_else(|| value.get("file_name"))
@@ -118,7 +148,7 @@ fn attachment_record_to_metadata(value: &Value) -> Option<AttachmentMetadata> {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| attachment_file_name(&path, "image"));
+        .unwrap_or_else(|| attachment_file_name(&path, "attachment"));
     let id = value
         .get("id")
         .and_then(Value::as_str)
@@ -138,7 +168,10 @@ fn attachment_record_to_metadata(value: &Value) -> Option<AttachmentMetadata> {
     })
 }
 
-fn collect_attachment_metadata(content: &str, provider_data: Option<&Value>) -> Vec<AttachmentMetadata> {
+fn collect_attachment_metadata(
+    content: &str,
+    provider_data: Option<&Value>,
+) -> Vec<AttachmentMetadata> {
     let mut attachments = Vec::<AttachmentMetadata>::new();
     let mut seen = HashSet::<String>::new();
     let mut push = |attachment: AttachmentMetadata| {
@@ -152,7 +185,10 @@ fn collect_attachment_metadata(content: &str, provider_data: Option<&Value>) -> 
     };
     for line in content.lines() {
         let trimmed = line.trim();
-        if !trimmed.starts_with('{') || !trimmed.contains("\"attachment\"") {
+        if !trimmed.starts_with('{') {
+            if let Some(attachment) = attachment_metadata_from_media_marker(trimmed) {
+                push(attachment);
+            }
             continue;
         }
         if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
@@ -162,7 +198,13 @@ fn collect_attachment_metadata(content: &str, provider_data: Option<&Value>) -> 
         }
     }
     if let Some(data) = provider_data {
-        for key in ["attachments", "attachmentContexts", "attachment_contexts", "mediaFiles", "media_files"] {
+        for key in [
+            "attachments",
+            "attachmentContexts",
+            "attachment_contexts",
+            "mediaFiles",
+            "media_files",
+        ] {
             match data.get(key) {
                 Some(Value::Array(items)) => {
                     for item in items {
@@ -181,6 +223,58 @@ fn collect_attachment_metadata(content: &str, provider_data: Option<&Value>) -> 
         }
     }
     attachments
+}
+
+fn attachment_metadata_from_media_marker(trimmed: &str) -> Option<AttachmentMetadata> {
+    let rest = trimmed.strip_prefix("[media attached:")?;
+    let (path, rest) = parse_media_attachment_path(rest.trim())?;
+    let rest = rest.trim_start();
+    let (mime_type, label) = if let Some(after_open) = rest.strip_prefix('(') {
+        let (mime, after_close) = after_open.split_once(')')?;
+        (mime.trim(), after_close.trim())
+    } else {
+        ("", rest)
+    };
+    let label = label
+        .trim_start_matches(']')
+        .trim_end_matches(']')
+        .trim()
+        .trim_matches('"')
+        .trim_matches('`')
+        .trim();
+    let file_name = if label.is_empty() {
+        attachment_file_name(&path, "attachment")
+    } else {
+        label.to_string()
+    };
+    let mime_type = if mime_type.is_empty() {
+        attachment_mime_from_path(&path)
+    } else {
+        mime_type.to_string()
+    };
+    Some(AttachmentMetadata {
+        id: file_name.clone(),
+        file_name,
+        mime_type,
+        path,
+        file_size: None,
+    })
+}
+
+fn parse_media_attachment_path(value: &str) -> Option<(String, &str)> {
+    let value = value.trim_start();
+    let mut chars = value.chars();
+    let first = chars.next()?;
+    if matches!(first, '"' | '\'' | '`') {
+        let end = value[first.len_utf8()..].find(first)? + first.len_utf8();
+        let path = value[first.len_utf8()..end].trim().to_string();
+        let rest = &value[end + first.len_utf8()..];
+        return (!path.is_empty()).then_some((path, rest));
+    }
+    let end = value.find(" (").or_else(|| value.find(']')).unwrap_or(value.len());
+    let path = value[..end].trim().to_string();
+    let rest = &value[end..];
+    (!path.is_empty()).then_some((path, rest))
 }
 
 fn attachment_identity(value: &Value) -> String {
@@ -207,12 +301,17 @@ fn attachment_identity(value: &Value) -> String {
     let mime_type = value
         .get("mimeType")
         .or_else(|| value.get("mime_type"))
+        .or_else(|| value.get("contentType"))
+        .or_else(|| value.get("content_type"))
         .and_then(Value::as_str)
         .unwrap_or_default();
     format!("{path}::{file_name}::{mime_type}")
 }
 
-fn provider_data_with_attachment_metadata(content: &str, provider_data: Option<Value>) -> Option<Value> {
+pub(super) fn provider_data_with_attachment_metadata(
+    content: &str,
+    provider_data: Option<Value>,
+) -> Option<Value> {
     let attachments = collect_attachment_metadata(content, provider_data.as_ref());
     if attachments.is_empty() {
         return provider_data;
@@ -231,7 +330,10 @@ fn provider_data_with_attachment_metadata(content: &str, provider_data: Option<V
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut seen = values.iter().map(attachment_identity).collect::<HashSet<_>>();
+    let mut seen = values
+        .iter()
+        .map(attachment_identity)
+        .collect::<HashSet<_>>();
     for attachment in attachments {
         let mut value = json!({
             "type": "attachment",
@@ -270,7 +372,6 @@ pub async fn run_chat_turn(
         .map(str::to_string);
     let source = turn_source_label(&request);
     let persona_id = request.persona_id.clone();
-
     if let (Some(app), Some(conversation_id)) = (app, conversation_id.as_deref()) {
         let _ = app.emit(
             "synthchat-chat-event",
@@ -385,6 +486,8 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     stream_delta_callback: Option<crate::llm::LlmDeltaCallback>,
     app: Option<&AppHandle>,
 ) -> AppResult<Vec<ChatMessage>> {
+    let silent_pet_vision = is_pet_vision_silent_request(&request);
+    let desktop_app = app;
     let conversation = match request.conversation_id.as_deref() {
         Some(id) if !id.trim().is_empty() => store.conversation(id)?,
         _ => store.create_conversation(None, request.persona_id.clone())?,
@@ -465,8 +568,8 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     user_message.provider_data =
         provider_data_with_attachment_metadata(&request.content, request.provider_data.clone());
     let user = store.append_message(user_message)?;
-    let silent_user_message = user.source == "proactive-internal";
-    if let Some(app) = app.filter(|_| !silent_user_message) {
+    let silent_user_message = user.source == "proactive-internal" || silent_pet_vision;
+    if let Some(app) = desktop_app.filter(|_| !silent_user_message) {
         let _ = app.emit(
             "synthchat-chat-event",
             json!({
@@ -513,9 +616,20 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     }
     run.user_request = effective_request_content.clone();
     run.queue_item_id = request.queue_item_id.clone();
+    if silent_pet_vision {
+        run.phase_events.push(AgentRunPhaseRecord {
+            phase: "request_visibility".into(),
+            detail: json!({
+                "source": "pet-vision",
+                "silentUserMessage": true,
+                "visibility": "desktop-tools-and-assistant",
+            }),
+            updated_at: now_iso(),
+        });
+    }
     run.state = "running".into();
     let saved_run = store.save_agent_run(run.clone())?;
-    emit_agent_run_record(app, &saved_run, None);
+    emit_agent_run_record(desktop_app, &saved_run, None);
     run_session_lifecycle_hooks(
         store,
         "on_session_start",
@@ -615,7 +729,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
             json!({"source": "context_compression_frozen"}),
         )
         .await;
-        let assistant = store.append_message(ChatMessage::new(
+        let mut assistant_message = ChatMessage::new(
             conversation.id.clone(),
             "assistant",
             format!(
@@ -626,8 +740,13 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                     .unwrap_or("unknown summary error")
             ),
             "desktop-agent-error",
-        ))?;
-        emit_agent_run_record(app, &saved_failed_run, Some(&assistant));
+        );
+        if silent_pet_vision {
+            assistant_message.source = "pet-vision".into();
+            mark_message_visible_for_pet_vision(&mut assistant_message);
+        }
+        let assistant = store.append_message(assistant_message)?;
+        emit_agent_run_record(desktop_app, &saved_failed_run, Some(&assistant));
         return Ok(vec![user, assistant]);
     }
     if let Some(note) = preflight_compact_context_for_agent_run(
@@ -660,7 +779,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
             run_started_at,
             run_timeout_seconds,
             post_tool_quiet_timeout_seconds,
-            app,
+            desktop_app,
         )? {
             return Ok(vec![user]);
         }
@@ -687,7 +806,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
             run_started_at,
             run_timeout_seconds,
             post_tool_quiet_timeout_seconds,
-            app,
+            desktop_app,
             complete_chat_with_provider_failover(
                 store,
                 Some(&saved_run.run_id),
@@ -713,7 +832,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                     run_started_at,
                     run_timeout_seconds,
                     post_tool_quiet_timeout_seconds,
-                    app,
+                    desktop_app,
                 )? {
                     return Ok(vec![user]);
                 }
@@ -747,9 +866,9 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                         json!({"source": "llm_error"}),
                     )
                     .await;
-                    emit_agent_run_record(app, &saved_failed_run, None);
+                    emit_agent_run_record(desktop_app, &saved_failed_run, None);
                 }
-                let assistant = store.append_message(ChatMessage::new(
+                let mut assistant_message = ChatMessage::new(
                     conversation.id.clone(),
                     "assistant",
                     format!(
@@ -757,14 +876,19 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                         llm_route_summary(&providers, &effective_persona, &error.to_string())
                     ),
                     "desktop-agent-error",
-                ))?;
+                );
+                if silent_pet_vision {
+                    assistant_message.source = "pet-vision".into();
+                    mark_message_visible_for_pet_vision(&mut assistant_message);
+                }
+                let assistant = store.append_message(assistant_message)?;
                 if let Ok(saved_failed_run) = store.agent_run(&saved_run.run_id) {
-                    emit_agent_run_record(app, &saved_failed_run, Some(&assistant));
+                    emit_agent_run_record(desktop_app, &saved_failed_run, Some(&assistant));
                 }
                 return Ok(vec![user, assistant]);
             }
         };
-        if abort_agent_run_for_turn_aborted_marker(store, &saved_run.run_id, &reply.content, app)? {
+        if abort_agent_run_for_turn_aborted_marker(store, &saved_run.run_id, &reply.content, desktop_app)? {
             return Ok(vec![user]);
         }
         if check_agent_run_interrupted(
@@ -773,7 +897,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
             run_started_at,
             run_timeout_seconds,
             post_tool_quiet_timeout_seconds,
-            app,
+            desktop_app,
         )? {
             return Ok(vec![user]);
         }
@@ -890,7 +1014,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                             if outcome.halt {
                                 record_tool_failed_for_run(
                                     store,
-                                    app,
+                                    desktop_app,
                                     &conversation.id,
                                     &saved_run.run_id,
                                     tool_name,
@@ -914,7 +1038,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                         run_started_at,
                         run_timeout_seconds,
                         post_tool_quiet_timeout_seconds,
-                        app,
+                        desktop_app,
                         execute_parallel_tool_batch(
                             store,
                             &agent,
@@ -948,7 +1072,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                     run_started_at,
                                     run_timeout_seconds,
                                     post_tool_quiet_timeout_seconds,
-                                    app,
+                                    desktop_app,
                                 )? {
                                     return Ok(vec![user]);
                                 }
@@ -982,7 +1106,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                 }
                                 let saved_tool_run = store.save_agent_run(run.clone())?;
                                 run = saved_tool_run.clone();
-                                emit_agent_run_record(app, &run, None);
+                                emit_agent_run_record(desktop_app, &run, None);
                                 let observation_text = append_subdirectory_hints_to_tool_result(
                                     &agent,
                                     &tool_name,
@@ -1016,7 +1140,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                             Err(error) => {
                                 record_tool_failed_for_run(
                                     store,
-                                    app,
+                                    desktop_app,
                                     &conversation.id,
                                     &saved_run.run_id,
                                     &tool_name,
@@ -1080,7 +1204,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                         if outcome.halt {
                             record_tool_failed_for_run(
                                 store,
-                                app,
+                                desktop_app,
                                 &conversation.id,
                                 &saved_run.run_id,
                                 &tool_name,
@@ -1104,7 +1228,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                             Err(error) => {
                                 record_tool_failed_for_run(
                                     store,
-                                    app,
+                                    desktop_app,
                                     &conversation.id,
                                     &saved_run.run_id,
                                     &tool_name,
@@ -1131,7 +1255,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                             Err(error) => {
                                 record_tool_failed_for_run(
                                     store,
-                                    app,
+                                    desktop_app,
                                     &conversation.id,
                                     &saved_run.run_id,
                                     &tool_name,
@@ -1163,7 +1287,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                             Err(error) => {
                                 record_tool_failed_for_run(
                                     store,
-                                    app,
+                                    desktop_app,
                                     &conversation.id,
                                     &saved_run.run_id,
                                     &tool_name,
@@ -1190,7 +1314,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                             Err(error) => {
                                 record_tool_failed_for_run(
                                     store,
-                                    app,
+                                    desktop_app,
                                     &conversation.id,
                                     &saved_run.run_id,
                                     &tool_name,
@@ -1232,8 +1356,8 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                             run.state = "pendingApproval".into();
                             run.updated_at = now_iso();
                             let saved_pending_run = store.save_agent_run(run)?;
-                            emit_agent_run_record(app, &saved_pending_run, None);
-                            let assistant = store.append_message(ChatMessage::new(
+                            emit_agent_run_record(desktop_app, &saved_pending_run, None);
+                            let mut assistant_message = ChatMessage::new(
                                 conversation.id,
                                 "assistant",
                                 format!(
@@ -1241,12 +1365,17 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                     approval.server_id, approval.tool_name
                                 ),
                                 "desktop-agent",
-                            ))?;
+                            );
+                            if silent_pet_vision {
+                                assistant_message.source = "pet-vision".into();
+                                mark_message_visible_for_pet_vision(&mut assistant_message);
+                            }
+                            let assistant = store.append_message(assistant_message)?;
                             return Ok(vec![user, assistant]);
                         }
                         record_tool_started_for_run(
                             store,
-                            app,
+                            desktop_app,
                             &saved_run.run_id,
                             "__internal",
                             &tool_name,
@@ -1254,14 +1383,14 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                             iteration + 1,
                         )?;
                         run = store.agent_run(&saved_run.run_id)?;
-                        emit_agent_run_record(app, &run, None);
+                        emit_agent_run_record(desktop_app, &run, None);
                         let tool_result = await_agent_run_interruptible(
                             store,
                             &saved_run.run_id,
                             run_started_at,
                             run_timeout_seconds,
                             post_tool_quiet_timeout_seconds,
-                            app,
+                            desktop_app,
                             execute_recovery_internal_tool(
                                 store,
                                 &agent,
@@ -1292,7 +1421,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                     run_started_at,
                                     run_timeout_seconds,
                                     post_tool_quiet_timeout_seconds,
-                                    app,
+                                    desktop_app,
                                 )? {
                                     return Ok(vec![user]);
                                 }
@@ -1316,7 +1445,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                 push_tool_event_record(&mut run, &event);
                                 let saved_tool_run = store.save_agent_run(run.clone())?;
                                 run = saved_tool_run.clone();
-                                emit_agent_run_record(app, &run, None);
+                                emit_agent_run_record(desktop_app, &run, None);
                                 let observation_text = append_subdirectory_hints_to_tool_result(
                                     &agent,
                                     &tool_name,
@@ -1350,7 +1479,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                             Err(error) => {
                                 record_tool_failed_for_run(
                                     store,
-                                    app,
+                                    desktop_app,
                                     &conversation.id,
                                     &saved_run.run_id,
                                     &tool_name,
@@ -1402,7 +1531,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                             Err(error) => {
                                 record_tool_failed_for_run(
                                     store,
-                                    app,
+                                    desktop_app,
                                     &conversation.id,
                                     &saved_run.run_id,
                                     &tool_name,
@@ -1429,7 +1558,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                             Err(error) => {
                                 record_tool_failed_for_run(
                                     store,
-                                    app,
+                                    desktop_app,
                                     &conversation.id,
                                     &saved_run.run_id,
                                     &tool_name,
@@ -1461,7 +1590,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                             Err(error) => {
                                 record_tool_failed_for_run(
                                     store,
-                                    app,
+                                    desktop_app,
                                     &conversation.id,
                                     &saved_run.run_id,
                                     &tool_name,
@@ -1488,7 +1617,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                             Err(error) => {
                                 record_tool_failed_for_run(
                                     store,
-                                    app,
+                                    desktop_app,
                                     &conversation.id,
                                     &saved_run.run_id,
                                     &tool_name,
@@ -1530,8 +1659,8 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                             run.state = "pendingApproval".into();
                             run.updated_at = now_iso();
                             let saved_pending_run = store.save_agent_run(run)?;
-                            emit_agent_run_record(app, &saved_pending_run, None);
-                            let assistant = store.append_message(ChatMessage::new(
+                            emit_agent_run_record(desktop_app, &saved_pending_run, None);
+                            let mut assistant_message = ChatMessage::new(
                                 conversation.id,
                                 "assistant",
                                 format!(
@@ -1539,12 +1668,17 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                     approval.server_id, approval.tool_name
                                 ),
                                 "desktop-agent",
-                            ))?;
+                            );
+                            if silent_pet_vision {
+                                assistant_message.source = "pet-vision".into();
+                                mark_message_visible_for_pet_vision(&mut assistant_message);
+                            }
+                            let assistant = store.append_message(assistant_message)?;
                             return Ok(vec![user, assistant]);
                         }
                         record_tool_started_for_run(
                             store,
-                            app,
+                            desktop_app,
                             &saved_run.run_id,
                             &definition.server_id,
                             &definition.tool_name,
@@ -1552,14 +1686,14 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                             iteration + 1,
                         )?;
                         run = store.agent_run(&saved_run.run_id)?;
-                        emit_agent_run_record(app, &run, None);
+                        emit_agent_run_record(desktop_app, &run, None);
                         let tool_result = await_agent_run_interruptible(
                             store,
                             &saved_run.run_id,
                             run_started_at,
                             run_timeout_seconds,
                             post_tool_quiet_timeout_seconds,
-                            app,
+                            desktop_app,
                             execute_recovery_mcp_tool(
                                 store,
                                 &saved_run.run_id,
@@ -1594,7 +1728,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                     run_started_at,
                                     run_timeout_seconds,
                                     post_tool_quiet_timeout_seconds,
-                                    app,
+                                    desktop_app,
                                 )? {
                                     return Ok(vec![user]);
                                 }
@@ -1618,7 +1752,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                                 push_tool_event_record(&mut run, &event);
                                 let saved_tool_run = store.save_agent_run(run.clone())?;
                                 run = saved_tool_run.clone();
-                                emit_agent_run_record(app, &run, None);
+                                emit_agent_run_record(desktop_app, &run, None);
                                 let tool_source =
                                     format!("{}:{}", definition.server_id, definition.tool_name);
                                 let observation_text = append_subdirectory_hints_to_tool_result(
@@ -1654,7 +1788,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                             Err(error) => {
                                 record_tool_failed_for_run(
                                     store,
-                                    app,
+                                    desktop_app,
                                     &conversation.id,
                                     &saved_run.run_id,
                                     &tool_name,
@@ -1699,7 +1833,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                             AppError::BadRequest(format!("tool is not available: {tool_name}"));
                         record_tool_failed_for_run(
                             store,
-                            app,
+                            desktop_app,
                             &conversation.id,
                             &saved_run.run_id,
                             &tool_name,
@@ -1820,7 +1954,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         run_started_at,
         run_timeout_seconds,
         post_tool_quiet_timeout_seconds,
-        app,
+        desktop_app,
     )? {
         return Ok(vec![user]);
     }
@@ -1831,6 +1965,10 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         "desktop-agent",
     );
     assistant_message.provider_data = assistant_provider_data;
+    if silent_pet_vision {
+        assistant_message.source = "pet-vision".into();
+        mark_message_visible_for_pet_vision(&mut assistant_message);
+    }
     let assistant = store.append_message(assistant_message)?;
 
     run.state = "completed".into();
@@ -1921,20 +2059,21 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or_default();
-    if source_for_queue_drain != "proactive-internal" {
+    if source_for_queue_drain != "proactive-internal" && !silent_pet_vision {
         spawn_user_queue_drain_after_turn(store, &conversation.id, app);
     }
     maybe_run_background_skill_curator(store, &chat_config)?;
     let saved_completed_run = store.agent_run(&saved_completed_run.run_id)?;
-    if let Some(app) = app {
-        let pet_event_source = request
-            .provider_data
-            .as_ref()
-            .and_then(|data| data.get("source"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("desktop");
+    let pet_event_source = request
+        .provider_data
+        .as_ref()
+        .and_then(|data| data.get("source"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("desktop");
+    let assistant_desktop_app = if silent_pet_vision { app } else { desktop_app };
+    if let Some(app) = assistant_desktop_app {
         let _ = app.emit(
             "synthchat-chat-event",
             json!({
@@ -1946,18 +2085,18 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                 "isLast": true,
             }),
         );
-        if pet_event_source != "wechat" {
-            emit_pet_assistant_event(
-                Some(app),
-                "assistant_final",
-                &assistant.source,
-                Some(&persona.id),
-                &conversation.id,
-                &assistant,
-            );
-        }
     }
-    emit_agent_run_record(app, &saved_completed_run, Some(&assistant));
+    if let Some(app) = app.filter(|_| pet_event_source != "wechat") {
+        emit_pet_assistant_event(
+            Some(app),
+            "assistant_final",
+            &assistant.source,
+            Some(&persona.id),
+            &conversation.id,
+            &assistant,
+        );
+    }
+    emit_agent_run_record(desktop_app, &saved_completed_run, Some(&assistant));
     Ok(vec![user, assistant])
 }
 

@@ -119,6 +119,16 @@ function formatTime(value: string) {
 }
 
 function isVisibleChatEventMessage(message: ChatMessage) {
+  const providerData = message.providerData;
+  const record = providerData && typeof providerData === "object" && !Array.isArray(providerData)
+    ? providerData as Record<string, unknown>
+    : null;
+  if (
+    record?.silent === true
+    && (message.source === "pet-vision" || record.source === "pet-vision" || record.visibility === "pet-only")
+  ) {
+    return false;
+  }
   return !(message.role === "user" && message.source === "proactive-internal");
 }
 

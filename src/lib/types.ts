@@ -1097,6 +1097,7 @@ export interface ProactiveStatus {
   consecutiveCount: number;
   maxConsecutive: number;
   inQuietHours: boolean;
+  petVisionSuspended?: boolean;
   canFire: boolean;
   blockedReason: string;
 }

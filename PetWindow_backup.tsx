@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Eye, EyeOff, FileText, Loader2, Menu, Palette, SendHorizontal, X } from "lucide-react";
-import { api, convertFileSrc, isTauri } from "./lib/api";
-import type { AgentRunEvent, ChatAttachment, ChatMessage, Conversation, EmojiGroup, Persona } from "./lib/types";
+import { Eye, EyeOff, Menu, Palette, SendHorizontal } from "lucide-react";
+import { api, convertFileSrc } from "./lib/api";
+import type { AgentRunEvent, ChatMessage, Conversation, EmojiGroup, Persona } from "./lib/types";
 import {
   PET_ACTIVE_CONTEXT_EVENT,
   PET_ACTIVE_CONTEXT_STORAGE_KEY,
@@ -29,9 +29,6 @@ const MAX_PET_ASSISTANT_CLOUD_DURATION_SECONDS = 120;
 const PET_EDGE_SNAP_THRESHOLD_PX = 64;
 const PET_EDGE_POINTER_THRESHOLD_PX = 96;
 const PET_ORB_CLICK_MOVE_TOLERANCE_PX = 5;
-const PET_VISION_INTERVAL_STORAGE_KEY = "synthchat.pet.visionIntervalSeconds";
-const DEFAULT_PET_VISION_INTERVAL_SECONDS = 60;
-const MIN_PET_VISION_INTERVAL_SECONDS = 30;
 
 const AVAILABLE_MODELS = [
   { id: "tororo", name: "Tororo", path: "/pet/model/Tororo/tororo.model3.json", greeting: "Tororo 到啦。", headX: 0.5, headY: 0.24, tailGap: 28 },
@@ -66,13 +63,6 @@ type PetMessage = {
   height?: number;
 };
 
-type NativeFileDropPayload = {
-  type: "enter" | "over" | "drop" | "leave";
-  paths?: string[];
-  position?: { x: number; y: number };
-  windowLabel?: string;
-};
-
 type PetModelBounds = {
   x: number;
   y: number;
@@ -91,12 +81,6 @@ type PetAttachment = {
   fileName: string;
   path: string;
   mimeType?: string;
-};
-
-type PetComposerAttachment = ChatAttachment & {
-  preview: string | null;
-  status: "ready" | "staging" | "error";
-  error?: string;
 };
 
 type PetAttachmentRender = PetAttachment & {
@@ -366,10 +350,6 @@ function touchCloudText(count: number) {
   return variants[Math.max(0, count - 1) % variants.length];
 }
 
-function fileNameFromLocalPath(path: string) {
-  return path.split(/[\\/]/).pop() || "attachment";
-}
-
 function decodePetVisionDataUrl(dataUrl: string) {
   const match = /^data:([^;,]+);base64,(.+)$/i.exec(dataUrl.trim());
   if (!match) throw new Error("invalid screen capture data url");
@@ -387,22 +367,7 @@ function petVisionFileName() {
   return `pet-screen-${stamp}.jpg`;
 }
 
-function clampPetVisionIntervalSeconds(value: unknown) {
-  const numeric = typeof value === "number" ? value : Number(value);
-  if (!Number.isFinite(numeric)) return DEFAULT_PET_VISION_INTERVAL_SECONDS;
-  return Math.max(MIN_PET_VISION_INTERVAL_SECONDS, Math.round(numeric));
-}
-
-function readStoredPetVisionIntervalSeconds() {
-  if (typeof window === "undefined") return DEFAULT_PET_VISION_INTERVAL_SECONDS;
-  try {
-    return clampPetVisionIntervalSeconds(window.localStorage.getItem(PET_VISION_INTERVAL_STORAGE_KEY));
-  } catch {
-    return DEFAULT_PET_VISION_INTERVAL_SECONDS;
-  }
-}
-
-function buildPetVisionContent(attachment: { fileName: string; path: string; mimeType?: string }) {
+function buildPetVisionContent(attachment: PetAttachment) {
   const prompt = "【视觉感知：这是一张刚刚截取的用户当前屏幕截图。请直接根据图片内容，用中文简短评价用户可能正在做什么，像桌宠一样给出一两句话的关心或吐槽；不要描述你无法看到图片，也不要展开长篇说明。】";
   const marker = `[media attached: "${attachment.path}" (${attachment.mimeType || "image/jpeg"})] ${attachment.fileName}`;
   const context = JSON.stringify({
@@ -415,13 +380,6 @@ function buildPetVisionContent(attachment: { fileName: string; path: string; mim
     source: "pet-vision"
   });
   return [prompt, marker, context].join("\n\n");
-}
-
-function hasFileDragData(dataTransfer: DataTransfer | null) {
-  if (!dataTransfer) return false;
-  if (dataTransfer.files.length > 0) return true;
-  return Array.from(dataTransfer.types).includes("Files")
-    || Array.from(dataTransfer.items).some((item) => item.kind === "file");
 }
 
 export function PetWindow() {
@@ -463,7 +421,6 @@ export function PetWindow() {
   const initialGreetingShownRef = useRef(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const hideTimeoutRef = useRef<number | null>(null);
-  const lastNativeDropRef = useRef<{ signature: string; at: number } | null>(null);
   const assistantCloudDurationMsRef = useRef(DEFAULT_PET_ASSISTANT_CLOUD_DURATION_SECONDS * 1000);
   const isNearModelRef = useRef(false);
   const modelMenuOpenRef = useRef(false);
@@ -471,13 +428,8 @@ export function PetWindow() {
   const [brokenCloudImages, setBrokenCloudImages] = useState<Record<string, true>>({});
   const [emojiGroups, setEmojiGroups] = useState<EmojiGroup[]>([]);
   const [visionEnabled, setVisionEnabled] = useState(false);
-  const [visionIntervalSeconds, setVisionIntervalSeconds] = useState(readStoredPetVisionIntervalSeconds);
-  const visionIntervalMs = clampPetVisionIntervalSeconds(visionIntervalSeconds) * 1000;
 
   useEffect(() => {
-    void invoke("set_pet_vision_active", { active: visionEnabled }).catch((error) => {
-      console.warn("pet vision active state sync failed:", error);
-    });
     if (!visionEnabled) return;
     let intervalId: number;
     let isCapturing = false;
@@ -527,28 +479,9 @@ export function PetWindow() {
     }
 
     void tick();
-    intervalId = window.setInterval(tick, visionIntervalMs);
-    return () => {
-      window.clearInterval(intervalId);
-      void invoke("set_pet_vision_active", { active: false }).catch((error) => {
-        console.warn("pet vision active state cleanup failed:", error);
-      });
-    };
-  }, [visionEnabled, visionIntervalMs]);
-
-  useEffect(() => {
-    const clamped = clampPetVisionIntervalSeconds(visionIntervalSeconds);
-    if (clamped !== visionIntervalSeconds) {
-      setVisionIntervalSeconds(clamped);
-      return;
-    }
-    try {
-      window.localStorage.setItem(PET_VISION_INTERVAL_STORAGE_KEY, String(clamped));
-    } catch {
-      // ignore preference persistence failures
-    }
-  }, [visionIntervalSeconds]);
-
+    intervalId = window.setInterval(tick, 60000);
+    return () => window.clearInterval(intervalId);
+  }, [visionEnabled]);
 
   const [input, setInput] = useState("");
   const [activeContext, setActiveContext] = useState<PetActiveContext | null>(activeContextRef.current);
@@ -560,8 +493,6 @@ export function PetWindow() {
   const [showInput, setShowInput] = useState(true);
   const [petWindowMode, setPetWindowMode] = useState<PetWindowMode>("model");
   const [dockEdge, setDockEdge] = useState<PetDockEdge>("right");
-  const [composerAttachments, setComposerAttachments] = useState<PetComposerAttachment[]>([]);
-  const [inputDragActive, setInputDragActive] = useState(false);
 
   const renderedCloudAttachments = useMemo(() => {
     const attachments = cloudBubble?.attachments ?? [];
@@ -998,6 +929,7 @@ export function PetWindow() {
       }
       if (message.type === "loaded") {
         setModelLoaded(true);
+        setModelMenuOpen(false);
         if (!initialGreetingShownRef.current) {
           initialGreetingShownRef.current = true;
           window.setTimeout(() => showCloud(selectedModel.greeting, "happy", 2400), 120);
@@ -2102,6 +2034,7 @@ export function PetWindow() {
             aria-label="功能菜单"
           >
             <Menu size={15} strokeWidth={2.4} aria-hidden="true" />
+            <span>功能菜单</span>
           </button>
           <input
             ref={inputRef}
@@ -2165,33 +2098,16 @@ export function PetWindow() {
         {modelMenuOpen ? (
           <div className="pet-input-model-menu" ref={modelMenuRef} role="menu" style={{ padding: "8px", gap: "6px" }}>
             <div style={{ gridColumn: "1 / -1", padding: "2px 8px 6px", fontSize: "11px", color: "#64748b", fontWeight: 700, letterSpacing: "0.5px" }}>功能选项</div>
-            <div className="pet-vision-menu-row" role="group" aria-label="视觉感知">
-              <button
-                className={visionEnabled ? "is-selected" : ""}
-                onClick={() => setVisionEnabled(v => !v)}
-                type="button"
-                role="menuitem"
-              >
-                {visionEnabled ? <Eye size={16} /> : <EyeOff size={16} />}
-                <span>视觉感知 {visionEnabled ? "(开启)" : "(关闭)"}</span>
-              </button>
-              <label className="pet-vision-interval-control">
-                <span>间隔</span>
-                <input
-                  aria-label="视觉感知间隔秒数"
-                  min={MIN_PET_VISION_INTERVAL_SECONDS}
-                  onBlur={() => setVisionIntervalSeconds((current) => clampPetVisionIntervalSeconds(current))}
-                  onChange={(event) => {
-                    const next = Number(event.target.value);
-                    setVisionIntervalSeconds(Number.isFinite(next) ? next : DEFAULT_PET_VISION_INTERVAL_SECONDS);
-                  }}
-                  step={10}
-                  type="number"
-                  value={visionIntervalSeconds}
-                />
-                <span>秒</span>
-              </label>
-            </div>
+            <button
+              className={visionEnabled ? "is-selected" : ""}
+              onClick={() => setVisionEnabled(v => !v)}
+              type="button"
+              role="menuitem"
+              style={{ gridColumn: "1 / -1", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", height: "34px" }}
+            >
+              {visionEnabled ? <Eye size={16} /> : <EyeOff size={16} />}
+              <span>视觉感知 {visionEnabled ? "(开启)" : "(关闭)"}</span>
+            </button>
             <div style={{ gridColumn: "1 / -1", height: 1, background: "rgba(0,0,0,0.06)", margin: "4px 4px" }} />
             <div style={{ gridColumn: "1 / -1", padding: "4px 8px 6px", fontSize: "11px", color: "#64748b", fontWeight: 700, letterSpacing: "0.5px" }}>模型切换</div>
             {AVAILABLE_MODELS.map((model) => (

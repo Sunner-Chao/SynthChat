@@ -292,6 +292,28 @@ fn order_llm_provider_credentials(
 }
 
 fn conversation_preview_message(message: &ChatMessage) -> bool {
+    if message
+        .provider_data
+        .as_ref()
+        .and_then(|data| data.get("silent"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && (message.source == "pet-vision"
+            || message
+                .provider_data
+                .as_ref()
+                .and_then(|data| data.get("source"))
+                .and_then(Value::as_str)
+                == Some("pet-vision")
+            || message
+                .provider_data
+                .as_ref()
+                .and_then(|data| data.get("visibility"))
+                .and_then(Value::as_str)
+                == Some("pet-only"))
+    {
+        return false;
+    }
     matches!(message.role.as_str(), "user" | "assistant")
         && !(message.role == "user" && message.source == "proactive-internal")
 }

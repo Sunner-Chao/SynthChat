@@ -75,6 +75,11 @@ struct PetDragState {
     pointer_y: i32,
 }
 
+#[derive(Debug, Default)]
+struct PetVisionState {
+    active: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PetDockEdge {
     Left,
@@ -680,6 +685,57 @@ fn cleanup_historical_resources(store: State<'_, AppStore>) -> AppResult<Value> 
 }
 
 #[tauri::command(rename_all = "camelCase")]
+fn capture_screen_base64() -> AppResult<String> {
+    use std::io::Cursor;
+
+    use base64::prelude::*;
+    use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage};
+
+    let monitors = xcap::Monitor::all().map_err(|e| error::AppError::BadRequest(e.to_string()))?;
+    let monitor = monitors
+        .iter()
+        .find(|monitor| monitor.is_primary().unwrap_or(false))
+        .or_else(|| monitors.first())
+        .ok_or_else(|| error::AppError::BadRequest("No monitors found".into()))?;
+    let image = monitor
+        .capture_image()
+        .map_err(|e| error::AppError::BadRequest(e.to_string()))?;
+    let mut image = DynamicImage::ImageRgba8(image);
+    const MAX_SIDE: u32 = 1280;
+    if image.width() > MAX_SIDE || image.height() > MAX_SIDE {
+        image = image.resize(MAX_SIDE, MAX_SIDE, FilterType::Triangle);
+    }
+    let rgb = image.to_rgb8();
+    let mut buffer = Cursor::new(Vec::new());
+    JpegEncoder::new_with_quality(&mut buffer, 86)
+        .encode_image(&rgb)
+        .map_err(|e| error::AppError::BadRequest(e.to_string()))?;
+    let base64_str = BASE64_STANDARD.encode(buffer.into_inner());
+    Ok(format!("data:image/jpeg;base64,{}", base64_str))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn set_pet_vision_active(
+    state: State<'_, Mutex<PetVisionState>>,
+    active: bool,
+) -> AppResult<bool> {
+    let mut guard = state
+        .lock()
+        .map_err(|_| AppError::BadRequest("pet vision state lock poisoned".into()))?;
+    guard.active = active;
+    Ok(guard.active)
+}
+
+fn pet_vision_active(app: Option<&AppHandle>) -> bool {
+    let Some(app) = app else {
+        return false;
+    };
+    app.try_state::<Mutex<PetVisionState>>()
+        .and_then(|state| state.lock().ok().map(|guard| guard.active))
+        .unwrap_or(false)
+}
+
+#[tauri::command(rename_all = "camelCase")]
 fn get_profile(store: State<'_, AppStore>) -> AppResult<ProfileConfig> {
     store.profile()
 }
@@ -1247,11 +1303,15 @@ fn delete_message(_store: State<'_, AppStore>, _message_id: String) -> AppResult
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn list_proactive_statuses(store: State<'_, AppStore>) -> AppResult<Vec<ProactiveStatus>> {
+fn list_proactive_statuses(
+    app: AppHandle,
+    store: State<'_, AppStore>,
+) -> AppResult<Vec<ProactiveStatus>> {
+    let suspended = pet_vision_active(Some(&app));
     store
         .personas()?
         .iter()
-        .map(|persona| proactive_status_for_persona(&store, persona))
+        .map(|persona| proactive_status_for_persona_with_runtime(&store, persona, suspended))
         .collect()
 }
 
@@ -1387,6 +1447,9 @@ async fn run_proactive_loop(app: AppHandle, store: AppStore) {
         };
         let now = epoch_seconds_now();
         for persona in personas {
+            if pet_vision_active(Some(&app)) {
+                continue;
+            }
             if !persona
                 .proactive
                 .get("enabled")
@@ -1413,6 +1476,14 @@ async fn run_proactive_loop(app: AppHandle, store: AppStore) {
 }
 
 fn proactive_status_for_persona(store: &AppStore, persona: &Persona) -> AppResult<ProactiveStatus> {
+    proactive_status_for_persona_with_runtime(store, persona, false)
+}
+
+fn proactive_status_for_persona_with_runtime(
+    store: &AppStore,
+    persona: &Persona,
+    pet_vision_suspended: bool,
+) -> AppResult<ProactiveStatus> {
     let conversation = store
         .conversations()?
         .into_iter()
@@ -1475,6 +1546,8 @@ fn proactive_status_for_persona(store: &AppStore, persona: &Persona) -> AppResul
     let mut blocked_reason = String::new();
     if !enabled {
         blocked_reason = "主动消息未启用".into();
+    } else if pet_vision_suspended {
+        blocked_reason = "视觉感知运行中，主动消息已暂停".into();
     } else if conversation.is_none() {
         blocked_reason = "没有该角色的会话".into();
     } else if last_user_at <= 0 {
@@ -1506,6 +1579,7 @@ fn proactive_status_for_persona(store: &AppStore, persona: &Persona) -> AppResul
         consecutive_count,
         max_consecutive,
         in_quiet_hours,
+        pet_vision_suspended,
         can_fire: blocked_reason.is_empty(),
         blocked_reason,
     })
@@ -4587,6 +4661,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(store)
         .manage(Mutex::new(PetDragState::default()))
+        .manage(Mutex::new(PetVisionState::default()))
         .on_window_event(|window, event| {
             if let WindowEvent::DragDrop(drop_event) = event {
                 emit_file_drop_event(window, drop_event);
@@ -4673,6 +4748,8 @@ pub fn run() {
             create_workspace_snapshot,
             restore_workspace_snapshot,
             cleanup_historical_resources,
+            capture_screen_base64,
+            set_pet_vision_active,
             get_profile,
             save_profile,
             upload_profile_avatar,

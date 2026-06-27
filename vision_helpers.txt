@@ -1,0 +1,32 @@
+function decodePetVisionDataUrl(dataUrl: string) {
+  const match = /^data:([^;,]+);base64,(.+)$/i.exec(dataUrl.trim());
+  if (!match) throw new Error("invalid screen capture data url");
+  const mimeType = match[1] || "image/jpeg";
+  const binary = atob(match[2]);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return { mimeType, bytes };
+}
+
+function petVisionFileName() {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `pet-screen-${stamp}.jpg`;
+}
+
+function buildPetVisionContent(attachment: PetAttachment) {
+  const prompt = "【视觉感知：这是一张刚刚截取的用户当前屏幕截图。请直接根据图片内容，用中文简短评价用户可能正在做什么，像桌宠一样给出一两句话的关心或吐槽；不要描述你无法看到图片，也不要展开长篇说明。】";
+  const marker = `[media attached: "${attachment.path}" (${attachment.mimeType || "image/jpeg"})] ${attachment.fileName}`;
+  const context = JSON.stringify({
+    type: "attachment",
+    id: attachment.fileName,
+    fileName: attachment.fileName,
+    mimeType: attachment.mimeType || "image/jpeg",
+    path: attachment.path,
+    recommendedTool: "vision_analyze",
+    source: "pet-vision"
+  });
+  return [prompt, marker, context].join("\n\n");
+}
+
