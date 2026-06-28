@@ -961,6 +961,12 @@ export interface MemoryStatus {
   promptInjected: number;
 }
 
+export interface ConversationDeleteMemorySettlingResult {
+  status: "scheduled" | "settled" | "skipped" | "failed" | string;
+  reason?: string | null;
+  memoryCount: number;
+}
+
 export interface WorldbookSection {
   id: string;
   key: string;

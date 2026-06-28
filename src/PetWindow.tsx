@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Eye, EyeOff, FileText, Loader2, Menu, Palette, SendHorizontal, Volume2, VolumeX, X } from "lucide-react";
 import { api, convertFileSrc, isTauri } from "./lib/api";
+import { PetStartupAwakening } from "./components/PetStartupAwakening";
 import type { AgentRunEvent, ChatAttachment, ChatMessage, Conversation, EmojiGroup, Persona } from "./lib/types";
 import {
   PET_ACTIVE_CONTEXT_EVENT,
@@ -29,6 +30,7 @@ const MAX_PET_ASSISTANT_CLOUD_DURATION_SECONDS = 120;
 const PET_EDGE_SNAP_THRESHOLD_PX = 64;
 const PET_EDGE_POINTER_THRESHOLD_PX = 96;
 const PET_ORB_CLICK_MOVE_TOLERANCE_PX = 5;
+const PET_DEFAULT_MODEL_STORAGE_KEY = "synthchat.pet.defaultModelId";
 const PET_VISION_INTERVAL_STORAGE_KEY = "synthchat.pet.visionIntervalSeconds";
 const DEFAULT_PET_VISION_INTERVAL_SECONDS = 60;
 const MIN_PET_VISION_INTERVAL_SECONDS = 30;
@@ -38,6 +40,10 @@ const PET_MODEL_INERTIA_MAX_DISTANCE = 180;
 const PET_MODEL_INERTIA_DURATION_MS = 680;
 const PET_MODEL_INERTIA_DISTANCE_MULTIPLIER = 300;
 const PET_MODEL_INERTIA_REBOUND_PX = 14;
+const PET_STARTUP_MIN_VISIBLE_MS = 5600;
+const PET_STARTUP_MAX_VISIBLE_MS = 8600;
+const PET_STARTUP_EXIT_MS = 920;
+const PET_STARTUP_REVEAL_AFTER_EXIT_MS = 180;
 
 const AVAILABLE_MODELS = [
   { id: "tororo", name: "Tororo", path: "/pet/model/Tororo/tororo.model3.json", greeting: "Tororo 到啦。", headX: 0.5, headY: 0.24, tailGap: 28 },
@@ -50,6 +56,29 @@ const AVAILABLE_MODELS = [
 ];
 
 type PetModel = (typeof AVAILABLE_MODELS)[number];
+
+function fallbackPetModel() {
+  return AVAILABLE_MODELS.find((model) => model.id === "hiyori") ?? AVAILABLE_MODELS[0];
+}
+
+function readStoredPetModel() {
+  if (typeof window === "undefined") return fallbackPetModel();
+  try {
+    const storedId = window.localStorage.getItem(PET_DEFAULT_MODEL_STORAGE_KEY);
+    return AVAILABLE_MODELS.find((model) => model.id === storedId) ?? fallbackPetModel();
+  } catch {
+    return fallbackPetModel();
+  }
+}
+
+function writeStoredPetModel(model: PetModel) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(PET_DEFAULT_MODEL_STORAGE_KEY, model.id);
+  } catch {
+    // ignore preference persistence failures
+  }
+}
 
 type PetSendContext = {
   conversationId: string;
@@ -483,9 +512,7 @@ export function PetWindow() {
   const modelMenuRef = useRef<HTMLDivElement>(null);
   const activeContextRef = useRef<PetActiveContext | null>(readStoredPetActiveContext());
   const frameReadyRef = useRef(false);
-  const selectedModelRef = useRef<PetModel>(
-    AVAILABLE_MODELS.find((model) => model.id === "hiyori") ?? AVAILABLE_MODELS[0]
-  );
+  const selectedModelRef = useRef<PetModel>(readStoredPetModel());
   const pendingModelLoadRef = useRef<{ model: PetModel; force: boolean } | null>(null);
   const modelBoundsRef = useRef<PetModelBounds | null>(null);
   const modelDragActiveRef = useRef(false);
@@ -504,6 +531,9 @@ export function PetWindow() {
   const dockEdgeRef = useRef<PetDockEdge>("right");
   const petWindowModeRef = useRef<PetWindowMode>("model");
   const modelLoadedRef = useRef(false);
+  const petStartupStartedAtRef = useRef(Date.now());
+  const petStartupClosingRef = useRef(false);
+  const petStartupTimersRef = useRef<number[]>([]);
   const ignoreCursorEventsRef = useRef(false);
   const sendingRef = useRef(false);
   const cloudTimerRef = useRef<number | null>(null);
@@ -630,6 +660,9 @@ export function PetWindow() {
   const [activeContext, setActiveContext] = useState<PetActiveContext | null>(activeContextRef.current);
   const [selectedModel, setSelectedModel] = useState<PetModel>(selectedModelRef.current);
   const [modelLoaded, setModelLoaded] = useState(false);
+  const [petAvatarRevealed, setPetAvatarRevealed] = useState(false);
+  const [petStartupVisible, setPetStartupVisible] = useState(true);
+  const [petStartupExiting, setPetStartupExiting] = useState(false);
   const [sending, setSending] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [cloudBubble, setCloudBubble] = useState<PetCloudBubble | null>(null);
@@ -672,6 +705,34 @@ export function PetWindow() {
     });
   }, [brokenCloudImages, cloudBubble?.attachments, emojiGroups]);
 
+  const queuePetStartupTimer = useCallback((handler: () => void, delayMs: number) => {
+    const timer = window.setTimeout(() => {
+      petStartupTimersRef.current = petStartupTimersRef.current.filter((item) => item !== timer);
+      handler();
+    }, delayMs);
+    petStartupTimersRef.current.push(timer);
+    return timer;
+  }, []);
+
+  const clearPetStartupTimers = useCallback(() => {
+    for (const timer of petStartupTimersRef.current) {
+      window.clearTimeout(timer);
+    }
+    petStartupTimersRef.current = [];
+  }, []);
+
+  const finishPetStartup = useCallback((delayMs = 0) => {
+    if (petStartupClosingRef.current) return;
+    petStartupClosingRef.current = true;
+    queuePetStartupTimer(() => {
+      setPetStartupExiting(true);
+      queuePetStartupTimer(() => {
+        setPetStartupVisible(false);
+        queuePetStartupTimer(() => setPetAvatarRevealed(true), PET_STARTUP_REVEAL_AFTER_EXIT_MS);
+      }, PET_STARTUP_EXIT_MS);
+    }, delayMs);
+  }, [queuePetStartupTimer]);
+
   useEffect(() => {
     document.body.classList.add("pet-window-body");
     document.documentElement.classList.add("pet-window-html");
@@ -679,12 +740,26 @@ export function PetWindow() {
     return () => {
       document.body.classList.remove("pet-window-body");
       document.documentElement.classList.remove("pet-window-html");
+      clearPetStartupTimers();
       clearCloudTimer();
       clearGlobalLookTimer();
       void syncPetPointerPassthrough(false);
       stopModelDrag();
     };
-  }, []);
+  }, [clearPetStartupTimers]);
+
+  useEffect(() => {
+    queuePetStartupTimer(() => {
+      finishPetStartup();
+    }, PET_STARTUP_MAX_VISIBLE_MS);
+  }, [finishPetStartup, queuePetStartupTimer]);
+
+  useEffect(() => {
+    if (!modelLoaded || !petStartupVisible) return;
+    const elapsedMs = Date.now() - petStartupStartedAtRef.current;
+    const finishDelayMs = Math.max(0, PET_STARTUP_MIN_VISIBLE_MS - elapsedMs);
+    finishPetStartup(finishDelayMs);
+  }, [finishPetStartup, modelLoaded, petStartupVisible]);
 
   useEffect(() => {
     activeContextRef.current = activeContext;
@@ -1087,7 +1162,10 @@ export function PetWindow() {
         setModelLoaded(true);
         if (!initialGreetingShownRef.current) {
           initialGreetingShownRef.current = true;
-          window.setTimeout(() => showCloud(selectedModel.greeting, "happy", 2400), 120);
+          const elapsedMs = Date.now() - petStartupStartedAtRef.current;
+          const exitDelayMs = Math.max(0, PET_STARTUP_MIN_VISIBLE_MS - elapsedMs);
+          const greetingDelayMs = exitDelayMs + PET_STARTUP_EXIT_MS + PET_STARTUP_REVEAL_AFTER_EXIT_MS + 1700;
+          window.setTimeout(() => showCloud(selectedModel.greeting, "happy", 2600), greetingDelayMs);
         }
         return;
       }
@@ -1818,6 +1896,7 @@ export function PetWindow() {
       return;
     }
     selectedModelRef.current = model;
+    writeStoredPetModel(model);
     setSelectedModel(model);
     setModelLoaded(false);
     modelBoundsRef.current = null;
@@ -2386,13 +2465,17 @@ export function PetWindow() {
   }
 
   return (
-    <main className={`live2d-pet-shell${cloudBubble ? " is-speaking" : ""}${petWindowMode === "orb" ? " is-orb" : ""}`}>
+    <main className={`live2d-pet-shell${cloudBubble ? " is-speaking" : ""}${petWindowMode === "orb" ? " is-orb" : ""}${petAvatarRevealed ? " is-avatar-revealed" : " is-avatar-priming"}`}>
       <iframe
         className="live2d-pet-frame"
         ref={frameRef}
         src="/pet/index.html?v=20260628-touch-drag-v2"
         title="SynthPet Live2D"
       />
+
+      {petWindowMode !== "orb" && petStartupVisible ? (
+        <PetStartupAwakening avatarRevealed={petAvatarRevealed} exiting={petStartupExiting} />
+      ) : null}
 
       {petWindowMode === "orb" ? (
         <button

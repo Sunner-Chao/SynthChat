@@ -751,7 +751,7 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
         ),
         (
             "image_generate",
-            r#"- image_generate: payload {"prompt":"image prompt","size":"1024x1024","n":1}"#,
+            r#"- image_generate: payload {"prompt":"image prompt","size":"1024x1024","n":1}. Uses the current persona image-generation settings for enablement, provider, model, style, and negative prompt."#,
         ),
         (
             "video_generate",

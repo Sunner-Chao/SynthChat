@@ -1669,7 +1669,7 @@ function ImageProviderSettings({
       baseUrl: "",
       apiKeyEnv: "SYNTHCHAT_IMAGE_API_KEY",
       apiKey: null,
-      model: "",
+      model: providerType === "openai_image" ? "gpt-image-2" : "",
       enabled: false,
       timeoutSeconds: 120
     };

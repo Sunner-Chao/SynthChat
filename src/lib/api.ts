@@ -27,6 +27,7 @@ import type {
   KanbanDispatchDrainResult,
   LlmProvider,
   ManagedProcessSnapshot,
+  ConversationDeleteMemorySettlingResult,
   MemoryEntry,
   MemoryStatus,
   ModelCatalogEntry,
@@ -212,7 +213,7 @@ const defaultPersona: Persona = {
     refinePrompt: "",
     refineTemperature: 0.7
   },
-  imageGeneration: { enabled: false, provider: "", model: "", stylePrefix: "", artStyle: "", negativePrompt: "", negativeEnabled: false, refMode: "avatar" }
+  imageGeneration: { enabled: false, provider: "", model: "", stylePrefix: "", artStyle: "anime style, masterpiece, best quality", negativePrompt: "low quality, blurry, watermark, text, signature, lowres, bad anatomy, extra fingers, jpeg artifacts", negativeEnabled: true, refMode: "avatar" }
 };
 
 const defaultAgent = (): AgentDefinition => ({
@@ -432,8 +433,12 @@ export async function createConversation(title?: string, personaId?: string): Pr
   }));
 }
 
-export async function deleteConversation(id: string): Promise<void> {
-  return call("delete_conversation", { id }, () => undefined);
+export async function deleteConversation(id: string): Promise<ConversationDeleteMemorySettlingResult> {
+  return call("delete_conversation", { id }, () => ({
+    status: "skipped",
+    reason: "desktop api unavailable",
+    memoryCount: 0
+  }));
 }
 
 export async function renameConversation(id: string, title: string): Promise<void> {

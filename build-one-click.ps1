@@ -6,6 +6,8 @@ param(
   [string]$WebviewInstallMode = "offlineInstaller",
   [switch]$PreflightOnly,
   [switch]$SkipNpmInstall,
+  [switch]$StrictBundlerExitCode,
+  [switch]$RetryWithDownloadBootstrapper,
   [switch]$OpenOutput
 )
 
@@ -151,11 +153,36 @@ if (-not [string]::IsNullOrWhiteSpace($UpdateManifestUrl)) {
 if ($PreflightOnly) {
   $buildArgs += "-PreflightOnly"
 }
+if (-not $StrictBundlerExitCode) {
+  $buildArgs += "-AcceptExistingArtifactOnTimeout"
+}
 
 Write-Step "Running native Windows build"
 & powershell @buildArgs
 if ($LASTEXITCODE -ne 0) {
-  throw "Native Windows build failed with exit code $LASTEXITCODE"
+  if ($RetryWithDownloadBootstrapper -and $WebviewInstallMode -ne "downloadBootstrapper") {
+    Write-Host "Native build failed. Retrying with WebView2 downloadBootstrapper mode..." -ForegroundColor Yellow
+    $retryArgs = @(
+      "-NoProfile",
+      "-ExecutionPolicy", "Bypass",
+      "-File", $NativeBuildScript,
+      "-Bundle", $Bundle,
+      "-WebviewInstallMode", "downloadBootstrapper"
+    )
+    if (-not [string]::IsNullOrWhiteSpace($UpdateManifestUrl)) {
+      $retryArgs += @("-UpdateManifestUrl", $UpdateManifestUrl.Trim())
+    }
+    if (-not $StrictBundlerExitCode) {
+      $retryArgs += "-AcceptExistingArtifactOnTimeout"
+    }
+    & powershell @retryArgs
+    if ($LASTEXITCODE -ne 0) {
+      throw "Native Windows build failed with exit code $LASTEXITCODE, including downloadBootstrapper retry"
+    }
+    $WebviewInstallMode = "downloadBootstrapper"
+  } else {
+    throw "Native Windows build failed with exit code $LASTEXITCODE"
+  }
 }
 
 if (-not $PreflightOnly) {

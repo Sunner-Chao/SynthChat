@@ -1,4 +1,4 @@
-import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { memo, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -740,7 +740,6 @@ const MessageList = memo(function MessageList({
   personaAvatar,
   copiedMessageId,
   onCopy,
-  renderLimit,
   previewCharLimit,
   onFirstStreamChar,
   animatedMessageIds,
@@ -756,7 +755,6 @@ const MessageList = memo(function MessageList({
   personaAvatar: string;
   copiedMessageId: string | null;
   onCopy: (message: ChatMessage) => void;
-  renderLimit: number;
   previewCharLimit: number;
   onFirstStreamChar?: () => void;
   animatedMessageIds: Set<string>;
@@ -766,7 +764,7 @@ const MessageList = memo(function MessageList({
   runStates: Map<string, string>;
 }) {
   const visibleMessages = useMemo(() => {
-    const sliced = messages.slice(-renderLimit);
+    const sliced = messages;
     const selectedToolMessages = new Map<string, { index: number; event: ToolEvent; message: ChatMessage }>();
     const toolKeys = new Map<string, string>();
     const suppressedToolKeys = new Set<string>();
@@ -810,15 +808,9 @@ const MessageList = memo(function MessageList({
       deduped.push(msg);
     }
     return deduped;
-  }, [messages, renderLimit, runStates]);
-  const hiddenCount = Math.max(0, messages.length - renderLimit);
+  }, [messages, runStates]);
   return (
     <>
-      {hiddenCount > 0 ? (
-        <div className="claw-history-trim">
-          已折叠 {hiddenCount} 条更早消息，当前仅渲染最近 {renderLimit} 条以保持页面流畅。
-        </div>
-      ) : null}
       {visibleMessages.map((message) => (
         <MessageRow
           key={message.id}
@@ -885,6 +877,7 @@ export const ChatExperience = memo(function ChatExperience() {
   const setSkillsPanelMode = useAppStore((state) => state.setSkillsPanelMode);
   const setMcpPanelMode = useAppStore((state) => state.setMcpPanelMode);
   const refreshChatData = useAppStore((state) => state.refreshChatData);
+  const loadOlderMessages = useAppStore((state) => state.loadOlderMessages);
   const refreshAgents = useAppStore((state) => state.refreshAgents);
   const refreshSkills = useAppStore((state) => state.refreshSkills);
   const refreshMcpServers = useAppStore((state) => state.refreshMcpServers);
@@ -922,6 +915,8 @@ export const ChatExperience = memo(function ChatExperience() {
   const sendingRef = useRef(false);
   const [isNearBottom, setIsNearBottom] = useState(true);
   const [unreadCount, setUnreadCount] = useState(0);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyExhausted, setHistoryExhausted] = useState(false);
   const seenMessageContentRef = useRef<Map<string, string>>(new Map());
   const [animatedMessageIds, setAnimatedMessageIds] = useState<Set<string>>(() => new Set());
   const [settlingConversationId, setSettlingConversationId] = useState<string | null>(null);
@@ -998,6 +993,13 @@ export const ChatExperience = memo(function ChatExperience() {
   const bottomFollowThresholdPx = clampCount(chatConfig?.bottomFollowThresholdPx, DEFAULT_BOTTOM_FOLLOW_THRESHOLD_PX, 24, 600);
   const activePollIntervalMs = clampCount(chatConfig?.activePollIntervalMs, DEFAULT_ACTIVE_POLL_INTERVAL_MS, 300, 30_000);
   const idlePollIntervalMs = clampCount(chatConfig?.idlePollIntervalMs, DEFAULT_IDLE_POLL_INTERVAL_MS, 1000, 120_000);
+
+  useEffect(() => {
+    setHistoryLoading(false);
+    setHistoryExhausted(false);
+    loadingHistoryRef.current = false;
+    preserveTopOnHistoryLoadRef.current = null;
+  }, [activeConversationId, renderLimit]);
   // Round-aware compaction tip: only count tokens/messages after the last summary boundary
   useEffect(() => {
     if (!activeConversationId) return;
@@ -1449,6 +1451,8 @@ export const ChatExperience = memo(function ChatExperience() {
   const scrollRestoreTargetRef = useRef<{ conversationId: string; memory: ConversationScrollMemory } | null>(null);
   const conversationActivatedAtRef = useRef<number>(Date.now());
   const notifiedAssistantMessageIdsRef = useRef<Set<string>>(new Set());
+  const loadingHistoryRef = useRef(false);
+  const preserveTopOnHistoryLoadRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
 
   const stopVoicePlayback = useCallback(() => {
     const audio = voiceAudioRef.current;
@@ -1466,6 +1470,30 @@ export const ChatExperience = memo(function ChatExperience() {
     activeVoiceReplyRequestRef.current = null;
     stopVoicePlayback();
   }, [activeSection, stopVoicePlayback]);
+
+  const loadMoreHistory = useCallback(async () => {
+    const element = scrollRef.current;
+    if (!element || !activeConversationId || loadingHistoryRef.current || historyExhausted) return;
+    loadingHistoryRef.current = true;
+    setHistoryLoading(true);
+    preserveTopOnHistoryLoadRef.current = {
+      scrollHeight: element.scrollHeight,
+      scrollTop: element.scrollTop
+    };
+    try {
+      const beforeCount = messages.length;
+      const result = await loadOlderMessages(activeConversationId, renderLimit);
+      if (result.loadedCount <= beforeCount || !result.hasMore) {
+        setHistoryExhausted(true);
+      }
+    } catch (error) {
+      console.warn("load older messages failed", error);
+      preserveTopOnHistoryLoadRef.current = null;
+    } finally {
+      loadingHistoryRef.current = false;
+      setHistoryLoading(false);
+    }
+  }, [activeConversationId, historyExhausted, loadOlderMessages, messages.length, renderLimit]);
 
   useEffect(() => {
     if (activeConversationPersona?.voiceReply?.enabled) return;
@@ -1627,7 +1655,10 @@ export const ChatExperience = memo(function ChatExperience() {
     if (settlingConversationId) return;
     setSettlingConversationId(conversationId);
     try {
-      await deleteConversation(conversationId);
+      const result = await deleteConversation(conversationId);
+      if (result.status === "failed") {
+        console.warn("Conversation deleted, but memory settling failed:", result.reason);
+      }
     } finally {
       setSettlingConversationId((current) => current === conversationId ? null : current);
     }
@@ -1709,6 +1740,19 @@ export const ChatExperience = memo(function ChatExperience() {
     };
   }, [activeConversationId, applyScrollMemory, bottomFollowThresholdPx, messages]);
 
+  useLayoutEffect(() => {
+    const snapshot = preserveTopOnHistoryLoadRef.current;
+    if (!snapshot) return;
+    const element = scrollRef.current;
+    preserveTopOnHistoryLoadRef.current = null;
+    if (!element) return;
+    const delta = element.scrollHeight - snapshot.scrollHeight;
+    element.scrollTop = snapshot.scrollTop + Math.max(0, delta);
+    if (activeConversationId && canPersistScrollPosition(element)) {
+      conversationScrollPositionCache.set(activeConversationId, getScrollAnchor(element));
+    }
+  }, [activeConversationId, getScrollAnchor, messages]);
+
   const handleScroll = useCallback(() => {
     const element = scrollRef.current;
     if (!element) return;
@@ -1717,13 +1761,16 @@ export const ChatExperience = memo(function ChatExperience() {
     nearBottomRef.current = near;
     setIsNearBottom(near);
     if (scrollOnNextMessagesRef.current) return;
+    if (element.scrollTop <= 48 && messages.length >= renderLimit && !historyLoading && !historyExhausted) {
+      void loadMoreHistory();
+    }
     // Save scroll position for current conversation
     saveCurrentScrollPosition(activeConversationId);
     if (near) {
       setUnreadCount(0);
       markConversationRead(activeConversationId ?? "");
     }
-  }, [activeConversationId, bottomFollowThresholdPx, markConversationRead, saveCurrentScrollPosition]);
+  }, [activeConversationId, bottomFollowThresholdPx, historyExhausted, historyLoading, loadMoreHistory, markConversationRead, messages.length, renderLimit, saveCurrentScrollPosition]);
 
   const handleScrollToBottom = useCallback(() => {
     setUnreadCount(0);
@@ -2373,7 +2420,7 @@ export const ChatExperience = memo(function ChatExperience() {
                   />
                   <span>
                     <strong>{persona?.name || conversation.title}</strong>
-                    <small>{settlingConversationId === conversation.id ? "正在沉淀长期记忆..." : conversation.lastMessage || "暂无消息"}</small>
+                    <small>{settlingConversationId === conversation.id ? "删除中，记忆稍后整理..." : conversation.lastMessage || "暂无消息"}</small>
                   </span>
                   {(() => {
                     const count = conversation.id === activeConversationId
@@ -2388,7 +2435,7 @@ export const ChatExperience = memo(function ChatExperience() {
                   className="claw-session-delete"
                   disabled={Boolean(settlingConversationId)}
                   onClick={() => void deleteConversationWithMemorySettling(conversation.id)}
-                  title="删除会话并沉淀长期记忆"
+                  title="整理长期记忆后删除会话"
                   type="button"
                 >
                   {settlingConversationId === conversation.id ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
@@ -2513,23 +2560,38 @@ export const ChatExperience = memo(function ChatExperience() {
                   onPrompt={(text) => setDraft(text)}
                 />
               ) : (
-                <MessageList
-                  messages={messages}
-                  profileName={profile.name}
-                  profileAvatar={profile.avatarPath ?? ""}
-                  personaName={selectedPersona?.name ?? "assistant"}
-                  personaAvatar={selectedPersona?.avatarPath ?? ""}
-                  onFirstStreamChar={handleFirstStreamChar}
-                  copiedMessageId={copiedMessageId}
-                  onCopy={copyMessage}
-                  renderLimit={renderLimit}
-                  previewCharLimit={previewCharLimit}
-                  animatedMessageIds={animatedMessageIds}
-                  streamCharsPerSecond={streamCharsPerSecond}
-                  onMessageAnimationDone={handleMessageAnimationDone}
-                  memoryStats={shortMemoryStats}
-                  runStates={runStates}
-                />
+                <>
+                  {messages.length >= renderLimit ? (
+                    <div className={`claw-history-loader${historyLoading ? " is-loading" : ""}${historyExhausted ? " is-exhausted" : ""}`}>
+                      {historyLoading ? (
+                        <>
+                          <Loader2 className="spin" size={14} />
+                          <span>正在加载更早消息...</span>
+                        </>
+                      ) : historyExhausted ? (
+                        <span>已到达当前会话最早消息</span>
+                      ) : (
+                        <span>继续向上滚动加载更早消息</span>
+                      )}
+                    </div>
+                  ) : null}
+                  <MessageList
+                    messages={messages}
+                    profileName={profile.name}
+                    profileAvatar={profile.avatarPath ?? ""}
+                    personaName={selectedPersona?.name ?? "assistant"}
+                    personaAvatar={selectedPersona?.avatarPath ?? ""}
+                    onFirstStreamChar={handleFirstStreamChar}
+                    copiedMessageId={copiedMessageId}
+                    onCopy={copyMessage}
+                    previewCharLimit={previewCharLimit}
+                    animatedMessageIds={animatedMessageIds}
+                    streamCharsPerSecond={streamCharsPerSecond}
+                    onMessageAnimationDone={handleMessageAnimationDone}
+                    memoryStats={shortMemoryStats}
+                    runStates={runStates}
+                  />
+                </>
               )}
               {thinkingMounted ? (
                 <div className={`claw-thinking-row${showThinking ? "" : " is-leaving"}`}>

@@ -36,6 +36,8 @@ npm run desktop:build:windows -- -Bundle nsis -WebviewInstallMode downloadBootst
 
 That fallback still works on a fresh Windows machine when the installer has internet access to fetch WebView2.
 
+The one-click wrapper accepts fresh installer artifacts when Tauri reports `failed to bundle project timeout: global` after writing the NSIS installer. To force strict bundler exit-code handling, pass `-StrictBundlerExitCode`. To automatically retry with the smaller WebView2 bootstrapper fallback, pass `-RetryWithDownloadBootstrapper`.
+
 ## GitHub Releases Update Source
 
 1. Create a GitHub Release whose tag is the app version, for example `v1.1.1`.

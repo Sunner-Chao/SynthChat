@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use crate::{
     error::{AppError, AppResult},
-    models::{AgentDefinition, ImageProvider, LlmProvider, VideoProvider, VisionProvider},
+    models::{AgentDefinition, ImageProvider, LlmProvider, Persona, VideoProvider, VisionProvider},
     process_utils::CommandWindowExt,
     store::AppStore,
 };
@@ -893,6 +893,7 @@ fn cleanup_temp_voice_recordings(max_age_seconds: u64) -> AppResult<usize> {
 
 pub(super) async fn image_generate_tool(
     store: &AppStore,
+    conversation_id: &str,
     run_id: &str,
     payload: &Value,
 ) -> AppResult<String> {
@@ -902,16 +903,187 @@ pub(super) async fn image_generate_tool(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::BadRequest("image_generate requires payload.prompt".into()))?;
-    let provider = store
-        .enabled_image_provider()?
-        .ok_or_else(|| AppError::BadRequest("no enabled image provider configured".into()))?;
-    match provider.provider_type.trim().to_lowercase().as_str() {
-        "openai" | "openai-compatible" | "openai_compatible" | "compatible" | "custom" | "" => {
-            openai_compatible_image_generate(store, run_id, &provider, prompt, payload).await
+    let persona = persona_for_image_generation(store, conversation_id)?;
+    if !persona_image_generation_enabled(&persona) {
+        return Err(AppError::BadRequest(format!(
+            "image generation is disabled for persona {}",
+            persona.name
+        )));
+    }
+    let provider = image_provider_for_persona(store, &persona)?;
+    let model = image_model_for_persona(&provider, &persona, payload)?;
+    let effective_prompt = compose_persona_image_prompt(&persona, prompt);
+    let effective_payload = payload_with_image_model(payload, &model);
+
+    match image_provider_kind(&provider) {
+        ImageProviderKind::OpenAiCompatible => {
+            openai_compatible_image_generate(
+                store,
+                run_id,
+                &provider,
+                &effective_prompt,
+                &effective_payload,
+            )
+            .await
         }
-        other => Err(AppError::BadRequest(format!(
-            "unsupported image provider type: {other}"
+        ImageProviderKind::Gemini => {
+            gemini_image_generate(store, run_id, &provider, &model, &effective_prompt).await
+        }
+        ImageProviderKind::NovelAi => Err(AppError::BadRequest(
+            "NovelAI image provider is configured, but the direct NovelAI image adapter is not implemented yet. Use an OpenAI-compatible image endpoint or proxy for now."
+                .into(),
+        )),
+        ImageProviderKind::Unsupported(kind) => Err(AppError::BadRequest(format!(
+            "unsupported image provider type: {kind}"
         ))),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImageProviderKind {
+    OpenAiCompatible,
+    Gemini,
+    NovelAi,
+    Unsupported(String),
+}
+
+fn persona_for_image_generation(store: &AppStore, conversation_id: &str) -> AppResult<Persona> {
+    let conversation = store.conversation(conversation_id)?;
+    store.persona(conversation.persona_id.as_deref())
+}
+
+fn persona_image_generation_enabled(persona: &Persona) -> bool {
+    image_generation_bool(persona, "enabled", false)
+}
+
+fn image_provider_for_persona(store: &AppStore, persona: &Persona) -> AppResult<ImageProvider> {
+    let configured_provider_id =
+        image_generation_string(persona, "provider").unwrap_or_default();
+    let providers = store.image_providers()?;
+    let provider = if configured_provider_id.is_empty() {
+        providers
+            .into_iter()
+            .find(|provider| provider.enabled && !provider.base_url.trim().is_empty())
+            .ok_or_else(|| AppError::BadRequest("no enabled image provider configured".into()))?
+    } else {
+        providers
+            .into_iter()
+            .find(|provider| provider.id == configured_provider_id)
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "persona image provider not found: {configured_provider_id}"
+                ))
+            })?
+    };
+
+    if !provider.enabled {
+        return Err(AppError::BadRequest(format!(
+            "persona image provider is disabled: {}",
+            provider.name
+        )));
+    }
+    if provider.base_url.trim().is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "persona image provider URL is empty: {}",
+            provider.name
+        )));
+    }
+    Ok(provider)
+}
+
+fn image_model_for_persona(
+    provider: &ImageProvider,
+    persona: &Persona,
+    payload: &Value,
+) -> AppResult<String> {
+    let provider_model = provider.model.trim();
+    if !provider_model.is_empty() {
+        return Ok(provider_model.to_string());
+    }
+    payload
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let model = image_generation_string(persona, "model")?;
+            if model.is_empty() {
+                None
+            } else {
+                Some(model)
+            }
+        })
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "image model is empty for provider {}",
+                provider.name
+            ))
+        })
+}
+
+fn payload_with_image_model(payload: &Value, model: &str) -> Value {
+    let mut next = payload.clone();
+    if let Some(object) = next.as_object_mut() {
+        object.insert("model".into(), Value::String(model.to_string()));
+    }
+    next
+}
+
+fn image_generation_string(persona: &Persona, key: &str) -> Option<String> {
+    persona
+        .image_generation
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn image_generation_bool(persona: &Persona, key: &str, default: bool) -> bool {
+    persona
+        .image_generation
+        .get(key)
+        .and_then(Value::as_bool)
+        .unwrap_or(default)
+}
+
+fn compose_persona_image_prompt(persona: &Persona, prompt: &str) -> String {
+    let mut parts = Vec::new();
+    if let Some(prefix) = image_generation_string(persona, "stylePrefix") {
+        parts.push(prefix);
+    }
+    parts.push(prompt.trim().to_string());
+    if matches!(
+        image_generation_string(persona, "refMode").as_deref(),
+        Some("avatar")
+    ) {
+        parts.push("Keep the current persona's established visual identity and avatar style when possible.".into());
+    }
+    if let Some(art_style) = image_generation_string(persona, "artStyle") {
+        parts.push(format!("Style: {art_style}"));
+    }
+    if image_generation_bool(persona, "negativeEnabled", true) {
+        if let Some(negative_prompt) = image_generation_string(persona, "negativePrompt") {
+            parts.push(format!("Avoid: {negative_prompt}"));
+        }
+    }
+    parts.join("\n")
+}
+
+fn image_provider_kind(provider: &ImageProvider) -> ImageProviderKind {
+    match provider
+        .provider_type
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
+        "" | "openai" | "openai_image" | "openai_compatible" | "compatible" | "custom"
+        | "dalle" | "dall_e" => ImageProviderKind::OpenAiCompatible,
+        "gemini" | "gemini_image" | "google_gemini" => ImageProviderKind::Gemini,
+        "novelai" | "novel_ai" => ImageProviderKind::NovelAi,
+        other => ImageProviderKind::Unsupported(other.to_string()),
     }
 }
 
@@ -943,6 +1115,15 @@ pub(super) async fn openai_compatible_image_generate(
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(&provider.model);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(provider.timeout_seconds.max(1)))
+        .no_proxy()
+        .user_agent("SynthChat-agent/1.0")
+        .build()
+        .map_err(|error| AppError::BadRequest(format!("failed to build image client: {error}")))?;
+    if model.trim().eq_ignore_ascii_case("gpt-image-2") {
+        return gpt_image_2_generate(store, run_id, provider, &client, url, prompt, payload).await;
+    }
     let mut body = json!({
         "model": model,
         "prompt": prompt,
@@ -957,12 +1138,6 @@ pub(super) async fn openai_compatible_image_generate(
             }
         }
     }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(provider.timeout_seconds.max(1)))
-        .no_proxy()
-        .user_agent("SynthChat-agent/1.0")
-        .build()
-        .map_err(|error| AppError::BadRequest(format!("failed to build image client: {error}")))?;
     let mut request = client.post(url.clone()).json(&body);
     if let Some(api_key) = provider_api_key(&provider.api_key, &provider.api_key_env) {
         request = request.bearer_auth(api_key);
@@ -1012,6 +1187,355 @@ pub(super) async fn openai_compatible_image_generate(
         "providerId": provider.id,
         "model": model,
         "prompt": prompt,
+        "artifacts": artifacts
+    }))?)
+}
+
+async fn gpt_image_2_generate(
+    store: &AppStore,
+    run_id: &str,
+    provider: &ImageProvider,
+    client: &reqwest::Client,
+    submit_url: reqwest::Url,
+    prompt: &str,
+    payload: &Value,
+) -> AppResult<String> {
+    let body = gpt_image_2_request_body(prompt, payload);
+    let mut request = client.post(submit_url).json(&body);
+    if let Some(api_key) = provider_api_key(&provider.api_key, &provider.api_key_env) {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("gpt-image-2 submit failed: {error}")))?;
+    let submit = response_json_or_error(response, "gpt-image-2 submit").await?;
+    let task_id = gpt_image_2_task_id(&submit).ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "gpt-image-2 submit response missing task_id: {}",
+            truncate_output(&submit.to_string(), 2000)
+        ))
+    })?;
+    let result = poll_gpt_image_2_task(client, provider, &task_id).await?;
+    let image_urls = gpt_image_2_result_urls(&result);
+    if image_urls.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "gpt-image-2 completed without result image URLs: {}",
+            truncate_output(&result.to_string(), 2000)
+        )));
+    }
+    let mut artifacts = Vec::new();
+    for image_url in image_urls {
+        validate_web_url(&image_url)?;
+        let (bytes, extension) = download_image_bytes(client, &image_url).await?;
+        let path = store.save_tool_binary_artifact(run_id, "image_generate", &extension, &bytes)?;
+        artifacts.push(json!({
+            "path": path.to_string_lossy(),
+            "source": image_url,
+            "sizeBytes": bytes.len()
+        }));
+    }
+    Ok(serde_json::to_string_pretty(&json!({
+        "providerId": provider.id,
+        "model": "gpt-image-2",
+        "prompt": prompt,
+        "taskId": task_id,
+        "task": result,
+        "artifacts": artifacts
+    }))?)
+}
+
+fn gpt_image_2_request_body(prompt: &str, payload: &Value) -> Value {
+    let mut body = json!({
+        "model": "gpt-image-2",
+        "prompt": prompt,
+        "n": 1,
+        "size": gpt_image_2_size(payload),
+        "resolution": gpt_image_2_resolution(payload)
+    });
+    for key in [
+        "background",
+        "moderation",
+        "output_format",
+        "outputFormat",
+        "partial_images",
+        "partialImages",
+        "stream",
+        "image",
+        "images",
+        "image_urls",
+        "imageUrls",
+        "input_image",
+        "inputImage",
+        "reference_images",
+        "referenceImages",
+    ] {
+        if let Some(value) = payload.get(key) {
+            if let Some(object) = body.as_object_mut() {
+                object.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    if let Some(extra) = payload.get("extra").and_then(Value::as_object) {
+        if let Some(object) = body.as_object_mut() {
+            for (key, value) in extra {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    body
+}
+
+fn gpt_image_2_size(payload: &Value) -> String {
+    let size = payload
+        .get("size")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("1:1");
+    match size {
+        "1024x1024" | "1024*1024" | "1x1" => "1:1".into(),
+        "1024x1792" | "9x16" => "9:16".into(),
+        "1792x1024" | "16x9" => "16:9".into(),
+        value => value.to_string(),
+    }
+}
+
+fn gpt_image_2_resolution(payload: &Value) -> String {
+    payload
+        .get("resolution")
+        .or_else(|| payload.get("quality"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| matches!(*value, "1k" | "2k" | "4k"))
+        .unwrap_or("1k")
+        .to_string()
+}
+
+fn gpt_image_2_task_id(value: &Value) -> Option<String> {
+    if let Some(task_id) = value
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| {
+            item.get("task_id")
+                .or_else(|| item.get("taskId"))
+                .or_else(|| item.get("id"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(task_id.to_string());
+    }
+    ["task_id", "taskId", "id", "data.task_id", "data.taskId", "data.id"]
+        .into_iter()
+        .find_map(|path| json_path_string(value, path))
+}
+
+async fn poll_gpt_image_2_task(
+    client: &reqwest::Client,
+    provider: &ImageProvider,
+    task_id: &str,
+) -> AppResult<Value> {
+    let interval = 3u64;
+    let max_wait = provider.timeout_seconds.max(60);
+    let started = Instant::now();
+    loop {
+        let url = gpt_image_2_task_url(provider, task_id)?;
+        let mut request = client.get(url);
+        if let Some(api_key) = provider_api_key(&provider.api_key, &provider.api_key_env) {
+            request = request.bearer_auth(api_key);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| AppError::BadRequest(format!("gpt-image-2 status failed: {error}")))?;
+        let value = response_json_or_error(response, "gpt-image-2 status").await?;
+        let status = json_path_string(&value, "data.status")
+            .or_else(|| json_path_string(&value, "status"))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if status == "completed" || !gpt_image_2_result_urls(&value).is_empty() {
+            return Ok(value);
+        }
+        if matches!(
+            status.as_str(),
+            "failed" | "error" | "canceled" | "cancelled"
+        ) {
+            let error = json_path_string(&value, "data.error.message")
+                .or_else(|| json_path_string(&value, "error.message"))
+                .unwrap_or_else(|| truncate_output(&value.to_string(), 2000));
+            return Err(AppError::BadRequest(format!(
+                "gpt-image-2 failed with status '{status}': {error}"
+            )));
+        }
+        if started.elapsed().as_secs() >= max_wait {
+            return Err(AppError::BadRequest(format!(
+                "gpt-image-2 timed out after {max_wait}s waiting for task {task_id}"
+            )));
+        }
+        tokio::time::sleep(Duration::from_secs(interval)).await;
+    }
+}
+
+fn gpt_image_2_task_url(provider: &ImageProvider, task_id: &str) -> AppResult<reqwest::Url> {
+    let mut url = reqwest::Url::parse(provider.base_url.trim())
+        .map_err(|error| AppError::BadRequest(format!("invalid image provider URL: {error}")))?;
+    let mut path = url.path().trim_end_matches('/').to_string();
+    if path.ends_with("/images/generations") {
+        path.truncate(path.len() - "/images/generations".len());
+    }
+    path.push_str("/tasks/");
+    path.push_str(task_id.trim());
+    url.set_path(&path);
+    Ok(url)
+}
+
+fn gpt_image_2_result_urls(value: &Value) -> Vec<String> {
+    let Some(images) = value
+        .pointer("/data/result/images")
+        .or_else(|| value.pointer("/result/images"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut urls = Vec::new();
+    for image in images {
+        if let Some(url) = image.get("url").and_then(Value::as_str) {
+            urls.push(url.to_string());
+        } else if let Some(items) = image.get("url").and_then(Value::as_array) {
+            for item in items {
+                if let Some(url) = item.as_str() {
+                    urls.push(url.to_string());
+                }
+            }
+        }
+    }
+    urls
+}
+
+async fn gemini_image_generate(
+    store: &AppStore,
+    run_id: &str,
+    provider: &ImageProvider,
+    model: &str,
+    prompt: &str,
+) -> AppResult<String> {
+    let api_key = provider_api_key(&provider.api_key, &provider.api_key_env).ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "Gemini image provider requires an API key: {}",
+            provider.name
+        ))
+    })?;
+    let mut base = provider.base_url.trim().trim_end_matches('/').to_string();
+    if base.ends_with("/models") {
+        base.truncate(base.len() - "/models".len());
+    }
+    let model_path = if model.starts_with("models/") {
+        model.to_string()
+    } else {
+        format!("models/{model}")
+    };
+    let mut url = reqwest::Url::parse(&format!("{base}/{model_path}:generateContent"))
+        .map_err(|error| AppError::BadRequest(format!("invalid Gemini image URL: {error}")))?;
+    url.query_pairs_mut().append_pair("key", &api_key);
+
+    let body = json!({
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "responseModalities": ["TEXT", "IMAGE"]
+        }
+    });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(provider.timeout_seconds.max(1)))
+        .no_proxy()
+        .user_agent("SynthChat-agent/1.0")
+        .build()
+        .map_err(|error| AppError::BadRequest(format!("failed to build Gemini image client: {error}")))?;
+    let response = client
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("gemini image_generate failed: {error}")))?;
+    let status = response.status();
+    let text = response.text().await.map_err(|error| {
+        AppError::BadRequest(format!("failed to read Gemini image response: {error}"))
+    })?;
+    if !status.is_success() {
+        return Err(AppError::BadRequest(format!(
+            "gemini image_generate returned HTTP {}: {}",
+            status.as_u16(),
+            truncate_output(&text, 2000)
+        )));
+    }
+    let value = serde_json::from_str::<Value>(&text)
+        .map_err(|error| AppError::BadRequest(format!("invalid Gemini image JSON: {error}")))?;
+    let candidates = value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::BadRequest("Gemini image response missing candidates".into()))?;
+    let mut artifacts = Vec::new();
+    let mut text_parts = Vec::new();
+    for candidate in candidates {
+        let parts = candidate
+            .get("content")
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten();
+        for part in parts {
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                if !text.trim().is_empty() {
+                    text_parts.push(text.trim().to_string());
+                }
+            }
+            let inline_data = part
+                .get("inlineData")
+                .or_else(|| part.get("inline_data"));
+            if let Some(inline_data) = inline_data {
+                let b64 = inline_data
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        AppError::BadRequest("Gemini inline image missing data".into())
+                    })?;
+                let mime_type = inline_data
+                    .get("mimeType")
+                    .or_else(|| inline_data.get("mime_type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("image/png");
+                let bytes = decode_base64_image(b64)?;
+                let extension = image_extension_from_content_type(mime_type);
+                let path =
+                    store.save_tool_binary_artifact(run_id, "image_generate", &extension, &bytes)?;
+                artifacts.push(json!({
+                    "path": path.to_string_lossy(),
+                    "source": "gemini_inline_data",
+                    "mimeType": mime_type,
+                    "sizeBytes": bytes.len()
+                }));
+            }
+        }
+    }
+    if artifacts.is_empty() {
+        return Err(AppError::BadRequest(
+            "Gemini image response did not contain inline image data".into(),
+        ));
+    }
+    Ok(serde_json::to_string_pretty(&json!({
+        "providerId": provider.id,
+        "model": model,
+        "prompt": prompt,
+        "text": text_parts,
         "artifacts": artifacts
     }))?)
 }
@@ -6284,5 +6808,91 @@ pub(super) fn video_mime_from_extension(ext: &str) -> Option<String> {
         "mkv" => Some("video/mp4".into()),
         "mpeg" | "mpg" => Some("video/mpeg".into()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_provider_kind_accepts_settings_openai_type() {
+        let provider = ImageProvider {
+            id: "img".into(),
+            name: "OpenAI Image".into(),
+            provider_type: "openai_image".into(),
+            base_url: "https://api.apimart.ai/v1".into(),
+            api_key_env: String::new(),
+            api_key: None,
+            model: "gpt-image-2".into(),
+            enabled: true,
+            timeout_seconds: 120,
+        };
+
+        assert_eq!(
+            image_provider_kind(&provider),
+            ImageProviderKind::OpenAiCompatible
+        );
+    }
+
+    #[test]
+    fn gpt_image_2_request_body_matches_apimart_shape() {
+        let body = gpt_image_2_request_body(
+            "draw",
+            &json!({
+                "n": 4,
+                "size": "1024x1024",
+                "resolution": "2k",
+                "image_urls": ["https://example.com/ref.png"],
+                "extra": {"official_fallback": true}
+            }),
+        );
+
+        assert_eq!(body["model"], "gpt-image-2");
+        assert_eq!(body["prompt"], "draw");
+        assert_eq!(body["n"], 1);
+        assert_eq!(body["size"], "1:1");
+        assert_eq!(body["resolution"], "2k");
+        assert_eq!(body["image_urls"][0], "https://example.com/ref.png");
+        assert_eq!(body["official_fallback"], true);
+    }
+
+    #[test]
+    fn gpt_image_2_task_id_reads_apimart_submit_response() {
+        let value = json!({
+            "code": 200,
+            "data": [
+                {
+                    "status": "submitted",
+                    "task_id": "task_01"
+                }
+            ]
+        });
+
+        assert_eq!(gpt_image_2_task_id(&value).as_deref(), Some("task_01"));
+    }
+
+    #[test]
+    fn gpt_image_2_result_urls_reads_apimart_task_response() {
+        let value = json!({
+            "code": 200,
+            "data": {
+                "status": "completed",
+                "result": {
+                    "images": [
+                        {
+                            "url": [
+                                "https://upload.apimart.ai/f/image/out.png"
+                            ]
+                        }
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(
+            gpt_image_2_result_urls(&value),
+            vec!["https://upload.apimart.ai/f/image/out.png".to_string()]
+        );
     }
 }

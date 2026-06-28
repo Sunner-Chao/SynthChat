@@ -62,6 +62,34 @@ export function PersonaPanel() {
 
   const provider = llmProviders.find((item) => item.id === draft.llmProvider) ?? llmProviders[0];
   const proactiveStatus = proactiveStatuses.find((status) => status.personaId === draft.id);
+  const selectedImageProvider = useMemo(() => {
+    const providerId = draft.imageGeneration?.provider ?? "";
+    if (providerId) {
+      return imageProviders.find((item) => item.id === providerId);
+    }
+    return imageProviders.find((item) => item.enabled && item.model.trim()) ?? imageProviders[0];
+  }, [draft.imageGeneration?.provider, imageProviders]);
+  const effectiveLlmModelId = (
+    draft.llmModel ||
+    provider?.model ||
+    catalogModels[0]?.id ||
+    ""
+  ).trim();
+  const effectiveImageModelId = (selectedImageProvider?.model ?? "").trim();
+
+  useEffect(() => {
+    const nextModel = (provider?.model || catalogModels[0]?.id || "").trim();
+    if (!nextModel) return;
+    setDraft((current) => {
+      const currentProviderId = current.llmProvider || llmProviders[0]?.id || "";
+      const activeProviderId = provider?.id || "";
+      if (currentProviderId !== activeProviderId && current.llmProvider) return current;
+      const currentModel = current.llmModel.trim();
+      const currentModelInCatalog = catalogModels.some((model) => model.id === currentModel);
+      if (currentModel && (currentModel === nextModel || currentModelInCatalog)) return current;
+      return { ...current, llmModel: nextModel };
+    });
+  }, [catalogModels, llmProviders, provider?.id, provider?.model]);
 
   const updateDraft = <K extends keyof Persona>(key: K, value: Persona[K]) => {
     setDraft((current) => ({ ...current, [key]: value }));
@@ -70,7 +98,15 @@ export function PersonaPanel() {
   const save = async () => {
     setSaving(true);
     try {
-      const saved = await savePersona(draft);
+      const imageGeneration = {
+        ...(draft.imageGeneration ?? defaultImageGenerationConfig()),
+        model: ""
+      };
+      const saved = await savePersona({
+        ...draft,
+        llmModel: effectiveLlmModelId || draft.llmModel,
+        imageGeneration
+      });
       setSelectedId(saved.id);
       setDraft(saved);
       setSaved(true);
@@ -215,7 +251,7 @@ export function PersonaPanel() {
               <div className="model-select-row">
                 {catalogModels.length > 0 ? (
                   <select
-                    value={catalogModels.some((model) => model.id === draft.llmModel) ? draft.llmModel : ""}
+                    value={catalogModels.some((model) => model.id === effectiveLlmModelId) ? effectiveLlmModelId : ""}
                     onChange={(event) => {
                       const value = event.target.value;
                       if (value) updateDraft("llmModel", value);
@@ -228,11 +264,14 @@ export function PersonaPanel() {
                   </select>
                 ) : null}
                 <input
-                  value={draft.llmModel || provider?.model || ""}
-                  onChange={(event) => updateDraft("llmModel", event.target.value)}
-                  placeholder={catalogModels.length > 0 ? "或手动输入" : "模型 ID"}
+                  value={effectiveLlmModelId}
+                  readOnly
+                  placeholder="自动使用服务商模型"
                 />
               </div>
+              <p className="form-hint" style={{ marginTop: 6, marginBottom: 0 }}>
+                自动从当前服务商模型目录或服务商默认模型获取；切换服务商时会同步刷新。
+              </p>
             </label>
             <label>
               绑定智能体
@@ -687,7 +726,7 @@ export function PersonaPanel() {
             <div className="two-column">
               <label>
                 生图服务商
-                <select value={draft.imageGeneration?.provider ?? ""} onChange={(event) => setDraft((current) => ({ ...current, imageGeneration: { ...(current.imageGeneration ?? defaultImageGenerationConfig()), provider: event.target.value } }))}>
+                <select value={draft.imageGeneration?.provider ?? ""} onChange={(event) => setDraft((current) => ({ ...current, imageGeneration: { ...(current.imageGeneration ?? defaultImageGenerationConfig()), provider: event.target.value, model: "" } }))}>
                   <option value="">使用默认启用服务商</option>
                   {imageProviders.map((item) => (
                     <option key={item.id} value={item.id}>{item.name}{item.model ? ` · ${item.model}` : ""}</option>
@@ -696,7 +735,10 @@ export function PersonaPanel() {
               </label>
               <label>
                 生图模型
-                <input value={draft.imageGeneration?.model ?? ""} onChange={(event) => setDraft((current) => ({ ...current, imageGeneration: { ...(current.imageGeneration ?? defaultImageGenerationConfig()), model: event.target.value } }))} />
+                <input value={effectiveImageModelId || "未配置"} readOnly />
+                <p className="form-hint" style={{ marginTop: 6, marginBottom: 0 }}>
+                  自动使用所选生图服务商的模型 ID；请在设置页维护服务商模型。
+                </p>
               </label>
             </div>
             <label>

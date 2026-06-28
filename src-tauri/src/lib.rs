@@ -1268,6 +1268,13 @@ fn save_persona(store: State<'_, AppStore>, mut persona: Persona) -> AppResult<P
     normalize_persona_string(&mut persona.voice_reply, "modelDir", "");
     normalize_persona_string(&mut persona.voice_reply, "speakerEmbedding", "");
     normalize_persona_string(&mut persona.voice_reply, "refinePrompt", "");
+    normalize_persona_bool(&mut persona.image_generation, "enabled", false);
+    normalize_persona_string(&mut persona.image_generation, "provider", "");
+    normalize_persona_string(&mut persona.image_generation, "model", "");
+    normalize_persona_string(&mut persona.image_generation, "stylePrefix", "");
+    normalize_persona_string(&mut persona.image_generation, "artStyle", "");
+    normalize_persona_string(&mut persona.image_generation, "negativePrompt", "");
+    normalize_persona_bool(&mut persona.image_generation, "negativeEnabled", true);
     normalize_persona_string(&mut persona.image_generation, "refMode", "avatar");
     let ref_mode = persona
         .image_generation
@@ -1664,8 +1671,42 @@ fn create_conversation(
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn delete_conversation(store: State<'_, AppStore>, id: String) -> AppResult<()> {
-    store.delete_conversation(&id)
+fn delete_conversation(
+    store: State<'_, AppStore>,
+    id: String,
+) -> AppResult<agent::ConversationDeleteMemorySettlingResult> {
+    let settling_plan = match agent::snapshot_conversation_memory_before_delete(&store, &id) {
+        Ok(plan) => plan,
+        Err(error) => {
+            store.delete_conversation(&id)?;
+            return Ok(agent::ConversationDeleteMemorySettlingResult {
+                status: "failed".into(),
+                reason: Some(error.to_string()),
+                memory_count: 0,
+            });
+        }
+    };
+    store.delete_conversation(&id)?;
+    match settling_plan {
+        agent::ConversationMemorySettlingPlan::Skip(result) => Ok(result),
+        agent::ConversationMemorySettlingPlan::Schedule(snapshot) => {
+            let store = store.inner().clone();
+            tauri::async_runtime::spawn(async move {
+                let result = agent::settle_conversation_memory_snapshot(&store, snapshot).await;
+                if result.status == "failed" {
+                    eprintln!(
+                        "SynthChat background memory settling after conversation delete failed: {}",
+                        result.reason.unwrap_or_else(|| "unknown error".into())
+                    );
+                }
+            });
+            Ok(agent::ConversationDeleteMemorySettlingResult {
+                status: "scheduled".into(),
+                reason: Some("background memory settling scheduled".into()),
+                memory_count: 0,
+            })
+        }
+    }
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -4354,6 +4395,14 @@ fn normalize_persona_string(value: &mut Value, key: &str, fallback: &str) {
         .filter(|text| !text.is_empty())
         .unwrap_or(fallback)
         .to_string();
+    object.insert(key.to_string(), json!(next));
+}
+
+fn normalize_persona_bool(value: &mut Value, key: &str, fallback: bool) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let next = object.get(key).and_then(Value::as_bool).unwrap_or(fallback);
     object.insert(key.to_string(), json!(next));
 }
 

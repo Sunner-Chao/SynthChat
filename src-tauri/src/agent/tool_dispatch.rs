@@ -1644,7 +1644,7 @@ pub(super) async fn execute_recovery_internal_tool(
             }
             skill_manage_tool(store, &payload)
         }
-        "image_generate" => image_generate_tool(store, run_id, &payload).await,
+        "image_generate" => image_generate_tool(store, conversation_id, run_id, &payload).await,
         "video_generate" => video_generate_tool(store, run_id, &payload).await,
         "text_to_speech" => text_to_speech_tool(store, run_id, &payload).await,
         "transcribe_audio" => transcribe_audio_tool(store, agent, run_id, &payload).await,

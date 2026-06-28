@@ -292,7 +292,7 @@ use memory::{
 pub(crate) use memory_manager::sync_builtin_memory_markdown;
 use memory_manager::{
     build_memory_context_block, builtin_memory_prefetch, memory_pre_compress_context,
-    on_memory_turn_start, on_memory_turn_synced, on_memory_write,
+    on_memory_turn_start, on_memory_turn_synced, on_memory_write, sanitize_memory_context,
 };
 use mixture::{
     mixture_aggregator_system_prompt, mixture_of_agents_tool, mixture_reference_providers,
@@ -375,6 +375,306 @@ pub(crate) async fn dispatch_kanban_and_drain_agent_queue(
         "nativeDispatcherDrainBridge": true,
         "boundary": "SynthChat claims ready Kanban tasks, enqueues Hermes-style worker prompts into the native agent queue, then optionally drains that queue through the existing async agent runtime."
     }))
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationDeleteMemorySettlingResult {
+    pub status: String,
+    pub reason: Option<String>,
+    pub memory_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConversationMemorySettlingSnapshot {
+    conversation: Conversation,
+    persona: Persona,
+    agent: AgentDefinition,
+    messages: Vec<ChatMessage>,
+}
+
+pub(crate) enum ConversationMemorySettlingPlan {
+    Schedule(ConversationMemorySettlingSnapshot),
+    Skip(ConversationDeleteMemorySettlingResult),
+}
+
+#[derive(Debug, Clone)]
+struct DeleteMemoryCandidate {
+    summary: String,
+    importance: u8,
+    target: String,
+}
+
+pub(crate) fn snapshot_conversation_memory_before_delete(
+    store: &AppStore,
+    conversation_id: &str,
+) -> AppResult<ConversationMemorySettlingPlan> {
+    let conversation = store.conversation(conversation_id)?;
+    let persona = store
+        .persona(conversation.persona_id.as_deref())
+        .or_else(|_| store.persona(None))?;
+    let enabled = persona
+        .memory
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if !enabled {
+        return Ok(ConversationMemorySettlingPlan::Skip(
+            delete_memory_settling_skipped("persona memory disabled"),
+        ));
+    }
+    let messages = store.messages(conversation_id, None)?;
+    let visible_messages = messages
+        .iter()
+        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+        .count();
+    let min_messages = store
+        .config()?
+        .chat
+        .background_memory_review_min_messages
+        .max(2);
+    if visible_messages < min_messages {
+        return Ok(ConversationMemorySettlingPlan::Skip(
+            delete_memory_settling_skipped(format!(
+                "not enough visible messages: {visible_messages}/{min_messages}"
+            )),
+        ));
+    }
+    let agent = store.agent(Some(&conversation.agent_id))?;
+    Ok(ConversationMemorySettlingPlan::Schedule(
+        ConversationMemorySettlingSnapshot {
+        conversation,
+        persona,
+        agent,
+        messages,
+        },
+    ))
+}
+
+pub(crate) async fn settle_conversation_memory_snapshot(
+    store: &AppStore,
+    snapshot: ConversationMemorySettlingSnapshot,
+) -> ConversationDeleteMemorySettlingResult {
+    let transcript = render_messages_for_summary(&snapshot.messages);
+    if transcript.trim().is_empty() {
+        return delete_memory_settling_skipped("conversation transcript is empty");
+    }
+    let providers = match store.provider_candidates(selected_provider_id(&snapshot.persona, &snapshot.agent)) {
+        Ok(providers) => providers,
+        Err(error) => {
+            return ConversationDeleteMemorySettlingResult {
+                status: "failed".into(),
+                reason: Some(error.to_string()),
+                memory_count: 0,
+            };
+        }
+    };
+    if providers.is_empty() {
+        return delete_memory_settling_skipped("no llm provider configured");
+    }
+    let mut effective_persona = effective_llm_persona(&snapshot.persona, &snapshot.agent);
+    effective_persona.max_tokens = effective_persona.max_tokens.min(1024).max(256);
+    let prompt = delete_memory_review_prompt(&snapshot.conversation, &transcript);
+    let message = ChatMessage::new(
+        snapshot.conversation.id.clone(),
+        "user",
+        prompt.clone(),
+        "delete-memory-review",
+    );
+    let reply = match complete_chat_with_provider_failover(
+        store,
+        None,
+        &providers,
+        &effective_persona,
+        delete_memory_review_system_prompt(),
+        vec![message],
+        &prompt,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(error) => {
+            return ConversationDeleteMemorySettlingResult {
+                status: "failed".into(),
+                reason: Some(format!("memory review llm failed: {error}")),
+                memory_count: 0,
+            };
+        }
+    };
+    let candidates = match parse_delete_memory_candidates(&reply.content) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            return ConversationDeleteMemorySettlingResult {
+                status: "failed".into(),
+                reason: Some(format!("memory review parse failed: {error}")),
+                memory_count: 0,
+            };
+        }
+    };
+    if candidates.is_empty() {
+        let _ = sync_builtin_memory_markdown(store, &snapshot.persona);
+        return ConversationDeleteMemorySettlingResult {
+            status: "settled".into(),
+            reason: Some("no durable memories found".into()),
+            memory_count: 0,
+        };
+    }
+    let mut saved = 0usize;
+    for candidate in candidates {
+        let summary = sanitize_memory_context(&candidate.summary);
+        if summary.trim().is_empty() {
+            continue;
+        }
+        if store
+            .memories(Some(&snapshot.persona.id))
+            .unwrap_or_default()
+            .iter()
+            .any(|memory| memory.summary.trim() == summary.trim() && memory.target == candidate.target)
+        {
+            continue;
+        }
+        match store.save_memory(MemoryEntry {
+            id: String::new(),
+            persona_id: snapshot.persona.id.clone(),
+            target: candidate.target,
+            summary,
+            importance: candidate.importance,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }) {
+            Ok(memory) => {
+                let _ = on_memory_write(
+                    store,
+                    "",
+                    &snapshot.persona,
+                    "add",
+                    &memory.id,
+                    &memory.summary,
+                );
+                saved += 1;
+            }
+            Err(_) => {}
+        }
+    }
+    let _ = sync_builtin_memory_markdown(store, &snapshot.persona);
+    ConversationDeleteMemorySettlingResult {
+        status: "settled".into(),
+        reason: None,
+        memory_count: saved,
+    }
+}
+
+fn delete_memory_settling_skipped(
+    reason: impl Into<String>,
+) -> ConversationDeleteMemorySettlingResult {
+    ConversationDeleteMemorySettlingResult {
+        status: "skipped".into(),
+        reason: Some(reason.into()),
+        memory_count: 0,
+    }
+}
+
+fn delete_memory_review_system_prompt() -> String {
+    "You review a soon-to-be-deleted chat session for long-term persona memory. Return only valid JSON. Store less, not more. Extract only durable user facts, preferences, routines, ongoing projects, constraints, important decisions, and explicit requests to remember. Do not store temporary tasks, implementation chatter, assistant behavior, duplicate facts, or private/secrets. JSON schema: {\"memories\":[{\"summary\":\"...\",\"importance\":1-5,\"target\":\"memory|user\"}]}.".into()
+}
+
+fn delete_memory_review_prompt(conversation: &Conversation, transcript: &str) -> String {
+    let transcript = transcript.chars().take(18_000).collect::<String>();
+    format!(
+        "Conversation title: {}\nConversation id: {}\n\nTranscript:\n{}\n\nReturn JSON only.",
+        conversation.title, conversation.id, transcript
+    )
+}
+
+fn parse_delete_memory_candidates(raw: &str) -> AppResult<Vec<DeleteMemoryCandidate>> {
+    let value = parse_json_value_from_model_text(raw).ok_or_else(|| {
+        AppError::BadRequest("memory review did not return valid JSON".into())
+    })?;
+    let items = value
+        .get("memories")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut candidates = Vec::new();
+    for item in items.into_iter().take(8) {
+        let summary = item
+            .get("summary")
+            .or_else(|| item.get("content"))
+            .or_else(|| item.get("fact"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if summary.is_empty() {
+            continue;
+        }
+        let importance = item
+            .get("importance")
+            .and_then(Value::as_u64)
+            .unwrap_or(4)
+            .clamp(1, 5) as u8;
+        let target = match item
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("memory")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "user" => "user".into(),
+            _ => "memory".into(),
+        };
+        candidates.push(DeleteMemoryCandidate {
+            summary,
+            importance,
+            target,
+        });
+    }
+    Ok(candidates)
+}
+
+fn parse_json_value_from_model_text(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str(trimmed) {
+        return Some(value);
+    }
+    let without_fence = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim);
+    if let Some(value) = without_fence.and_then(|value| serde_json::from_str(value).ok()) {
+        return Some(value);
+    }
+    let first = trimmed.find(|ch| ch == '{' || ch == '[')?;
+    let last = trimmed.rfind(|ch| ch == '}' || ch == ']')?;
+    if first <= last {
+        serde_json::from_str(&trimmed[first..=last]).ok()
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod delete_memory_review_tests {
+    use super::*;
+
+    #[test]
+    fn parse_delete_memory_candidates_accepts_fenced_json() {
+        let raw = r#"```json
+{"memories":[{"summary":"User prefers concise answers.","importance":5,"target":"user"},{"summary":"Project uses SynthChat release builds.","importance":3}]}
+```"#;
+
+        let parsed = parse_delete_memory_candidates(raw).unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].summary, "User prefers concise answers.");
+        assert_eq!(parsed[0].importance, 5);
+        assert_eq!(parsed[0].target, "user");
+        assert_eq!(parsed[1].target, "memory");
+    }
 }
 use security_tools::{osv_check_tool, security_scan_tool};
 use session_search::{

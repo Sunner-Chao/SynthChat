@@ -13,6 +13,7 @@ import type {
   CapabilityAdapter,
   ChatMessage,
   Conversation,
+  ConversationDeleteMemorySettlingResult,
   EmojiGroup,
   EnhancedSkillSummary,
   ImageProvider,
@@ -130,6 +131,13 @@ function uiMessageLimit(config: AppConfig | null) {
   const configured = config?.chat.uiMessageLimit ?? DEFAULT_UI_MESSAGE_LIMIT;
   if (!Number.isFinite(configured)) return DEFAULT_UI_MESSAGE_LIMIT;
   return Math.min(MAX_UI_MESSAGE_LIMIT, Math.max(MIN_UI_MESSAGE_LIMIT, Math.floor(configured)));
+}
+
+function conversationMessageLimit(config: AppConfig | null, conversationId: string | null | undefined, overrides: Record<string, number>) {
+  const baseLimit = uiMessageLimit(config);
+  const configured = conversationId ? overrides[conversationId] : undefined;
+  if (typeof configured !== "number" || !Number.isFinite(configured)) return baseLimit;
+  return Math.min(MAX_UI_MESSAGE_LIMIT, Math.max(baseLimit, Math.floor(configured)));
 }
 
 function uiMessagePreviewChars(config: AppConfig | null) {
@@ -257,7 +265,10 @@ function appendLocalAssistantNotice(
       accountId: null
     };
     return {
-      messages: displayMessages([...current.messages, message], uiMessageLimit(current.config)),
+      messages: displayMessages(
+        [...current.messages, message],
+        conversationMessageLimit(current.config, conversationId, current.conversationMessageLimits)
+      ),
       conversations: current.conversations.map((conversation) =>
         conversation.id === conversationId
           ? { ...conversation, lastMessage: content, updatedAt: now }
@@ -452,6 +463,7 @@ interface AppState {
   conversations: Conversation[];
   activeConversationId: string | null;
   messages: ChatMessage[];
+  conversationMessageLimits: Record<string, number>;
   processingConversationIds: string[];
   conversationUnreadCounts: Record<string, number>;
   llmProviders: LlmProvider[];
@@ -492,13 +504,14 @@ interface AppState {
   goBack: () => void;
   bootstrap: () => Promise<void>;
   refreshChatData: (preferredConversationId?: string | null, preferredPersonaId?: string | null) => Promise<void>;
+  loadOlderMessages: (conversationId?: string | null, pageSize?: number) => Promise<{ loadedCount: number; hasMore: boolean }>;
   setConversationProcessing: (conversationId: string, processing: boolean) => void;
   incrementConversationUnread: (conversationId: string, amount?: number) => void;
   markConversationRead: (conversationId: string) => void;
   upsertIncomingMessage: (message: ChatMessage) => void;
   createConversation: (personaId?: string) => Promise<void>;
   openPersonaConversation: (personaId: string) => Promise<void>;
-  deleteConversation: (conversationId: string) => Promise<void>;
+  deleteConversation: (conversationId: string) => Promise<ConversationDeleteMemorySettlingResult>;
   selectConversation: (conversationId: string) => Promise<void>;
   sendMessage: (content: string, personaId?: string, agentId?: string) => Promise<void>;
   deleteMessage: (messageId: string) => Promise<void>;
@@ -578,6 +591,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   conversations: [],
   activeConversationId: null,
   messages: [],
+  conversationMessageLimits: {},
   processingConversationIds: [],
   conversationUnreadCounts: {},
   llmProviders: bootstrapCache?.llmProviders ?? [],
@@ -708,7 +722,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const activeConversationId = currentActive && conversations.some((item) => item.id === currentActive)
       ? currentActive
       : conversations[0]?.id ?? null;
-    const messageLimit = uiMessageLimit(config);
+    const messageLimit = conversationMessageLimit(config, activeConversationId, get().conversationMessageLimits);
     const previewChars = uiMessagePreviewChars(config);
     const messages = activeConversationId
       ? visibleChatMessages(await api.listMessages(activeConversationId, messageLimit, previewChars).catch((error) => {
@@ -749,6 +763,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       activeAgentRuns: {},
       managedProcessEvents: [],
       processingConversationIds: [],
+      conversationMessageLimits: activeConversationId
+        ? {
+          ...get().conversationMessageLimits,
+          [activeConversationId]: messageLimit
+        }
+        : get().conversationMessageLimits,
       loading: false
     });
     writeBootstrapCache({
@@ -772,7 +792,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         api.listConversations()
       ]);
       const state = get();
-      const messageLimit = uiMessageLimit(state.config);
+      const messageLimit = conversationMessageLimit(state.config, state.activeConversationId, state.conversationMessageLimits);
       const previewChars = uiMessagePreviewChars(state.config);
       const nextMessages = state.activeConversationId
         ? visibleChatMessages(await api.listMessages(state.activeConversationId, messageLimit, previewChars))
@@ -806,7 +826,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         : null)
       ?? conversations[0]?.id
       ?? null;
-    const messageLimit = uiMessageLimit(state.config);
+    const messageLimit = conversationMessageLimit(state.config, activeConversationId, state.conversationMessageLimits);
     const previewChars = uiMessagePreviewChars(state.config);
     const backendMessages = activeConversationId
       ? visibleChatMessages(await api.listMessages(activeConversationId, messageLimit, previewChars))
@@ -839,6 +859,38 @@ export const useAppStore = create<AppState>((set, get) => ({
         ? current.processingConversationIds.filter((id) => id !== activeConversationId)
         : current.processingConversationIds
     }));
+  },
+  loadOlderMessages: async (conversationId, pageSize) => {
+    const state = get();
+    const targetConversationId = conversationId ?? state.activeConversationId;
+    if (!targetConversationId) return { loadedCount: state.messages.length, hasMore: false };
+    const baseLimit = uiMessageLimit(state.config);
+    const increment = Math.max(baseLimit, pageSize ?? baseLimit);
+    const currentLimit = conversationMessageLimit(state.config, targetConversationId, state.conversationMessageLimits);
+    const nextLimit = Math.min(MAX_UI_MESSAGE_LIMIT, currentLimit + increment);
+    if (nextLimit <= currentLimit && state.messages.length >= currentLimit) {
+      return { loadedCount: state.messages.length, hasMore: false };
+    }
+    const previewChars = uiMessagePreviewChars(state.config);
+    const backendMessages = visibleChatMessages(await api.listMessages(targetConversationId, nextLimit, previewChars));
+    const messages = mergeLocalUiMessages(backendMessages, state.messages, targetConversationId, nextLimit);
+    if (get().activeConversationId === targetConversationId) {
+      set((current) => ({
+        conversationMessageLimits: {
+          ...current.conversationMessageLimits,
+          [targetConversationId]: nextLimit
+        },
+        messages
+      }));
+    } else {
+      set((current) => ({
+        conversationMessageLimits: {
+          ...current.conversationMessageLimits,
+          [targetConversationId]: nextLimit
+        }
+      }));
+    }
+    return { loadedCount: messages.length, hasMore: backendMessages.length >= nextLimit && nextLimit < MAX_UI_MESSAGE_LIMIT };
   },
   setConversationProcessing: (conversationId, processing) => {
     if (!conversationId) return;
@@ -905,7 +957,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         return state;
       }
       const index = state.messages.findIndex((item) => item.id === message.id);
-      const messageLimit = uiMessageLimit(state.config);
+      const messageLimit = conversationMessageLimit(state.config, message.conversationId, state.conversationMessageLimits);
       const messages = index >= 0
         ? state.messages.map((item) => (item.id === message.id ? message : item))
         : [...state.messages, message];
@@ -919,11 +971,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     const messageLimit = uiMessageLimit(get().config);
     const previewChars = uiMessagePreviewChars(get().config);
     const messages = visibleChatMessages(await api.listMessages(conversation.id, messageLimit, previewChars));
-    set({
+    set((current) => ({
       conversations,
       activeConversationId: conversation.id,
-      messages
-    });
+      messages,
+      conversationMessageLimits: {
+        ...current.conversationMessageLimits,
+        [conversation.id]: messageLimit
+      }
+    }));
   },
   openPersonaConversation: async (personaId) => {
     const persona = get().personas.find((item) => item.id === personaId);
@@ -932,23 +988,30 @@ export const useAppStore = create<AppState>((set, get) => ({
     const messageLimit = uiMessageLimit(get().config);
     const previewChars = uiMessagePreviewChars(get().config);
     const messages = visibleChatMessages(await api.listMessages(conversation.id, messageLimit, previewChars));
-    set({
+    set((current) => ({
       conversations,
       activeConversationId: conversation.id,
-      messages
-    });
+      messages,
+      conversationMessageLimits: {
+        ...current.conversationMessageLimits,
+        [conversation.id]: messageLimit
+      }
+    }));
   },
   deleteConversation: async (conversationId) => {
-    await api.deleteConversation(conversationId);
+    const settling = await api.deleteConversation(conversationId);
+    const state = get();
     const conversations = await api.listConversations();
-    const activeConversationId = get().activeConversationId === conversationId
+    const activeConversationId = state.activeConversationId === conversationId
       ? conversations[0]?.id ?? null
-      : get().activeConversationId;
-    const messageLimit = uiMessageLimit(get().config);
-    const previewChars = uiMessagePreviewChars(get().config);
+      : state.activeConversationId;
+    const { [conversationId]: _, ...conversationMessageLimits } = state.conversationMessageLimits;
+    const messageLimit = conversationMessageLimit(state.config, activeConversationId, conversationMessageLimits);
+    const previewChars = uiMessagePreviewChars(state.config);
     const messages = activeConversationId ? visibleChatMessages(await api.listMessages(activeConversationId, messageLimit, previewChars)) : [];
-    const { [conversationId]: _, ...unreadCounts } = get().conversationUnreadCounts;
-    set({ conversations, activeConversationId, messages, conversationUnreadCounts: unreadCounts });
+    const { [conversationId]: _unread, ...unreadCounts } = state.conversationUnreadCounts;
+    set({ conversations, activeConversationId, messages, conversationUnreadCounts: unreadCounts, conversationMessageLimits });
+    return settling;
   },
   selectConversation: async (conversationId) => {
     set((state) => {
@@ -961,11 +1024,19 @@ export const useAppStore = create<AppState>((set, get) => ({
         conversationUnreadCounts: unreadCounts
       };
     });
-    const messageLimit = uiMessageLimit(get().config);
-    const previewChars = uiMessagePreviewChars(get().config);
+    const state = get();
+    const messageLimit = conversationMessageLimit(state.config, conversationId, state.conversationMessageLimits);
+    const previewChars = uiMessagePreviewChars(state.config);
     const messages = visibleChatMessages(await api.listMessages(conversationId, messageLimit, previewChars));
     if (get().activeConversationId === conversationId) {
-      set({ activeConversationId: conversationId, messages });
+      set((current) => ({
+        activeConversationId: conversationId,
+        messages,
+        conversationMessageLimits: {
+          ...current.conversationMessageLimits,
+          [conversationId]: messageLimit
+        }
+      }));
     }
   },
   sendMessage: async (content, personaId, agentId) => {
@@ -979,12 +1050,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       const conversations = await api.listConversations();
       const messageLimit = uiMessageLimit(state.config);
       const previewChars = uiMessagePreviewChars(state.config);
-      set({
+      const messages = visibleChatMessages(await api.listMessages(conversation.id, messageLimit, previewChars));
+      set((current) => ({
         conversations,
         activeConversationId: conversation.id,
-        messages: visibleChatMessages(await api.listMessages(conversation.id, messageLimit, previewChars)),
-        processingConversationIds: state.processingConversationIds.filter((id) => id !== state.activeConversationId)
-      });
+        messages,
+        processingConversationIds: state.processingConversationIds.filter((id) => id !== state.activeConversationId),
+        conversationMessageLimits: {
+          ...current.conversationMessageLimits,
+          [conversation.id]: messageLimit
+        }
+      }));
       return;
     }
     const sessionSelector = parseSessionSwitchCommand(cleanContent);
@@ -998,17 +1074,22 @@ export const useAppStore = create<AppState>((set, get) => ({
       );
       if (matches.length === 1) {
         const conversation = matches[0];
-        const messageLimit = uiMessageLimit(state.config);
+        const messageLimit = conversationMessageLimit(state.config, conversation.id, state.conversationMessageLimits);
         const previewChars = uiMessagePreviewChars(state.config);
         const unreadCounts = { ...state.conversationUnreadCounts };
         delete unreadCounts[conversation.id];
-        set({
+        const messages = visibleChatMessages(await api.listMessages(conversation.id, messageLimit, previewChars));
+        set((current) => ({
           conversations,
           activeConversationId: conversation.id,
-          messages: visibleChatMessages(await api.listMessages(conversation.id, messageLimit, previewChars)),
+          messages,
           conversationUnreadCounts: unreadCounts,
-          processingConversationIds: state.processingConversationIds.filter((id) => id !== state.activeConversationId)
-        });
+          processingConversationIds: state.processingConversationIds.filter((id) => id !== state.activeConversationId),
+          conversationMessageLimits: {
+            ...current.conversationMessageLimits,
+            [conversation.id]: messageLimit
+          }
+        }));
         return;
       }
     }
@@ -1022,7 +1103,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       const conversations = await api.listConversations();
       const messageLimit = uiMessageLimit(state.config);
       const previewChars = uiMessagePreviewChars(state.config);
-      set({ conversations, activeConversationId, messages: visibleChatMessages(await api.listMessages(conversation.id, messageLimit, previewChars)) });
+      const messages = visibleChatMessages(await api.listMessages(conversation.id, messageLimit, previewChars));
+      set((current) => ({
+        conversations,
+        activeConversationId,
+        messages,
+        conversationMessageLimits: {
+          ...current.conversationMessageLimits,
+          [conversation.id]: messageLimit
+        }
+      }));
     }
     const temporaryMessage: ChatMessage = {
       id: `local-${crypto.randomUUID()}`,
@@ -1034,7 +1124,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       accountId: null
     };
     set((current) => ({
-      messages: displayMessages([...current.messages, temporaryMessage], uiMessageLimit(current.config)),
+      messages: displayMessages(
+        [...current.messages, temporaryMessage],
+        conversationMessageLimit(current.config, activeConversationId, current.conversationMessageLimits)
+      ),
       processingConversationIds: current.processingConversationIds.includes(activeConversationId ?? "")
         ? current.processingConversationIds
         : [...current.processingConversationIds, activeConversationId ?? ""].filter(Boolean),
@@ -1066,7 +1159,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         const visibleResponseMessages = visibleChatMessages(responseMessages ?? []);
         const hasAssistantReply = visibleResponseMessages.some((m) => m.role === "assistant" && m.content.trim());
         if (visibleResponseMessages.length > 0) {
-          const messageLimit = uiMessageLimit(get().config);
+          const currentState = get();
+          const messageLimit = conversationMessageLimit(currentState.config, conversationIdForSend, currentState.conversationMessageLimits);
           set((current) => {
             const backendUserIds = new Set(
               visibleResponseMessages.filter((m) => m.role === "user").map((m) => m.id)
@@ -1570,7 +1664,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const activeConversationId = currentActive && conversations.some((item) => item.id === currentActive)
       ? currentActive
       : conversations[0]?.id ?? null;
-    const messageLimit = uiMessageLimit(state.config);
+    const messageLimit = conversationMessageLimit(state.config, activeConversationId, state.conversationMessageLimits);
     const previewChars = uiMessagePreviewChars(state.config);
     const messages = activeConversationId
       ? visibleChatMessages(await api.listMessages(activeConversationId, messageLimit, previewChars))

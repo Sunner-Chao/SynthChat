@@ -5,7 +5,8 @@ param(
   [ValidateSet("config", "offlineInstaller", "embedBootstrapper", "downloadBootstrapper", "skip")]
   [string]$WebviewInstallMode = "config",
   [switch]$SkipPreflight,
-  [switch]$PreflightOnly
+  [switch]$PreflightOnly,
+  [switch]$AcceptExistingArtifactOnTimeout
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,6 +16,7 @@ $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $RepoRoot
 $TauriConfigPath = "src-tauri\tauri.conf.json"
 $OriginalTauriConfig = $null
+$BuildStartedAt = Get-Date
 
 function Assert-RequiredPath {
   param(
@@ -37,6 +39,32 @@ function Write-Utf8NoBom {
   )
   $encoding = New-Object System.Text.UTF8Encoding $false
   [System.IO.File]::WriteAllText((Resolve-Path -LiteralPath $Path), $Value, $encoding)
+}
+
+function Get-LatestBundleArtifact {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Bundle
+  )
+  $bundleRoot = Join-Path $RepoRoot "src-tauri\target\release\bundle"
+  $searchRoots = @()
+  if ($Bundle -eq "all") {
+    $searchRoots = @(
+      (Join-Path $bundleRoot "nsis"),
+      (Join-Path $bundleRoot "msi")
+    )
+  } else {
+    $searchRoots = @((Join-Path $bundleRoot $Bundle))
+  }
+  $extensions = @("*.exe", "*.msi", "*.msix")
+  $items = @()
+  foreach ($root in $searchRoots) {
+    if (-not (Test-Path -LiteralPath $root)) { continue }
+    foreach ($extension in $extensions) {
+      $items += Get-ChildItem -LiteralPath $root -Filter $extension -File -ErrorAction SilentlyContinue
+    }
+  }
+  $items | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 }
 
 if (-not $SkipPreflight) {
@@ -95,6 +123,19 @@ try {
   Write-Host "Building SynthChat native Windows package..."
   & npm @tauriArgs
   if ($LASTEXITCODE -ne 0) {
+    $artifact = Get-LatestBundleArtifact -Bundle $Bundle
+    $acceptArtifact = $false
+    if ($AcceptExistingArtifactOnTimeout -and $null -ne $artifact) {
+      $acceptArtifact = (
+        $artifact.LastWriteTime -ge $BuildStartedAt.AddMinutes(-2) -and
+        $artifact.Length -gt 1MB
+      )
+    }
+    if ($acceptArtifact) {
+      Write-Warning "Tauri returned exit code $LASTEXITCODE, but a fresh installer artifact exists: $($artifact.FullName)"
+      Write-Warning "Accepting this artifact because -AcceptExistingArtifactOnTimeout was specified. If installation fails, rebuild with -WebviewInstallMode downloadBootstrapper."
+      return
+    }
     throw "Tauri build failed with exit code $LASTEXITCODE"
   }
 } finally {
