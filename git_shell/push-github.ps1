@@ -1,6 +1,12 @@
 ﻿param(
     [string]$Message,
-    [string]$Version
+    [string]$Version,
+    [switch]$CreateRelease,
+    [string[]]$ReleaseAsset,
+    [string]$ReleaseTitle,
+    [string]$ReleaseNotes,
+    [switch]$Draft,
+    [switch]$Prerelease
 )
 
 $ErrorActionPreference = 'Stop'
@@ -204,6 +210,111 @@ try {
         }
     }
 
+    function Test-GitHubCli {
+        $gh = Get-Command gh -ErrorAction SilentlyContinue
+        if (-not $gh) {
+            return $false
+        }
+        & gh auth status 1>$null 2>$null
+        return ($LASTEXITCODE -eq 0)
+    }
+
+    function Resolve-CreateGithubRelease {
+        param([bool]$UseTagRelease)
+
+        if (-not $UseTagRelease) {
+            return $false
+        }
+        if ($CreateRelease) {
+            return $true
+        }
+        $choice = Read-Host "是否创建/更新 GitHub Release 并上传安装包？(y/N)"
+        return $choice -match '^(y|yes)$'
+    }
+
+    function Resolve-ReleaseAssets {
+        if ($ReleaseAsset -and $ReleaseAsset.Count -gt 0) {
+            return @($ReleaseAsset)
+        }
+
+        $defaultAssets = @(
+            Get-ChildItem -Path "src-tauri\target\release\bundle\nsis" -Filter "*.exe" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 1 -ExpandProperty FullName
+        )
+        if ($defaultAssets.Count -gt 0 -and $defaultAssets[0]) {
+            Write-Host "[push-github] 检测到最新安装包：" -ForegroundColor DarkGray
+            Write-Host "  $($defaultAssets[0])" -ForegroundColor DarkGray
+            $choice = Read-Host "是否上传该安装包到 Release？(Y/n)"
+            if (-not $choice -or $choice -match '^(y|yes)$') {
+                return @($defaultAssets[0])
+            }
+        }
+
+        $inputAssets = Read-Host "请输入要上传的安装包路径（可留空，仅创建 Release；多个路径用英文逗号分隔）"
+        if (-not $inputAssets -or -not $inputAssets.Trim()) {
+            return @()
+        }
+        return @($inputAssets -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+
+    function Invoke-GitHubRelease {
+        param(
+            [string]$VersionTag,
+            [string[]]$Assets
+        )
+
+        if (-not $VersionTag) {
+            return
+        }
+        if (-not (Test-GitHubCli)) {
+            throw "需要 GitHub CLI gh 且已登录。请先运行：winget install GitHub.cli；gh auth login"
+        }
+
+        $title = if ($ReleaseTitle -and $ReleaseTitle.Trim()) { $ReleaseTitle.Trim() } else { $VersionTag }
+        $notes = if ($ReleaseNotes -and $ReleaseNotes.Trim()) { $ReleaseNotes.Trim() } else { "Release $VersionTag" }
+        $validAssets = @()
+        foreach ($asset in @($Assets)) {
+            if (-not $asset) { continue }
+            $resolved = Resolve-Path -LiteralPath $asset -ErrorAction SilentlyContinue
+            if (-not $resolved) {
+                throw "Release asset 不存在：$asset"
+            }
+            $validAssets += $resolved.Path
+        }
+
+        & gh release view $VersionTag 1>$null 2>$null
+        $releaseExists = ($LASTEXITCODE -eq 0)
+        if ($releaseExists) {
+            Write-Host "[push-github] GitHub Release 已存在，更新标题/说明并上传资产: $VersionTag" -ForegroundColor Cyan
+            $editArgs = @("release", "edit", $VersionTag, "--title", $title, "--notes", $notes)
+            if ($Draft) { $editArgs += "--draft" }
+            if ($Prerelease) { $editArgs += "--prerelease" }
+            & gh @editArgs
+            if ($LASTEXITCODE -ne 0) {
+                throw "gh release edit 失败。"
+            }
+            if ($validAssets.Count -gt 0) {
+                Write-Host "[push-github] 上传 Release 资产..." -ForegroundColor Cyan
+                & gh release upload $VersionTag @validAssets --clobber
+                if ($LASTEXITCODE -ne 0) {
+                    throw "gh release upload 失败。"
+                }
+            }
+            return
+        }
+
+        Write-Host "[push-github] 创建 GitHub Release: $VersionTag" -ForegroundColor Cyan
+        $createArgs = @("release", "create", $VersionTag, "--title", $title, "--notes", $notes)
+        if ($Draft) { $createArgs += "--draft" }
+        if ($Prerelease) { $createArgs += "--prerelease" }
+        if ($validAssets.Count -gt 0) { $createArgs += $validAssets }
+        & gh @createArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw "gh release create 失败。"
+        }
+    }
+
     function Invoke-Push {
         param(
             [string]$Branch,
@@ -230,6 +341,7 @@ try {
 
     $releaseMode = Resolve-ReleaseMode
     $useTagRelease = ($releaseMode -eq 'tag_release')
+    $createGithubRelease = Resolve-CreateGithubRelease -UseTagRelease:$useTagRelease
     $pushMode = Resolve-PushMode
     $forcePush = ($pushMode -eq 'full_override')
 
@@ -344,9 +456,17 @@ try {
         }
     }
 
+    if ($createGithubRelease -and $versionTag) {
+        $assets = Resolve-ReleaseAssets
+        Invoke-GitHubRelease -VersionTag $versionTag -Assets $assets
+    }
+
     Write-Host "[push-github] 已完成推送。分支: $branch" -ForegroundColor Green
     if ($versionTag) {
         Write-Host "[push-github] 已完成远端版本标签同步: $versionTag" -ForegroundColor Green
+    }
+    if ($createGithubRelease -and $versionTag) {
+        Write-Host "[push-github] 已完成 GitHub Release: $versionTag" -ForegroundColor Green
     }
 }
 finally {
