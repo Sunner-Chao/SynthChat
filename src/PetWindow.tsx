@@ -389,7 +389,8 @@ function touchAreaCloudText(area: string | undefined, count: number) {
     : normalized === "body" || normalized === "belly"
       ? ["哎呀，戳到我了。", "我会站稳一点。", "别闹，我还在看着当前对话呢。"]
       : ["我在哦。", "有什么想问的，直接在下面说就好。", "我会在这里看着当前对话。"];
-  return variants[Math.max(0, count - 1) % variants.length];
+  const text = variants[Math.max(0, count - 1) % variants.length];
+  return `${text} 悄悄说一句，双击我就能打开主窗口啦。`;
 }
 
 function fileNameFromLocalPath(path: string) {
@@ -2227,7 +2228,7 @@ export function PetWindow() {
       <iframe
         className="live2d-pet-frame"
         ref={frameRef}
-        src="/pet/index.html?v=20260627-touch-feedback-v7"
+        src="/pet/index.html?v=20260628-single-tap-v1"
         title="SynthPet Live2D"
       />
 

@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -19,6 +20,9 @@ use crate::{
 };
 
 use super::*;
+
+static CHAT_TURN_LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
 
 /// Resolve the user-facing source label for a chat turn from its request
 /// `provider_data.source`, defaulting to "desktop". Mirrors the source logic
@@ -96,6 +100,15 @@ fn is_pet_vision_silent_provider_data(source: &str, provider_data: Option<&Value
         .and_then(Value::as_bool)
         .unwrap_or(false);
     (source == "pet-vision" || provider_source == "pet-vision") && silent
+}
+
+fn chat_turn_lock(conversation_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let locks = CHAT_TURN_LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().unwrap();
+    locks
+        .entry(conversation_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 pub(super) fn persona_tool_policy_max_iterations(persona: &Persona) -> Option<u32> {
@@ -562,6 +575,15 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     stream_delta_callback: Option<crate::llm::LlmDeltaCallback>,
     app: Option<&AppHandle>,
 ) -> AppResult<Vec<ChatMessage>> {
+    let admission_guard = match request
+        .conversation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|conversation_id| !conversation_id.is_empty())
+    {
+        Some(conversation_id) => Some(chat_turn_lock(conversation_id).lock_owned().await),
+        None => None,
+    };
     let silent_pet_vision = is_pet_vision_silent_request(&request);
     let desktop_app = app;
     let conversation = match request.conversation_id.as_deref() {
@@ -720,6 +742,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     }
     run.state = "running".into();
     let saved_run = store.save_agent_run(run.clone())?;
+    drop(admission_guard);
     emit_agent_run_record(desktop_app, &saved_run, None);
     run_session_lifecycle_hooks(
         store,

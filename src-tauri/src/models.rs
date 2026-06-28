@@ -474,6 +474,8 @@ pub struct ProactiveStatus {
     pub persona_name: String,
     pub enabled: bool,
     pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub conversation_busy: bool,
     pub last_user_at: i64,
     pub seconds_since_last_user: i64,
     pub last_reply_at: i64,

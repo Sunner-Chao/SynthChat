@@ -8112,6 +8112,47 @@ fn busy_input_queue_preserves_request_source_and_provider_data() {
 }
 
 #[test]
+fn proactive_status_marks_busy_conversation_as_blocked() {
+    let dir = std::env::temp_dir().join(format!(
+        "synthchat-proactive-busy-{}",
+        new_id("test")
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let store = AppStore::new(dir.join("state.json")).unwrap();
+    let mut persona = store.persona(None).unwrap();
+    persona.proactive["enabled"] = json!(true);
+    persona.proactive["minIdleHours"] = json!(0.0);
+    persona.proactive["maxIdleHours"] = json!(0.0);
+    store.save_persona(persona.clone()).unwrap();
+    let conversation = store
+        .create_conversation(Some("Proactive Busy".into()), Some(persona.id.clone()))
+        .unwrap();
+    store
+        .append_message(ChatMessage::new(
+            conversation.id.clone(),
+            "user",
+            "last user request".into(),
+            "wechat",
+        ))
+        .unwrap();
+    let mut run = AgentRunRecord::new(
+        conversation.id.clone(),
+        persona.id.clone(),
+        conversation.agent_id.clone(),
+    );
+    run.run_id = "run_proactive_busy".into();
+    run.state = "running".into();
+    store.save_agent_run(run).unwrap();
+
+    let status = crate::proactive_status_for_persona(&store, &persona).unwrap();
+    assert!(status.conversation_busy);
+    assert!(!status.can_fire);
+    assert!(status.blocked_reason.contains("处理"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn hermes_gateway_control_command_bypass_recognizes_registered_names_only() {
     for command in [
         "model",

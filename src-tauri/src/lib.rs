@@ -1763,6 +1763,9 @@ async fn trigger_proactive_for_persona(
     force: bool,
 ) -> AppResult<bool> {
     let status = proactive_status_for_persona(&store, &persona)?;
+    if status.conversation_busy {
+        return Ok(false);
+    }
     if !force && !status.can_fire {
         return Ok(false);
     }
@@ -1924,6 +1927,13 @@ fn proactive_status_for_persona_with_runtime(
     } else {
         Vec::new()
     };
+    let conversation_busy = conversation.as_ref().is_some_and(|conversation| {
+        store
+            .active_agent_run_for_conversation(&conversation.id)
+            .ok()
+            .flatten()
+            .is_some()
+    });
     let last_user_at = messages
         .iter()
         .rev()
@@ -1990,6 +2000,8 @@ fn proactive_status_for_persona_with_runtime(
         blocked_reason = "已达到用户回复前的连续主动消息上限".into();
     } else if ready_in_seconds > 0 {
         blocked_reason = format!("还需等待 {} 秒", ready_in_seconds);
+    } else if conversation_busy {
+        blocked_reason = "当前会话正在处理其他请求".into();
     } else if let Some(conversation) = &conversation {
         if conversation.wechat_account_id.is_some() && seconds_since_last_user > 82_800 {
             blocked_reason = "微信上下文超过 23 小时安全窗口".into();
@@ -2000,6 +2012,7 @@ fn proactive_status_for_persona_with_runtime(
         persona_name: persona.name.clone(),
         enabled,
         conversation_id: conversation.map(|conversation| conversation.id),
+        conversation_busy,
         last_user_at,
         seconds_since_last_user,
         last_reply_at,

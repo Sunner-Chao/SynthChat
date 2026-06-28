@@ -52,6 +52,7 @@ let behaviorDebugSerial = 0;
 const MODEL_HIT_PADDING = 28;
 const MODEL_DRAG_DELAY_MS = 180;
 const MODEL_DRAG_START_MOVE_PX = 5;
+const MODEL_TAP_CONFIRM_DELAY_MS = 360;
 const MODEL_LAYOUT_BASE_HEIGHT = 440;
 const MODEL_VERTICAL_SCALE_RATIO = 0.74;
 const MODEL_HORIZONTAL_SCALE_RATIO = 0.84;
@@ -85,6 +86,32 @@ function postMessageToHost(data) {
         window.chrome.webview.postMessage(payload);
     }
     window.parent?.postMessage(payload, "*");
+}
+
+function clearTapTimer() {
+    if (tapTimer !== null) {
+        window.clearTimeout(tapTimer);
+        tapTimer = null;
+    }
+}
+
+function scheduleModelTap(clientX, clientY) {
+    clearTapTimer();
+    tapTimer = window.setTimeout(() => {
+        tapTimer = null;
+        void (async () => {
+            if (!pointInModelBounds(clientX, clientY)) return;
+            const touch = await touchInfoAtPoint(clientX, clientY);
+            stopBehaviorAnimation();
+            playTouchMotion(touch.area);
+            playBehavior(touch.area === "head" ? "happy" : "idle", { durationMs: 900 });
+            postMessageToHost({
+                type: "tap",
+                area: touch.area,
+                areas: touch.areas.length > 0 ? touch.areas : [touch.area]
+            });
+        })();
+    }, MODEL_TAP_CONFIRM_DELAY_MS);
 }
 
 function listenHostMessages(handler) {
@@ -1174,10 +1201,7 @@ canvas.addEventListener("contextmenu", (event) => {
 canvas.addEventListener("dblclick", (event) => {
     clearModelDragTimer();
     if (!pointInModelBounds(event.clientX, event.clientY)) return;
-    if (tapTimer !== null) {
-        window.clearTimeout(tapTimer);
-        tapTimer = null;
-    }
+    clearTapTimer();
     postMessageToHost({ type: "toggle_main_window", areas: ["model"] });
 });
 
@@ -1210,6 +1234,7 @@ canvas.addEventListener("pointerleave", () => {
 canvas.addEventListener("pointerdown", (event) => {
     if (event.button !== 0 || !pointInModelBounds(event.clientX, event.clientY)) return;
     event.preventDefault();
+    clearTapTimer();
     stopBehaviorAnimation();
     stopReleasePhysics();
     activePointerId = event.pointerId;
@@ -1239,24 +1264,21 @@ canvas.addEventListener("pointerup", (event) => {
     const wasPendingTap = modelDragPending && !draggingModel && pointInModelBounds(event.clientX, event.clientY);
     finishModelDrag(event.screenX, event.screenY);
     if (wasPendingTap) {
-        if (tapTimer !== null) window.clearTimeout(tapTimer);
-        tapTimer = null;
-        void (async () => {
-            const touch = await touchInfoAtPoint(clientX, clientY);
-            stopBehaviorAnimation();
-            playTouchMotion(touch.area);
-            playBehavior(touch.area === "head" ? "happy" : "idle", { durationMs: 900 });
-            postMessageToHost({
-                type: "tap",
-                area: touch.area,
-                areas: touch.areas.length > 0 ? touch.areas : [touch.area]
-            });
-        })();
+        scheduleModelTap(clientX, clientY);
     }
 });
-canvas.addEventListener("pointercancel", finishModelDrag);
-canvas.addEventListener("lostpointercapture", finishModelDrag);
-window.addEventListener("blur", finishModelDrag);
+canvas.addEventListener("pointercancel", (event) => {
+    clearTapTimer();
+    finishModelDrag(event.screenX, event.screenY);
+});
+canvas.addEventListener("lostpointercapture", (event) => {
+    clearTapTimer();
+    finishModelDrag(event.screenX, event.screenY);
+});
+window.addEventListener("blur", () => {
+    clearTapTimer();
+    finishModelDrag();
+});
 window.addEventListener("resize", layoutModel);
 
 postMessageToHost({ type: "ready" });
