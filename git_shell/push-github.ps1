@@ -273,8 +273,14 @@ try {
             $validAssets += $resolved.Path
         }
 
-        & gh release view $VersionTag 1>$null 2>$null
-        $releaseExists = ($LASTEXITCODE -eq 0)
+        $prevErrorPref = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'SilentlyContinue'
+            & gh release view $VersionTag 1>$null 2>$null
+            $releaseExists = ($LASTEXITCODE -eq 0)
+        } finally {
+            $ErrorActionPreference = $prevErrorPref
+        }
         if ($releaseExists) {
             Write-Host "[push-github] GitHub Release 已存在，更新标题/说明并上传资产: $VersionTag" -ForegroundColor Cyan
             $editArgs = @("release", "edit", $VersionTag, "--title", $title, "--notes", $notes)
