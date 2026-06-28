@@ -1,7 +1,6 @@
 ﻿param(
     [string]$Message,
     [string]$Version,
-    [switch]$CreateRelease,
     [string[]]$ReleaseAsset,
     [string]$ReleaseTitle,
     [string]$ReleaseNotes,
@@ -117,11 +116,15 @@ try {
     function Resolve-ReleaseMode {
         Write-Host "[push-github] 请选择本次发布方式：" -ForegroundColor Cyan
         Write-Host "  1. 默认分支推送（不创建版本 tag）" -ForegroundColor DarkGray
-        Write-Host "  2. 版本发布推送（创建并同步版本 tag）" -ForegroundColor DarkGray
-        $choice = Read-Host "请输入 1 或 2（直接回车默认 1）"
+        Write-Host "  2. 版本 tag 推送（创建并同步版本 tag）" -ForegroundColor DarkGray
+        Write-Host "  3. GitHub Release 发布（创建 tag、创建/更新 Release、上传安装包）" -ForegroundColor DarkGray
+        $choice = Read-Host "请输入 1 / 2 / 3（直接回车默认 1）"
 
         if ($choice -eq '2') {
             return 'tag_release'
+        }
+        if ($choice -eq '3') {
+            return 'github_release'
         }
 
         return 'branch_only'
@@ -217,19 +220,6 @@ try {
         }
         & gh auth status 1>$null 2>$null
         return ($LASTEXITCODE -eq 0)
-    }
-
-    function Resolve-CreateGithubRelease {
-        param([bool]$UseTagRelease)
-
-        if (-not $UseTagRelease) {
-            return $false
-        }
-        if ($CreateRelease) {
-            return $true
-        }
-        $choice = Read-Host "是否创建/更新 GitHub Release 并上传安装包？(y/N)"
-        return $choice -match '^(y|yes)$'
     }
 
     function Resolve-ReleaseAssets {
@@ -340,8 +330,8 @@ try {
     }
 
     $releaseMode = Resolve-ReleaseMode
-    $useTagRelease = ($releaseMode -eq 'tag_release')
-    $createGithubRelease = Resolve-CreateGithubRelease -UseTagRelease:$useTagRelease
+    $useTagRelease = ($releaseMode -eq 'tag_release' -or $releaseMode -eq 'github_release')
+    $createGithubRelease = ($releaseMode -eq 'github_release')
     $pushMode = Resolve-PushMode
     $forcePush = ($pushMode -eq 'full_override')
 

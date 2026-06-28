@@ -59,6 +59,21 @@
 | git-quick-status.ps1 | 快速查看 Git 状态 |
 | git-script-profile.ps1 | 脚本配置管理 |
 
+## push-github.ps1 发布方式
+
+脚本会在交互中提供发布方式数字菜单：
+
+1. 默认分支推送：只推送分支，不创建版本 tag。
+2. 版本 tag 推送：创建并同步 `v*` tag。
+3. GitHub Release 发布：创建 tag、创建/更新 GitHub Release，并上传安装包资产。
+
+选择第 3 项时，脚本会优先查找 `src-tauri\target\release\bundle\nsis\*.exe` 中最新的安装包；也可以手动输入安装包路径。该功能需要 GitHub CLI：
+
+```powershell
+winget install GitHub.cli
+gh auth login
+```
+
 ## 权限级别说明
 
 | 权限级别 | 说明 |
