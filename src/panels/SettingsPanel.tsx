@@ -1,12 +1,16 @@
-import { ChangeEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
+import { listen } from "@tauri-apps/api/event";
 import {
+  AlertTriangle,
   Bot,
+  CheckCircle2,
   ChevronRight,
   Edit3,
   Globe,
   ImagePlus,
   Info,
+  Loader2,
   Plus,
   Puzzle,
   RefreshCw,
@@ -19,6 +23,8 @@ import {
   Upload,
   Video,
   Wand2,
+  Wifi,
+  XCircle,
   Palette,
   PlugZap
 } from "lucide-react";
@@ -27,7 +33,9 @@ import { filterSkillsByQuery } from "../lib/skillSearch";
 import { useAppStore, consumePendingSettingsView } from "../lib/store";
 import type {
   AccountConfig,
+  AppBuildInfo,
   AppSection,
+  AppUpdateCheck,
   AgentConfig,
   AgentDefinition,
   BrowserProvider,
@@ -55,25 +63,13 @@ import { Avatar, MenuRow } from "../components/common";
 
 const UPDATE_MANIFEST_STORAGE_KEY = "synthchat.update.manifest.url.v1";
 
-type UpdateManifest = {
-  latestVersion: string;
-  downloadUrl?: string;
-  releaseUrl?: string;
-  notes?: string;
-  publishedAt?: string;
-};
-
-type GitHubRelease = {
-  tag_name?: string;
-  html_url?: string;
-  body?: string;
-  published_at?: string;
-  assets?: Array<{ browser_download_url?: string }>;
-};
-
 function formatTime(value: string) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function isSilentInstallAssetUrl(value?: string | null) {
+  return /\.(exe|msi|msix)(?:[?#].*)?$/i.test(value ?? "");
 }
 
 function normalizeQrBaseUrl(value?: string | null) {
@@ -204,27 +200,6 @@ function imageProviderTypeLabel(id: string) {
   return labels[id] ?? id;
 }
 
-function normalizeVersionText(value: string) {
-  return value.trim().replace(/^v/i, "");
-}
-
-function compareVersionStrings(left: string, right: string) {
-  const parse = (value: string) => normalizeVersionText(value).split(".").map((part) => {
-    const numeric = Number.parseInt(part.replace(/[^\d].*$/, ""), 10);
-    return Number.isFinite(numeric) ? numeric : 0;
-  });
-  const leftParts = parse(left);
-  const rightParts = parse(right);
-  const length = Math.max(leftParts.length, rightParts.length);
-  for (let index = 0; index < length; index += 1) {
-    const leftPart = leftParts[index] ?? 0;
-    const rightPart = rightParts[index] ?? 0;
-    if (leftPart > rightPart) return 1;
-    if (leftPart < rightPart) return -1;
-  }
-  return 0;
-}
-
 function readUpdateManifestUrl() {
   if (typeof window === "undefined") return "";
   try {
@@ -243,36 +218,8 @@ function writeUpdateManifestUrl(value: string) {
   }
 }
 
-function parseUpdateManifest(payload: unknown): UpdateManifest {
-  if (!payload || typeof payload !== "object") {
-    throw new Error("更新源返回内容无效");
-  }
-  const candidate = payload as Record<string, unknown>;
-  if (typeof candidate.latestVersion === "string") {
-    return {
-      latestVersion: candidate.latestVersion,
-      downloadUrl: typeof candidate.downloadUrl === "string" ? candidate.downloadUrl : undefined,
-      releaseUrl: typeof candidate.releaseUrl === "string" ? candidate.releaseUrl : undefined,
-      notes: typeof candidate.notes === "string" ? candidate.notes : undefined,
-      publishedAt: typeof candidate.publishedAt === "string" ? candidate.publishedAt : undefined
-    };
-  }
-  if (typeof candidate.tag_name === "string") {
-    const release = candidate as GitHubRelease;
-    const tagName = candidate.tag_name;
-    const latestVersion = tagName.trim();
-    if (!latestVersion) {
-      throw new Error("GitHub Release 缺少 tag_name");
-    }
-    return {
-      latestVersion,
-      downloadUrl: release.assets?.find((asset) => asset.browser_download_url)?.browser_download_url,
-      releaseUrl: release.html_url,
-      notes: release.body,
-      publishedAt: release.published_at
-    };
-  }
-  throw new Error("不支持的更新源格式");
+function cleanNativeError(error: unknown) {
+  return String(error).replace(/^bad request:\s*/i, "").trim();
 }
 
 type SettingsView =
@@ -340,7 +287,7 @@ export function SettingsPanel() {
     setMcpPanelMode
   } = useAppStore();
   const [view, setView] = useState<SettingsView>("menu");
-  const [menuAppVersion, setMenuAppVersion] = useState("v1.0.0");
+  const [menuAppVersion, setMenuAppVersion] = useState("v1.1.0");
   const focusedAgent = agents.find((agent) => agent.id === focusedAgentId) ?? agents.find((agent) => agent.isDefault) ?? agents[0] ?? null;
 
   useEffect(() => {
@@ -933,12 +880,59 @@ function AccountsSettings({
   const [qrStatusText, setQrStatusText] = useState("");
   const [checking, setChecking] = useState(false);
   const [scanSuccess, setScanSuccess] = useState(false);
+  const [pollingDetail, setPollingDetail] = useState(false);
   const qrPollingRef = useRef(false);
   const detail = accounts.find((account) => account.id === detailId) ?? null;
 
   useEffect(() => {
     void api.getWechatConfig().then(setWechatConfig);
   }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void listen<{ accountId?: string; error?: string }>("synthchat-wechat-poll-error", (event) => {
+      const accountId = event.payload?.accountId ?? "";
+      if (detailId && accountId && accountId !== detailId) return;
+      const error = event.payload?.error || "微信后台连接失败";
+      setPollStatus(`后台轮询失败：${cleanNativeError(error)}`);
+    }).then((handler) => {
+      unlisten = handler;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [detailId]);
+
+  const pollAccountOnce = async (account: AccountConfig, options?: { quietEmpty?: boolean }) => {
+    if (!account.linkedPersona?.trim()) {
+      setPollStatus("已登录，但还没有绑定角色；保存角色后微信端才能连接。");
+      return;
+    }
+    setPollingDetail(true);
+    setPollStatus("正在测试微信连接...");
+    try {
+      const result = await api.wechatPollOnce(account.id);
+      await refreshAccounts();
+      const failed = result.processed.filter((item) => !item.delivered || item.deliveryError);
+      if (failed.length > 0) {
+        const firstError = failed.find((item) => item.deliveryError)?.deliveryError;
+        setPollStatus(firstError ? `微信已连接，但回复发送失败：${firstError}` : "微信已连接，但有消息处理失败。");
+        return;
+      }
+      if (result.receivedCount) {
+        setPollStatus(`微信连接正常，收到 ${result.receivedCount} 条，已处理 ${result.processed.length} 条，跳过 ${result.skippedCount} 条。`);
+      } else if (!options?.quietEmpty) {
+        setPollStatus("微信连接正常，暂无新消息。");
+      } else {
+        setPollStatus("微信连接正常。");
+      }
+    } catch (error) {
+      await refreshAccounts().catch(() => {});
+      setPollStatus(`微信连接失败：${cleanNativeError(error)}`);
+    } finally {
+      setPollingDetail(false);
+    }
+  };
 
   const checkQrOnce = async () => {
     if (!qr?.qrcode || qrPollingRef.current || scanSuccess) return;
@@ -967,7 +961,11 @@ function AccountsSettings({
           setScanSuccess(false);
           setDetailId(account.id);
           setBindDraft(account.linkedPersona || "");
-          setPollStatus("已登录，请绑定角色");
+          if (account.linkedPersona) {
+            void pollAccountOnce(account, { quietEmpty: true });
+          } else {
+            setPollStatus("已登录，但还没有绑定角色；保存角色后微信端才能连接。");
+          }
         }, 1200);
       } else if (normalizedStatus === "wait") {
         setQrError("");
@@ -1062,38 +1060,18 @@ function AccountsSettings({
     const input = document.getElementById("acct-note") as HTMLInputElement | null;
     const note = input?.value.trim() ?? "";
     const latestAccounts = await api.listAccounts();
-    await saveAccounts(latestAccounts.map((account) => {
+    const nextAccounts = latestAccounts.map((account) => {
       if (account.id === detail.id) return { ...account, note, linkedPersona: bindDraft };
       if (bindDraft && account.linkedPersona === bindDraft) return { ...account, linkedPersona: "" };
       return account;
-    }));
+    });
+    await saveAccounts(nextAccounts);
+    setPollStatus("");
     setDetailId("");
-    setBindDraft("");
   };
   const pollDetailOnce = async () => {
     if (!detail) return;
-    setPollStatus("正在同步微信消息...");
-    try {
-      const result = await api.wechatPollOnce(detail.id);
-      await refreshAccounts();
-      const conversationId = result.processed.find((item) => item.conversationId)?.conversationId;
-      if (conversationId) {
-        const store = useAppStore.getState();
-        store.setSection("chat");
-        store.setConversationProcessing(conversationId, true);
-        void store.refreshChatData(conversationId, detail.linkedPersona || null).then(() => {
-          store.setConversationProcessing(conversationId, true);
-          window.setTimeout(() => {
-            useAppStore.getState().setConversationProcessing(conversationId, false);
-          }, 900);
-        });
-      }
-      setPollStatus(result.receivedCount
-        ? `收到 ${result.receivedCount} 条，已处理 ${result.processed.length} 条，跳过 ${result.skippedCount} 条`
-        : "没有新的微信消息");
-    } catch (error) {
-      setPollStatus(String(error));
-    }
+    await pollAccountOnce(detail);
   };
 
   if (detail) {
@@ -1103,8 +1081,51 @@ function AccountsSettings({
           <button className="icon-only-btn" onClick={() => setDetailId("")} title="返回" type="button"><ChevronRight size={19} style={{ transform: "rotate(180deg)" }} /></button>
           <div className="panel-title-text"><span>Account</span><strong>账号详情</strong></div>
         </div>
+        {/* Status + Test Connection */}
         <div className="card" style={{ margin: "0 16px 12px" }}>
-          <div className="card-header">基本信息</div>
+          <div className="card-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span>连接状态</span>
+            <button className="btn-primary-outline" disabled={pollingDetail} onClick={() => void pollDetailOnce()} type="button" style={{ padding: "4px 12px", fontSize: 12 }}>
+              {pollingDetail ? "测试中..." : "测试连接"}
+            </button>
+          </div>
+          <div className="form-group" style={{ padding: "8px 16px 12px" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px 16px" }}>
+              <div className="detail-row"><span>Bot ID</span><strong>{detail.id}</strong></div>
+              <div className="detail-row">
+                <span>状态</span>
+                <strong className={detail.online ? "status-online" : "status-offline"}>
+                  {detail.online ? "● 在线" : "● 离线"}
+                </strong>
+              </div>
+              <div className="detail-row"><span>链接角色</span><strong>{personas.find((persona) => persona.id === detail.linkedPersona)?.name || detail.linkedPersona || "未链接"}</strong></div>
+              <div className="detail-row"><span>iLink 用户</span><strong>{detail.ilinkUserId || "未记录"}</strong></div>
+              <div className="detail-row"><span>创建时间</span><strong>{detail.createdAt ? formatTime(detail.createdAt) : "未知"}</strong></div>
+              <div className="detail-row"><span>最后登录</span><strong>{detail.lastLoginAt ? formatTime(detail.lastLoginAt) : "未记录"}</strong></div>
+            </div>
+            {pollStatus ? (
+              <div style={{
+                marginTop: 10,
+                padding: "8px 12px",
+                borderRadius: "var(--radius-md)",
+                fontSize: 13,
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                background: pollStatus.includes("失败") ? "rgba(239, 68, 68, 0.08)" : pollStatus.includes("正常") || pollStatus.includes("收到") ? "rgba(34, 197, 94, 0.08)" : pollStatus.includes("测试") ? "var(--primary-light)" : "rgba(234, 179, 8, 0.08)",
+                border: `1px solid ${pollStatus.includes("失败") ? "rgba(239, 68, 68, 0.15)" : pollStatus.includes("正常") || pollStatus.includes("收到") ? "rgba(34, 197, 94, 0.15)" : pollStatus.includes("测试") ? "rgba(8, 145, 178, 0.15)" : "rgba(234, 179, 8, 0.15)"}`,
+                color: pollStatus.includes("失败") ? "var(--danger)" : pollStatus.includes("正常") || pollStatus.includes("收到") ? "#16a34a" : pollStatus.includes("测试") ? "var(--primary)" : "#a16207",
+              }}>
+                {pollStatus.includes("失败") ? <XCircle size={15} /> : pollStatus.includes("正常") || pollStatus.includes("收到") ? <CheckCircle2 size={15} /> : pollStatus.includes("测试") ? <Loader2 size={15} className="spin" /> : <AlertTriangle size={15} />}
+                <span>{pollStatus}</span>
+              </div>
+            ) : null}
+          </div>
+        </div>
+
+        {/* Edit Config */}
+        <div className="card" style={{ margin: "0 16px 12px" }}>
+          <div className="card-header">配置</div>
           <div className="form-group">
             <div className="form-row">
               <label>备注名</label>
@@ -1118,30 +1139,17 @@ function AccountsSettings({
               </select>
             </div>
           </div>
-          <div className="form-group">
-            <div className="detail-row"><span>Bot ID</span><strong>{detail.id}</strong></div>
-            <div className="detail-row">
-              <span>状态</span>
-              <strong className={detail.online ? "status-online" : "status-offline"}>
-                {detail.online ? "● 在线" : "● 离线"}
-              </strong>
-            </div>
-            <div className="detail-row"><span>链接角色</span><strong>{personas.find((persona) => persona.id === detail.linkedPersona)?.name || detail.linkedPersona || "未链接"}</strong></div>
-            <div className="detail-row"><span>iLink 用户</span><strong>{detail.ilinkUserId || "未记录"}</strong></div>
-            <div className="detail-row"><span>创建时间</span><strong>{detail.createdAt ? formatTime(detail.createdAt) : "未知"}</strong></div>
-            <div className="detail-row"><span>最后登录</span><strong>{detail.lastLoginAt ? formatTime(detail.lastLoginAt) : "未记录"}</strong></div>
-          </div>
-          <div className="form-hint">
+          <div className="form-hint" style={{ padding: "0 16px 10px" }}>
             保存链接角色后，后台会自动轮询该微信账号并把手机消息送入对应角色会话。
           </div>
         </div>
+
+        {/* Actions */}
         <div className="card" style={{ margin: "0 16px 12px" }}>
-          <div className="card-header">操作</div>
           <div className="form-actions">
             <button className="btn-primary" onClick={() => void saveDetailNote()} type="button">保存配置</button>
             <button className="btn-danger" onClick={() => { if (window.confirm("确定要删除此账号吗？")) { void saveAccounts(accounts.filter((account) => account.id !== detail.id)); setDetailId(""); } }} type="button">删除账号</button>
           </div>
-          {pollStatus ? <p className="form-hint">{pollStatus}</p> : null}
         </div>
       </div>
     );
@@ -1182,14 +1190,25 @@ function AccountsSettings({
           ))}
         </div>
       )}
-      <div className="settings-advanced">
-        <details>
-          <summary>高级接口设置</summary>
-          <div className="settings-form">
-            <label>微信接口 Base URL<input value={wechatConfig.baseUrl} onChange={(event) => setWechatConfig({ ...wechatConfig, baseUrl: event.target.value })} /></label>
-            <label>轮询超时秒数<input min={5} type="number" value={wechatConfig.timeoutSeconds} onChange={(event) => setWechatConfig({ ...wechatConfig, timeoutSeconds: Number(event.target.value) })} /></label>
-            <button onClick={() => void saveWechat({})} type="button">保存接口</button>
-            <button onClick={add} type="button">手动添加测试账号</button>
+      <div style={{ padding: "0 16px 16px" }}>
+        <details className="card" style={{ margin: 0, overflow: "hidden" }}>
+          <summary className="card-header" style={{ cursor: "pointer", userSelect: "none", display: "flex", alignItems: "center", justifyContent: "flex-start", gap: 6 }}>
+            <Settings size={14} />
+            <span>高级接口设置</span>
+          </summary>
+          <div className="form-group" style={{ padding: "4px 16px 8px" }}>
+            <div className="form-row">
+              <label>微信接口 Base URL</label>
+              <input value={wechatConfig.baseUrl} onChange={(event) => setWechatConfig({ ...wechatConfig, baseUrl: event.target.value })} placeholder="http://localhost:3000" />
+            </div>
+            <div className="form-row">
+              <label>轮询超时（秒）</label>
+              <input min={5} type="number" value={wechatConfig.timeoutSeconds} onChange={(event) => setWechatConfig({ ...wechatConfig, timeoutSeconds: Number(event.target.value) })} />
+            </div>
+          </div>
+          <div className="form-actions" style={{ padding: "0 16px 12px" }}>
+            <button className="btn-secondary" onClick={() => void saveWechat({})} type="button">保存接口</button>
+            <button className="btn-secondary" onClick={add} type="button">手动添加测试账号</button>
           </div>
         </details>
       </div>
@@ -2558,12 +2577,6 @@ function ChatSettings({
   const [dedupWindow, setDedupWindow] = useState(config.messageDedupWindowSeconds ?? 30);
   const [runTimeout, setRunTimeout] = useState(config.agentRunTimeoutSeconds ?? 600);
   const [busyInputMode, setBusyInputMode] = useState(config.busyInputMode ?? "queue");
-  const [delegationMaxConcurrentChildren, setDelegationMaxConcurrentChildren] = useState(config.delegationMaxConcurrentChildren ?? 3);
-  const [delegationOrchestratorEnabled, setDelegationOrchestratorEnabled] = useState(config.delegationOrchestratorEnabled !== false);
-  const [delegationSubagentAutoApprove, setDelegationSubagentAutoApprove] = useState(config.delegationSubagentAutoApprove === true);
-  const [delegationInheritMcpToolsets, setDelegationInheritMcpToolsets] = useState(config.delegationInheritMcpToolsets !== false);
-  const [delegationSubagentProviderId, setDelegationSubagentProviderId] = useState(config.delegationSubagentProviderId ?? "");
-  const [delegationSubagentModel, setDelegationSubagentModel] = useState(config.delegationSubagentModel ?? "");
   const [shortContextAbortOnSummaryFailure, setShortContextAbortOnSummaryFailure] = useState(config.shortContextAbortOnSummaryFailure === true);
   const [shortContextSummaryProviderId, setShortContextSummaryProviderId] = useState(config.shortContextSummaryProviderId ?? "");
   const [shortContextSummaryModel, setShortContextSummaryModel] = useState(config.shortContextSummaryModel ?? "");
@@ -2634,12 +2647,6 @@ function ChatSettings({
     setDedupWindow(config.messageDedupWindowSeconds ?? 30);
     setRunTimeout(config.agentRunTimeoutSeconds ?? 600);
     setBusyInputMode(config.busyInputMode ?? "queue");
-    setDelegationMaxConcurrentChildren(config.delegationMaxConcurrentChildren ?? 3);
-    setDelegationOrchestratorEnabled(config.delegationOrchestratorEnabled !== false);
-    setDelegationSubagentAutoApprove(config.delegationSubagentAutoApprove === true);
-    setDelegationInheritMcpToolsets(config.delegationInheritMcpToolsets !== false);
-    setDelegationSubagentProviderId(config.delegationSubagentProviderId ?? "");
-    setDelegationSubagentModel(config.delegationSubagentModel ?? "");
     setShortContextAbortOnSummaryFailure(config.shortContextAbortOnSummaryFailure === true);
     setShortContextSummaryProviderId(config.shortContextSummaryProviderId ?? "");
     setShortContextSummaryModel(config.shortContextSummaryModel ?? "");
@@ -2703,7 +2710,7 @@ function ChatSettings({
     setStoredMessages(config.maxStoredMessagesPerConversation ?? 300);
     setStoredRuns(config.maxStoredAgentRuns ?? 50);
     setStoredTraces(config.maxStoredToolTraces ?? 100);
-  }, [config.activePollIntervalMs, config.agentRunTimeoutSeconds, config.artifactScanLimit, config.autoTitleEnabled, config.backgroundMemoryReviewEnabled, config.backgroundMemoryReviewMinMessages, config.backgroundSkillCuratorEnabled, config.backgroundSkillCuratorIntervalHours, config.backgroundSkillReviewAutoCreateEnabled, config.backgroundSkillReviewEnabled, config.bottomFollowThresholdPx, config.busyInputMode, config.delegationInheritMcpToolsets, config.delegationMaxConcurrentChildren, config.delegationOrchestratorEnabled, config.delegationSubagentAutoApprove, config.delegationSubagentModel, config.delegationSubagentProviderId, config.historyCleanupEnabled, config.historyRetentionDays, config.idlePollIntervalMs, config.intentAnalyzerMode, config.intentAnalyzerModel, config.intentAnalyzerProviderId, config.intentEmbeddingMinConfidence, config.intentLlmMaxTokens, config.intentLlmMinConfidence, config.intentLlmPrompt, config.intentLlmTimeoutSeconds, config.llmCredentialPoolStrategy, config.llmRetryBackoffMs, config.llmRetryCount, config.maxStoredAgentRuns, config.maxStoredMessagesPerConversation, config.maxStoredToolTraces, config.messageDedupEnabled, config.messageDedupWindowSeconds, config.petCloudDurationSeconds, config.queueWaitSeconds, config.responsesReasoningReplayEnabled, config.sendMessageToolEnabled, config.shortContextAbortOnSummaryFailure, config.shortContextSummaryModel, config.shortContextSummaryProviderId, config.skillHotReloadEnabled, config.skillHotReloadIntervalSeconds, config.thinkingMinVisibleMs, config.toolApprovalMode, config.toolCallRetryBackoffMs, config.toolCallRetryCount, config.toolEnvPassthrough, config.toolGuardrailExactFailureLimit, config.toolGuardrailExactFailureWarnAfter, config.toolGuardrailHardStopEnabled, config.toolGuardrailNoProgressLimit, config.toolGuardrailNoProgressWarnAfter, config.toolGuardrailSameToolFailureLimit, config.toolGuardrailSameToolFailureWarnAfter, config.toolGuardrailWarningsEnabled, config.toolParallelEnabled, config.toolParallelLimit, config.toolRouterLlmEnabled, config.toolRouterLlmMaxTokens, config.toolRouterLlmMinConfidence, config.toolRouterLlmPrompt, config.toolRouterLlmTimeoutSeconds, config.toolUseEnforcement, config.trustedCommandPatterns, config.trustedToolPatterns, config.uiMessageLimit, config.uiMessagePreviewChars, config.uiStreamCharsPerSecond]);
+  }, [config.activePollIntervalMs, config.agentRunTimeoutSeconds, config.artifactScanLimit, config.autoTitleEnabled, config.backgroundMemoryReviewEnabled, config.backgroundMemoryReviewMinMessages, config.backgroundSkillCuratorEnabled, config.backgroundSkillCuratorIntervalHours, config.backgroundSkillReviewAutoCreateEnabled, config.backgroundSkillReviewEnabled, config.bottomFollowThresholdPx, config.busyInputMode, config.delegationInheritMcpToolsets, config.delegationMaxConcurrentChildren, config.delegationOrchestratorEnabled, config.delegationStrategy, config.delegationSubagentAutoApprove, config.delegationSubagentModel, config.delegationSubagentProviderId, config.historyCleanupEnabled, config.historyRetentionDays, config.idlePollIntervalMs, config.intentAnalyzerMode, config.intentAnalyzerModel, config.intentAnalyzerProviderId, config.intentEmbeddingMinConfidence, config.intentLlmMaxTokens, config.intentLlmMinConfidence, config.intentLlmPrompt, config.intentLlmTimeoutSeconds, config.llmCredentialPoolStrategy, config.llmRetryBackoffMs, config.llmRetryCount, config.maxStoredAgentRuns, config.maxStoredMessagesPerConversation, config.maxStoredToolTraces, config.messageDedupEnabled, config.messageDedupWindowSeconds, config.petCloudDurationSeconds, config.queueWaitSeconds, config.responsesReasoningReplayEnabled, config.sendMessageToolEnabled, config.shortContextAbortOnSummaryFailure, config.shortContextSummaryModel, config.shortContextSummaryProviderId, config.skillHotReloadEnabled, config.skillHotReloadIntervalSeconds, config.thinkingMinVisibleMs, config.toolApprovalMode, config.toolCallRetryBackoffMs, config.toolCallRetryCount, config.toolEnvPassthrough, config.toolGuardrailExactFailureLimit, config.toolGuardrailExactFailureWarnAfter, config.toolGuardrailHardStopEnabled, config.toolGuardrailNoProgressLimit, config.toolGuardrailNoProgressWarnAfter, config.toolGuardrailSameToolFailureLimit, config.toolGuardrailSameToolFailureWarnAfter, config.toolGuardrailWarningsEnabled, config.toolParallelEnabled, config.toolParallelLimit, config.toolRouterLlmEnabled, config.toolRouterLlmMaxTokens, config.toolRouterLlmMinConfidence, config.toolRouterLlmPrompt, config.toolRouterLlmTimeoutSeconds, config.toolUseEnforcement, config.trustedCommandPatterns, config.trustedToolPatterns, config.uiMessageLimit, config.uiMessagePreviewChars, config.uiStreamCharsPerSecond]);
 
   const save = () => void onSave({
     busyInputMode: busyInputMode,
@@ -2714,12 +2721,6 @@ function ChatSettings({
     shortContextSummaryModel: shortContextSummaryModel,
     autoTitleEnabled: autoTitleEnabled,
     queueWaitSeconds: wait,
-    delegationMaxConcurrentChildren: delegationMaxConcurrentChildren,
-    delegationOrchestratorEnabled: delegationOrchestratorEnabled,
-    delegationSubagentAutoApprove: delegationSubagentAutoApprove,
-    delegationInheritMcpToolsets: delegationInheritMcpToolsets,
-    delegationSubagentProviderId: delegationSubagentProviderId,
-    delegationSubagentModel: delegationSubagentModel,
     agentRunTimeoutSeconds: runTimeout,
     uiMessageLimit: uiLimit,
     artifactScanLimit: artifactLimit,
@@ -2888,49 +2889,6 @@ function ChatSettings({
           </div>
         </div>
         <div className="form-hint">控制 agent 正在运行时新消息的默认处理方式；单轮最长运行设为 0 时不自动超时。开启压缩失败冻结后，摘要模型失败不会丢弃旧历史，会暂停 agent 直到 /compact 成功。摘要服务商/模型为空时跟随当前主模型，辅助摘要失败会自动回退主模型一次。</div>
-      </div>
-      <div className="card" style={{ margin: "0 16px 12px" }}>
-        <div className="card-header">子智能体</div>
-        <div className="form-group">
-          <div className="form-row">
-            <label>并发子任务</label>
-            <div className="stepper">
-              <button onClick={() => setDelegationMaxConcurrentChildren(Math.max(1, delegationMaxConcurrentChildren - 1))} type="button">−</button>
-              <span className="stepper-val">{delegationMaxConcurrentChildren}</span>
-              <button onClick={() => setDelegationMaxConcurrentChildren(delegationMaxConcurrentChildren + 1)} type="button">+</button>
-            </div>
-          </div>
-          <div className="form-row">
-            <label>允许 Orchestrator</label>
-            <input checked={delegationOrchestratorEnabled} onChange={(event) => setDelegationOrchestratorEnabled(event.target.checked)} type="checkbox" />
-          </div>
-          <div className="form-row">
-            <label>子任务自动审批</label>
-            <input checked={delegationSubagentAutoApprove} onChange={(event) => setDelegationSubagentAutoApprove(event.target.checked)} type="checkbox" />
-          </div>
-          <div className="form-row">
-            <label>继承 MCP 工具</label>
-            <input checked={delegationInheritMcpToolsets} onChange={(event) => setDelegationInheritMcpToolsets(event.target.checked)} type="checkbox" />
-          </div>
-          <div className="form-row">
-            <label>子任务服务商</label>
-            <select value={delegationSubagentProviderId} onChange={(event) => setDelegationSubagentProviderId(event.target.value)}>
-              <option value="">继承父 Agent</option>
-              {llmProviders.map((provider) => (
-                <option key={provider.id} value={provider.id}>{provider.name || provider.id}</option>
-              ))}
-            </select>
-          </div>
-          <div className="form-row">
-            <label>子任务模型</label>
-            <input
-              value={delegationSubagentModel}
-              onChange={(event) => setDelegationSubagentModel(event.target.value)}
-              placeholder="留空继承父 Agent 模型"
-            />
-          </div>
-        </div>
-        <div className="form-hint">控制 delegate_task 的并发、嵌套委派和无人值守审批。自动审批关闭时，子智能体遇到危险工具会自动拒绝并继续把失败反馈给规划器；继承 MCP 工具开启时，子任务显式缩窄 toolsets 也会保留父 Agent 的 MCP 能力；服务商和模型留空时继承父 Agent。</div>
       </div>
       <div className="card" style={{ margin: "0 16px 12px" }}>
         <div className="card-header">意图分析</div>
@@ -3867,24 +3825,42 @@ function NetworkSettings({
 }
 
 function AboutSettings({ onBack, setView }: { onBack?: () => void; setView: (view: SettingsView) => void }) {
-  const [appVersion, setAppVersion] = useState("V1.0.0");
+  const [appVersion, setAppVersion] = useState("V1.1.0");
+  const [buildInfo, setBuildInfo] = useState<AppBuildInfo | null>(null);
   const [manifestUrl, setManifestUrl] = useState(readUpdateManifestUrl);
   const [updateStatus, setUpdateStatus] = useState("未检查");
   const [updateDetail, setUpdateDetail] = useState("");
   const [checking, setChecking] = useState(false);
-  const [availableUpdate, setAvailableUpdate] = useState<UpdateManifest | null>(null);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [availableUpdate, setAvailableUpdate] = useState<AppUpdateCheck | null>(null);
+  const autoCheckedRef = useRef(false);
 
   useEffect(() => {
-    void getVersion().then((version) => setAppVersion(`V${version}`)).catch(() => {
-      setAppVersion("V1.0.0");
+    let cancelled = false;
+    void api.getAppBuildInfo().then((info: AppBuildInfo) => {
+      if (cancelled) return;
+      setBuildInfo(info);
+      setAppVersion(`V${info.version}`);
+      if (!readUpdateManifestUrl() && info.updateManifestUrl) {
+        setManifestUrl(info.updateManifestUrl);
+      }
+    }).catch(() => {
+      void getVersion().then((version) => {
+        if (!cancelled) setAppVersion(`V${version}`);
+      }).catch(() => {
+        if (!cancelled) setAppVersion("V1.1.0");
+      });
     });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  const checkUpdates = async () => {
-    const url = manifestUrl.trim();
+  const checkUpdates = useCallback(async (urlOverride?: string) => {
+    const url = (urlOverride ?? manifestUrl).trim();
     if (!url) {
       setUpdateStatus("未配置更新源");
-      setUpdateDetail("请填写可访问的版本清单地址。");
+      setUpdateDetail("请填写可访问的版本清单地址，或在构建时注入 SYNTHCHAT_UPDATE_MANIFEST_URL。");
       setAvailableUpdate(null);
       return;
     }
@@ -3892,44 +3868,80 @@ function AboutSettings({ onBack, setView }: { onBack?: () => void; setView: (vie
     setUpdateStatus("正在检查更新...");
     setUpdateDetail("");
     try {
-      const response = await fetch(url, { cache: "no-store" });
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-      const manifest = parseUpdateManifest(await response.json());
-      if (!manifest.latestVersion) {
-        throw new Error("缺少 latestVersion");
-      }
-      const currentVersion = appVersion;
-      const comparison = compareVersionStrings(manifest.latestVersion, currentVersion);
-      if (comparison > 0) {
-        setAvailableUpdate(manifest);
-        setUpdateStatus(`发现新版本 ${manifest.latestVersion}`);
-        setUpdateDetail(manifest.notes?.trim() || "可点击下方按钮打开下载页。");
+      const result = await api.checkAppUpdate(url) as AppUpdateCheck;
+      writeUpdateManifestUrl(url);
+      if (url !== manifestUrl) setManifestUrl(url);
+      if (result.updateAvailable) {
+        setAvailableUpdate(result);
+        setUpdateStatus(`发现新版本 ${result.latestVersion}`);
+        const detail = result.notes?.trim()
+          || (result.publishedAt ? `发布时间 ${formatTime(result.publishedAt)}` : "可点击下方按钮打开下载页。");
+        setUpdateDetail(detail);
       } else {
         setAvailableUpdate(null);
         setUpdateStatus("已经是最新版本");
-        setUpdateDetail(`当前 ${currentVersion}，远端 ${manifest.latestVersion}`);
+        const checked = result.checkedAt ? `，检查时间 ${formatTime(result.checkedAt)}` : "";
+        setUpdateDetail(`当前 ${result.currentVersion}，远端 ${result.latestVersion}${checked}`);
       }
     } catch (error) {
+      const message = String(error).replace(/^bad request:\s*/i, "");
       setAvailableUpdate(null);
-      setUpdateStatus("检查失败");
-      setUpdateDetail(String(error));
+      if (message.includes("not configured")) {
+        setUpdateStatus("未配置更新源");
+        setUpdateDetail("请填写可访问的版本清单地址，或在构建时注入 SYNTHCHAT_UPDATE_MANIFEST_URL。");
+      } else {
+        setUpdateStatus("检查失败");
+        setUpdateDetail(message);
+      }
     } finally {
       setChecking(false);
     }
-  };
+  }, [manifestUrl]);
+
+  useEffect(() => {
+    if (autoCheckedRef.current) return;
+    const url = (manifestUrl || buildInfo?.updateManifestUrl || "").trim();
+    if (!url) return;
+    autoCheckedRef.current = true;
+    void checkUpdates(url);
+  }, [buildInfo?.updateManifestUrl, checkUpdates, manifestUrl]);
 
   const saveManifestUrl = () => {
     writeUpdateManifestUrl(manifestUrl);
     setUpdateStatus("更新源已保存");
-    setUpdateDetail("");
+    setUpdateDetail("之后进入关于页会自动检查该地址。");
   };
 
-  const openUpdateUrl = () => {
+  const openUpdateUrl = async () => {
     const target = availableUpdate?.downloadUrl || availableUpdate?.releaseUrl || manifestUrl.trim();
     if (!target) return;
-    window.open(target, "_blank", "noopener,noreferrer");
+    try {
+      await api.openAppUpdateUrl(target);
+    } catch {
+      window.open(target, "_blank", "noopener,noreferrer");
+    }
+  };
+
+  const installUpdateSilently = async () => {
+    const target = availableUpdate?.downloadUrl;
+    if (!isSilentInstallAssetUrl(target)) {
+      setUpdateStatus("无法自动安装");
+      setUpdateDetail("当前更新源没有可静默安装的 .exe、.msi 或 .msix 资产，请打开下载页手动安装。");
+      return;
+    }
+    const confirmed = window.confirm("将下载新版本安装包，随后关闭 SynthChat 并静默安装。是否继续？");
+    if (!confirmed) return;
+    setInstallingUpdate(true);
+    setUpdateStatus("正在下载更新安装包...");
+    setUpdateDetail("下载完成后应用会自动关闭，并在后台执行安装器。");
+    try {
+      await api.installAppUpdate(target);
+      setUpdateDetail("安装器已启动，SynthChat 即将关闭。");
+    } catch (error) {
+      setInstallingUpdate(false);
+      setUpdateStatus("自动安装失败");
+      setUpdateDetail(String(error).replace(/^bad request:\s*/i, ""));
+    }
   };
 
   return (
@@ -3938,7 +3950,6 @@ function AboutSettings({ onBack, setView }: { onBack?: () => void; setView: (vie
         <BackBtn onBack={onBack} />
         <div className="panel-title-text"><span>About</span><strong>关于 SynthChat</strong></div>
       </div>
-      {/* Brand Hero Section */}
       <div className="about-hero">
         <div className="brand-mark about-logo"><Sparkles size={32} /></div>
         <h2>SynthChat</h2>
@@ -3946,7 +3957,6 @@ function AboutSettings({ onBack, setView }: { onBack?: () => void; setView: (vie
         <p className="about-subtitle">智能 AI 聊天机器人</p>
       </div>
 
-      {/* Update Section */}
       <div className="about-section">
         <div className="about-section-title">
           <RefreshCw size={14} />
@@ -3972,28 +3982,37 @@ function AboutSettings({ onBack, setView }: { onBack?: () => void; setView: (vie
             )}
             {availableUpdate ? (
               <div className="form-actions" style={{ marginTop: 8 }}>
-                <button className="btn-primary" onClick={openUpdateUrl} type="button" style={{ width: "100%" }}>
+                <button className="btn-primary" onClick={() => void openUpdateUrl()} type="button" style={{ width: "100%" }}>
                   下载新版本 {availableUpdate.latestVersion}
                 </button>
+                {isSilentInstallAssetUrl(availableUpdate.downloadUrl) ? (
+                  <button className="btn-secondary" onClick={() => void installUpdateSilently()} disabled={installingUpdate} type="button" style={{ width: "100%" }}>
+                    {installingUpdate ? "正在准备安装..." : "下载并静默安装"}
+                  </button>
+                ) : null}
               </div>
             ) : null}
           </div>
         </div>
       </div>
 
-      {/* Links Section */}
       <div className="about-section">
         <div className="about-section-title">
           <Info size={14} />
           <span>更多信息</span>
         </div>
         <div className="menu-card flat-card about-card">
+          {buildInfo ? (
+            <div className="form-hint" style={{ padding: "10px 14px" }}>
+              构建目标 {buildInfo.target} · 应用 ID {buildInfo.identifier}
+            </div>
+          ) : null}
           <MenuRow icon={Info} label="隐私说明及设置" onClick={() => setView("privacy")} iconColor="neutral" />
           <MenuRow icon={Info} label="软件声明" onClick={() => setView("statement")} iconColor="neutral" />
         </div>
       </div>
 
-      <p className="about-footer">Made with ❤️</p>
+      <p className="about-footer">Made with love</p>
     </div>
   );
 }

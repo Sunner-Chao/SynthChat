@@ -3,6 +3,7 @@ use super::browser_tools::{
     browser_session_create_request, wait_browser_run_interruptible,
 };
 use super::decision_parser::provider_tool_call_id;
+use super::delegation::apply_delegation_iteration_budget;
 use super::diagnostics::{
     diagnostics_to_lsp_json, format_lsp_diagnostics_report, lsp_broken_snapshots,
     lsp_clear_all_broken_for_workspace, lsp_diagnostic_key, lsp_encode_message, lsp_file_uri,
@@ -5061,6 +5062,7 @@ fn tool_batch_execute_code_refund_rule_matches_hermes() {
 fn default_tool_parallel_limit_matches_hermes_worker_cap() {
     assert_eq!(ChatConfig::default().tool_parallel_limit, 8);
     assert_eq!(ChatConfig::default().delegation_max_concurrent_children, 3);
+    assert_eq!(ChatConfig::default().delegation_strategy, "auto");
     assert!(ChatConfig::default().delegation_orchestrator_enabled);
     assert!(!ChatConfig::default().delegation_subagent_auto_approve);
     assert!(ChatConfig::default().delegation_inherit_mcp_toolsets);
@@ -40768,7 +40770,38 @@ fn planner_prompt_suppresses_stale_deterministic_fallback_tasks() {
 fn planner_prompt_exposes_delegate_task_tool() {
     let prompt = agent_planner_prompt(&[], &[], &[], &empty_short_context(), &[]);
     assert!(prompt.contains("delegate_task"));
+    assert!(prompt.contains("Current strategy: auto"));
+    assert!(prompt.contains("delegate focused subagents"));
+    assert!(prompt.contains("If a recent attempt failed"));
     assert!(is_internal_tool("delegate_task"));
+}
+
+#[test]
+fn planner_prompt_uses_configured_multi_agent_strategy() {
+    let dir =
+        std::env::temp_dir().join(format!("synthchat-delegation-strategy-{}", new_id("test")));
+    fs::create_dir_all(&dir).unwrap();
+    let store = AppStore::new(dir.join("state.json")).unwrap();
+    let mut config = store.config().unwrap();
+    config.chat.delegation_strategy = "planner_executor".into();
+    store.set_config(config).unwrap();
+
+    let prompt = agent_planner_prompt_for_agent_context_with_store(
+        &store,
+        &[],
+        &[],
+        &[],
+        &empty_short_context(),
+        &[],
+        ToolExecutionContext::Interactive,
+        &AgentDefinition::default(),
+        None,
+    );
+    assert!(prompt.contains("Current strategy: planner_executor"));
+    assert!(prompt.contains("plan before executing"));
+    assert!(prompt.contains("executor/reviewer split"));
+
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -40793,6 +40826,10 @@ fn delegate_task_prompt_reflects_agent_limits() {
     assert!(prompt.contains("maxSubagents=7"));
     assert!(prompt.contains("maxSubagentDepth=3"));
     assert!(prompt.contains("Nested delegation is enabled"));
+    assert!(prompt.contains("delegationMaxConcurrentChildren=3"));
+    assert!(prompt.contains("delegationStrategy=auto"));
+    assert!(prompt.contains("min(maxSubagents, delegationMaxConcurrentChildren)=3"));
+    assert!(prompt.contains("caller-supplied maxIterations is ignored"));
 
     let description = tool_describe_tool(
         &store,
@@ -40806,6 +40843,14 @@ fn delegate_task_prompt_reflects_agent_limits() {
         .as_str()
         .unwrap()
         .contains("maxSubagents=7"));
+    assert!(description["payloadShape"]
+        .as_str()
+        .unwrap()
+        .contains("delegationMaxConcurrentChildren=3"));
+    assert!(description["payloadShape"]
+        .as_str()
+        .unwrap()
+        .contains("delegationStrategy=auto"));
 
     let _ = fs::remove_dir_all(dir);
 }
@@ -40868,6 +40913,58 @@ fn delegate_task_requests_parse_batch_tasks() {
 
     assert!(delegate_task_requests(&json!({"tasks": []})).is_err());
     assert!(delegate_task_requests(&json!({"tasks": [{"context": "missing goal"}]})).is_err());
+}
+
+#[test]
+fn delegate_task_requests_accept_stringified_batch_payload() {
+    let requests = delegate_task_requests(&json!({
+        "role": "planner",
+        "toolsets": "[\"file\", \"browser\"]",
+        "canDelegate": "false",
+        "maxIterations": "12",
+        "tasks": r#"[
+            {
+                "goal": "搜索今日国内社会领域热点新闻",
+                "context": "每条给出标题和一句话摘要",
+                "toolsets": "[\"browser\"]",
+                "maxIterations": "8"
+            },
+            "{\"goal\":\"搜索今日国际热点新闻\",\"toolsets\":[\"browser\"],\"canDelegate\":\"true\"}"
+        ]"#
+    }))
+    .unwrap();
+
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].role, "planner");
+    assert!(!requests[0].can_delegate);
+    assert_eq!(requests[0].toolsets, vec!["browser"]);
+    assert_eq!(requests[0].max_iterations, 8);
+    assert!(requests[0]
+        .task
+        .contains("Goal:\n搜索今日国内社会领域热点新闻"));
+    assert!(requests[0]
+        .task
+        .contains("Context:\n每条给出标题和一句话摘要"));
+    assert_eq!(requests[1].task, "搜索今日国际热点新闻");
+    assert!(requests[1].can_delegate);
+}
+
+#[test]
+fn delegation_iteration_budget_uses_agent_policy_not_payload() {
+    let mut requests = delegate_task_requests(&json!({
+        "maxIterations": 5,
+        "tasks": [
+            {"goal": "inspect parser", "maxIterations": 9},
+            {"goal": "summarize registry", "maxIterations": 500}
+        ]
+    }))
+    .unwrap();
+    assert_eq!(requests[0].max_iterations, 9);
+    assert_eq!(requests[1].max_iterations, 90);
+
+    apply_delegation_iteration_budget(&mut requests, 37);
+    assert_eq!(requests[0].max_iterations, 37);
+    assert_eq!(requests[1].max_iterations, 37);
 }
 
 #[tokio::test]
@@ -45189,6 +45286,34 @@ fn delegation_child_toolsets_can_preserve_parent_mcp_scope() {
 
     let strict = delegation_child_toolsets(&agent, &request, false).unwrap();
     assert_eq!(strict, vec!["file"]);
+}
+
+#[test]
+fn delegation_browser_toolset_prefers_safe_browser_tools_for_children() {
+    let agent = AgentDefinition::default();
+    let request = delegate_task_requests(&json!({
+        "task": "search news",
+        "toolsets": ["browser"]
+    }))
+    .unwrap()
+    .remove(0);
+
+    let toolsets = delegation_child_toolsets(&agent, &request, false).unwrap();
+    assert!(toolsets.contains(&"browser".into()));
+    assert!(toolsets.contains(&"browser_safe".into()));
+    assert!(toolsets.contains(&"not_tool:browser_scroll".into()));
+    assert!(toolsets.contains(&"not_tool:browser_click".into()));
+
+    let mut child = AgentDefinition::default();
+    child.enabled_toolsets = toolsets;
+    let snapshot = test_internal_tool("browser_snapshot");
+    let scroll = test_internal_tool("browser_scroll");
+    let click = test_internal_tool("browser_click");
+    let filtered = apply_agent_toolset_policy(vec![snapshot, scroll, click], &child)
+        .into_iter()
+        .map(|tool| tool.tool_name)
+        .collect::<Vec<_>>();
+    assert_eq!(filtered, vec!["browser_snapshot"]);
 }
 
 #[test]

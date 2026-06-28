@@ -1,4 +1,6 @@
 fn main() {
+    println!("cargo:rerun-if-env-changed=SYNTHCHAT_UPDATE_MANIFEST_URL");
+
     #[cfg(target_os = "windows")]
     build_windows();
 

@@ -164,6 +164,7 @@ function providerPresetDefaults(id: string) {
 }
 
 const WECHAT_THINKING_MIN_VISIBLE_MS = 900;
+const WECHAT_REPLY_INSERT_DEFER_MS = 750;
 
 function imageProviderTypeLabel(id: string) {
   const labels: Record<string, string> = {
@@ -202,6 +203,10 @@ export function App() {
   const themes = useAppStore((state) => state.themes);
   const lastCountedMessageRef = useRef<Map<string, string>>(new Map());
   const processingStartedAtRef = useRef<Map<string, number>>(new Map());
+  const activeWechatTurnRef = useRef<Set<string>>(new Set());
+  const visibleWechatUserRef = useRef<Set<string>>(new Set());
+  const deferredWechatMessagesRef = useRef<Map<string, Array<{ message: ChatMessage; personaId: string | null }>>>(new Map());
+  const deferredWechatTimerRef = useRef<Map<string, number>>(new Map());
 
   const showConversationProcessing = useCallback((
     conversationId: string,
@@ -235,6 +240,50 @@ export function App() {
       setConversationProcessing(conversationId, false);
     }, delay);
   }, [setConversationProcessing]);
+
+  const flushDeferredWechatMessages = useCallback((conversationId: string) => {
+    const timer = deferredWechatTimerRef.current.get(conversationId);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      deferredWechatTimerRef.current.delete(conversationId);
+    }
+    const pending = deferredWechatMessagesRef.current.get(conversationId);
+    if (!pending || pending.length === 0) return;
+    deferredWechatMessagesRef.current.delete(conversationId);
+    pending.forEach((item) => upsertIncomingMessage(item.message));
+  }, [upsertIncomingMessage]);
+
+  const scheduleWechatFallbackRefresh = useCallback((conversationId: string, personaId?: string | null) => {
+    const timer = deferredWechatTimerRef.current.get(conversationId);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+    }
+    const nextTimer = window.setTimeout(() => {
+      deferredWechatTimerRef.current.delete(conversationId);
+      flushDeferredWechatMessages(conversationId);
+      activeWechatTurnRef.current.delete(conversationId);
+      visibleWechatUserRef.current.delete(conversationId);
+      void refreshChatData(conversationId, personaId ?? null);
+    }, WECHAT_REPLY_INSERT_DEFER_MS);
+    deferredWechatTimerRef.current.set(conversationId, nextTimer);
+  }, [flushDeferredWechatMessages, refreshChatData]);
+
+  const deferWechatTurnMessage = useCallback((
+    conversationId: string,
+    personaId: string | null | undefined,
+    message: ChatMessage
+  ) => {
+    const pending = deferredWechatMessagesRef.current.get(conversationId) ?? [];
+    const entry = { message, personaId: personaId ?? null };
+    const existingIndex = pending.findIndex((item) => item.message.id === message.id);
+    if (existingIndex >= 0) {
+      pending[existingIndex] = entry;
+    } else {
+      pending.push(entry);
+    }
+    deferredWechatMessagesRef.current.set(conversationId, pending);
+    scheduleWechatFallbackRefresh(conversationId, personaId ?? null);
+  }, [scheduleWechatFallbackRefresh]);
 
   useEffect(() => {
     void bootstrap();
@@ -294,7 +343,13 @@ export function App() {
       isLast?: boolean;
     }>("synthchat-chat-event", (event) => {
       const payload = event.payload;
-      const messageSource = payload.message?.source ?? payload.source ?? "";
+      const eventSource = payload.source ?? "";
+      const messageSource = payload.message?.source ?? eventSource;
+      const isWechatEvent = eventSource === "wechat" || payload.message?.source === "wechat";
+      const isActiveWechatTurn = Boolean(
+        payload.conversationId && activeWechatTurnRef.current.has(payload.conversationId)
+      );
+      const isWechatTurnEvent = isWechatEvent || isActiveWechatTurn;
       const externalSource =
         messageSource !== "desktop"
         && messageSource !== "desktop-control"
@@ -306,6 +361,15 @@ export function App() {
       // drives its "thinking" UI solely from this pair and auto-follows the
       // turn's conversation, so timing is uniform across all sources.
       if (payload.type === "turn_started" && payload.conversationId) {
+        if (isWechatEvent) {
+          const timer = deferredWechatTimerRef.current.get(payload.conversationId);
+          if (timer !== undefined) {
+            window.clearTimeout(timer);
+            deferredWechatTimerRef.current.delete(payload.conversationId);
+          }
+          deferredWechatMessagesRef.current.delete(payload.conversationId);
+          activeWechatTurnRef.current.add(payload.conversationId);
+        }
         const shouldSwitchSection = externalSource && messageSource !== "pet" && messageSource !== "wechat";
         showConversationProcessing(
           payload.conversationId,
@@ -317,37 +381,78 @@ export function App() {
       }
       if (payload.type === "turn_finished" && payload.conversationId) {
         hideConversationProcessing(payload.conversationId);
+        if (isWechatEvent) {
+          if (
+            payload.message
+            && isVisibleChatEventMessage(payload.message)
+            && (payload.message.role === "assistant" || payload.message.role === "tool")
+          ) {
+            if (visibleWechatUserRef.current.has(payload.conversationId)) {
+              upsertIncomingMessage(payload.message);
+            } else {
+              deferWechatTurnMessage(payload.conversationId, payload.personaId, payload.message);
+            }
+          }
+          scheduleWechatFallbackRefresh(payload.conversationId, payload.personaId ?? null);
+          return;
+        }
         void refreshChatData(payload.conversationId ?? null, payload.personaId ?? null);
         return;
       }
-      if (
-        payload.conversationId
-        && payload.message
-        && (payload.type === "assistant_message" || payload.type === "new_message")
-        && isVisibleChatEventMessage(payload.message)
-      ) {
+      const isMessageEvent =
+        payload.type === "assistant_stream"
+        || payload.type === "new_message"
+        || payload.type === "tool_message"
+        || payload.type === "assistant_message";
+      const isVisibleMessageEvent =
+        Boolean(payload.conversationId && payload.message && isVisibleChatEventMessage(payload.message));
+      if (isMessageEvent && payload.conversationId && payload.message && isVisibleMessageEvent) {
         if (payload.message.role === "user" && messageSource === "desktop") {
           // Desktop sends its own user messages and handles optimistic UI locally.
           return;
         }
-        const state = useAppStore.getState();
-        const shouldMarkUnread =
-          payload.conversationId !== state.activeConversationId
-          || state.activeSection !== "chat";
-        const messageKey = payload.message.id.trim() || `${payload.message.createdAt}:${payload.message.content.length}`;
-        const previousKey = lastCountedMessageRef.current.get(payload.conversationId);
-        if (shouldMarkUnread && previousKey !== messageKey) {
-          lastCountedMessageRef.current.set(payload.conversationId, messageKey);
-          incrementConversationUnread(payload.conversationId);
+        const isWechatUserMessage = payload.message.role === "user" && isWechatEvent;
+        if (isWechatUserMessage) {
+          visibleWechatUserRef.current.add(payload.conversationId);
         }
-      }
-      if ((payload.type === "assistant_stream" || payload.type === "new_message" || payload.type === "tool_message" || payload.type === "assistant_message") && payload.message && isVisibleChatEventMessage(payload.message)) {
+        const shouldDeferWechatTurnMessage =
+          isWechatTurnEvent
+          && !visibleWechatUserRef.current.has(payload.conversationId)
+          && (payload.message.role === "assistant" || payload.message.role === "tool");
+        if (shouldDeferWechatTurnMessage) {
+          deferWechatTurnMessage(payload.conversationId, payload.personaId, payload.message);
+          return;
+        }
+        if (payload.type === "assistant_message" || payload.type === "new_message") {
+          const state = useAppStore.getState();
+          const shouldMarkUnread =
+            payload.conversationId !== state.activeConversationId
+            || state.activeSection !== "chat";
+          const messageKey = payload.message.id.trim() || `${payload.message.createdAt}:${payload.message.content.length}`;
+          const previousKey = lastCountedMessageRef.current.get(payload.conversationId);
+          if (shouldMarkUnread && previousKey !== messageKey) {
+            lastCountedMessageRef.current.set(payload.conversationId, messageKey);
+            incrementConversationUnread(payload.conversationId);
+          }
+        }
         upsertIncomingMessage(payload.message);
+        if (isWechatUserMessage) {
+          flushDeferredWechatMessages(payload.conversationId);
+        }
       }
       if (payload.type === "assistant_stream") {
         return;
       }
       if (payload.type === "tool_message") {
+        return;
+      }
+      if (
+        payload.type === "conversation_updated"
+        && payload.conversationId
+        && isWechatEvent
+        && !visibleWechatUserRef.current.has(payload.conversationId)
+      ) {
+        scheduleWechatFallbackRefresh(payload.conversationId, payload.personaId ?? null);
         return;
       }
       if (payload.type === "new_message" || payload.type === "assistant_message" || payload.type === "conversation_updated") {
@@ -358,8 +463,20 @@ export function App() {
     });
     return () => {
       if (unlisten) unlisten();
+      deferredWechatTimerRef.current.forEach((timer) => window.clearTimeout(timer));
+      deferredWechatTimerRef.current.clear();
     };
-  }, [hideConversationProcessing, incrementConversationUnread, refreshChatData, setConversationProcessing, showConversationProcessing, upsertIncomingMessage]);
+  }, [
+    deferWechatTurnMessage,
+    flushDeferredWechatMessages,
+    hideConversationProcessing,
+    incrementConversationUnread,
+    refreshChatData,
+    scheduleWechatFallbackRefresh,
+    setConversationProcessing,
+    showConversationProcessing,
+    upsertIncomingMessage
+  ]);
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;

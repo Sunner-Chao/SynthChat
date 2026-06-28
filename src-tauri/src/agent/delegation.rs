@@ -71,7 +71,8 @@ pub(super) use super::delegation_artifacts::{
     delegation_file_state_reminder, save_subagent_failure_diagnostic_artifact,
 };
 pub(super) use super::delegation_request::{
-    apply_delegation_runtime_config, delegate_task_requests, DelegateTaskRequest,
+    apply_delegation_iteration_budget, apply_delegation_runtime_config, delegate_task_requests,
+    DelegateTaskRequest,
 };
 use super::delegation_run_state::{latest_run_for_conversation, mark_run_as_subagent};
 pub(super) use super::delegation_scope::{acp_mcp_servers_for_agent, delegation_child_toolsets};
@@ -87,6 +88,7 @@ pub(super) async fn delegate_task_tool(
     let is_batch = payload.get("tasks").is_some();
     let mut requests = delegate_task_requests(payload)?;
     let chat_config = store.config()?.chat;
+    apply_delegation_iteration_budget(&mut requests, agent.max_tool_iterations);
     let max_concurrent_children = chat_config.delegation_max_concurrent_children.max(1);
     if is_batch && requests.len() as u32 > max_concurrent_children {
         return Err(AppError::BadRequest(format!(

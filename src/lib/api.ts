@@ -11,7 +11,10 @@ import type {
   AgentRuntimeEventStream,
   AgentRunRecord,
   AgentTodoItem,
+  AppBuildInfo,
   AppConfig,
+  AppUpdateCheck,
+  AppUpdateInstallResult,
   BrowserProvider,
   ChatAttachment,
   ChatMessage,
@@ -69,6 +72,7 @@ const fallbackConfig: AppConfig = {
     autoTitleEnabled: true,
     queueWaitSeconds: 7,
     delegationMaxConcurrentChildren: 3,
+    delegationStrategy: "auto",
     delegationOrchestratorEnabled: true,
     delegationSubagentAutoApprove: false,
     delegationInheritMcpToolsets: true,
@@ -247,6 +251,47 @@ async function call<T>(cmd: string, args: Record<string, unknown> = {}, fallback
 
 function ok(message = "standalone mock"): ActionResult {
   return { success: true, message };
+}
+
+export async function getAppBuildInfo(): Promise<AppBuildInfo> {
+  return call("get_app_build_info", {}, () => ({
+    productName: "SynthChat",
+    version: "1.1.0",
+    identifier: "cc.synthchat.v1",
+    target: "web-preview",
+    updateManifestUrl: ""
+  }));
+}
+
+export async function checkAppUpdate(manifestUrl?: string): Promise<AppUpdateCheck> {
+  return call("check_app_update", { manifestUrl }, () => ({
+    currentVersion: "1.1.0",
+    latestVersion: "1.1.0",
+    updateAvailable: false,
+    downloadUrl: null,
+    releaseUrl: null,
+    notes: null,
+    publishedAt: null,
+    sourceUrl: manifestUrl ?? "",
+    checkedAt: new Date().toISOString()
+  }));
+}
+
+export async function installAppUpdate(downloadUrl: string): Promise<AppUpdateInstallResult> {
+  return call("install_app_update", { downloadUrl }, () => ({
+    installerPath: "",
+    helperScriptPath: "",
+    mode: "unavailable",
+    message: "Native updater is unavailable in web preview."
+  }));
+}
+
+export async function openAppUpdateUrl(url: string): Promise<void> {
+  return call("open_app_update_url", { url }, () => {
+    if (typeof window !== "undefined") {
+      window.open(url, "_blank", "noopener,noreferrer");
+    }
+  });
 }
 
 export function convertFileSrc(path: string): string {
@@ -491,6 +536,10 @@ const empty = async <T,>(): Promise<T[]> => [];
 const pass = async <T,>(value: T): Promise<T> => value;
 
 export const api: Record<string, any> = {
+  getAppBuildInfo,
+  checkAppUpdate,
+  installAppUpdate,
+  openAppUpdateUrl,
   getConfig,
   saveConfig,
   addTrustedToolPattern,

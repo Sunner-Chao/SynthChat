@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { Bot, Plus, Trash2, Save, Cpu, Settings2, ShieldAlert, FolderOpen, Wrench, ChevronRight, Puzzle } from "lucide-react";
+import { Bot, Plus, Trash2, Save, Cpu, Settings2, ShieldAlert, FolderOpen, Wrench, ChevronRight, Puzzle, Users } from "lucide-react";
 import { api } from "../lib/api";
 import { useAppStore } from "../lib/store";
 import type { AgentDefinition, ModelCatalogEntry } from "../lib/types";
@@ -11,7 +11,7 @@ const clampNumber = (value: number, min: number, max: number) => {
 
 export function AgentsManagerPanel() {
   const {
-    agents, refreshAgents, saveAgent, deleteAgent, goBack, llmProviders,
+    agents, refreshAgents, saveAgent, deleteAgent, goBack, llmProviders, config, saveConfig,
     focusedAgentId, setFocusedAgentId, setMcpPanelMode, setSkillsPanelMode, setSection
   } = useAppStore();
 
@@ -19,6 +19,15 @@ export function AgentsManagerPanel() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [catalogModels, setCatalogModels] = useState<ModelCatalogEntry[]>([]);
+  // Delegation settings (from ChatConfig)
+  const chatCfg = config?.chat;
+  const [delegationMax, setDelegationMax] = useState(chatCfg?.delegationMaxConcurrentChildren ?? 3);
+  const [delegationStrategy, setDelegationStrategy] = useState(chatCfg?.delegationStrategy ?? "auto");
+  const [delegationOrch, setDelegationOrch] = useState(chatCfg?.delegationOrchestratorEnabled !== false);
+  const [delegationAutoApprove, setDelegationAutoApprove] = useState(chatCfg?.delegationSubagentAutoApprove === true);
+  const [delegationInheritMcp, setDelegationInheritMcp] = useState(chatCfg?.delegationInheritMcpToolsets !== false);
+  const [delegationProviderId, setDelegationProviderId] = useState(chatCfg?.delegationSubagentProviderId ?? "");
+  const [delegationModel, setDelegationModel] = useState(chatCfg?.delegationSubagentModel ?? "");
   // Ref to reliably track "creating new" mode across renders (avoids stale closure)
   const isCreatingNewRef = useRef(false);
 
@@ -84,8 +93,8 @@ export function AgentsManagerPanel() {
       mcpEnabled: true,
       skillsEnabled: true,
       allowShell: false,
-      maxSubagents: 3,
-      maxSubagentDepth: 2,
+      maxSubagents: 4,
+      maxSubagentDepth: 1,
       maxToolIterations: 90,
       skillsDir: "",
       enabledSkills: [],
@@ -110,6 +119,22 @@ export function AgentsManagerPanel() {
     setSaving(true);
     try {
       const saved = await saveAgent(draft);
+      // Save delegation settings to chat config
+      if (config) {
+        await saveConfig({
+          ...config,
+          chat: {
+            ...config.chat,
+            delegationMaxConcurrentChildren: delegationMax,
+            delegationStrategy,
+            delegationOrchestratorEnabled: delegationOrch,
+            delegationSubagentAutoApprove: delegationAutoApprove,
+            delegationInheritMcpToolsets: delegationInheritMcp,
+            delegationSubagentProviderId: delegationProviderId,
+            delegationSubagentModel: delegationModel,
+          }
+        });
+      }
       isCreatingNewRef.current = false;
       setFocusedAgentId(saved.id);
     } catch (e) {
@@ -347,11 +372,11 @@ export function AgentsManagerPanel() {
                       <div className="agent-field">
                         <label>最大子 Agent</label>
                         <input
-                          min={0}
+                          min={1}
                           max={20}
                           type="number"
                           value={draft.maxSubagents}
-                          onChange={e => handleChange("maxSubagents", clampNumber(Number(e.target.value), 0, 20))}
+                          onChange={e => handleChange("maxSubagents", clampNumber(Number(e.target.value), 1, 20))}
                         />
                       </div>
                       <div className="agent-field">
@@ -377,6 +402,56 @@ export function AgentsManagerPanel() {
                   <input type="checkbox" className="beautiful-checkbox" checked={draft.allowShell} onChange={e => handleChange("allowShell", e.target.checked)} />
                 </label>
 
+              </div>
+
+              {/* Delegation Settings */}
+              <div className="card beautiful-card" style={{ marginBottom: "20px" }}>
+                <div className="card-header"><Users size={15} style={{ marginRight: 6 }}/> 子智能体委派 (Delegation)</div>
+                <div className="form-group" style={{ padding: "16px 20px" }}>
+                  <div className="agent-form-row">
+                    <div className="agent-field">
+                      <label>并发子任务</label>
+                      <input min={1} max={16} type="number" value={delegationMax} onChange={e => setDelegationMax(clampNumber(Number(e.target.value), 1, 16))} />
+                    </div>
+                    <div className="agent-field">
+                      <label>协作策略</label>
+                      <select value={delegationStrategy} onChange={e => setDelegationStrategy(e.target.value)}>
+                        <option value="auto">自动平衡</option>
+                        <option value="single_agent_chat">单 Agent 对话</option>
+                        <option value="router_specialists">路由专家</option>
+                        <option value="planner_executor">规划-执行</option>
+                        <option value="supervisor_dynamic">动态监督者</option>
+                        <option value="peer_handoff">Peer Handoff</option>
+                        <option value="mixture_consensus">MoA 共识</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div className="agent-form-row" style={{ marginTop: 12 }}>
+                    <div className="agent-field">
+                      <label>子任务服务商</label>
+                      <select value={delegationProviderId} onChange={e => setDelegationProviderId(e.target.value)}>
+                        <option value="">继承父 Agent</option>
+                        {llmProviders.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                      </select>
+                    </div>
+                    <div className="agent-field">
+                      <label>子任务模型</label>
+                      <input value={delegationModel} onChange={e => setDelegationModel(e.target.value)} placeholder="留空继承父 Agent 模型" />
+                    </div>
+                  </div>
+                </div>
+                <label className="adapter-row" style={{ cursor: "pointer", padding: "12px 20px", display: "grid", gridTemplateColumns: "auto 1fr auto", borderTop: "1px solid var(--divider)" }}>
+                  <div className="adapter-info"><strong>允许 Orchestrator</strong><small>启用编排器模式协调多 Agent</small></div>
+                  <input type="checkbox" className="beautiful-checkbox" checked={delegationOrch} onChange={e => setDelegationOrch(e.target.checked)} />
+                </label>
+                <label className="adapter-row" style={{ cursor: "pointer", padding: "12px 20px", display: "grid", gridTemplateColumns: "auto 1fr auto", borderTop: "1px solid var(--divider)" }}>
+                  <div className="adapter-info"><strong>子任务自动审批</strong><small>关闭时危险工具调用会自动拒绝</small></div>
+                  <input type="checkbox" className="beautiful-checkbox" checked={delegationAutoApprove} onChange={e => setDelegationAutoApprove(e.target.checked)} />
+                </label>
+                <label className="adapter-row" style={{ cursor: "pointer", padding: "12px 20px", display: "grid", gridTemplateColumns: "auto 1fr auto", borderTop: "1px solid var(--divider)" }}>
+                  <div className="adapter-info"><strong>继承 MCP 工具</strong><small>子任务保留父 Agent 的 MCP 能力</small></div>
+                  <input type="checkbox" className="beautiful-checkbox" checked={delegationInheritMcp} onChange={e => setDelegationInheritMcp(e.target.checked)} />
+                </label>
               </div>
             </div>
           ) : (

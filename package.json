@@ -1,6 +1,6 @@
 {
   "name": "synthchat-v1",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,7 +9,8 @@
     "preview": "vite preview --host 127.0.0.1",
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
-    "desktop:build": "tauri build"
+    "desktop:build": "tauri build",
+    "desktop:build:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-native.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

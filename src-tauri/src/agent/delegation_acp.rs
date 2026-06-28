@@ -36,9 +36,12 @@ pub(super) async fn execute_acp_delegate_task_request(
     inherit_mcp_toolsets: bool,
 ) -> AppResult<Value> {
     let parent_run = store.agent_run(parent_run_id)?;
-    let child_conversation = store.create_conversation(
+    let child_conversation = store.create_internal_subagent_conversation(
         Some(format!("ACP subagent {} · {}", child_index, request.role)),
         Some(parent_run.persona_id.clone()),
+        parent_run_id,
+        child_index,
+        "acp",
     )?;
     let mut child_run = AgentRunRecord::new(
         child_conversation.id.clone(),

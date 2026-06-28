@@ -7,7 +7,8 @@ use crate::{
     error::{AppError, AppResult},
     model_catalog::model_capability_prompt_block,
     models::{
-        AgentDefinition, MemoryEntry, Persona, ShortContextState, SkillPromptBlock, ToolDefinition,
+        AgentDefinition, ChatConfig, MemoryEntry, Persona, ShortContextState, SkillPromptBlock,
+        ToolDefinition,
     },
     process_utils::CommandWindowExt,
     store::AppStore,
@@ -77,6 +78,7 @@ pub(super) fn agent_planner_prompt_for_agent_context(
         agent,
         None,
         None,
+        None,
         &InternalToolAvailability::all_available(),
         "Current LLM model metadata: unavailable.",
     )
@@ -110,6 +112,7 @@ pub(super) fn agent_planner_prompt_for_agent_context_with_store(
         agent,
         persona,
         user_profile_name.as_deref(),
+        Some(store),
         &availability,
         &model_metadata_block,
     )
@@ -125,6 +128,7 @@ pub(super) fn agent_planner_prompt_for_agent_context_with_availability(
     agent: &AgentDefinition,
     persona: Option<&Persona>,
     user_profile_name: Option<&str>,
+    store: Option<&AppStore>,
     availability: &InternalToolAvailability,
     model_metadata_block: &str,
 ) -> String {
@@ -137,9 +141,11 @@ pub(super) fn agent_planner_prompt_for_agent_context_with_availability(
     let memory_block = render_memory_prompt_blocks(memory_blocks);
     let short_context_block = render_short_context_block(short_context);
     let mcp_tool_block = render_mcp_tool_definitions(mcp_tools);
-    let internal_tool_block = render_internal_tool_prompt_block(agent, tool_context, availability);
+    let internal_tool_block =
+        render_internal_tool_prompt_block(agent, tool_context, availability, store);
     let environment_probe_block = environment_probe_prompt_block();
     let persona_block = render_persona_prompt_block(persona, user_profile_name);
+    let delegation_strategy_block = delegation_strategy_prompt_block(store);
     format!(
         r#"You are SynthChat's recovered agent runtime. Decide the next step from the user request and current observations.
 
@@ -147,6 +153,9 @@ Return JSON only. Do not wrap it in markdown.
 
 Tool-use enforcement:
 When tools are available and the task needs inspection, commands, file edits, browsing, or other action, take that action with a tool instead of describing what you would do. If you say you will inspect, run, create, edit, search, fetch, or test something, your next response must be the corresponding tool call. Do not end with a promise of future tool use.
+
+Multi-agent collaboration:
+{delegation_strategy_block}
 
 Skill instructions:
 {skill_block}
@@ -193,6 +202,50 @@ If no tool is needed, answer directly with final.
 Current observations:
 {observation_block}"#
     )
+}
+
+fn delegation_strategy_prompt_block(store: Option<&AppStore>) -> String {
+    let strategy = store
+        .and_then(|store| store.config().ok())
+        .map(|config| normalize_delegation_strategy(&config.chat.delegation_strategy))
+        .unwrap_or_else(|| {
+            normalize_delegation_strategy(&ChatConfig::default().delegation_strategy)
+        });
+    match strategy.as_str() {
+        "single_agent_chat" => {
+            "Current strategy: single_agent_chat. Prefer direct main-agent execution for normal work. Use delegate_task only when the user explicitly asks for subagents, an isolated second opinion is needed, or the same direct path has failed and a focused diagnostic child can unblock it. If you do delegate, keep children leaf-only and synthesize their result before finalizing.".into()
+        }
+        "router_specialists" => {
+            "Current strategy: router_specialists. Classify the task into concrete specialties first, then route only the needed specialty work to focused delegate_task children such as researcher, planner, coder, reviewer, or debugger. Avoid broad duplicate children; each child should receive a precise goal, relevant context, and narrowed toolsets. The main agent synthesizes specialist outputs and resolves conflicts.".into()
+        }
+        "planner_executor" => {
+            "Current strategy: planner_executor. For implementation, debugging, research, and recovery tasks, plan before executing: decompose the objective, delegate execution or verification subtasks to focused children, then validate and synthesize. Prefer at least one executor/reviewer split when file edits or repeated tool calls are likely. Small single-step answers may still run directly.".into()
+        }
+        "supervisor_dynamic" => {
+            "Current strategy: supervisor_dynamic. Act as a supervisor that assigns work dynamically, monitors child results, and spawns follow-up delegate_task children only when new evidence justifies it. Use role=orchestrator and canDelegate=true only when nested delegation is enabled by current limits; otherwise keep children as leaf workers. Do not retry a failed direct workflow before delegating a focused diagnostic or recovery child.".into()
+        }
+        "peer_handoff" => {
+            "Current strategy: peer_handoff. Use sequential peer handoffs for non-trivial work: one child proposes or investigates, another critiques or verifies, and the main agent resolves disagreements before acting or finalizing. Include the previous peer's findings in the next child context. Keep handoffs short and evidence-based.".into()
+        }
+        "mixture_consensus" => {
+            "Current strategy: mixture_consensus. For hard reasoning, ambiguous design choices, or answer quality comparisons, prefer mixture_of_agents to gather multiple model perspectives and synthesize. For tool-heavy local tasks, use delegate_task for focused execution and optionally mixture_of_agents for final reasoning or review. The main agent remains responsible for verification.".into()
+        }
+        _ => {
+            "Current strategy: auto. Small single-step tasks may run directly. For complex implementation, debugging, review, research, recovery, broad code inspection, terminal work, or file edits, delegate focused subagents before deep main-agent execution, then synthesize and verify. If a recent attempt failed, looped, or produced conflicting evidence, do not immediately retry the same direct workflow; delegate a focused diagnostic or implementation child with the failure context first.".into()
+        }
+    }
+}
+
+fn normalize_delegation_strategy(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "single_agent" | "single" | "direct" | "single_agent_chat" => "single_agent_chat".into(),
+        "router" | "specialists" | "router_specialists" => "router_specialists".into(),
+        "planner" | "executor" | "planner_executor" => "planner_executor".into(),
+        "supervisor" | "dynamic" | "supervisor_dynamic" => "supervisor_dynamic".into(),
+        "peer" | "handoff" | "peer_handoff" => "peer_handoff".into(),
+        "mixture" | "moa" | "consensus" | "mixture_consensus" => "mixture_consensus".into(),
+        _ => "auto".into(),
+    }
 }
 
 fn render_persona_prompt_block(

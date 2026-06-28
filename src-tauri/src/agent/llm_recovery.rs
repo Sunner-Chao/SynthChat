@@ -1747,6 +1747,14 @@ fn history_with_native_image_attachments(
 
 fn history_with_current_user_content(history: &[ChatMessage], user_content: &str) -> Vec<ChatMessage> {
     let Some(last_user_index) = history.iter().rposition(|message| message.role == "user") else {
+        if !user_content.trim().is_empty() {
+            return vec![ChatMessage::new(
+                "__current_turn__".into(),
+                "user",
+                user_content.to_string(),
+                "desktop-agent-current-turn",
+            )];
+        }
         return history.to_vec();
     };
     if user_content.trim().is_empty() {
@@ -1763,6 +1771,49 @@ fn history_with_current_user_content(history: &[ChatMessage], user_content: &str
             message
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_with_current_user_content_adds_missing_user_turn() {
+        let history = history_with_current_user_content(&[], "search today's news");
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[0].content, "search today's news");
+    }
+
+    #[test]
+    fn history_with_current_user_content_replaces_latest_user_turn() {
+        let earlier = ChatMessage::new(
+            "conv".into(),
+            "user",
+            "old request".into(),
+            "test",
+        );
+        let assistant = ChatMessage::new(
+            "conv".into(),
+            "assistant",
+            "old answer".into(),
+            "test",
+        );
+        let latest = ChatMessage::new(
+            "conv".into(),
+            "user",
+            "placeholder".into(),
+            "test",
+        );
+
+        let history =
+            history_with_current_user_content(&[earlier, assistant, latest], "current request");
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].content, "old request");
+        assert_eq!(history[2].content, "current request");
+    }
 }
 
 fn image_attachments_from_message(message: &ChatMessage, attachment_root: &PathBuf) -> Vec<ImageAttachmentPart> {

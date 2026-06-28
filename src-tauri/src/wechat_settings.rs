@@ -10,6 +10,7 @@ use std::{
 use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes128;
 use base64::{engine::general_purpose, Engine as _};
+use chrono::DateTime;
 use image::codecs::jpeg::JpegEncoder;
 use md5::{Digest, Md5};
 use rand::RngCore;
@@ -1800,7 +1801,11 @@ fn detect_local_media_mime(path: &Path, fallback_label: &str) -> String {
     }
     fs::read(path)
         .ok()
-        .and_then(|bytes| detect_wechat_image_mime(&bytes, path).ok().map(str::to_string))
+        .and_then(|bytes| {
+            detect_wechat_image_mime(&bytes, path)
+                .ok()
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| "application/octet-stream".to_string())
 }
 
@@ -1825,10 +1830,15 @@ fn attachment_value_to_saved_media(store: &AppStore, value: &Value) -> Option<We
     if value.is_null() {
         return None;
     }
-    if let Some(text) = value.as_str().map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(text) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         if text.starts_with("data:") {
             let (bytes, mime_type) = decode_data_url_payload(text)?;
-            let label = file_name_with_mime_extension(&format!("wechat-{}", new_id("media")), &mime_type);
+            let label =
+                file_name_with_mime_extension(&format!("wechat-{}", new_id("media")), &mime_type);
             return save_wechat_attachment(store, label.clone(), bytes, mime_type, label).ok();
         }
         let source_path = PathBuf::from(text);
@@ -1977,7 +1987,7 @@ fn attachment_value_to_saved_media_candidate(value: &Value) -> bool {
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .is_some_and(|text| text.starts_with("data:") || looks_like_base64_media(text))
-    });
+        });
     has_path || has_inline_data
 }
 
@@ -2025,7 +2035,10 @@ fn attachment_file_name_for_path(path: &str) -> String {
         .unwrap_or_else(|| "wechat-file".to_string())
 }
 
-fn media_from_extra_attachments(store: &AppStore, attachments: &[Value]) -> Vec<WechatInboundMedia> {
+fn media_from_extra_attachments(
+    store: &AppStore,
+    attachments: &[Value],
+) -> Vec<WechatInboundMedia> {
     let mut media = Vec::new();
     for attachment in attachments {
         if let Some(item) = attachment_value_to_saved_media(store, attachment) {
@@ -2904,6 +2917,15 @@ pub async fn wechat_poll_once(
     }
 
     let next_updates_buf = first_value_string(&raw, &[&["get_updates_buf"], &["getUpdatesBuf"]]);
+    let mut updated_buffer = false;
+    if let Some(new_buf) = next_updates_buf.as_ref() {
+        let mut accounts = list_accounts()?;
+        if let Some(account) = accounts.iter_mut().find(|account| account.id == account_id) {
+            account.get_updates_buf = new_buf.clone();
+            save_accounts(accounts)?;
+            updated_buffer = true;
+        }
+    }
 
     let msgs = raw
         .get("msgs")
@@ -2938,19 +2960,45 @@ pub async fn wechat_poll_once(
             continue;
         }
         let context_token = extract_wechat_context_token(&raw_msg);
-        let result = wechat_inbound_text_with_extras(
+        let result = match wechat_inbound_text_with_extras(
             store,
             app,
             account_id.clone(),
             user_id.clone(),
-            text,
+            text.clone(),
             context_token,
             WechatInboundExtras {
-                raw_message: Some(raw_msg),
+                raw_message: Some(raw_msg.clone()),
                 attachments: Vec::new(),
             },
         )
-        .await?;
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let message = error.to_string();
+                eprintln!(
+                    "SynthChat wechat inbound failed: account={} user={} error={}",
+                    account_id, user_id, message
+                );
+                let _ = app.emit(
+                    "synthchat-wechat-poll-error",
+                    json!({
+                        "accountId": account_id,
+                        "userId": user_id,
+                        "error": message,
+                    }),
+                );
+                processed.push(WechatProcessedInbound {
+                    user_id,
+                    text,
+                    conversation_id: None,
+                    delivered: false,
+                    delivery_error: Some(message),
+                });
+                continue;
+            }
+        };
         eprintln!(
             "SynthChat wechat inbound processed: account={} user={} delivered={}",
             account_id, user_id, result.delivered
@@ -2982,16 +3030,6 @@ pub async fn wechat_poll_once(
             delivered: result.delivered,
             delivery_error: result.delivery_error,
         });
-    }
-
-    let mut updated_buffer = false;
-    if let Some(new_buf) = next_updates_buf {
-        let mut accounts = list_accounts()?;
-        if let Some(account) = accounts.iter_mut().find(|account| account.id == account_id) {
-            account.get_updates_buf = new_buf;
-            save_accounts(accounts)?;
-            updated_buffer = true;
-        }
     }
 
     let account = list_accounts()?
@@ -3037,13 +3075,8 @@ pub async fn run_wechat_poll_loop(store: AppStore, app: AppHandle) {
                 "SynthChat wechat poll target: account={} persona={}",
                 account.id, account.linked_persona
             );
-            let result = wechat_poll_once(
-                &store,
-                &app,
-                account.id.clone(),
-                Some(timeout_seconds),
-            )
-            .await;
+            let result =
+                wechat_poll_once(&store, &app, account.id.clone(), Some(timeout_seconds)).await;
             if let Err(error) = result {
                 let _ = app.emit(
                     "synthchat-wechat-poll-error",
@@ -3122,24 +3155,37 @@ pub async fn wechat_inbound_text_with_extras(
     .await;
     let content = append_media_contexts(&content, &media);
     if content.trim().is_empty() {
-        return Err(AppError::BadRequest("message text or media is required".into()));
+        return Err(AppError::BadRequest(
+            "message text or media is required".into(),
+        ));
     }
-    emit_wechat_processing(app, &conversation_id, &persona.id, true);
+    let provider_data = json!({
+        "source": "wechat",
+        "accountId": account.id,
+        "userId": user_id,
+        "contextToken": context_token.clone(),
+        "agentId": persona.agent_id,
+    });
     let turn_started_at = now_iso();
+    let user_message = ensure_wechat_user_message_visible(
+        store,
+        &conversation_id,
+        &content,
+        provider_data.clone(),
+        &turn_started_at,
+    )?;
+    emit_wechat_user_message(app, &conversation_id, &persona.id, &user_message);
+    emit_wechat_processing(app, &conversation_id, &persona.id, true);
+    let request_provider_data =
+        wechat_provider_data_with_pre_persisted_user(provider_data.clone(), &user_message);
     let messages_result = run_wechat_chat_turn(
         store,
         SendChatRequest {
             conversation_id: Some(conversation_id.clone()),
             persona_id: Some(persona.id.clone()),
             agent_id: Some(persona.agent_id.clone()),
-            content,
-            provider_data: Some(json!({
-                "source": "wechat",
-                "accountId": account.id,
-                "userId": user_id,
-                "contextToken": context_token.clone(),
-                "agentId": persona.agent_id,
-            })),
+            content: content.clone(),
+            provider_data: Some(request_provider_data),
             queue_item_id: None,
         },
         app,
@@ -3152,15 +3198,15 @@ pub async fn wechat_inbound_text_with_extras(
             return Err(error);
         }
     };
-    let user_message = messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user" && message.source == "wechat")
-        .cloned();
-    if let Some(message) = user_message.as_ref() {
-        // Re-emit from the caller thread so the desktop window cannot miss the
-        // persisted WeChat user message due to cross-thread event timing.
-        emit_wechat_user_message(app, &conversation_id, &persona.id, message);
+    if let Some(index) = messages.iter().position(|message| {
+        message.id == user_message.id
+            || (message.role == "user"
+                && message.source == "wechat"
+                && message.content.trim() == content.trim())
+    }) {
+        messages[index] = user_message.clone();
+    } else {
+        messages.insert(0, user_message.clone());
     }
     emit_wechat_processing(app, &conversation_id, &persona.id, false);
     let mut reply_message = messages
@@ -3201,6 +3247,29 @@ pub async fn wechat_inbound_text_with_extras(
     })
 }
 
+fn wechat_provider_data_with_pre_persisted_user(
+    provider_data: Value,
+    user_message: &ChatMessage,
+) -> Value {
+    let mut root = match provider_data {
+        Value::Object(object) => object,
+        value => {
+            let mut object = serde_json::Map::new();
+            object.insert("originalProviderData".into(), value);
+            object
+        }
+    };
+    root.insert(
+        "prePersistedUserMessageId".into(),
+        Value::String(user_message.id.clone()),
+    );
+    root.insert(
+        "prePersistedUserCreatedAt".into(),
+        Value::String(user_message.created_at.clone()),
+    );
+    Value::Object(root)
+}
+
 fn attach_wechat_deliverable_to_reply(
     store: &AppStore,
     conversation_id: &str,
@@ -3236,6 +3305,47 @@ fn persist_wechat_assistant_message_if_missing(
         let _ = store.append_message(message.clone())?;
     }
     Ok(())
+}
+
+fn ensure_wechat_user_message_visible(
+    store: &AppStore,
+    conversation_id: &str,
+    content: &str,
+    provider_data: Value,
+    turn_started_at: &str,
+) -> AppResult<ChatMessage> {
+    if let Some(existing) = store
+        .messages(conversation_id, None)?
+        .into_iter()
+        .rev()
+        .find(|message| {
+            message.role == "user"
+                && message.source == "wechat"
+                && message.content.trim() == content.trim()
+                && message_at_or_after(&message.created_at, turn_started_at)
+        })
+    {
+        return Ok(existing);
+    }
+    let mut message = ChatMessage::new(
+        conversation_id.to_string(),
+        "user",
+        content.to_string(),
+        "wechat",
+    );
+    message.created_at = turn_started_at.to_string();
+    message.provider_data = Some(provider_data);
+    store.append_message(message)
+}
+
+fn message_at_or_after(message_at: &str, cutoff: &str) -> bool {
+    let Ok(message_at) = DateTime::parse_from_rfc3339(message_at) else {
+        return false;
+    };
+    let Ok(cutoff) = DateTime::parse_from_rfc3339(cutoff) else {
+        return false;
+    };
+    message_at >= cutoff
 }
 
 fn emit_wechat_assistant_message(
@@ -3618,7 +3728,8 @@ mod tests {
 
     #[test]
     fn extra_attachment_local_path_is_copied_into_attachment_cache() {
-        let dir = std::env::temp_dir().join(format!("synthchat-wechat-local-extra-{}", new_id("case")));
+        let dir =
+            std::env::temp_dir().join(format!("synthchat-wechat-local-extra-{}", new_id("case")));
         let external = dir.join("incoming");
         fs::create_dir_all(&external).unwrap();
         let source = external.join("photo");
@@ -3638,7 +3749,65 @@ mod tests {
         assert!(saved_path.is_file());
         assert!(saved_path.starts_with(store.data_dir().join("attachments")));
         assert_ne!(saved_path, source);
-        assert!(saved_path.extension().and_then(|value| value.to_str()).is_some());
+        assert!(saved_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ensure_wechat_user_message_visible_persists_once() {
+        let dir = std::env::temp_dir().join(format!(
+            "synthchat-wechat-visible-user-{}",
+            new_id("case")
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let store = AppStore::new(dir.join("state.json")).unwrap();
+        let conversation = store
+            .create_conversation(Some("wechat chat".into()), Some("default".into()))
+            .unwrap();
+        let provider_data = json!({
+            "source": "wechat",
+            "accountId": "wechat-account",
+            "userId": "wechat-user",
+            "contextToken": "ctx-1",
+            "agentId": "default",
+        });
+        let turn_started_at = "2026-06-28T02:24:48.884Z";
+        let content = "dispatch two subagents and summarize";
+
+        let first = ensure_wechat_user_message_visible(
+            &store,
+            &conversation.id,
+            content,
+            provider_data.clone(),
+            turn_started_at,
+        )
+        .unwrap();
+        let second = ensure_wechat_user_message_visible(
+            &store,
+            &conversation.id,
+            content,
+            provider_data.clone(),
+            turn_started_at,
+        )
+        .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.role, "user");
+        assert_eq!(first.source, "wechat");
+        assert_eq!(first.content, content);
+        assert_eq!(first.created_at, turn_started_at);
+        assert_eq!(first.provider_data.as_ref(), Some(&provider_data));
+        let messages = store.messages(&conversation.id, None).unwrap();
+        let matching = messages
+            .iter()
+            .filter(|message| {
+                message.role == "user" && message.source == "wechat" && message.content == content
+            })
+            .count();
+        assert_eq!(matching, 1);
         let _ = fs::remove_dir_all(dir);
     }
 

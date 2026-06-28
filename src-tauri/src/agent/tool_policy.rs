@@ -582,13 +582,27 @@ pub(super) fn tool_allowed_by_agent_toolsets(
     if (enabled.contains("no_mcp") || disabled.contains("mcp")) && tool_is_mcp_scoped(tool) {
         return false;
     }
+    let blocked_enabled_tools = enabled
+        .iter()
+        .filter_map(|name| name.strip_prefix("not_tool:"))
+        .map(normalize_toolset_name)
+        .collect::<HashSet<_>>();
+
     let enabled = enabled
         .into_iter()
-        .filter(|name| name != "no_mcp")
+        .filter(|name| name != "no_mcp" && !name.starts_with("not_tool:"))
         .collect::<HashSet<_>>();
     let explicitly_enabled =
         enabled.is_empty() || toolsets.iter().any(|name| enabled.contains(name));
-    let explicitly_disabled = toolsets.iter().any(|name| disabled.contains(name));
+    let tool_name = normalize_toolset_name(&tool.tool_name);
+    let explicitly_disabled = blocked_enabled_tools.contains(&tool_name)
+        || toolsets.iter().any(|name| disabled.contains(name))
+        || disabled.iter().any(|name| {
+            name.strip_prefix("tool:")
+                .or_else(|| name.strip_prefix("not_tool:"))
+                .map(|blocked| normalize_toolset_name(blocked) == tool_name)
+                .unwrap_or(false)
+        });
     explicitly_enabled && !explicitly_disabled
 }
 
@@ -678,12 +692,14 @@ pub(super) fn semantic_toolsets_for_tool(tool: &ToolDefinition) -> Vec<&'static 
             "browser_navigate"
             | "browser_snapshot"
             | "browser_back"
-            | "browser_get_images"
-            | "browser_plugins"
+            | "browser_get_images" => vec!["browser", "browser_safe"],
+            "browser_plugins"
             | "browser_provider"
             | "browser_create_session"
             | "browser_close_session"
-            | "browser_cdp"
+            | "browser_supervisor_state"
+            | "browser_supervisor_remove" => vec!["browser", "browser_safe"],
+            "browser_cdp"
             | "browser_click"
             | "browser_type"
             | "browser_press"
@@ -692,9 +708,7 @@ pub(super) fn semantic_toolsets_for_tool(tool: &ToolDefinition) -> Vec<&'static 
             | "browser_record"
             | "browser_vision"
             | "browser_console"
-            | "browser_supervisor_register"
-            | "browser_supervisor_state"
-            | "browser_supervisor_remove" => vec!["browser"],
+            | "browser_supervisor_register" => vec!["browser", "browser_cdp"],
             "web_provider" => vec!["web", "config"],
             "web_search" | "x_search" => vec!["web", "search"],
             "web_extract" | "web_request" | "weather" => vec!["web"],

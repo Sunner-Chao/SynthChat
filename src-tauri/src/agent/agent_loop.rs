@@ -35,6 +35,38 @@ fn turn_source_label(request: &SendChatRequest) -> String {
         .to_string()
 }
 
+fn pre_persisted_user_message_id(provider_data: Option<&Value>) -> Option<String> {
+    provider_data
+        .and_then(|data| {
+            data.get("prePersistedUserMessageId")
+                .or_else(|| data.get("pre_persisted_user_message_id"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn pre_persisted_user_message(
+    store: &AppStore,
+    conversation_id: &str,
+    content: &str,
+    provider_data: Option<&Value>,
+) -> AppResult<Option<ChatMessage>> {
+    let Some(message_id) = pre_persisted_user_message_id(provider_data) else {
+        return Ok(None);
+    };
+    let content = content.trim();
+    Ok(store
+        .messages(conversation_id, None)?
+        .into_iter()
+        .find(|message| {
+            message.id == message_id
+                && message.role == "user"
+                && message.content.trim() == content
+        }))
+}
+
 fn request_provider_data_bool(request: &SendChatRequest, key: &str) -> bool {
     request
         .provider_data
@@ -312,7 +344,10 @@ fn parse_media_attachment_path(value: &str) -> Option<(String, &str)> {
         let rest = &value[end + first.len_utf8()..];
         return (!path.is_empty()).then_some((path, rest));
     }
-    let end = value.find(" (").or_else(|| value.find(']')).unwrap_or(value.len());
+    let end = value
+        .find(" (")
+        .or_else(|| value.find(']'))
+        .unwrap_or(value.len());
     let path = value[..end].trim().to_string();
     let rest = &value[end..];
     (!path.is_empty()).then_some((path, rest))
@@ -577,16 +612,16 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         clarification_response_context_for_turn(store, &conversation.id, &request.content)?
             .unwrap_or_else(|| request.content.clone())
     };
-    if silent_pet_vision && store.active_agent_run_for_conversation(&conversation.id)?.is_some() {
+    if silent_pet_vision
+        && store
+            .active_agent_run_for_conversation(&conversation.id)?
+            .is_some()
+    {
         return Ok(Vec::new());
     }
-    if let Some(messages) = handle_busy_conversation_input_for_request(
-        store,
-        &conversation,
-        &persona,
-        &request,
-        app,
-    )? {
+    if let Some(messages) =
+        handle_busy_conversation_input_for_request(store, &conversation, &persona, &request, app)?
+    {
         return Ok(messages);
     }
     let chat_config = store.config()?.chat;
@@ -597,24 +632,35 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         Some(&store.data_dir().join("attachments")),
     )
     .await?;
-    let mut user_message = ChatMessage::new(
-        conversation.id.clone(),
-        "user",
-        request.content.clone(),
-        request
-            .provider_data
-            .as_ref()
-            .and_then(|data| data.get("source"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|source| !source.is_empty())
-            .unwrap_or("desktop"),
-    );
-    user_message.provider_data =
-        provider_data_with_attachment_metadata(&request.content, request.provider_data.clone());
-    let user = store.append_message(user_message)?;
+    let pre_persisted_user = pre_persisted_user_message(
+        store,
+        &conversation.id,
+        &request.content,
+        request.provider_data.as_ref(),
+    )?;
+    let user_was_pre_persisted = pre_persisted_user.is_some();
+    let user = if let Some(user) = pre_persisted_user {
+        user
+    } else {
+        let mut user_message = ChatMessage::new(
+            conversation.id.clone(),
+            "user",
+            request.content.clone(),
+            request
+                .provider_data
+                .as_ref()
+                .and_then(|data| data.get("source"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|source| !source.is_empty())
+                .unwrap_or("desktop"),
+        );
+        user_message.provider_data =
+            provider_data_with_attachment_metadata(&request.content, request.provider_data.clone());
+        store.append_message(user_message)?
+    };
     let silent_user_message = user.source == "proactive-internal" || silent_pet_vision;
-    if let Some(app) = desktop_app.filter(|_| !silent_user_message) {
+    if let Some(app) = desktop_app.filter(|_| !silent_user_message && !user_was_pre_persisted) {
         let _ = app.emit(
             "synthchat-chat-event",
             json!({
@@ -933,7 +979,12 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                 return Ok(vec![user, assistant]);
             }
         };
-        if abort_agent_run_for_turn_aborted_marker(store, &saved_run.run_id, &reply.content, desktop_app)? {
+        if abort_agent_run_for_turn_aborted_marker(
+            store,
+            &saved_run.run_id,
+            &reply.content,
+            desktop_app,
+        )? {
             return Ok(vec![user]);
         }
         if check_agent_run_interrupted(
@@ -2191,7 +2242,12 @@ pub(crate) async fn drain_queued_requests_for_conversation(
                     fallback.completed_at = Some(now_iso());
                     fallback
                 });
-            emit_agent_queue_event(app, &completed.status, Some(&completed), Some(conversation_id));
+            emit_agent_queue_event(
+                app,
+                &completed.status,
+                Some(&completed),
+                Some(conversation_id),
+            );
             continue;
         }
         let request = SendChatRequest {
@@ -2946,6 +3002,8 @@ fn handle_busy_conversation_input_with_origin(
     let Some(active) = store.active_agent_run_for_conversation(&conversation.id)? else {
         return Ok(None);
     };
+    let pre_persisted_user =
+        pre_persisted_user_message(store, &conversation.id, content, provider_data.as_ref())?;
     match normalize_busy_input_mode(&store.config()?.chat.busy_input_mode).as_str() {
         "interrupt" => {
             abort_agent_run(
@@ -2957,12 +3015,16 @@ fn handle_busy_conversation_input_with_origin(
             Ok(None)
         }
         "steer" => {
-            let user = store.append_message(ChatMessage::new(
-                conversation.id.clone(),
-                "user",
-                content.to_string(),
-                "desktop-steer",
-            ))?;
+            let user = if let Some(user) = pre_persisted_user {
+                user
+            } else {
+                store.append_message(ChatMessage::new(
+                    conversation.id.clone(),
+                    "user",
+                    content.to_string(),
+                    "desktop-steer",
+                ))?
+            };
             store.append_agent_run_steer(&active.run_id, content.to_string())?;
             let assistant = store.append_message(control_message(
                 conversation,
@@ -2974,14 +3036,23 @@ fn handle_busy_conversation_input_with_origin(
             Ok(Some(vec![user, assistant]))
         }
         _ => {
-            let (user, queued) = enqueue_prompt_for_conversation_with_origin(
-                store,
-                conversation,
-                persona,
-                content,
-                source,
-                provider_data,
-            )?;
+            let (user, queued) = if let Some(user) = pre_persisted_user {
+                let queued = store.enqueue_agent_request(
+                    conversation.id.clone(),
+                    persona.id.clone(),
+                    &user,
+                )?;
+                (user, queued)
+            } else {
+                enqueue_prompt_for_conversation_with_origin(
+                    store,
+                    conversation,
+                    persona,
+                    content,
+                    source,
+                    provider_data,
+                )?
+            };
             emit_agent_queue_event(app, "queued", Some(&queued), Some(&conversation.id));
             let assistant = store.append_message(control_message(
                 conversation,

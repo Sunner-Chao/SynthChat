@@ -38,6 +38,7 @@ pub(super) fn render_internal_tool_prompt_block(
     agent: &AgentDefinition,
     context: ToolExecutionContext,
     availability: &InternalToolAvailability,
+    store: Option<&AppStore>,
 ) -> String {
     internal_tool_prompt_lines()
         .into_iter()
@@ -59,7 +60,7 @@ pub(super) fn render_internal_tool_prompt_block(
                 && tool_allowed_by_agent_capabilities(&tool, agent)
                 && tool_allowed_by_agent_toolsets(&tool, agent)
         })
-        .map(|(name, line)| internal_tool_prompt_line_for_agent(name, line, agent))
+        .map(|(name, line)| internal_tool_prompt_line_for_agent(name, line, agent, store))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1088,7 +1089,7 @@ pub(super) fn visible_tool_definitions_for_agent(
         .map(|(name, line)| ToolDefinition {
             name: name.into(),
             display_name: name.into(),
-            description: internal_tool_prompt_line_for_agent(name, line, agent)
+            description: internal_tool_prompt_line_for_agent(name, line, agent, None)
                 .trim_start_matches("- ")
                 .to_string(),
             source: "internal".into(),
@@ -1511,6 +1512,7 @@ pub(super) async fn execute_recovery_mcp_tool(
         definition.tool_name.clone(),
         payload.clone(),
         None,
+        Some(run_id),
         store.config()?.chat.tool_call_retry_count,
         store.config()?.chat.tool_call_retry_backoff_ms,
     )
@@ -2123,7 +2125,7 @@ fn tool_catalog(
         let tool = ToolDefinition {
             name: name.into(),
             display_name: name.into(),
-            description: internal_tool_prompt_line_for_agent(name, line, agent)
+            description: internal_tool_prompt_line_for_agent(name, line, agent, Some(store))
                 .trim_start_matches("- ")
                 .to_string(),
             source: "internal".into(),
@@ -2140,7 +2142,7 @@ fn tool_catalog(
         }
         let available = internal_tool_available(name, &availability);
         if available || include_unavailable {
-            let rendered_line = internal_tool_prompt_line_for_agent(name, line, agent);
+            let rendered_line = internal_tool_prompt_line_for_agent(name, line, agent, Some(store));
             let unavailable_reason = if available {
                 Value::Null
             } else {
@@ -2185,26 +2187,48 @@ fn internal_tool_prompt_line_for_agent(
     name: &str,
     line: &'static str,
     agent: &AgentDefinition,
+    store: Option<&AppStore>,
 ) -> String {
     if name == "delegate_task" {
-        return delegate_task_prompt_line(agent);
+        return delegate_task_prompt_line(agent, store);
     }
     line.to_string()
 }
 
-fn delegate_task_prompt_line(agent: &AgentDefinition) -> String {
+fn delegate_task_prompt_line(agent: &AgentDefinition, store: Option<&AppStore>) -> String {
     let max_subagents = agent.max_subagents.max(1);
     let max_depth = agent.max_subagent_depth.max(1);
-    let nested = if max_depth > 1 {
+    let chat_config = store
+        .and_then(|store| store.config().ok())
+        .map(|config| config.chat);
+    let max_concurrent_children = chat_config
+        .as_ref()
+        .map(|config| config.delegation_max_concurrent_children.max(1))
+        .unwrap_or(3);
+    let orchestrator_enabled = chat_config
+        .as_ref()
+        .map(|config| config.delegation_orchestrator_enabled)
+        .unwrap_or(true);
+    let delegation_strategy = chat_config
+        .as_ref()
+        .map(|config| config.delegation_strategy.trim())
+        .filter(|strategy| !strategy.is_empty())
+        .unwrap_or("auto");
+    let batch_limit = max_subagents.min(max_concurrent_children);
+    let nested = if max_depth > 1 && orchestrator_enabled {
         format!(
             "Nested delegation is enabled up to maxSubagentDepth={max_depth}; child agents may delegate only when payload.canDelegate=true and depth remains below the limit."
+        )
+    } else if max_depth > 1 {
+        format!(
+            "Nested delegation is disabled by delegationOrchestratorEnabled=false even though maxSubagentDepth={max_depth}; role=orchestrator is coerced to leaf."
         )
     } else {
         "Nested delegation is off for this agent; children are leaf workers and cannot call delegate_task."
             .into()
     };
     format!(
-        r#"- delegate_task: single payload {{"task":"focused subtask","role":"researcher|planner|coder|orchestrator","toolsets":["file","browser"],"canDelegate":false}} or concurrent batch payload {{"tasks":[{{"goal":"subtask A","context":"needed details","toolsets":["file"],"role":"planner"}}]}}. Batch accepts up to maxSubagents={max_subagents} minus existing child runs. Current limits: maxSubagents={max_subagents}, maxSubagentDepth={max_depth}. {nested}"#
+        r#"- delegate_task: single payload {{"task":"focused subtask","role":"researcher|planner|coder|orchestrator","toolsets":["file","browser"],"canDelegate":false}} or concurrent batch payload {{"tasks":[{{"goal":"subtask A","context":"needed details","toolsets":["file"],"role":"planner"}}]}}. Batch accepts up to min(maxSubagents, delegationMaxConcurrentChildren)={batch_limit} minus existing child runs. Current limits: maxSubagents={max_subagents}, maxSubagentDepth={max_depth}, delegationMaxConcurrentChildren={max_concurrent_children}, delegationOrchestratorEnabled={orchestrator_enabled}, delegationStrategy={delegation_strategy}. Subagent maxIterations is controlled by the active persona/Agent tool policy; caller-supplied maxIterations is ignored. {nested}"#
     )
 }
 

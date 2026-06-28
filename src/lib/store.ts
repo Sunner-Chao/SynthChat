@@ -142,6 +142,20 @@ function limitMessages(messages: ChatMessage[], limit: number) {
   return messages.length > limit ? messages.slice(-limit) : messages;
 }
 
+function sortMessagesForDisplay(messages: ChatMessage[]) {
+  return messages
+    .map((message, index) => ({ message, index }))
+    .sort((left, right) => {
+      const timeDelta = messageTime(left.message) - messageTime(right.message);
+      return timeDelta === 0 ? left.index - right.index : timeDelta;
+    })
+    .map((item) => item.message);
+}
+
+function displayMessages(messages: ChatMessage[], limit: number) {
+  return limitMessages(sortMessagesForDisplay(messages), limit);
+}
+
 function messageProviderDataRecord(message: ChatMessage): Record<string, unknown> | null {
   const value = message.providerData;
   return value && typeof value === "object" && !Array.isArray(value)
@@ -161,7 +175,7 @@ function isVisibleChatMessage(message: ChatMessage) {
 }
 
 function visibleChatMessages(messages: ChatMessage[]) {
-  return messages.filter(isVisibleChatMessage);
+  return sortMessagesForDisplay(messages.filter(isVisibleChatMessage));
 }
 
 function isLocalUiMessage(message: ChatMessage) {
@@ -178,7 +192,7 @@ function messageTime(message: ChatMessage) {
 }
 
 function mergeLocalUiMessages(backendMessages: ChatMessage[], currentMessages: ChatMessage[], conversationId: string | null, limit: number) {
-  if (!conversationId) return limitMessages(backendMessages, limit);
+  if (!conversationId) return displayMessages(backendMessages, limit);
   const backendIds = new Set(backendMessages.map((message) => message.id));
   const localMessages = currentMessages.filter((message) => {
     if (message.conversationId !== conversationId || !isLocalUiMessage(message) || backendIds.has(message.id)) {
@@ -194,8 +208,8 @@ function mergeLocalUiMessages(backendMessages: ChatMessage[], currentMessages: C
     }
     return false;
   });
-  if (localMessages.length === 0) return limitMessages(backendMessages, limit);
-  return limitMessages([...backendMessages, ...localMessages].sort((left, right) => messageTime(left) - messageTime(right)), limit);
+  if (localMessages.length === 0) return displayMessages(backendMessages, limit);
+  return displayMessages([...backendMessages, ...localMessages], limit);
 }
 
 function hasPendingAgentWork(state: AppState, conversationId: string | null) {
@@ -243,7 +257,7 @@ function appendLocalAssistantNotice(
       accountId: null
     };
     return {
-      messages: limitMessages([...current.messages, message], uiMessageLimit(current.config)),
+      messages: displayMessages([...current.messages, message], uiMessageLimit(current.config)),
       conversations: current.conversations.map((conversation) =>
         conversation.id === conversationId
           ? { ...conversation, lastMessage: content, updatedAt: now }
@@ -895,7 +909,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       const messages = index >= 0
         ? state.messages.map((item) => (item.id === message.id ? message : item))
         : [...state.messages, message];
-      return { messages: limitMessages(messages, messageLimit) };
+      return { messages: displayMessages(messages, messageLimit) };
     });
   },
   createConversation: async (personaId) => {
@@ -1020,7 +1034,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       accountId: null
     };
     set((current) => ({
-      messages: limitMessages([...current.messages, temporaryMessage], uiMessageLimit(current.config)),
+      messages: displayMessages([...current.messages, temporaryMessage], uiMessageLimit(current.config)),
       processingConversationIds: current.processingConversationIds.includes(activeConversationId ?? "")
         ? current.processingConversationIds
         : [...current.processingConversationIds, activeConversationId ?? ""].filter(Boolean),
@@ -1066,7 +1080,7 @@ export const useAppStore = create<AppState>((set, get) => ({
             const existingIds = new Set(withoutTemp.map((m) => m.id));
             const newMessages = visibleResponseMessages.filter((m) => !existingIds.has(m.id));
             const merged = [...withoutTemp, ...newMessages];
-            return { messages: limitMessages(merged, messageLimit) };
+            return { messages: displayMessages(merged, messageLimit) };
           });
         }
         if (get().activeConversationId === conversationIdForSend) {

@@ -25,23 +25,24 @@ use std::{
 
 use chrono::Timelike;
 use error::{AppError, AppResult};
+use futures::StreamExt;
 use model_catalog::{DetectedModelList, ModelCapabilities, ModelCatalogEntry, ProviderCatalogInfo};
 use models::{
     new_id, AgentDefinition, AppConfig, BrowserProvider, EmojiGroupConfig, ImageProvider,
     LlmProvider, Persona, ProactiveStatus, ProfileConfig, ScheduledAgentJob,
     ScheduledJobOutputRecord, SearchProvider, SendChatRequest, VideoProvider, VisionProvider,
 };
-use serde::Deserialize;
+use process_utils::CommandWindowExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use store::AppStore;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
     App, AppHandle, DragDropEvent, Emitter, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
-    State,
-    WebviewUrl,
-    WebviewWindowBuilder, WindowEvent,
+    State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
+use tokio::io::AsyncWriteExt;
 
 const REMOTE_SKILL_FETCH_TIMEOUT_SECS: u64 = 20;
 const MAX_CHAT_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
@@ -66,6 +67,53 @@ const TRAY_ID: &str = "synthchat-tray";
 const TRAY_OPEN_ID: &str = "open";
 const TRAY_PET_ID: &str = "pet";
 const TRAY_QUIT_ID: &str = "quit";
+const APP_UPDATE_FETCH_TIMEOUT_SECS: u64 = 15;
+const APP_UPDATE_DOWNLOAD_TIMEOUT_SECS: u64 = 600;
+const MAX_APP_UPDATE_INSTALLER_BYTES: u64 = 500 * 1024 * 1024;
+const APP_UPDATE_USER_AGENT: &str = "SynthChat-Update-Checker";
+const DEFAULT_APP_UPDATE_MANIFEST_URL: Option<&str> = option_env!("SYNTHCHAT_UPDATE_MANIFEST_URL");
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppBuildInfo {
+    product_name: String,
+    version: String,
+    identifier: String,
+    target: String,
+    update_manifest_url: String,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedAppUpdateManifest {
+    latest_version: String,
+    download_url: Option<String>,
+    release_url: Option<String>,
+    notes: Option<String>,
+    published_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdateCheck {
+    current_version: String,
+    latest_version: String,
+    update_available: bool,
+    download_url: Option<String>,
+    release_url: Option<String>,
+    notes: Option<String>,
+    published_at: Option<String>,
+    source_url: String,
+    checked_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdateInstallResult {
+    installer_path: String,
+    helper_script_path: String,
+    mode: String,
+    message: String,
+}
 
 #[derive(Debug, Default)]
 struct PetDragState {
@@ -202,6 +250,195 @@ fn sync_runtime_env_from_store(store: &AppStore) {
     }
 }
 
+fn default_app_update_manifest_url() -> String {
+    DEFAULT_APP_UPDATE_MANIFEST_URL
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn normalize_version_text(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches(&['v', 'V'][..])
+        .split(['-', '+'])
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn version_part_number(part: &str) -> u64 {
+    let digits: String = part.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    digits.parse::<u64>().unwrap_or(0)
+}
+
+fn compare_app_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    let left = normalize_version_text(left);
+    let right = normalize_version_text(right);
+    let left_parts: Vec<&str> = left.split('.').collect();
+    let right_parts: Vec<&str> = right.split('.').collect();
+    let len = left_parts.len().max(right_parts.len());
+    for index in 0..len {
+        let left_part = left_parts
+            .get(index)
+            .map(|part| version_part_number(part))
+            .unwrap_or(0);
+        let right_part = right_parts
+            .get(index)
+            .map(|part| version_part_number(part))
+            .unwrap_or(0);
+        match left_part.cmp(&right_part) {
+            std::cmp::Ordering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn json_string_field(object: &serde_json::Map<String, Value>, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| object.get(*name).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn update_asset_download_url(payload: &Value) -> Option<String> {
+    let assets = payload
+        .as_object()
+        .and_then(|object| object.get("assets"))
+        .and_then(Value::as_array)?;
+    let mut first_url: Option<String> = None;
+    let mut first_zip_url: Option<String> = None;
+    for asset in assets {
+        let Some(object) = asset.as_object() else {
+            continue;
+        };
+        let Some(url) = json_string_field(
+            object,
+            &["browser_download_url", "downloadUrl", "download_url", "url"],
+        ) else {
+            continue;
+        };
+        if first_url.is_none() {
+            first_url = Some(url.clone());
+        }
+        let lower = url.to_ascii_lowercase();
+        if lower.ends_with(".exe") || lower.ends_with(".msi") || lower.ends_with(".msix") {
+            return Some(url);
+        }
+        if lower.ends_with(".zip") && first_zip_url.is_none() {
+            first_zip_url = Some(url.clone());
+        }
+    }
+    first_zip_url.or(first_url)
+}
+
+fn parse_app_update_manifest(payload: Value) -> AppResult<ParsedAppUpdateManifest> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest("update manifest must be a JSON object".into()))?;
+    let latest_version = json_string_field(
+        object,
+        &["latestVersion", "latest_version", "version", "tag_name"],
+    )
+    .ok_or_else(|| {
+        AppError::BadRequest("update manifest missing latestVersion/version/tag_name".into())
+    })?;
+    let download_url = json_string_field(
+        object,
+        &[
+            "downloadUrl",
+            "download_url",
+            "installerUrl",
+            "installer_url",
+        ],
+    )
+    .or_else(|| update_asset_download_url(&payload));
+    let release_url = json_string_field(object, &["releaseUrl", "release_url", "html_url"]);
+    let notes = json_string_field(object, &["notes", "body", "changelog", "releaseNotes"]);
+    let published_at = json_string_field(object, &["publishedAt", "published_at", "date"]);
+    Ok(ParsedAppUpdateManifest {
+        latest_version,
+        download_url,
+        release_url,
+        notes,
+        published_at,
+    })
+}
+
+fn app_update_file_name_from_url(url: &reqwest::Url) -> AppResult<String> {
+    let name = url
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("SynthChat-update.exe");
+    let decoded = name.replace("%20", " ");
+    let sanitized = sanitize_attachment_file_name(&decoded);
+    let lower = sanitized.to_ascii_lowercase();
+    if lower.ends_with(".exe") || lower.ends_with(".msi") || lower.ends_with(".msix") {
+        return Ok(sanitized);
+    }
+    Err(AppError::BadRequest(
+        "update asset must be an .exe, .msi, or .msix installer".into(),
+    ))
+}
+
+fn app_update_installer_mode(path: &Path) -> AppResult<&'static str> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("exe") => Ok("exe"),
+        Some("msi") => Ok("msi"),
+        Some("msix") => Ok("msix"),
+        _ => Err(AppError::BadRequest(
+            "update installer must end with .exe, .msi, or .msix".into(),
+        )),
+    }
+}
+
+fn powershell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn write_update_helper_script(
+    script_path: &Path,
+    installer_path: &Path,
+    mode: &str,
+    current_pid: u32,
+) -> AppResult<()> {
+    let installer = powershell_single_quote(&installer_path.display().to_string());
+    let script = format!(
+        r#"$ErrorActionPreference = "Stop"
+$installer = {installer}
+$mode = "{mode}"
+$pidToWait = {current_pid}
+try {{
+  Wait-Process -Id $pidToWait -Timeout 120 -ErrorAction SilentlyContinue
+}} catch {{}}
+Start-Sleep -Seconds 2
+if ($mode -eq "msi") {{
+  $process = Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", $installer, "/quiet", "/norestart") -WindowStyle Hidden -PassThru
+}} elseif ($mode -eq "msix") {{
+  $process = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "Add-AppxPackage -ForceApplicationShutdown -Path $installer") -WindowStyle Hidden -PassThru
+}} else {{
+  $process = Start-Process -FilePath $installer -ArgumentList @("/S") -WindowStyle Hidden -PassThru
+}}
+$process.WaitForExit()
+"#,
+    );
+    if let Some(parent) = script_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(script_path, script)?;
+    Ok(())
+}
+
 pub fn acp_stdio_requested_from_args<I, S>(args: I) -> bool
 where
     I: IntoIterator<Item = S>,
@@ -315,6 +552,201 @@ pub fn run_acp_setup_browser() -> AppResult<()> {
     println!(
         "SynthChat browser tools are configured from the desktop settings page. No terminal browser bootstrap is required."
     );
+    Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn get_app_build_info() -> AppBuildInfo {
+    AppBuildInfo {
+        product_name: "SynthChat".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        identifier: "cc.synthchat.v1".into(),
+        target: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        update_manifest_url: default_app_update_manifest_url(),
+    }
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn check_app_update(manifest_url: Option<String>) -> AppResult<AppUpdateCheck> {
+    let manifest_url = manifest_url
+        .unwrap_or_else(default_app_update_manifest_url)
+        .trim()
+        .to_string();
+    if manifest_url.is_empty() {
+        return Err(AppError::BadRequest(
+            "update manifest URL is not configured".into(),
+        ));
+    }
+    let parsed_url = reqwest::Url::parse(&manifest_url)
+        .map_err(|error| AppError::BadRequest(format!("invalid update manifest URL: {error}")))?;
+    if !matches!(parsed_url.scheme(), "http" | "https") {
+        return Err(AppError::BadRequest(
+            "update manifest URL must use http or https".into(),
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(APP_UPDATE_FETCH_TIMEOUT_SECS))
+        .build()
+        .map_err(|error| AppError::BadRequest(format!("create update client failed: {error}")))?;
+    let response = client
+        .get(parsed_url.clone())
+        .header("User-Agent", APP_UPDATE_USER_AGENT)
+        .send()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("fetch update manifest failed: {error}")))?;
+    let response = response
+        .error_for_status()
+        .map_err(|error| AppError::BadRequest(format!("fetch update manifest failed: {error}")))?;
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("read update manifest failed: {error}")))?;
+    let manifest = parse_app_update_manifest(payload)?;
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let update_available = compare_app_versions(&manifest.latest_version, &current_version)
+        == std::cmp::Ordering::Greater;
+    Ok(AppUpdateCheck {
+        current_version,
+        latest_version: manifest.latest_version,
+        update_available,
+        download_url: manifest.download_url,
+        release_url: manifest.release_url,
+        notes: manifest.notes,
+        published_at: manifest.published_at,
+        source_url: parsed_url.to_string(),
+        checked_at: chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn install_app_update(
+    app: AppHandle,
+    download_url: String,
+) -> AppResult<AppUpdateInstallResult> {
+    let parsed_url = reqwest::Url::parse(download_url.trim())
+        .map_err(|error| AppError::BadRequest(format!("invalid update download URL: {error}")))?;
+    if parsed_url.scheme() != "https" {
+        return Err(AppError::BadRequest(
+            "update installer download URL must use https".into(),
+        ));
+    }
+    let file_name = app_update_file_name_from_url(&parsed_url)?;
+    let updates_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| AppError::BadRequest(error.to_string()))?
+        .join("updates");
+    fs::create_dir_all(&updates_dir)?;
+    let installer_path = updates_dir.join(file_name);
+    let mode = app_update_installer_mode(&installer_path)?.to_string();
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(APP_UPDATE_DOWNLOAD_TIMEOUT_SECS))
+        .build()
+        .map_err(|error| {
+            AppError::BadRequest(format!("create update downloader failed: {error}"))
+        })?;
+    let response = client
+        .get(parsed_url.clone())
+        .header("User-Agent", APP_UPDATE_USER_AGENT)
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::BadRequest(format!("download update installer failed: {error}"))
+        })?;
+    let response = response.error_for_status().map_err(|error| {
+        AppError::BadRequest(format!("download update installer failed: {error}"))
+    })?;
+    if let Some(length) = response.content_length() {
+        if length > MAX_APP_UPDATE_INSTALLER_BYTES {
+            return Err(AppError::BadRequest(format!(
+                "update installer is too large: {length} bytes"
+            )));
+        }
+    }
+    let mut file = tokio::fs::File::create(&installer_path)
+        .await
+        .map_err(AppError::Io)?;
+    let mut stream = response.bytes_stream();
+    let mut downloaded: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            AppError::BadRequest(format!("read update installer stream failed: {error}"))
+        })?;
+        downloaded += chunk.len() as u64;
+        if downloaded > MAX_APP_UPDATE_INSTALLER_BYTES {
+            return Err(AppError::BadRequest(format!(
+                "update installer is too large: {downloaded} bytes"
+            )));
+        }
+        file.write_all(&chunk).await.map_err(AppError::Io)?;
+    }
+    file.flush().await.map_err(AppError::Io)?;
+    drop(file);
+
+    let helper_script_path = updates_dir.join("install-synthchat-update.ps1");
+    write_update_helper_script(
+        &helper_script_path,
+        &installer_path,
+        &mode,
+        std::process::id(),
+    )?;
+
+    #[cfg(windows)]
+    {
+        Command::new("powershell.exe")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&helper_script_path)
+            .hide_window()
+            .spawn()?;
+        app.exit(0);
+    }
+
+    #[cfg(not(windows))]
+    {
+        return Err(AppError::BadRequest(
+            "silent update install is only supported on Windows".into(),
+        ));
+    }
+
+    Ok(AppUpdateInstallResult {
+        installer_path: installer_path.display().to_string(),
+        helper_script_path: helper_script_path.display().to_string(),
+        mode,
+        message:
+            "Update installer downloaded; SynthChat is closing so the installer can run silently."
+                .into(),
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn open_app_update_url(url: String) -> AppResult<()> {
+    let parsed_url = reqwest::Url::parse(url.trim())
+        .map_err(|error| AppError::BadRequest(format!("invalid update URL: {error}")))?;
+    if !matches!(parsed_url.scheme(), "http" | "https") {
+        return Err(AppError::BadRequest(
+            "update URL must use http or https".into(),
+        ));
+    }
+    let target = parsed_url.as_str();
+    #[cfg(windows)]
+    {
+        Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", target])
+            .hide_window()
+            .spawn()?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(target).spawn()?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open").arg(target).spawn()?;
+    }
     Ok(())
 }
 
@@ -716,10 +1148,7 @@ fn capture_screen_base64() -> AppResult<String> {
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn set_pet_vision_active(
-    state: State<'_, Mutex<PetVisionState>>,
-    active: bool,
-) -> AppResult<bool> {
+fn set_pet_vision_active(state: State<'_, Mutex<PetVisionState>>, active: bool) -> AppResult<bool> {
     let mut guard = state
         .lock()
         .map_err(|_| AppError::BadRequest("pet vision state lock poisoned".into()))?;
@@ -1904,6 +2333,7 @@ async fn call_mcp_tool(
         tool_name,
         payload,
         timeout_seconds,
+        None,
         chat_config.tool_call_retry_count,
         chat_config.tool_call_retry_backoff_ms,
     )
@@ -2385,7 +2815,10 @@ fn list_agents(store: State<'_, AppStore>) -> AppResult<Vec<AgentDefinition>> {
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn save_agent(store: State<'_, AppStore>, mut agent: AgentDefinition) -> AppResult<AgentDefinition> {
+fn save_agent(
+    store: State<'_, AppStore>,
+    mut agent: AgentDefinition,
+) -> AppResult<AgentDefinition> {
     agent.name = agent.name.trim().to_string();
     if agent.name.is_empty() {
         return Err(AppError::BadRequest("agent name is required".into()));
@@ -2413,7 +2846,7 @@ fn save_agent(store: State<'_, AppStore>, mut agent: AgentDefinition) -> AppResu
     agent.llm_provider = agent.llm_provider.trim().to_string();
     agent.llm_model = agent.llm_model.trim().to_string();
     agent.skills_dir = agent.skills_dir.trim().to_string();
-    agent.max_subagents = agent.max_subagents.min(32);
+    agent.max_subagents = agent.max_subagents.clamp(1, 32);
     agent.max_subagent_depth = agent.max_subagent_depth.clamp(1, 4);
     agent.max_tool_iterations = agent.max_tool_iterations.clamp(1, 90);
     let agents = store.agents()?;
@@ -2465,7 +2898,7 @@ fn save_agent_config(store: State<'_, AppStore>, config: Value) -> AppResult<Val
         agent.allow_shell = value;
     }
     if let Some(value) = config.get("maxSubagents").and_then(Value::as_u64) {
-        agent.max_subagents = value.min(u32::MAX as u64) as u32;
+        agent.max_subagents = value.clamp(1, 32) as u32;
     }
     if let Some(value) = config.get("maxSubagentDepth").and_then(Value::as_u64) {
         agent.max_subagent_depth = value.min(u32::MAX as u64) as u32;
@@ -3194,7 +3627,10 @@ fn parse_skills_sh_path(url: &reqwest::Url) -> Option<(String, String)> {
     let owner = segments.first()?;
     let repo = segments.get(1)?;
     let skill = segments.last()?;
-    Some((format!("https://github.com/{owner}/{repo}"), (*skill).to_string()))
+    Some((
+        format!("https://github.com/{owner}/{repo}"),
+        (*skill).to_string(),
+    ))
 }
 
 fn parse_github_repo_identifier(repo_url: &str) -> Option<String> {
@@ -3341,7 +3777,8 @@ async fn search_github_skill_under_path(
                 .next()
                 .map(normalize_skill_lookup_token)
                 .unwrap_or_default();
-            if folder_slug != target_slug && !entry.path.to_ascii_lowercase().contains(target_slug) {
+            if folder_slug != target_slug && !entry.path.to_ascii_lowercase().contains(target_slug)
+            {
                 continue;
             }
             let raw = fetch_text_url(
@@ -4775,6 +5212,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_app_build_info,
+            check_app_update,
+            install_app_update,
+            open_app_update_url,
             get_config,
             save_config,
             add_trusted_tool_pattern,
@@ -5025,6 +5466,65 @@ mod tests {
     }
 
     #[test]
+    fn app_update_manifest_accepts_github_release_payload() {
+        let manifest = parse_app_update_manifest(json!({
+            "tag_name": "v1.1.2",
+            "html_url": "https://github.com/Sunner-Chao/SynthChat/releases/tag/v1.1.2",
+            "body": "Release notes",
+            "published_at": "2026-06-28T00:00:00Z",
+            "assets": [
+                {"name": "source.zip", "browser_download_url": "https://github.com/Sunner-Chao/SynthChat/releases/download/v1.1.2/source.zip"},
+                {"name": "SynthChat_1.1.2_x64-setup.exe", "browser_download_url": "https://github.com/Sunner-Chao/SynthChat/releases/download/v1.1.2/SynthChat_1.1.2_x64-setup.exe"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(manifest.latest_version, "v1.1.2");
+        assert_eq!(
+            manifest.download_url.as_deref(),
+            Some("https://github.com/Sunner-Chao/SynthChat/releases/download/v1.1.2/SynthChat_1.1.2_x64-setup.exe")
+        );
+        assert_eq!(
+            manifest.release_url.as_deref(),
+            Some("https://github.com/Sunner-Chao/SynthChat/releases/tag/v1.1.2")
+        );
+        assert_eq!(manifest.notes.as_deref(), Some("Release notes"));
+        assert_eq!(manifest.published_at.as_deref(), Some("2026-06-28T00:00:00Z"));
+    }
+
+    #[test]
+    fn app_update_version_compare_ignores_v_prefix_and_numeric_suffixes() {
+        assert_eq!(
+            compare_app_versions("v1.1.10", "1.1.2"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_app_versions("1.1.0", "v1.1.0"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_app_versions("1.1.0-beta.1", "1.1.0"),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn app_update_installer_file_name_requires_native_installer_extension() {
+        let exe = reqwest::Url::parse(
+            "https://github.com/Sunner-Chao/SynthChat/releases/download/v1.1.2/SynthChat%201.1.2.exe",
+        )
+        .unwrap();
+        assert_eq!(
+            app_update_file_name_from_url(&exe).unwrap(),
+            "SynthChat_1.1.2.exe"
+        );
+        let zip = reqwest::Url::parse(
+            "https://github.com/Sunner-Chao/SynthChat/releases/download/v1.1.2/SynthChat.zip",
+        )
+        .unwrap();
+        assert!(app_update_file_name_from_url(&zip).is_err());
+    }
+
+    #[test]
     fn mcp_stdio_initialize_ping_and_empty_lists_are_protocol_compatible() {
         let dir = std::env::temp_dir().join(format!("synthchat-mcp-protocol-{}", new_id("test")));
         std::fs::create_dir_all(&dir).unwrap();
@@ -5241,17 +5741,16 @@ mod tests {
 
     #[test]
     fn github_skill_raw_url_is_derived_from_blob_and_tree_urls() {
-        let blob = reqwest::Url::parse(
-            "https://github.com/owner/repo/blob/main/skills/demo/SKILL.md",
-        )
-        .unwrap();
+        let blob =
+            reqwest::Url::parse("https://github.com/owner/repo/blob/main/skills/demo/SKILL.md")
+                .unwrap();
         assert_eq!(
             github_blob_skill_raw_url(&blob).as_deref(),
             Some("https://raw.githubusercontent.com/owner/repo/main/skills/demo/SKILL.md")
         );
 
-        let tree = reqwest::Url::parse("https://github.com/owner/repo/tree/main/skills/demo")
-            .unwrap();
+        let tree =
+            reqwest::Url::parse("https://github.com/owner/repo/tree/main/skills/demo").unwrap();
         assert_eq!(
             github_blob_skill_raw_url(&tree).as_deref(),
             Some("https://raw.githubusercontent.com/owner/repo/main/skills/demo/SKILL.md")

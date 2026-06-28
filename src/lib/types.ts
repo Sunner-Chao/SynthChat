@@ -42,6 +42,7 @@ export interface ChatConfig {
   messageDedupEnabled?: boolean;
   messageDedupWindowSeconds?: number;
   delegationMaxConcurrentChildren?: number;
+  delegationStrategy?: string;
   delegationOrchestratorEnabled?: boolean;
   delegationSubagentAutoApprove?: boolean;
   delegationInheritMcpToolsets?: boolean;
@@ -1318,6 +1319,33 @@ export interface TokenUsageResponse {
   callCount: number;
   byProvider?: Record<string, TokenUsageStats>;
   byModel?: Record<string, TokenUsageStats>;
+}
+
+export interface AppBuildInfo {
+  productName: string;
+  version: string;
+  identifier: string;
+  target: string;
+  updateManifestUrl: string;
+}
+
+export interface AppUpdateCheck {
+  currentVersion: string;
+  latestVersion: string;
+  updateAvailable: boolean;
+  downloadUrl?: string | null;
+  releaseUrl?: string | null;
+  notes?: string | null;
+  publishedAt?: string | null;
+  sourceUrl: string;
+  checkedAt: string;
+}
+
+export interface AppUpdateInstallResult {
+  installerPath: string;
+  helperScriptPath: string;
+  mode: string;
+  message: string;
 }
 
 export interface ModelCatalogEntry {

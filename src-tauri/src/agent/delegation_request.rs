@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::error::{AppError, AppResult};
 
-use super::{normalize_toolset_name, payload_string_array};
+use super::normalize_toolset_name;
 pub(super) struct DelegateTaskRequest {
     pub(super) task: String,
     pub(super) role: String,
@@ -21,25 +21,20 @@ pub(super) fn delegate_task_requests(payload: &Value) -> AppResult<Vec<DelegateT
         .and_then(Value::as_str)
         .map(normalize_delegate_role)
         .unwrap_or_else(|| "subagent".into());
-    let top_can_delegate_explicit = payload
-        .get("canDelegate")
-        .or_else(|| payload.get("can_delegate"))
-        .and_then(Value::as_bool);
+    let top_can_delegate_explicit = delegate_payload_bool(payload, "canDelegate", "can_delegate");
     let top_can_delegate = delegate_role_can_delegate(&top_role, top_can_delegate_explicit);
     let top_toolsets = delegate_task_toolsets(
-        payload_string_array(payload, "toolsets", "toolsets"),
+        delegate_payload_string_array(payload, "toolsets", "toolsets"),
         &top_role,
         top_can_delegate,
     );
     let top_max_iterations = delegate_task_max_iterations(payload, 50);
     let top_acp_command = delegate_task_acp_command(payload);
-    let top_acp_args = payload_string_array(payload, "acpArgs", "acp_args");
+    let top_acp_args = delegate_payload_string_array(payload, "acpArgs", "acp_args");
     let top_acp_session_id = delegate_task_acp_session_id(payload);
     let top_acp_session_mode = delegate_task_acp_session_mode(payload);
     if let Some(tasks) = payload.get("tasks") {
-        let tasks = tasks.as_array().ok_or_else(|| {
-            AppError::BadRequest("delegate_task payload.tasks must be an array".into())
-        })?;
+        let tasks = delegate_task_tasks(tasks)?;
         if tasks.is_empty() {
             return Err(AppError::BadRequest(
                 "delegate_task payload.tasks must not be empty".into(),
@@ -90,6 +85,8 @@ fn delegate_task_request_from_value(
     top_acp_session_id: &str,
     top_acp_session_mode: &str,
 ) -> AppResult<DelegateTaskRequest> {
+    let parsed_item = delegate_parse_json_string(item, "delegate_task tasks item")?;
+    let item = parsed_item.as_ref().unwrap_or(item);
     let object = item.as_object().ok_or_else(|| {
         AppError::BadRequest(format!("delegate_task tasks[{index}] must be an object"))
     })?;
@@ -99,13 +96,10 @@ fn delegate_task_request_from_value(
         .and_then(Value::as_str)
         .map(normalize_delegate_role)
         .unwrap_or_else(|| top_role.to_string());
-    let explicit_can_delegate = object
-        .get("canDelegate")
-        .or_else(|| object.get("can_delegate"))
-        .and_then(Value::as_bool);
+    let explicit_can_delegate = delegate_payload_bool(item, "canDelegate", "can_delegate");
     let can_delegate =
         explicit_can_delegate.unwrap_or_else(|| role == "orchestrator" || top_can_delegate);
-    let toolsets = payload_string_array(item, "toolsets", "toolsets");
+    let toolsets = delegate_payload_string_array(item, "toolsets", "toolsets");
     let toolsets = if toolsets.is_empty() {
         top_toolsets.to_vec()
     } else {
@@ -113,7 +107,7 @@ fn delegate_task_request_from_value(
     };
     let max_iterations = delegate_task_max_iterations(item, top_max_iterations);
     let acp_command = delegate_task_acp_command(item);
-    let acp_args = payload_string_array(item, "acpArgs", "acp_args");
+    let acp_args = delegate_payload_string_array(item, "acpArgs", "acp_args");
     let acp_session_id = delegate_task_acp_session_id(item);
     let acp_session_mode = delegate_task_acp_session_mode(item);
     Ok(DelegateTaskRequest {
@@ -181,12 +175,99 @@ fn delegate_task_acp_session_mode(payload: &Value) -> String {
         .unwrap_or_default()
 }
 
+fn delegate_task_tasks(value: &Value) -> AppResult<Vec<Value>> {
+    let parsed = delegate_parse_json_string(value, "delegate_task payload.tasks")?;
+    let value = parsed.as_ref().unwrap_or(value);
+    value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| AppError::BadRequest("delegate_task payload.tasks must be an array".into()))
+}
+
+fn delegate_parse_json_string(value: &Value, label: &str) -> AppResult<Option<Value>> {
+    let Some(text) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
+        return Ok(None);
+    };
+    let looks_like_json = matches!(
+        text.as_bytes().first(),
+        Some(b'[' | b'{' | b'"' | b't' | b'f' | b'n' | b'0'..=b'9' | b'-')
+    );
+    if !looks_like_json {
+        return Ok(None);
+    }
+    serde_json::from_str::<Value>(text)
+        .map(Some)
+        .map_err(|error| AppError::BadRequest(format!("{label} contains invalid JSON: {error}")))
+}
+
+fn delegate_payload_value<'a>(
+    payload: &'a Value,
+    camel_key: &str,
+    snake_key: &str,
+) -> Option<&'a Value> {
+    payload.get(camel_key).or_else(|| payload.get(snake_key))
+}
+
+fn delegate_payload_bool(payload: &Value, camel_key: &str, snake_key: &str) -> Option<bool> {
+    let value = delegate_payload_value(payload, camel_key, snake_key)?;
+    if let Some(value) = value.as_bool() {
+        return Some(value);
+    }
+    match value.as_str()?.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn delegate_payload_string_array(payload: &Value, camel_key: &str, snake_key: &str) -> Vec<String> {
+    let Some(value) = delegate_payload_value(payload, camel_key, snake_key) else {
+        return Vec::new();
+    };
+    if let Some(items) = value.as_array() {
+        return items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    let Some(text) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
+        return Vec::new();
+    };
+    if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(text) {
+        return items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    text.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn delegate_task_max_iterations(payload: &Value, default_value: u32) -> u32 {
-    payload
-        .get("maxIterations")
-        .or_else(|| payload.get("max_iterations"))
-        .and_then(Value::as_u64)
-        .map(|value| value as u32)
+    delegate_payload_value(payload, "maxIterations", "max_iterations")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str()?.trim().parse::<u64>().ok())
+        })
+        .map(|value| value.min(u32::MAX as u64) as u32)
         .unwrap_or(default_value)
         .max(1)
         .min(90)
@@ -237,6 +318,16 @@ pub(super) fn apply_delegation_runtime_config(
         request
             .toolsets
             .retain(|toolset| normalize_toolset_name(toolset) != "delegation");
+    }
+}
+
+pub(super) fn apply_delegation_iteration_budget(
+    requests: &mut [DelegateTaskRequest],
+    max_iterations: u32,
+) {
+    let max_iterations = max_iterations.max(1).min(90);
+    for request in requests {
+        request.max_iterations = max_iterations;
     }
 }
 

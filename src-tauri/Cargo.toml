@@ -1,7 +1,7 @@
 [package]
 name = "synthchat-v1"
-version = "1.0.0"
-description = "SynthChat V1.0.0 Desktop Application"
+version = "1.1.0"
+description = "SynthChat V1.1.0 Desktop Application"
 authors = ["pro_sunner"]
 edition = "2021"
 

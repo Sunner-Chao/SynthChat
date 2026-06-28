@@ -18,8 +18,8 @@ use tokio::task::AbortHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
-    error::{AppError, AppResult},
     agent::decode_terminal_output,
+    error::{AppError, AppResult},
     models::{
         new_id, now_iso, AgentCheckpointRecord, AgentDefinition, AgentQueuedRequest,
         AgentRunRecord, AgentTodoItem, AppConfig, BrowserProvider, CapabilityAdapter, ChatMessage,
@@ -688,6 +688,65 @@ mod tests {
             .unwrap();
         assert_eq!(dead["status"], "dead");
         assert_eq!(dead["cooldown"]["kind"], "terminal_auth");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conversations_hide_internal_subagent_conversations() {
+        let dir = std::env::temp_dir().join(format!(
+            "synthchat-internal-subagent-conversation-test-{}",
+            new_id("state")
+        ));
+        let path = dir.join("state.json");
+        let store = AppStore::new(path).unwrap();
+        let persona = store.persona(None).unwrap();
+        let parent = store
+            .create_conversation(Some("Parent".into()), Some(persona.id.clone()))
+            .unwrap();
+        let child = store
+            .create_internal_subagent_conversation(
+                Some("Subagent 1".into()),
+                Some(persona.id.clone()),
+                "run-parent",
+                1,
+                "synthchat",
+            )
+            .unwrap();
+        let legacy_child = store
+            .create_conversation(Some("Legacy Subagent".into()), Some(persona.id.clone()))
+            .unwrap();
+        let mut legacy_run =
+            AgentRunRecord::new(legacy_child.id.clone(), persona.id.clone(), legacy_child.agent_id);
+        legacy_run.parent_run_id = Some("run-parent".into());
+        store.save_agent_run(legacy_run).unwrap();
+
+        let visible = store.conversations().unwrap();
+        assert!(visible.iter().any(|conversation| conversation.id == parent.id));
+        assert!(!visible
+            .iter()
+            .any(|conversation| conversation.id == child.id));
+        assert!(!visible
+            .iter()
+            .any(|conversation| conversation.id == legacy_child.id));
+        assert_eq!(
+            store
+                .conversation(&child.id)
+                .unwrap()
+                .metadata
+                .get("internalSubagent")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            store
+                .all_conversations()
+                .unwrap()
+                .iter()
+                .filter(|conversation| conversation.id == child.id)
+                .count(),
+            1
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -2019,7 +2078,9 @@ mod tests {
                 wechat.id.as_str()
             ]
         );
-        assert!(!messages.iter().any(|message| message.id == proactive_user.id));
+        assert!(!messages
+            .iter()
+            .any(|message| message.id == proactive_user.id));
         assert_eq!(
             messages
                 .iter()
@@ -2050,10 +2111,8 @@ mod tests {
 
     #[test]
     fn merge_conversation_messages_by_id_keeps_concurrent_append() {
-        let dir = std::env::temp_dir().join(format!(
-            "synthchat-message-merge-race-{}",
-            new_id("state")
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("synthchat-message-merge-race-{}", new_id("state")));
         let path = dir.join("state.json");
         let store = AppStore::new(path).unwrap();
         let persona = store.persona(None).unwrap();
@@ -5385,14 +5444,14 @@ fn normalize_stale_landed_write_file_runs(state: &mut PersistedState) -> bool {
     let completed_at = now_iso();
     let mut changed = false;
     for run_index in 0..state.agent_runs.len() {
-        if !matches!(state.agent_runs[run_index].state.as_str(), "started" | "running") {
+        if !matches!(
+            state.agent_runs[run_index].state.as_str(),
+            "started" | "running"
+        ) {
             continue;
         }
         let activity_at = agent_run_activity_at(&state.agent_runs[run_index], now);
-        if now
-            .signed_duration_since(activity_at)
-            .num_seconds()
-            < STALE_WRITE_FILE_RECOVERY_SECONDS
+        if now.signed_duration_since(activity_at).num_seconds() < STALE_WRITE_FILE_RECOVERY_SECONDS
         {
             continue;
         }
@@ -5435,8 +5494,9 @@ fn normalize_stale_landed_write_file_runs(state: &mut PersistedState) -> bool {
                     .iter()
                     .filter_map(|event| tool_event_provider_call_id(event).map(str::to_string))
                     .collect(),
-                summary: "Recovered stale running write_file event after verified file write landed."
-                    .into(),
+                summary:
+                    "Recovered stale running write_file event after verified file write landed."
+                        .into(),
             });
         }
         let conversation_id = state.agent_runs[run_index].conversation_id.clone();
@@ -5514,7 +5574,10 @@ fn landed_write_file_recovery_event(
             Value::String(full_path.to_string_lossy().to_string()),
         );
         object.insert("exists".into(), Value::Bool(true));
-        object.insert("recoveredAt".into(), Value::String(completed_at.to_string()));
+        object.insert(
+            "recoveredAt".into(),
+            Value::String(completed_at.to_string()),
+        );
     }
     Some(recovered)
 }
@@ -5524,7 +5587,11 @@ fn recovered_tool_elapsed_ms(
     completed_at: &str,
     fallback_started_at: DateTime<Utc>,
 ) -> u128 {
-    if let Some(value) = event.get("elapsedMs").and_then(Value::as_u64).filter(|value| *value > 0) {
+    if let Some(value) = event
+        .get("elapsedMs")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+    {
         return value as u128;
     }
     let Some(completed_at) = DateTime::parse_from_rfc3339(completed_at)
@@ -5860,6 +5927,35 @@ fn conversation_accepts_wechat_delivery(state: &PersistedState, conversation_id:
             .messages
             .get(conversation_id)
             .is_some_and(|messages| messages.iter().any(|message| message.source == "wechat"))
+}
+
+fn conversation_is_internal_subagent(conversation: &Conversation) -> bool {
+    conversation
+        .metadata
+        .get("internalSubagent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || conversation
+            .metadata
+            .get("internal_subagent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || conversation
+            .metadata
+            .get("source")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == "internal_subagent")
+}
+
+fn conversation_has_subagent_run(state: &PersistedState, conversation_id: &str) -> bool {
+    state.agent_runs.iter().any(|run| {
+        run.conversation_id == conversation_id
+            && run
+                .parent_run_id
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|parent| !parent.is_empty())
+    })
 }
 
 fn run_delivery_recovery_was_user_stopped(run: &AgentRunRecord) -> bool {
@@ -6679,7 +6775,11 @@ fn persona_tool_iterations(persona: &Persona) -> u32 {
                 .as_u64()
                 .map(|number| number as u32)
                 .or_else(|| value.as_f64().map(|number| number.round() as u32))
-                .or_else(|| value.as_str().and_then(|text| text.trim().parse::<u32>().ok()))
+                .or_else(|| {
+                    value
+                        .as_str()
+                        .and_then(|text| text.trim().parse::<u32>().ok())
+                })
         })
         .map(clamp_agent_tool_iterations)
         .unwrap_or(90)
@@ -8605,7 +8705,11 @@ impl AppStore {
             let persona_provider = persona.llm_provider.trim().to_string();
             let persona_model = persona.llm_model.trim().to_string();
             let persona_max_tool_iterations = persona_tool_iterations(&persona);
-            if let Some(agent) = s.agents.iter_mut().find(|agent| agent.id == persona.agent_id) {
+            if let Some(agent) = s
+                .agents
+                .iter_mut()
+                .find(|agent| agent.id == persona.agent_id)
+            {
                 agent.llm_provider = persona_provider;
                 agent.llm_model = persona_model;
                 agent.max_tool_iterations = persona_max_tool_iterations;
@@ -8651,6 +8755,22 @@ impl AppStore {
 
     pub fn conversations(&self) -> AppResult<Vec<Conversation>> {
         self.with_state(|s| {
+            let mut items = s
+                .conversations
+                .iter()
+                .filter(|conversation| {
+                    !conversation_is_internal_subagent(conversation)
+                        && !conversation_has_subagent_run(s, &conversation.id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            Ok(items)
+        })
+    }
+
+    pub fn all_conversations(&self) -> AppResult<Vec<Conversation>> {
+        self.with_state(|s| {
             let mut items = s.conversations.clone();
             items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
             Ok(items)
@@ -8694,6 +8814,50 @@ impl AppStore {
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| persona.name.clone());
             let conversation = Conversation::new(title, persona.id, agent_id);
+            s.messages.insert(conversation.id.clone(), vec![]);
+            s.conversations.push(conversation.clone());
+            self.persist(s)?;
+            Ok(conversation)
+        })
+    }
+
+    pub fn create_internal_subagent_conversation(
+        &self,
+        title: Option<String>,
+        persona_id: Option<String>,
+        parent_run_id: &str,
+        child_index: u32,
+        transport: &str,
+    ) -> AppResult<Conversation> {
+        self.with_state(|s| {
+            if s.agents.is_empty() {
+                s.agents.push(AgentDefinition::default());
+            }
+            let persona = s
+                .personas
+                .iter()
+                .find(|p| Some(&p.id) == persona_id.as_ref())
+                .or_else(|| s.personas.first())
+                .cloned()
+                .ok_or_else(|| AppError::NotFound("persona".into()))?;
+            let agent_id = s
+                .agents
+                .iter()
+                .find(|agent| agent.id == persona.agent_id)
+                .map(|agent| agent.id.clone())
+                .or_else(|| s.agents.first().map(|agent| agent.id.clone()))
+                .ok_or_else(|| AppError::NotFound("agent".into()))?;
+            let title = title
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| format!("Subagent {child_index}"));
+            let mut conversation = Conversation::new(title, persona.id, agent_id);
+            conversation.metadata = json!({
+                "internal": true,
+                "internalSubagent": true,
+                "parentRunId": parent_run_id,
+                "subagentIndex": child_index,
+                "transport": transport
+            });
             s.messages.insert(conversation.id.clone(), vec![]);
             s.conversations.push(conversation.clone());
             self.persist(s)?;
@@ -10727,6 +10891,8 @@ impl AppStore {
                     agent.created_at = current.created_at.clone();
                 }
             }
+            agent.max_subagents = agent.max_subagents.clamp(1, 32);
+            agent.max_subagent_depth = agent.max_subagent_depth.clamp(1, 4);
             agent.max_tool_iterations = clamp_agent_tool_iterations(agent.max_tool_iterations);
             agent.updated_at = now_iso();
             if agent.created_at.trim().is_empty() {

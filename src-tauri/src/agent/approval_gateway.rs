@@ -22,6 +22,7 @@ pub async fn call_mcp_tool_with_retry(
     tool_name: String,
     payload: Value,
     timeout_seconds: Option<u64>,
+    run_id: Option<&str>,
     retry_count: usize,
     retry_backoff_ms: usize,
 ) -> AppResult<McpCallResult> {
@@ -33,6 +34,7 @@ pub async fn call_mcp_tool_with_retry(
             tool_name.clone(),
             payload.clone(),
             timeout_seconds,
+            run_id,
         )
         .await
         {
@@ -1164,6 +1166,7 @@ pub(super) async fn approve_tool_call_common(
             approval.tool_name.clone(),
             execution_payload,
             timeout_seconds,
+            approval.run_id.as_deref(),
             0,
             0,
         );

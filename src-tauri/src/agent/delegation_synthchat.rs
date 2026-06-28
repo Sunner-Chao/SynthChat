@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 
 use crate::{
     error::AppResult,
-    models::{AgentDefinition, SendChatRequest},
+    models::{AgentDefinition, ChatMessage, SendChatRequest},
     store::AppStore,
 };
 
@@ -38,9 +38,12 @@ pub(super) async fn execute_synthchat_delegate_task_request(
     } else {
         super::ToolExecutionContext::SubagentLeaf
     };
-    let child_conversation = store.create_conversation(
+    let child_conversation = store.create_internal_subagent_conversation(
         Some(format!("Subagent {} · {}", child_index, request.role)),
         Some(parent_run.persona_id.clone()),
+        parent_run_id,
+        child_index,
+        "synthchat",
     )?;
     let child_prompt = format!(
         "You are a focused SynthChat subagent.\nRole: {}\nToolsets: {}\nMax iterations budget: {}\n\nTask:\n{}\n\nReturn a concise result for the parent agent. Do not ask the user follow-up questions. You have no memory of the parent conversation beyond this task text. Use tools when evidence is needed, and return verifiable handles for file writes, URLs, or external side effects.",
@@ -53,19 +56,44 @@ pub(super) async fn execute_synthchat_delegate_task_request(
         request.max_iterations,
         request.task
     );
+    let mut child_user_message = ChatMessage::new(
+        child_conversation.id.clone(),
+        "user",
+        child_prompt.clone(),
+        "desktop-subagent",
+    );
+    let child_user_message_id = child_user_message.id.clone();
+    child_user_message.provider_data = Some(json!({
+        "source": "desktop-subagent",
+        "delegation": {
+            "parentRunId": parent_run_id,
+            "subagentIndex": child_index,
+            "role": request.role,
+        }
+    }));
+    store.append_message(child_user_message)?;
     let enabled_toolsets = delegation_child_toolsets(agent, request, inherit_mcp_toolsets);
+    let child_send_request = SendChatRequest {
+        conversation_id: Some(child_conversation.id.clone()),
+        persona_id: Some(parent_run.persona_id.clone()),
+        agent_id: None,
+        content: child_prompt,
+        provider_data: Some(json!({
+            "source": "desktop-subagent",
+            "prePersistedUserMessageId": child_user_message_id,
+            "delegation": {
+                "parentRunId": parent_run_id,
+                "subagentIndex": child_index,
+                "role": request.role,
+            }
+        })),
+        queue_item_id: None,
+    };
     let result = Box::pin(run_chat_turn_with_toolset_policy_and_iteration_limit(
         store,
-        SendChatRequest {
-            conversation_id: Some(child_conversation.id.clone()),
-            persona_id: Some(parent_run.persona_id.clone()),
-            agent_id: None,
-            content: child_prompt,
-            provider_data: None,
-            queue_item_id: None,
-        },
+        child_send_request.clone(),
         child_context,
-        enabled_toolsets,
+        enabled_toolsets.clone(),
         None,
         Some(request.max_iterations),
         Some(provider_id_override.to_string()),
@@ -79,6 +107,47 @@ pub(super) async fn execute_synthchat_delegate_task_request(
         None,
     ))
     .await;
+    let result = match result {
+        Err(error) => {
+            let missing_child_conversation = error
+                .to_string()
+                .contains(&format!("not found: conversation {}", child_conversation.id));
+            if missing_child_conversation && store.conversation(&child_conversation.id).is_ok() {
+                append_parent_phase_event(
+                    store,
+                    parent_run_id,
+                    "subagent_bootstrap_retry",
+                    json!({
+                        "childConversationId": child_conversation.id,
+                        "role": request.role,
+                        "task": request.task,
+                        "reason": "conversation was readable after an initial not-found error"
+                    }),
+                )?;
+                Box::pin(run_chat_turn_with_toolset_policy_and_iteration_limit(
+                    store,
+                    child_send_request,
+                    child_context,
+                    enabled_toolsets,
+                    None,
+                    Some(request.max_iterations),
+                    Some(provider_id_override.to_string()),
+                    Some(model_override.to_string()),
+                    None,
+                    None,
+                    Some(subagent_auto_approve),
+                    None,
+                    None,
+                    None,
+                    None,
+                ))
+                .await
+            } else {
+                Err(error)
+            }
+        }
+        Ok(messages) => Ok(messages),
+    };
 
     let child_run = latest_run_for_conversation(store, &child_conversation.id);
     match result {

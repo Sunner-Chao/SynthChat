@@ -33,8 +33,9 @@ static MCP_SAMPLING_STATE: OnceLock<std::sync::Mutex<HashMap<String, McpSampling
     OnceLock::new();
 static MCP_NOTIFICATION_STATE: OnceLock<std::sync::Mutex<HashMap<String, McpNotificationState>>> =
     OnceLock::new();
-static MCP_PERSISTENT_SESSIONS: OnceLock<AsyncMutex<HashMap<String, McpPersistentSession>>> =
-    OnceLock::new();
+static MCP_PERSISTENT_SESSIONS: OnceLock<
+    AsyncMutex<HashMap<String, Arc<AsyncMutex<McpPersistentSession>>>>,
+> = OnceLock::new();
 static MCP_HTTP_SESSION_IDS: OnceLock<std::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
 static MCP_CIRCUIT_BREAKERS: OnceLock<std::sync::Mutex<HashMap<String, McpCircuitBreakerState>>> =
     OnceLock::new();
@@ -302,18 +303,36 @@ pub async fn reset_mcp_persistent_session(
     let mut closed = Vec::new();
     let mut missing = Vec::new();
     if let Some(lock) = MCP_PERSISTENT_SESSIONS.get() {
-        let mut sessions = lock.lock().await;
-        for id in &target_ids {
-            if let Some(mut session) = sessions.remove(id) {
-                kill_mcp_child_tree(&mut session.child).await;
-                closed.push(json!({
-                    "serverId": id,
-                    "startedAt": session.started_at,
-                    "calls": session.calls
-                }));
-            } else {
-                missing.push(id.clone());
+        let removed = {
+            let mut sessions = lock.lock().await;
+            let mut removed = Vec::new();
+            for id in &target_ids {
+                let scoped_ids = sessions
+                    .keys()
+                    .filter(|key| *key == id || key.starts_with(&format!("{id}::")))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if scoped_ids.is_empty() {
+                    missing.push(id.clone());
+                } else {
+                    for scoped_id in scoped_ids {
+                        if let Some(session) = sessions.remove(&scoped_id) {
+                            removed.push((id.clone(), scoped_id, session));
+                        }
+                    }
+                }
             }
+            removed
+        };
+        for (id, scoped_id, session) in removed {
+            let mut session = session.lock().await;
+            kill_mcp_child_tree(&mut session.child).await;
+            closed.push(json!({
+                "serverId": id,
+                "sessionKey": scoped_id,
+                "startedAt": session.started_at,
+                "calls": session.calls
+            }));
         }
     } else {
         missing.extend(target_ids.iter().cloned());
@@ -2665,6 +2684,7 @@ pub async fn call_tool(
     tool_name: String,
     payload: Value,
     timeout_seconds: Option<u64>,
+    run_id: Option<&str>,
 ) -> AppResult<McpCallResult> {
     let server = get_server(store, &server_id)?;
     let started = Instant::now();
@@ -2679,7 +2699,7 @@ pub async fn call_tool(
         Some(
             timeout(
                 Duration::from_secs(timeout_secs),
-                call_tool_once(store, &server, &tool_name, payload.clone()),
+                call_tool_once(store, &server, &tool_name, payload.clone(), run_id),
             )
             .await,
         )
@@ -2716,7 +2736,7 @@ pub async fn call_tool(
                 let retry_server = get_server(store, &server.id)?;
                 match timeout(
                     Duration::from_secs(timeout_secs),
-                    call_tool_once(store, &retry_server, &tool_name, payload.clone()),
+                    call_tool_once(store, &retry_server, &tool_name, payload.clone(), run_id),
                 )
                 .await
                 {
@@ -2866,6 +2886,7 @@ async fn call_tool_once(
     server: &McpServer,
     tool_name: &str,
     payload: Value,
+    run_id: Option<&str>,
 ) -> AppResult<Value> {
     if let Some(request) = mcp_utility_request(tool_name, payload.clone()) {
         let (method, params) = request?;
@@ -2902,7 +2923,7 @@ async fn call_tool_once(
     } else if server.protocol == "oneShotJson" {
         one_shot_json(server, json!({"method": tool_name, "params": payload})).await
     } else {
-        mcp_json_rpc_call(Some(store), server, tool_name, payload).await
+        mcp_json_rpc_call(Some(store), server, tool_name, payload, run_id).await
     }
 }
 
@@ -3470,7 +3491,8 @@ async fn mcp_json_rpc_tools_list(store: Option<&AppStore>, server: &McpServer) -
         let raw_servers = store.static_list("mcpServers")?;
         let raw = raw_mcp_server_config(&raw_servers, server);
         if mcp_persistent_session_enabled(&raw) {
-            return mcp_json_rpc_persistent_method(store, server, "tools/list", json!({})).await;
+            return mcp_json_rpc_persistent_method(store, server, "tools/list", json!({}), None)
+                .await;
         }
     }
     let mut child = spawn_mcp_server(server).await?;
@@ -3517,12 +3539,13 @@ async fn mcp_json_rpc_call(
     server: &McpServer,
     tool_name: &str,
     payload: Value,
+    run_id: Option<&str>,
 ) -> AppResult<Value> {
     if let Some(store) = store {
         let raw_servers = store.static_list("mcpServers")?;
         let raw = raw_mcp_server_config(&raw_servers, server);
         if mcp_persistent_session_enabled(&raw) {
-            return mcp_json_rpc_persistent_call(store, server, tool_name, payload).await;
+            return mcp_json_rpc_persistent_call(store, server, tool_name, payload, run_id).await;
         }
     }
     let mut child = spawn_mcp_server(server).await?;
@@ -3575,12 +3598,14 @@ async fn mcp_json_rpc_persistent_call(
     server: &McpServer,
     tool_name: &str,
     payload: Value,
+    run_id: Option<&str>,
 ) -> AppResult<Value> {
     mcp_json_rpc_persistent_method(
         store,
         server,
         "tools/call",
         json!({"name": tool_name, "arguments": payload}),
+        run_id,
     )
     .await
 }
@@ -3590,34 +3615,37 @@ async fn mcp_json_rpc_persistent_method(
     server: &McpServer,
     method: &str,
     params: Value,
+    run_id: Option<&str>,
 ) -> AppResult<Value> {
     let sessions = MCP_PERSISTENT_SESSIONS.get_or_init(|| AsyncMutex::new(HashMap::new()));
-    let mut guard = sessions.lock().await;
     let fingerprint = mcp_persistent_session_fingerprint(server);
-    let needs_restart = guard
-        .get(&server.id)
-        .map(|session| session.fingerprint != fingerprint)
-        .unwrap_or(true);
-    if needs_restart {
-        if let Some(mut old) = guard.remove(&server.id) {
-            kill_mcp_child_tree(&mut old.child).await;
-        }
-        let session = start_mcp_persistent_session(store, server, fingerprint).await?;
-        guard.insert(server.id.clone(), session);
-    }
+    let session_key = mcp_persistent_session_key(store, server, run_id);
+    let session = mcp_persistent_session_for_key(
+        store,
+        server,
+        sessions,
+        &session_key,
+        fingerprint,
+    )
+    .await?;
 
     let mut remove_session = false;
     let result = {
-        let session = guard
-            .get_mut(&server.id)
-            .ok_or_else(|| AppError::BadRequest("missing MCP persistent session".into()))?;
-        session.next_id = session.next_id.saturating_add(1);
-        let id = session.next_id;
-        let result = match write_rpc(&mut session.stdin, id, method, params).await {
+        let mut session = session.lock().await;
+        let McpPersistentSession {
+            stdin,
+            lines,
+            next_id,
+            calls,
+            ..
+        } = &mut *session;
+        *next_id = (*next_id).saturating_add(1);
+        let id = *next_id;
+        let result = match write_rpc(stdin, id, method, params).await {
             Ok(()) => {
                 read_response(
-                    &mut session.lines,
-                    &mut session.stdin,
+                    lines,
+                    stdin,
                     Some(store),
                     server,
                     id,
@@ -3628,7 +3656,7 @@ async fn mcp_json_rpc_persistent_method(
         };
         match result {
             Ok(value) => {
-                session.calls = session.calls.saturating_add(1);
+                *calls = (*calls).saturating_add(1);
                 Ok(value)
             }
             Err(error) => {
@@ -3638,11 +3666,66 @@ async fn mcp_json_rpc_persistent_method(
         }
     };
     if remove_session {
-        if let Some(mut failed) = guard.remove(&server.id) {
+        let mut guard = sessions.lock().await;
+        if let Some(failed) = guard.remove(&session_key) {
+            let mut failed = failed.lock().await;
             kill_mcp_child_tree(&mut failed.child).await;
         }
     }
     result
+}
+
+async fn mcp_persistent_session_for_key(
+    store: &AppStore,
+    server: &McpServer,
+    sessions: &AsyncMutex<HashMap<String, Arc<AsyncMutex<McpPersistentSession>>>>,
+    session_key: &str,
+    fingerprint: String,
+) -> AppResult<Arc<AsyncMutex<McpPersistentSession>>> {
+    loop {
+        let existing = {
+            let guard = sessions.lock().await;
+            guard.get(session_key).cloned()
+        };
+        if let Some(existing) = existing {
+            let stale = {
+                let session = existing.lock().await;
+                session.fingerprint != fingerprint
+            };
+            if !stale {
+                return Ok(existing);
+            }
+            let removed = {
+                let mut guard = sessions.lock().await;
+                if guard
+                    .get(session_key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &existing))
+                {
+                    guard.remove(session_key)
+                } else {
+                    None
+                }
+            };
+            if let Some(old) = removed {
+                let mut old = old.lock().await;
+                kill_mcp_child_tree(&mut old.child).await;
+            }
+            continue;
+        }
+
+        let created = Arc::new(AsyncMutex::new(
+            start_mcp_persistent_session(store, server, fingerprint.clone()).await?,
+        ));
+        let mut guard = sessions.lock().await;
+        if guard.contains_key(session_key) {
+            drop(guard);
+            let mut created = created.lock().await;
+            kill_mcp_child_tree(&mut created.child).await;
+            continue;
+        }
+        guard.insert(session_key.to_string(), created.clone());
+        return Ok(created);
+    }
 }
 
 async fn start_mcp_persistent_session(
@@ -3700,6 +3783,48 @@ fn mcp_persistent_session_fingerprint(server: &McpServer) -> String {
         "protocol": server.protocol
     }))
     .unwrap_or_else(|_| server.id.clone())
+}
+
+fn mcp_persistent_session_key(
+    store: &AppStore,
+    server: &McpServer,
+    run_id: Option<&str>,
+) -> String {
+    let Some(run_id) = run_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return server.id.clone();
+    };
+    let raw_servers = match store.static_list("mcpServers") {
+        Ok(servers) => servers,
+        Err(_) => return server.id.clone(),
+    };
+    let raw = raw_mcp_server_config(&raw_servers, server);
+    if !mcp_is_playwright_stdio(&raw) {
+        return server.id.clone();
+    }
+    if let Some(scope) = store
+        .agent_run(run_id)
+        .ok()
+        .and_then(|run| {
+            let internal_subagent = store
+                .conversation(&run.conversation_id)
+                .ok()
+                .and_then(|conversation| {
+                    conversation
+                        .metadata
+                        .get("internalSubagent")
+                        .and_then(Value::as_bool)
+                })
+                .unwrap_or(false);
+            if run.parent_run_id.is_some() || internal_subagent {
+                Some(run.conversation_id)
+            } else {
+                None
+            }
+        })
+    {
+        return format!("{}::run:{}", server.id, scope);
+    }
+    server.id.clone()
 }
 
 async fn mcp_json_rpc_method(server: &McpServer, method: &str, params: Value) -> AppResult<Value> {
@@ -5338,14 +5463,48 @@ fn mcp_persistent_session_status(server_id: &str, raw: &Value) -> Value {
             "locked": true
         });
     };
-    if let Some(session) = map.get(server_id) {
+    let scoped_prefix = format!("{server_id}::");
+    let mut sessions = Vec::new();
+    let mut locked = false;
+    for (key, session) in map.iter().filter(|(key, _)| {
+        key.as_str() == server_id || key.as_str().starts_with(&scoped_prefix)
+    }) {
+        match session.try_lock() {
+            Ok(session) => {
+                sessions.push(json!({
+                    "sessionKey": key,
+                    "startedAt": session.started_at,
+                    "calls": session.calls,
+                    "nextId": session.next_id
+                }));
+            }
+            Err(_) => locked = true,
+        }
+    }
+    if !sessions.is_empty() || locked {
+        let calls = sessions
+            .iter()
+            .filter_map(|session| session.get("calls").and_then(Value::as_u64))
+            .sum::<u64>();
+        let started_at = sessions
+            .first()
+            .and_then(|session| session.get("startedAt"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let next_id = sessions
+            .first()
+            .and_then(|session| session.get("nextId"))
+            .cloned()
+            .unwrap_or(Value::Null);
         json!({
             "enabled": enabled,
             "active": true,
-            "locked": false,
-            "startedAt": session.started_at,
-            "calls": session.calls,
-            "nextId": session.next_id
+            "locked": locked,
+            "startedAt": started_at,
+            "calls": calls,
+            "nextId": next_id,
+            "sessionCount": sessions.len(),
+            "sessions": sessions
         })
     } else {
         json!({
@@ -5633,6 +5792,7 @@ fn parse_tools(raw: &Value) -> Vec<McpToolInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::AgentRunRecord;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_mcp_server(id: &str) -> McpServer {
@@ -6705,6 +6865,7 @@ mod tests {
             "demo".into(),
             json!({}),
             Some(10),
+            None,
         )
         .await
         .unwrap();
@@ -6740,7 +6901,14 @@ mod tests {
             })])
             .unwrap();
 
-        let result = call_tool(&store, "docs".into(), "write".into(), json!({}), Some(1))
+        let result = call_tool(
+            &store,
+            "docs".into(),
+            "write".into(),
+            json!({}),
+            Some(1),
+            None,
+        )
             .await
             .unwrap();
 
@@ -7611,7 +7779,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
             .find(|server| server.id == "roots-rpc")
             .unwrap();
 
-        let result = mcp_json_rpc_call(Some(&store), &server, "noop", json!({}))
+        let result = mcp_json_rpc_call(Some(&store), &server, "noop", json!({}), None)
             .await
             .unwrap();
         assert_eq!(result["content"][0]["text"], "ok");
@@ -7672,10 +7840,10 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
             .find(|server| server.id == "persistent")
             .unwrap();
 
-        let first = mcp_json_rpc_call(Some(&store), &server, "noop", json!({}))
+        let first = mcp_json_rpc_call(Some(&store), &server, "noop", json!({}), None)
             .await
             .unwrap();
-        let second = mcp_json_rpc_call(Some(&store), &server, "noop", json!({}))
+        let second = mcp_json_rpc_call(Some(&store), &server, "noop", json!({}), None)
             .await
             .unwrap();
         assert_eq!(first["content"][0]["text"], "init=1 call=1");
@@ -7699,6 +7867,66 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
             reset_status["servers"][0]["persistentSession"]["active"],
             false
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn playwright_mcp_persistent_session_key_is_scoped_to_subagent_conversation() {
+        let dir =
+            std::env::temp_dir().join(format!("synthchat-playwright-scope-{}", new_id("test")));
+        let store = AppStore::new(dir.join("state.json")).unwrap();
+        store
+            .set_mcp_servers(vec![json!({
+                "id": "browser",
+                "name": "browser",
+                "command": "npx",
+                "args": ["@playwright/mcp"],
+                "protocol": "mcpJsonRpc",
+                "enabled": true,
+                "timeoutSeconds": 20
+            })])
+            .unwrap();
+        let server = mcp_servers(&store)
+            .unwrap()
+            .into_iter()
+            .find(|server| server.id == "browser")
+            .unwrap();
+        let first_conversation = store
+            .create_internal_subagent_conversation(
+                Some("Child A".into()),
+                None,
+                "parent-run",
+                1,
+                "synthchat",
+            )
+            .unwrap();
+        let second_conversation = store
+            .create_internal_subagent_conversation(
+                Some("Child B".into()),
+                None,
+                "parent-run",
+                2,
+                "synthchat",
+            )
+            .unwrap();
+        let first_child =
+            AgentRunRecord::new(first_conversation.id.clone(), "persona".into(), "agent".into());
+        let first_child_id = first_child.run_id.clone();
+        store.save_agent_run(first_child).unwrap();
+        let second_child =
+            AgentRunRecord::new(second_conversation.id.clone(), "persona".into(), "agent".into());
+        let second_child_id = second_child.run_id.clone();
+        store.save_agent_run(second_child).unwrap();
+
+        let parent_key = mcp_persistent_session_key(&store, &server, Some(&first_child_id));
+        let sibling_key = mcp_persistent_session_key(&store, &server, Some(&second_child_id));
+        let same_child_key = mcp_persistent_session_key(&store, &server, Some(&first_child_id));
+
+        assert_eq!(parent_key, same_child_key);
+        assert_ne!(parent_key, sibling_key);
+        assert!(parent_key.contains(&first_conversation.id));
+        assert!(sibling_key.contains(&second_conversation.id));
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

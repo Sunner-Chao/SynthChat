@@ -22,6 +22,25 @@ pub(super) fn delegation_child_toolsets(
         return None;
     }
     let mut toolsets = request.toolsets.clone();
+    if request.toolsets.iter().any(|toolset| {
+        normalize_toolset_name(toolset) == "browser"
+            && !toolset.trim().to_ascii_lowercase().starts_with("tool:")
+    }) {
+        push_unique_toolset(&mut toolsets, "browser_safe");
+        for unsafe_tool in [
+            "browser_click",
+            "browser_type",
+            "browser_press",
+            "browser_scroll",
+            "browser_cdp",
+            "browser_dialog",
+            "browser_record",
+            "browser_vision",
+            "browser_console",
+        ] {
+            push_unique_toolset(&mut toolsets, &format!("not_tool:{unsafe_tool}"));
+        }
+    }
     if inherit_mcp_toolsets && agent.mcp_enabled {
         push_unique_toolset(&mut toolsets, "mcp");
         push_unique_toolset(&mut toolsets, "mcp_utility");
