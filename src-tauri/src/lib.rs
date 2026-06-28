@@ -1265,8 +1265,12 @@ fn save_persona(store: State<'_, AppStore>, mut persona: Persona) -> AppResult<P
     normalize_persona_number(&mut persona.voice_reply, "refineTemperature", 0.01, 2.0);
     normalize_persona_string(&mut persona.voice_reply, "engine", "chattts");
     normalize_persona_string(&mut persona.voice_reply, "pythonPath", "");
-    normalize_persona_string(&mut persona.voice_reply, "modelDir", "");
-    normalize_persona_string(&mut persona.voice_reply, "speakerEmbedding", "");
+    normalize_persona_string(&mut persona.voice_reply, "modelDir", r"E:\SynthChat\ChatTTS");
+    normalize_persona_string(
+        &mut persona.voice_reply,
+        "speakerEmbedding",
+        r"E:\SynthChat\ChatTTS\speaker\speaker_20240.pt",
+    );
     normalize_persona_string(&mut persona.voice_reply, "refinePrompt", "");
     normalize_persona_bool(&mut persona.image_generation, "enabled", false);
     normalize_persona_string(&mut persona.image_generation, "provider", "");
@@ -1762,7 +1766,11 @@ async fn send_chat_message(
                 }
             }
             let assistant = &messages[index];
-            wechat_settings::dispatch_desktop_reply_to_wechat(&conversation, &assistant.content);
+            wechat_settings::dispatch_desktop_reply_to_wechat(
+                &store,
+                &conversation,
+                &assistant.content,
+            );
         }
     }
     Ok(messages)
@@ -1884,7 +1892,11 @@ async fn trigger_proactive_for_persona(
         .find(|message| message.role == "assistant" && message.source == "proactive")
     {
         if let Ok(conversation) = store.conversation(&conversation_id) {
-            wechat_settings::dispatch_desktop_reply_to_wechat(&conversation, &assistant.content);
+            wechat_settings::dispatch_desktop_reply_to_wechat(
+                store,
+                &conversation,
+                &assistant.content,
+            );
         }
     }
     if let Err(error) =

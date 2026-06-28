@@ -1,13 +1,17 @@
 use std::{
     collections::HashSet,
     fs,
+    io::Read,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Mutex, OnceLock},
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{json, Value};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt as WindowsCommandExt;
 
 use crate::{
     error::{AppError, AppResult},
@@ -1087,6 +1091,18 @@ fn image_provider_kind(provider: &ImageProvider) -> ImageProviderKind {
     }
 }
 
+fn image_http_client(provider: &ImageProvider) -> AppResult<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(provider.timeout_seconds.max(1)))
+        .user_agent("SynthChat-agent/1.0");
+    if !provider.use_system_proxy {
+        builder = builder.no_proxy();
+    }
+    builder
+        .build()
+        .map_err(|error| AppError::BadRequest(format!("failed to build image client: {error}")))
+}
+
 pub(super) async fn openai_compatible_image_generate(
     store: &AppStore,
     run_id: &str,
@@ -1115,12 +1131,7 @@ pub(super) async fn openai_compatible_image_generate(
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(&provider.model);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(provider.timeout_seconds.max(1)))
-        .no_proxy()
-        .user_agent("SynthChat-agent/1.0")
-        .build()
-        .map_err(|error| AppError::BadRequest(format!("failed to build image client: {error}")))?;
+    let client = image_http_client(provider)?;
     if model.trim().eq_ignore_ascii_case("gpt-image-2") {
         return gpt_image_2_generate(store, run_id, provider, &client, url, prompt, payload).await;
     }
@@ -1339,7 +1350,7 @@ async fn poll_gpt_image_2_task(
     task_id: &str,
 ) -> AppResult<Value> {
     let interval = 3u64;
-    let max_wait = provider.timeout_seconds.max(60);
+    let max_wait = provider.timeout_seconds.max(300);
     let started = Instant::now();
     loop {
         let url = gpt_image_2_task_url(provider, task_id)?;
@@ -1454,12 +1465,7 @@ async fn gemini_image_generate(
             "responseModalities": ["TEXT", "IMAGE"]
         }
     });
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(provider.timeout_seconds.max(1)))
-        .no_proxy()
-        .user_agent("SynthChat-agent/1.0")
-        .build()
-        .map_err(|error| AppError::BadRequest(format!("failed to build Gemini image client: {error}")))?;
+    let client = image_http_client(provider)?;
     let response = client
         .post(url)
         .json(&body)
@@ -2175,6 +2181,54 @@ fn resolve_desktop_chattts_model_dir(payload: &Value) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
+fn default_desktop_chattts_speaker_embedding(model_dir: &Path) -> Option<String> {
+    [
+        model_dir.join("speaker").join("speaker_20240.pt"),
+        PathBuf::from(r"E:\SynthChat\ChatTTS\speaker\speaker_20240.pt"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .map(|path| path.to_string_lossy().to_string())
+}
+
+fn resolve_desktop_chattts_speaker_embedding(value: &str, model_dir: &Path) -> Option<String> {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return path
+            .is_file()
+            .then(|| path.to_string_lossy().to_string());
+    }
+
+    let mut roots = Vec::new();
+    if let Ok(current_dir) = std::env::current_dir() {
+        push_path_with_ancestors(&mut roots, current_dir);
+    }
+    if let Some(exe_dir) = current_exe_dir() {
+        push_path_with_ancestors(&mut roots, exe_dir);
+    }
+    roots.push(model_dir.to_path_buf());
+    if let Some(parent) = model_dir.parent() {
+        roots.push(parent.to_path_buf());
+    }
+    roots.push(PathBuf::from(r"E:\SynthChat\ChatTTS"));
+    roots.push(PathBuf::from(r"E:\SynthChat"));
+
+    let mut seen = HashSet::new();
+    roots
+        .into_iter()
+        .flat_map(|root| {
+            [
+                root.join(&path),
+                root.join("speaker").join(&path),
+                root.join("ChatTTS").join(&path),
+                root.join("models").join("ChatTTS").join(&path),
+            ]
+        })
+        .filter_map(|candidate| dedupe_existing_path(candidate, &mut seen))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().to_string())
+}
+
 fn desktop_edge_tts_payload(payload: &Value) -> Value {
     let mut next = payload.clone();
     let uses_chattts_scale = payload
@@ -2232,7 +2286,7 @@ fn desktop_chattts_command_template(payload: &Value) -> Option<String> {
                 .or_else(|| std::env::var("HERMES_CHATTTS_PYTHON").ok())
                 .or_else(|| std::env::var("HERMES_TTS_PYTHON").ok())
         })
-        .unwrap_or_else(|| "python".into());
+        .unwrap_or_else(default_desktop_python_command);
     let sample_rate = payload
         .get("sampleRate")
         .or_else(|| payload.get("sample_rate"))
@@ -2264,14 +2318,31 @@ fn desktop_chattts_command_template(payload: &Value) -> Option<String> {
         .get("speakerSeed")
         .or_else(|| payload.get("speaker_seed"))
         .and_then(Value::as_u64)
-        .unwrap_or(0);
+        .unwrap_or(20240);
     let speaker_embedding = payload
         .get("speakerEmbedding")
         .or_else(|| payload.get("speaker_embedding"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_string);
+        .and_then(|value| {
+            let path = Path::new(value);
+            let looks_like_embedding = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "pt" | "pth" | "safetensors"
+                    )
+                });
+            if looks_like_embedding {
+                resolve_desktop_chattts_speaker_embedding(value, &model_path)
+            } else {
+                Some(value.to_string())
+            }
+        })
+        .or_else(|| default_desktop_chattts_speaker_embedding(&model_path));
     let temperature = payload
         .get("temperature")
         .and_then(Value::as_f64)
@@ -4032,7 +4103,7 @@ fn finalize_tts_audio(
 }
 
 fn tts_format_is_voice_compatible(format: &str) -> bool {
-    matches!(normalize_tts_audio_format(format).as_str(), "opus")
+    matches!(normalize_tts_audio_format(format).as_str(), "opus" | "mp3" | "wav")
 }
 
 fn tts_media_tag(artifact: &TtsAudioArtifact) -> String {
@@ -4263,17 +4334,25 @@ pub(super) fn local_command_text_to_speech(
                 output_path.display()
             )));
         }
-        let path = store.save_tool_binary_artifact(run_id, "text_to_speech", &format, &audio)?;
+        let artifact =
+            finalize_tts_audio(store, run_id, "local_command", &audio, &format, &format)?;
         Ok::<_, AppError>(serde_json::to_string_pretty(&json!({
             "provider": "local_command",
             "providerId": provider.id,
             "model": model,
             "voice": voice,
+            "speed": speed,
             "format": format,
+            "actualFormat": artifact.format,
+            "voiceCompatible": artifact.voice_compatible,
+            "voice_compatible": artifact.voice_compatible,
+            "mediaTag": tts_media_tag(&artifact),
+            "media_tag": tts_media_tag(&artifact),
+            "conversion": artifact.conversion,
             "source": output_path.to_string_lossy(),
             "artifact": {
-                "path": path.to_string_lossy(),
-                "sizeBytes": audio.len()
+                "path": artifact.path.to_string_lossy(),
+                "sizeBytes": artifact.size
             }
         }))?)
     })();
@@ -5491,12 +5570,39 @@ fn shell_quote_value(value: &str) -> String {
     }
 }
 
+fn default_desktop_python_command() -> String {
+    [
+        r"F:\python313\python.exe",
+        r"F:\python312\python.exe",
+        r"F:\python311\python.exe",
+        r"C:\Python313\python.exe",
+        r"C:\Python312\python.exe",
+        r"C:\Python311\python.exe",
+    ]
+    .into_iter()
+    .find(|path| Path::new(path).is_file())
+    .unwrap_or("python")
+    .to_string()
+}
+
+fn read_command_pipe(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = pipe.read_to_end(&mut output);
+        output
+    })
+}
+
 fn run_shell_command_with_timeout(command_text: &str, timeout_seconds: u64) -> AppResult<String> {
-    let mut command = if cfg!(target_os = "windows") {
+    #[cfg(target_os = "windows")]
+    let mut command = {
         let mut command = Command::new("cmd");
-        command.arg("/C").arg(command_text);
+        command.arg("/C");
+        command.raw_arg(command_text);
         command
-    } else {
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut command = {
         let mut command = Command::new("sh");
         command.arg("-c").arg(command_text);
         command
@@ -5507,27 +5613,44 @@ fn run_shell_command_with_timeout(command_text: &str, timeout_seconds: u64) -> A
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|error| {
-        AppError::BadRequest(format!("failed to start local STT command: {error}"))
+        AppError::BadRequest(format!("failed to start local audio command: {error}"))
     })?;
+    let stdout = child.stdout.take().map(read_command_pipe);
+    let stderr = child.stderr.take().map(read_command_pipe);
     let started = Instant::now();
     loop {
         if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+            let status = child.wait()?;
+            let stdout = stdout
+                .map(|handle| handle.join().unwrap_or_default())
+                .unwrap_or_default();
+            let stderr = stderr
+                .map(|handle| handle.join().unwrap_or_default())
+                .unwrap_or_default();
+            if !status.success() {
+                let stderr = String::from_utf8_lossy(&stderr);
                 return Err(AppError::BadRequest(format!(
-                    "local STT command exited with {}: {}",
-                    output.status,
+                    "local audio command exited with {status}: {}",
                     truncate_output(&stderr, 2000)
                 )));
             }
-            return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+            return Ok(String::from_utf8_lossy(&stdout).trim().to_string());
         }
         if started.elapsed() >= Duration::from_secs(timeout_seconds) {
             let _ = child.kill();
             let _ = child.wait();
+            let stdout = stdout
+                .map(|handle| handle.join().unwrap_or_default())
+                .unwrap_or_default();
+            let stderr = stderr
+                .map(|handle| handle.join().unwrap_or_default())
+                .unwrap_or_default();
+            let stderr = String::from_utf8_lossy(&stderr);
+            let stdout = String::from_utf8_lossy(&stdout);
             return Err(AppError::BadRequest(format!(
-                "local STT command timed out after {timeout_seconds}s"
+                "local audio command timed out after {timeout_seconds}s; stderr: {}; stdout: {}",
+                truncate_output(&stderr, 1000),
+                truncate_output(&stdout, 1000)
             )));
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -6826,7 +6949,8 @@ mod tests {
             api_key: None,
             model: "gpt-image-2".into(),
             enabled: true,
-            timeout_seconds: 120,
+            timeout_seconds: 300,
+            use_system_proxy: true,
         };
 
         assert_eq!(
@@ -6895,4 +7019,5 @@ mod tests {
             vec!["https://upload.apimart.ai/f/image/out.png".to_string()]
         );
     }
+
 }

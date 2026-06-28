@@ -1,4 +1,4 @@
-"""Generate a ChatTTS speaker embedding from a seed and save as .pt file.
+r"""Generate a ChatTTS speaker embedding from a seed and save as .pt file.
 
 Usage:
     python generate_speaker_embedding.py --seed 20240 --out speaker_20240.pt

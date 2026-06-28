@@ -6850,6 +6850,14 @@ fn set_persona_tool_iterations(persona: &mut Persona, value: u32) {
     }
 }
 
+fn normalize_image_provider(mut provider: ImageProvider) -> ImageProvider {
+    if provider.model.trim().eq_ignore_ascii_case("gpt-image-2") && provider.timeout_seconds < 300
+    {
+        provider.timeout_seconds = 300;
+    }
+    provider
+}
+
 impl AppStore {
     pub fn new(path: PathBuf) -> AppResult<Self> {
         let state_existed = path.exists();
@@ -9750,12 +9758,18 @@ impl AppStore {
     }
 
     pub fn image_providers(&self) -> AppResult<Vec<ImageProvider>> {
-        self.with_state(|s| Ok(s.image_providers.clone()))
+        self.with_state(|s| {
+            Ok(s.image_providers
+                .iter()
+                .cloned()
+                .map(normalize_image_provider)
+                .collect())
+        })
     }
 
     pub fn set_image_providers(&self, providers: Vec<ImageProvider>) -> AppResult<()> {
         self.with_state(|s| {
-            s.image_providers = providers;
+            s.image_providers = providers.into_iter().map(normalize_image_provider).collect();
             self.persist(s)
         })
     }

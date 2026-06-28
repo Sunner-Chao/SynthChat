@@ -127,6 +127,18 @@ def _load_speaker_embedding(value: str, torch_module):
         return None
     path = Path(speaker_embedding)
     if not path.is_file():
+        if path.suffix.lower() in {".pt", ".pth", ".safetensors"}:
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "warning": f"speaker embedding file not found, falling back to speaker seed: {path}",
+                    },
+                    ensure_ascii=True,
+                ),
+                file=sys.stderr,
+            )
+            return None
         return speaker_embedding
     try:
         loaded = torch_module.load(path, map_location="cpu")
@@ -322,7 +334,7 @@ def main() -> None:
         "sampleRate": sample_rate,
         "playtimeMs": playtime_ms,
         "speakerSeed": int(args.speaker_seed),
-        "speakerEmbedding": speaker_embedding if isinstance(speaker_embedding, str) else "",
+        "speakerEmbedding": str(Path(args.speaker_embedding)) if args.speaker_embedding.strip() else "",
         "inferPrompt": infer_prompt,
         "refinePrompt": refine_prompt,
         "text": text,

@@ -717,6 +717,7 @@ export interface ImageProvider {
   model: string;
   enabled: boolean;
   timeoutSeconds: number;
+  useSystemProxy?: boolean;
 }
 
 export interface VideoProvider {

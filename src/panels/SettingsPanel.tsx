@@ -1671,7 +1671,8 @@ function ImageProviderSettings({
       apiKey: null,
       model: providerType === "openai_image" ? "gpt-image-2" : "",
       enabled: false,
-      timeoutSeconds: 120
+      timeoutSeconds: 300,
+      useSystemProxy: true
     };
     setDraft({ ...provider });
     setSelectedId(provider.id);
@@ -1758,6 +1759,7 @@ function ImageProviderSettings({
             </div>
             <label>API Key（可选）<input type="password" value={draft.apiKey ?? ""} onChange={(event) => setDraft((d) => d ? { ...d, apiKey: event.target.value || null } : d)} /></label>
             <label>超时秒数<input min={1} type="number" value={draft.timeoutSeconds} onChange={(event) => setDraft((d) => d ? { ...d, timeoutSeconds: Number(event.target.value) } : d)} /></label>
+            <label className="checkbox-row"><input checked={draft.useSystemProxy ?? true} onChange={(event) => setDraft((d) => d ? { ...d, useSystemProxy: event.target.checked } : d)} type="checkbox" />使用系统/环境代理</label>
             <button className="btn-danger-outline" onClick={remove} type="button">删除服务商</button>
           </div>
         ) : (

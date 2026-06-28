@@ -415,7 +415,7 @@ fn default_proactive_config() -> Value {
 }
 
 fn default_voice_reply_config() -> Value {
-    json!({"enabled": false, "engine": "chattts", "pythonPath": "", "modelDir": "", "sampleRate": 16000, "speed": 5, "oral": 2, "laugh": 0, "breakLevel": 4, "speakerSeed": 20240, "speakerEmbedding": "models/ChatTTS/speaker/speaker_20240.pt", "temperature": 0.3, "topP": 0.7, "topK": 20, "refineTextEnabled": true, "refinePrompt": "[oral_2][laugh_0][break_4]", "refineTemperature": 0.7})
+    json!({"enabled": false, "engine": "chattts", "pythonPath": "", "modelDir": "E:\\SynthChat\\ChatTTS", "sampleRate": 16000, "speed": 5, "oral": 2, "laugh": 0, "breakLevel": 4, "speakerSeed": 20240, "speakerEmbedding": "E:\\SynthChat\\ChatTTS\\speaker\\speaker_20240.pt", "temperature": 0.3, "topP": 0.7, "topK": 20, "refineTextEnabled": true, "refinePrompt": "[oral_2][laugh_0][break_4]", "refineTemperature": 0.7})
 }
 
 fn default_image_generation_config() -> Value {
@@ -634,6 +634,12 @@ pub struct ImageProvider {
     pub model: String,
     pub enabled: bool,
     pub timeout_seconds: u64,
+    #[serde(default = "default_true")]
+    pub use_system_proxy: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

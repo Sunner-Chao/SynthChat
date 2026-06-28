@@ -51850,6 +51850,7 @@ fn provider_plugins_tool_maps_hermes_provider_manifests_to_synthchat_config() {
             model: "flux".into(),
             enabled: true,
             timeout_seconds: 60,
+            use_system_proxy: true,
         }])
         .unwrap();
     store
