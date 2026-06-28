@@ -4021,6 +4021,119 @@ async fn transcribe_chat_audio(
 }
 
 #[tauri::command(rename_all = "camelCase")]
+async fn speak_chat_text(
+    store: State<'_, AppStore>,
+    text: String,
+    provider_id: Option<String>,
+    voice: Option<String>,
+    format: Option<String>,
+    engine: Option<String>,
+    speed_scale: Option<String>,
+    speed: Option<f64>,
+    model_dir: Option<String>,
+    python_path: Option<String>,
+    sample_rate: Option<u32>,
+    oral: Option<u32>,
+    laugh: Option<u32>,
+    break_level: Option<u32>,
+    speaker_seed: Option<u64>,
+    speaker_embedding: Option<String>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    top_k: Option<u32>,
+    refine_text_enabled: Option<bool>,
+    refine_prompt: Option<String>,
+    refine_temperature: Option<f64>,
+) -> AppResult<Value> {
+    let mut payload = json!({
+        "text": text,
+        "format": format.unwrap_or_else(|| "mp3".into()),
+    });
+    if let Some(provider_id) = provider_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        payload["providerId"] = json!(provider_id);
+    }
+    if let Some(voice) = voice
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        payload["voice"] = json!(voice);
+    }
+    if let Some(engine) = engine
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        payload["engine"] = json!(engine);
+    }
+    if let Some(speed_scale) = speed_scale
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        payload["speedScale"] = json!(speed_scale);
+    }
+    if let Some(speed) = speed {
+        payload["speed"] = json!(speed);
+    }
+    if let Some(model_dir) = model_dir
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        payload["modelDir"] = json!(model_dir);
+    }
+    if let Some(python_path) = python_path
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        payload["pythonPath"] = json!(python_path);
+    }
+    if let Some(sample_rate) = sample_rate {
+        payload["sampleRate"] = json!(sample_rate);
+    }
+    if let Some(oral) = oral {
+        payload["oral"] = json!(oral);
+    }
+    if let Some(laugh) = laugh {
+        payload["laugh"] = json!(laugh);
+    }
+    if let Some(break_level) = break_level {
+        payload["breakLevel"] = json!(break_level);
+    }
+    if let Some(speaker_seed) = speaker_seed {
+        payload["speakerSeed"] = json!(speaker_seed);
+    }
+    if let Some(speaker_embedding) = speaker_embedding
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        payload["speakerEmbedding"] = json!(speaker_embedding);
+    }
+    if let Some(temperature) = temperature {
+        payload["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = top_p {
+        payload["topP"] = json!(top_p);
+    }
+    if let Some(top_k) = top_k {
+        payload["topK"] = json!(top_k);
+    }
+    if let Some(refine_text_enabled) = refine_text_enabled {
+        payload["refineTextEnabled"] = json!(refine_text_enabled);
+    }
+    if let Some(refine_prompt) = refine_prompt
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        payload["refinePrompt"] = json!(refine_prompt);
+    }
+    if let Some(refine_temperature) = refine_temperature {
+        payload["refineTemperature"] = json!(refine_temperature);
+    }
+    agent::text_to_speech_payload_for_desktop(&store, &payload).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
 fn upload_chat_attachment(
     store: State<'_, AppStore>,
     file_name: String,
@@ -5425,6 +5538,7 @@ pub fn run() {
             get_token_usage_stats,
             get_short_context_state,
             transcribe_chat_audio,
+            speak_chat_text,
             upload_chat_attachment,
             upload_chat_attachment_from_path,
             environment_check,

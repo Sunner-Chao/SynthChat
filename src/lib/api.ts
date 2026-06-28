@@ -144,7 +144,8 @@ const fallbackConfig: AppConfig = {
     typingSpeedRandomMin: 0.05,
     typingSpeedRandomMax: 0.1,
     splitByNewline: true,
-    showTypingIndicator: true
+    showTypingIndicator: true,
+    typingIndicatorRefreshSeconds: 2
   },
   web: { port: 62000, password: "", publicEnabled: false, publicPort: 0, publicSecret: "" },
   weather: { defaultLocation: "", qweatherApiHost: "", qweatherApiKey: "", timeoutSeconds: 15 },
@@ -786,6 +787,30 @@ export const api: Record<string, any> = {
   })),
   transcribeChatAudio: (dataUrl: string, mimeType?: string): Promise<{ ok: boolean; transcript: string; provider?: unknown; providerId?: unknown; mimeType?: string }> =>
     call("transcribe_chat_audio", { dataUrl, mimeType }, () => ({ ok: false, transcript: "" })),
+  speakChatText: (text: string, options?: { providerId?: string; voice?: string; format?: string; engine?: string; speedScale?: string; speed?: number; modelDir?: string; pythonPath?: string; sampleRate?: number; oral?: number; laugh?: number; breakLevel?: number; speakerSeed?: number; speakerEmbedding?: string; temperature?: number; topP?: number; topK?: number; refineTextEnabled?: boolean; refinePrompt?: string; refineTemperature?: number }): Promise<{ ok: boolean; dataUrl: string; mimeType?: string; provider?: unknown; providerId?: unknown; voice?: unknown }> =>
+    call("speak_chat_text", {
+      text,
+      providerId: options?.providerId,
+      voice: options?.voice,
+      format: options?.format,
+      engine: options?.engine,
+      speedScale: options?.speedScale,
+      speed: options?.speed,
+      modelDir: options?.modelDir,
+      pythonPath: options?.pythonPath,
+      sampleRate: options?.sampleRate,
+      oral: options?.oral,
+      laugh: options?.laugh,
+      breakLevel: options?.breakLevel,
+      speakerSeed: options?.speakerSeed,
+      speakerEmbedding: options?.speakerEmbedding,
+      temperature: options?.temperature,
+      topP: options?.topP,
+      topK: options?.topK,
+      refineTextEnabled: options?.refineTextEnabled,
+      refinePrompt: options?.refinePrompt,
+      refineTemperature: options?.refineTemperature
+    }, () => ({ ok: false, dataUrl: "" })),
   getMessageContent: async (messageId: string) => messageId,
   assetUrl: convertFileSrc,
   convertFileSrc,

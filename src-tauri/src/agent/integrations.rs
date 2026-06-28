@@ -57,8 +57,8 @@ use super::{
     dashboard_plugins_tool, emit_agent_run_record, kanban_decompose_tool, kanban_specify_tool,
     list_agent_control_commands,
     media_tools::{
-        audio_mime_from_extension, image_mime_from_path, provider_api_key, text_to_speech_tool,
-        transcribe_audio_tool,
+        audio_mime_from_extension, desktop_local_command_transcribe_audio, desktop_text_to_speech,
+        image_mime_from_path, provider_api_key, text_to_speech_tool, transcribe_audio_tool,
     },
     normalize_toolset_name, redact_sensitive_text, required_string_arg,
     shell_hooks::{
@@ -22127,6 +22127,79 @@ pub(crate) async fn transcribe_audio_payload_for_desktop(
     api_server_transcribe_audio_payload(store, body).await
 }
 
+pub(crate) async fn text_to_speech_payload_for_desktop(
+    store: &AppStore,
+    body: &Value,
+) -> AppResult<Value> {
+    use base64::Engine;
+
+    let text = string_arg(body, &["text", "input", "content"])
+        .ok_or_else(|| AppError::BadRequest("Text is required".into()))?;
+    if text.trim().is_empty() {
+        return Err(AppError::BadRequest("Text is required".into()));
+    }
+    let mut payload = body.clone();
+    payload["text"] = json!(text);
+    if payload.get("format").is_none() && payload.get("response_format").is_none() {
+        payload["format"] = json!("wav");
+    }
+    let explicit_provider = payload
+        .get("providerId")
+        .or_else(|| payload.get("provider_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let result_text = if explicit_provider {
+        text_to_speech_tool(store, "desktop-chat-tts", &payload).await?
+    } else {
+        match desktop_text_to_speech(store, "desktop-chat-tts", &text, &payload) {
+            Ok(value) => value,
+            Err(local_error) => match text_to_speech_tool(store, "desktop-chat-tts", &payload).await {
+                Ok(value) => value,
+                Err(provider_error) => {
+                    return Err(AppError::BadRequest(format!(
+                        "Local TTS failed: {local_error}; configured TTS provider failed: {provider_error}. Install edge-tts, configure ChatTTS model dir, set SYNTHCHAT_LOCAL_TTS_COMMAND, or configure an audio-capable provider."
+                    )));
+                }
+            },
+        }
+    };
+    let result = serde_json::from_str::<Value>(&result_text)
+        .map_err(|error| AppError::BadRequest(format!("Invalid TTS response: {error}")))?;
+    let artifact_path = result
+        .get("artifact")
+        .and_then(|artifact| artifact.get("path"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest("Audio file missing".into()))?;
+    let audio_bytes = fs::read(artifact_path)
+        .map_err(|error| AppError::BadRequest(format!("Could not read audio: {error}")))?;
+    let format = result
+        .get("actualFormat")
+        .and_then(Value::as_str)
+        .or_else(|| result.get("format").and_then(Value::as_str))
+        .unwrap_or_else(|| {
+            Path::new(artifact_path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("mp3")
+        });
+    let mime_type = audio_mime_from_extension(format);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(audio_bytes);
+    Ok(json!({
+        "ok": true,
+        "data_url": format!("data:{mime_type};base64,{encoded}"),
+        "dataUrl": format!("data:{mime_type};base64,{encoded}"),
+        "mime_type": mime_type,
+        "mimeType": mime_type,
+        "provider": result.get("provider").cloned().unwrap_or(Value::Null),
+        "providerId": result.get("providerId").cloned().unwrap_or(Value::Null),
+        "voice": result.get("voice").cloned().unwrap_or(Value::Null),
+        "artifact": result.get("artifact").cloned().unwrap_or(Value::Null),
+        "schema": "synthchat_desktop_chat_tts_v1",
+        "desktopAdaptation": true
+    }))
+}
+
 async fn api_server_transcribe_audio_payload(store: &AppStore, body: &Value) -> AppResult<Value> {
     use base64::Engine;
 
@@ -22197,7 +22270,38 @@ async fn api_server_transcribe_audio_payload(store: &AppStore, body: &Value) -> 
         .unwrap_or_else(|_| PathBuf::from("."))
         .to_string_lossy()
         .to_string();
-    let result_text = transcribe_audio_tool(store, &agent, "dashboard-audio", &payload).await?;
+    let explicit_provider = payload
+        .get("providerId")
+        .or_else(|| payload.get("provider_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let prefer_local = payload
+        .get("preferLocal")
+        .or_else(|| payload.get("prefer_local"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let local_result = if !explicit_provider && prefer_local {
+        match desktop_local_command_transcribe_audio(store, "dashboard-audio", &source, &payload) {
+            Ok(Some(value)) => Some(Ok(value)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        }
+    } else {
+        None
+    };
+    let result_text = match local_result {
+        Some(Ok(value)) => value,
+        Some(Err(local_error)) => match transcribe_audio_tool(store, &agent, "dashboard-audio", &payload).await {
+            Ok(value) => value,
+            Err(provider_error) => {
+                return Err(AppError::BadRequest(format!(
+                    "Local STT failed: {local_error}; configured STT provider failed: {provider_error}. Configure SYNTHCHAT_LOCAL_STT_COMMAND or an audio-capable provider."
+                )));
+            }
+        },
+        None => transcribe_audio_tool(store, &agent, "dashboard-audio", &payload).await?,
+    };
     let result = serde_json::from_str::<Value>(&result_text).map_err(|error| {
         AppError::BadRequest(format!("Invalid transcription response: {error}"))
     })?;

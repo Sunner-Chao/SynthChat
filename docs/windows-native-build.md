@@ -4,6 +4,14 @@ SynthChat uses Tauri release builds for native Windows packaging.
 
 ## Build
 
+From the repository root, the one-click wrapper is:
+
+```powershell
+.\build-one-click.ps1
+```
+
+For double-click usage, run `build-one-click.cmd`. The wrapper auto-detects the GitHub Releases update source from `origin`, keeps WebView2 in silent `offlineInstaller` mode, calls the native build script, and copies installer artifacts into `release-dist/`.
+
 Run the preflight checks first:
 
 ```powershell
@@ -49,10 +57,21 @@ The latest release tag must be greater than the currently installed version. If 
 - Release builds use `windows_subsystem = "windows"` in `src-tauri/src/main.rs`, so the app does not open an extra console window.
 - `src-tauri/tauri.conf.json` defaults to WebView2 `offlineInstaller` with `silent: true`, which is heavier but is the desired fully native fresh-Windows mode.
 - `downloadBootstrapper` is the practical fallback when Tauri cannot finish embedding the offline WebView2 installer in the current environment.
-- `bundle.resources` explicitly includes `skills` and `public/pet`, while Vite also copies `public` into `dist` for normal frontend loading.
+- `bundle.resources` explicitly includes `skills`, `public/pet`, and `data/tts`; `data/tts/chattts_synth.py` travels with the app, while Vite also copies `public` into `dist` for normal frontend loading.
 - The About page checks either the saved manifest URL or the build-time `SYNTHCHAT_UPDATE_MANIFEST_URL`.
 - Silent replacement install is supported for `.exe`, `.msi`, and `.msix` assets. The NSIS `.exe` path uses `/S`, which Tauri NSIS installers support.
 - Windows UAC or SmartScreen may still show system prompts if the package is unsigned or requires elevation.
+
+## ChatTTS Packaging Mode
+
+SynthChat uses the lightweight recommended ChatTTS mode:
+
+- The installer bundles the SynthChat app and `data/tts/chattts_synth.py`.
+- The installer does not bundle the full `E:\SynthChat\ChatTTS` model/runtime directory.
+- ChatTTS model files, Python, `ChatTTS`, `torch`, `torchaudio`, `numpy`, and `ffmpeg` remain external user/runtime dependencies.
+- Runtime discovery checks configured paths first, then common local paths such as `ChatTTS`, `models/ChatTTS`, Tauri resource paths, and `E:\SynthChat\ChatTTS`.
+
+For a fresh Windows machine, prepare the external ChatTTS directory and Python environment separately, then set the voice reply `模型目录` / `Python 路径` in the persona settings if auto-discovery does not find them.
 
 ## Update Manifest
 

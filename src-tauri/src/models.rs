@@ -60,7 +60,8 @@ impl Default for AppConfig {
                 "typingSpeedRandomMin": 0.05,
                 "typingSpeedRandomMax": 0.1,
                 "splitByNewline": true,
-                "showTypingIndicator": true
+                "showTypingIndicator": true,
+                "typingIndicatorRefreshSeconds": 2
             }),
             web: json!({"port": 62000, "password": "", "publicEnabled": false, "publicPort": 0, "publicSecret": ""}),
             weather: json!({"defaultLocation": "", "qweatherApiHost": "", "qweatherApiKey": "", "timeoutSeconds": 15}),

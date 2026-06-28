@@ -45,6 +45,7 @@ pub(super) fn voice_status_tool(store: &AppStore, payload: &Value) -> AppResult<
         .clamp(60, 24 * 3600);
     let audio_capture = local_audio_capture_status();
     let playback = local_audio_playback_status();
+    let desktop_stt = desktop_local_stt_status();
     let recording = current_voice_recording_status_value()?;
     let tts = voice_llm_audio_provider_status(store, "text_to_speech")?;
     let stt = voice_llm_audio_provider_status(store, "transcribe_audio")?;
@@ -63,6 +64,7 @@ pub(super) fn voice_status_tool(store: &AppStore, payload: &Value) -> AppResult<
         "ttsAvailable": tts["available"],
         "audioCapture": audio_capture,
         "playback": playback,
+        "desktopLocalStt": desktop_stt,
         "recording": recording,
         "sttProvider": stt,
         "ttsProvider": tts,
@@ -555,6 +557,41 @@ fn local_audio_playback_status() -> Value {
         "available": command.is_some(),
         "command": command.unwrap_or_else(|| "none".into())
     })
+}
+
+pub(super) fn desktop_local_stt_status() -> Value {
+    let command = desktop_local_stt_command_template();
+    json!({
+        "available": command.is_some(),
+        "backend": if std::env::var("HERMES_LOCAL_STT_COMMAND").ok().or_else(|| std::env::var("SYNTHCHAT_LOCAL_STT_COMMAND").ok()).is_some() {
+            "command"
+        } else if python_module_available("faster_whisper") {
+            "faster_whisper"
+        } else if command_available("whisper") {
+            "whisper_cli"
+        } else {
+            "none"
+        },
+        "commandConfigured": std::env::var("HERMES_LOCAL_STT_COMMAND").ok().or_else(|| std::env::var("SYNTHCHAT_LOCAL_STT_COMMAND").ok()).is_some(),
+        "requirements": if command.is_some() {
+            Value::Null
+        } else {
+            json!("Configure SYNTHCHAT_LOCAL_STT_COMMAND, install faster-whisper, or install a whisper CLI.")
+        }
+    })
+}
+
+fn python_module_available(module: &str) -> bool {
+    let script = format!("import importlib.util, sys; sys.exit(0 if importlib.util.find_spec({}) else 1)", python_string_literal(module));
+    Command::new("python")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn voice_llm_audio_provider_status(store: &AppStore, capability: &str) -> AppResult<Value> {
@@ -1420,6 +1457,367 @@ pub(super) async fn text_to_speech_tool(
             "unsupported text_to_speech provider type: {other}"
         ))),
     }
+}
+
+pub(super) fn desktop_text_to_speech(
+    store: &AppStore,
+    run_id: &str,
+    text: &str,
+    payload: &Value,
+) -> AppResult<String> {
+    let mut errors = Vec::new();
+    let engine = desktop_tts_engine(payload);
+    let explicit_engine = desktop_tts_engine_explicit(payload);
+    if engine == "edge" || engine == "edge_tts" || engine == "edge-tts" {
+        let provider = desktop_voice_provider("desktop-edge-tts", "edge", "", "", 90);
+        let edge_payload = desktop_edge_tts_payload(payload);
+        return edge_text_to_speech(store, run_id, &provider, text, &edge_payload);
+    }
+    if let Some(command) = std::env::var("SYNTHCHAT_LOCAL_TTS_COMMAND")
+        .ok()
+        .or_else(|| std::env::var("HERMES_LOCAL_TTS_COMMAND").ok())
+        .filter(|value| !value.trim().is_empty())
+        .filter(|_| !explicit_engine || desktop_tts_engine_is_local_command(&engine))
+    {
+        let provider = desktop_voice_provider("desktop-local-tts", "local_command", "", &command, 180);
+        match local_command_text_to_speech(store, run_id, &provider, text, payload) {
+            Ok(value) => return Ok(value),
+            Err(error) => errors.push(format!("local command: {error}")),
+        }
+    }
+    if let Some(command) = desktop_chattts_command_template(payload) {
+        let provider = desktop_voice_provider("desktop-chattts", "local_command", "", &command, 240);
+        match local_command_text_to_speech(store, run_id, &provider, text, payload) {
+            Ok(value) => return Ok(value),
+            Err(error) => errors.push(format!("ChatTTS: {error}")),
+        }
+    }
+    let provider = desktop_voice_provider("desktop-edge-tts", "edge", "", "", 90);
+    let edge_payload = desktop_edge_tts_payload(payload);
+    match edge_text_to_speech(store, run_id, &provider, text, &edge_payload) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            errors.push(format!("Edge TTS: {error}"));
+            Err(AppError::BadRequest(format!(
+                "No desktop TTS backend succeeded: {}",
+                errors.join("; ")
+            )))
+        }
+    }
+}
+
+fn desktop_tts_engine_explicit(payload: &Value) -> bool {
+    payload
+        .get("engine")
+        .or_else(|| payload.get("provider"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn desktop_tts_engine_is_local_command(engine: &str) -> bool {
+    matches!(
+        engine,
+        "local_command"
+            | "command"
+            | "command_tts"
+            | "tts-command"
+            | "fish"
+            | "fish_tts"
+            | "fish-tts"
+            | "indextts"
+            | "index_tts"
+            | "index-tts"
+    )
+}
+
+fn desktop_tts_engine(payload: &Value) -> String {
+    payload
+        .get("engine")
+        .or_else(|| payload.get("provider"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("chattts")
+        .to_lowercase()
+}
+
+fn env_path_value(keys: &[&str]) -> Option<PathBuf> {
+    keys.iter()
+        .find_map(|key| std::env::var_os(key).filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+}
+
+fn current_exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+fn push_path_with_ancestors(paths: &mut Vec<PathBuf>, root: PathBuf) {
+    paths.push(root.clone());
+    for ancestor in root.ancestors().skip(1).take(6) {
+        paths.push(ancestor.to_path_buf());
+    }
+}
+
+fn dedupe_existing_path(path: PathBuf, seen: &mut HashSet<String>) -> Option<PathBuf> {
+    let normalized = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.clone())
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    seen.insert(normalized).then_some(path)
+}
+
+fn resolve_desktop_chattts_script() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = env_path_value(&[
+        "SYNTHCHAT_CHATTTS_SCRIPT",
+        "SYNTHCHAT_TTS_SCRIPT",
+        "HERMES_CHATTTS_SCRIPT",
+        "HERMES_TTS_SCRIPT",
+    ]) {
+        candidates.push(path);
+    }
+    let mut roots = Vec::new();
+    if let Ok(current_dir) = std::env::current_dir() {
+        push_path_with_ancestors(&mut roots, current_dir);
+    }
+    if let Some(exe_dir) = current_exe_dir() {
+        push_path_with_ancestors(&mut roots, exe_dir);
+    }
+    for root in roots {
+        candidates.push(root.join("data").join("tts").join("chattts_synth.py"));
+        candidates.push(
+            root.join("resources")
+                .join("data")
+                .join("tts")
+                .join("chattts_synth.py"),
+        );
+    }
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter_map(|path| dedupe_existing_path(path, &mut seen))
+        .find(|path| path.is_file())
+}
+
+fn payload_string(payload: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        payload
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn resolve_desktop_chattts_model_dir(payload: &Value) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(model_dir) = payload_string(payload, &["modelDir", "model_dir"]) {
+        candidates.push(PathBuf::from(model_dir));
+    }
+    if let Some(path) = env_path_value(&[
+        "SYNTHCHAT_CHATTTS_MODEL_DIR",
+        "SYNTHCHAT_TTS_MODEL_DIR",
+        "HERMES_CHATTTS_MODEL_DIR",
+        "HERMES_TTS_MODEL_DIR",
+        "CHAT_TTS_MODEL_DIR",
+        "CHATTTS_MODEL_DIR",
+    ]) {
+        candidates.push(path);
+    }
+    let mut roots = Vec::new();
+    if let Ok(current_dir) = std::env::current_dir() {
+        push_path_with_ancestors(&mut roots, current_dir);
+    }
+    if let Some(exe_dir) = current_exe_dir() {
+        push_path_with_ancestors(&mut roots, exe_dir);
+    }
+    for root in roots {
+        candidates.push(root.join("models").join("ChatTTS"));
+        candidates.push(root.join("ChatTTS"));
+        candidates.push(root.join("resources").join("models").join("ChatTTS"));
+        candidates.push(root.join("resources").join("ChatTTS"));
+    }
+    candidates.push(PathBuf::from(r"E:\SynthChat\ChatTTS"));
+
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter_map(|path| dedupe_existing_path(path, &mut seen))
+        .find(|path| path.exists())
+}
+
+fn desktop_edge_tts_payload(payload: &Value) -> Value {
+    let mut next = payload.clone();
+    let uses_chattts_scale = payload
+        .get("speedScale")
+        .or_else(|| payload.get("speed_scale"))
+        .and_then(Value::as_str)
+        .map(|value| value.eq_ignore_ascii_case("chattts"))
+        .unwrap_or(false);
+    if uses_chattts_scale {
+        if let Some(speed) = payload.get("speed").and_then(Value::as_f64) {
+            let edge_speed = (1.0 + (speed.clamp(1.0, 9.0) - 5.0) * 0.125).clamp(0.5, 1.5);
+            next["speed"] = json!(edge_speed);
+        }
+    }
+    next
+}
+
+fn desktop_voice_provider(
+    id: &str,
+    provider_type: &str,
+    model: &str,
+    base_url: &str,
+    timeout_seconds: u64,
+) -> LlmProvider {
+    let mut provider = LlmProvider::default();
+    provider.id = id.into();
+    provider.name = id.into();
+    provider.provider_type = provider_type.into();
+    provider.model = model.into();
+    provider.base_url = base_url.into();
+    provider.timeout_seconds = timeout_seconds;
+    provider.enabled = true;
+    provider
+}
+
+fn desktop_chattts_command_template(payload: &Value) -> Option<String> {
+    let engine = desktop_tts_engine(payload);
+    if !matches!(engine.as_str(), "chattts" | "chat_tts") {
+        return None;
+    }
+    let script = resolve_desktop_chattts_script()?;
+    let model_path = resolve_desktop_chattts_model_dir(payload)?;
+    let model_dir = model_path.to_string_lossy().to_string();
+    let python = payload
+        .get("pythonPath")
+        .or_else(|| payload.get("python_path"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("SYNTHCHAT_CHATTTS_PYTHON")
+                .ok()
+                .or_else(|| std::env::var("SYNTHCHAT_TTS_PYTHON").ok())
+                .or_else(|| std::env::var("HERMES_CHATTTS_PYTHON").ok())
+                .or_else(|| std::env::var("HERMES_TTS_PYTHON").ok())
+        })
+        .unwrap_or_else(|| "python".into());
+    let sample_rate = payload
+        .get("sampleRate")
+        .or_else(|| payload.get("sample_rate"))
+        .and_then(Value::as_u64)
+        .unwrap_or(24000);
+    let speed = payload
+        .get("speed")
+        .and_then(Value::as_f64)
+        .map(|value| value.round() as i64)
+        .unwrap_or(5)
+        .clamp(1, 9);
+    let oral = payload
+        .get("oral")
+        .and_then(Value::as_i64)
+        .unwrap_or(2)
+        .clamp(0, 9);
+    let laugh = payload
+        .get("laugh")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .clamp(0, 9);
+    let break_level = payload
+        .get("breakLevel")
+        .or_else(|| payload.get("break_level"))
+        .and_then(Value::as_i64)
+        .unwrap_or(4)
+        .clamp(0, 9);
+    let speaker_seed = payload
+        .get("speakerSeed")
+        .or_else(|| payload.get("speaker_seed"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let speaker_embedding = payload
+        .get("speakerEmbedding")
+        .or_else(|| payload.get("speaker_embedding"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let temperature = payload
+        .get("temperature")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.3)
+        .clamp(0.01, 2.0);
+    let top_p = payload
+        .get("topP")
+        .or_else(|| payload.get("top_p"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.7)
+        .clamp(0.01, 1.0);
+    let top_k = payload
+        .get("topK")
+        .or_else(|| payload.get("top_k"))
+        .and_then(Value::as_u64)
+        .unwrap_or(20)
+        .clamp(1, 100);
+    let refine_text_enabled = payload
+        .get("refineTextEnabled")
+        .or_else(|| payload.get("refine_text_enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let refine_prompt = payload
+        .get("refinePrompt")
+        .or_else(|| payload.get("refine_prompt"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let refine_temperature = payload
+        .get("refineTemperature")
+        .or_else(|| payload.get("refine_temperature"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.7)
+        .clamp(0.01, 2.0);
+    let speaker_seed_arg = if speaker_seed > 0 {
+        format!(" --speaker-seed {}", speaker_seed)
+    } else {
+        String::new()
+    };
+    let speaker_embedding_arg = speaker_embedding
+        .map(|value| format!(" --speaker-embedding {}", shell_quote_value(&value)))
+        .unwrap_or_default();
+    let refine_text_arg = if refine_text_enabled {
+        "--refine-text"
+    } else {
+        "--no-refine-text"
+    };
+    let refine_prompt_arg = refine_prompt
+        .map(|value| format!(" --refine-prompt {}", shell_quote_value(&value)))
+        .unwrap_or_default();
+    Some(format!(
+        "{} {} --text-file {{input_path}} --out {{output_path}} --sample-rate {} --model-dir {} --speed {} --oral {} --laugh {} --break-level {}{}{} --temperature {} --top-p {} --top-k {} {}{} --refine-temperature {} --no-silk",
+        shell_quote_value(&python),
+        shell_quote_path(&script),
+        sample_rate,
+        shell_quote_value(&model_dir),
+        speed,
+        oral,
+        laugh,
+        break_level,
+        speaker_seed_arg,
+        speaker_embedding_arg,
+        temperature,
+        top_p,
+        top_k,
+        refine_text_arg,
+        refine_prompt_arg,
+        refine_temperature
+    ))
 }
 
 pub(super) async fn openai_compatible_text_to_speech(
@@ -3491,6 +3889,143 @@ pub(super) async fn transcribe_audio_tool(
             "unsupported transcribe_audio provider type: {other}"
         ))),
     }
+}
+
+pub(super) fn desktop_local_command_transcribe_audio(
+    store: &AppStore,
+    run_id: &str,
+    source: &str,
+    payload: &Value,
+) -> AppResult<Option<String>> {
+    let Some(command_template) = desktop_local_stt_command_template() else {
+        return Ok(None);
+    };
+    let (audio_path, cleanup_path) = desktop_local_stt_source_path(source)?;
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var("SYNTHCHAT_LOCAL_STT_MODEL").ok())
+        .or_else(|| std::env::var("HERMES_LOCAL_STT_MODEL").ok())
+        .unwrap_or_else(|| "small".into());
+    let language = payload
+        .get("language")
+        .or_else(|| payload.get("lang"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var("SYNTHCHAT_LOCAL_STT_LANGUAGE").ok())
+        .or_else(|| std::env::var("HERMES_LOCAL_STT_LANGUAGE").ok())
+        .unwrap_or_else(|| "zh".into());
+    let timeout_seconds = payload
+        .get("timeoutSeconds")
+        .or_else(|| payload.get("timeout_seconds"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            std::env::var("SYNTHCHAT_LOCAL_STT_TIMEOUT_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .or_else(|| {
+            std::env::var("HERMES_LOCAL_STT_TIMEOUT_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .unwrap_or(120)
+        .max(1);
+    let output_path =
+        std::env::temp_dir().join(format!("synthchat-chat-stt-{}.txt", timestamp_millis()?));
+    let command_text = render_local_stt_command(
+        &command_template,
+        &audio_path,
+        &output_path,
+        &model,
+        &language,
+    );
+    let result = (|| {
+        let output = run_shell_command_with_timeout(&command_text, timeout_seconds)?;
+        let raw_transcript = read_local_stt_output(&output_path, &output)?;
+        let filtered = is_whisper_hallucination(&raw_transcript);
+        let transcript = if filtered {
+            String::new()
+        } else {
+            raw_transcript.clone()
+        };
+        let artifact_path = store.save_tool_artifact(run_id, "transcribe_audio", &transcript)?;
+        Ok::<_, AppError>(serde_json::to_string_pretty(&json!({
+            "success": true,
+            "provider": "desktop_local_command",
+            "providerId": "desktop-local-stt",
+            "model": model,
+            "language": language,
+            "source": audio_path.to_string_lossy(),
+            "artifactPath": artifact_path.to_string_lossy(),
+            "transcript": transcript,
+            "filtered": filtered,
+            "filteredReason": if filtered { Some("whisper_silence_hallucination") } else { None::<&str> },
+            "rawTranscript": if filtered { Some(raw_transcript) } else { None::<String> }
+        }))?)
+    })();
+    let _ = fs::remove_file(&output_path);
+    if let Some(path) = cleanup_path {
+        let _ = fs::remove_file(path);
+    }
+    result.map(Some)
+}
+
+fn desktop_local_stt_command_template() -> Option<String> {
+    std::env::var("HERMES_LOCAL_STT_COMMAND")
+        .ok()
+        .or_else(|| std::env::var("SYNTHCHAT_LOCAL_STT_COMMAND").ok())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            python_module_available("faster_whisper").then(|| {
+                let script = "from faster_whisper import WhisperModel; import pathlib, sys; audio, out, model, language = sys.argv[1:5]; whisper = WhisperModel(model or 'small', device='cpu', compute_type='int8'); segments, _ = whisper.transcribe(audio, language=(language or None), vad_filter=True); pathlib.Path(out).write_text(''.join(segment.text for segment in segments).strip(), encoding='utf-8')";
+                format!(
+                    "python -c {} {{path}} {{output_path}} {{model}} {{language}}",
+                    shell_quote_value(script)
+                )
+            })
+        })
+        .or_else(|| {
+            command_available("whisper").then(|| {
+                "whisper {path} --model {model} --language {language} --output_format txt --output_dir {output_dir}".into()
+            })
+        })
+}
+
+fn desktop_local_stt_source_path(source: &str) -> AppResult<(PathBuf, Option<PathBuf>)> {
+    let source = source.trim();
+    if source.starts_with("data:audio/") {
+        let (mime, bytes) = decode_audio_data_url(source)?;
+        ensure_transcribe_audio_size(bytes.len())?;
+        let path = std::env::temp_dir().join(format!(
+            "synthchat-chat-stt-{}.{}",
+            timestamp_millis()?,
+            audio_extension_from_mime(&mime)
+        ));
+        fs::write(&path, bytes)?;
+        return Ok((path.clone(), Some(path)));
+    }
+    if source.starts_with("file://") {
+        let path = reqwest::Url::parse(source)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+            .unwrap_or_else(|| PathBuf::from(source.trim_start_matches("file://")));
+        if path.is_file() {
+            return Ok((path, None));
+        }
+    }
+    let path = PathBuf::from(source);
+    if path.is_file() {
+        return Ok((path, None));
+    }
+    Err(AppError::BadRequest(
+        "desktop local STT requires inline audio data or a local audio file".into(),
+    ))
 }
 
 pub(super) async fn openai_compatible_transcribe_audio(

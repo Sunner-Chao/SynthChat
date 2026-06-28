@@ -50,9 +50,9 @@ let ambientStartedAt = performance.now();
 let behaviorDebugSerial = 0;
 
 const MODEL_HIT_PADDING = 28;
-const MODEL_DRAG_DELAY_MS = 180;
-const MODEL_DRAG_START_MOVE_PX = 5;
-const MODEL_TAP_CONFIRM_DELAY_MS = 360;
+const MODEL_DRAG_DELAY_MS = 90;
+const MODEL_DRAG_START_MOVE_PX = 3;
+const MODEL_TAP_CONFIRM_DELAY_MS = 300;
 const MODEL_LAYOUT_BASE_HEIGHT = 440;
 const MODEL_VERTICAL_SCALE_RATIO = 0.74;
 const MODEL_HORIZONTAL_SCALE_RATIO = 0.84;
@@ -1272,7 +1272,6 @@ canvas.addEventListener("pointercancel", (event) => {
     finishModelDrag(event.screenX, event.screenY);
 });
 canvas.addEventListener("lostpointercapture", (event) => {
-    clearTapTimer();
     finishModelDrag(event.screenX, event.screenY);
 });
 window.addEventListener("blur", () => {

@@ -155,6 +155,7 @@ export interface ReplyConfig {
   typingSpeedRandomMax: number;
   splitByNewline: boolean;
   showTypingIndicator: boolean;
+  typingIndicatorRefreshSeconds?: number;
 }
 
 export interface MomentsConfig {

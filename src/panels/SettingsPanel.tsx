@@ -3397,6 +3397,7 @@ function ReplySettings({
     typingSpeedRandomMax: number;
     splitByNewline: boolean;
     showTypingIndicator: boolean;
+    typingIndicatorRefreshSeconds?: number;
   };
   onSave: (patch: Partial<typeof config>) => Promise<void>;
 }) {
@@ -3406,6 +3407,7 @@ function ReplySettings({
   const [randomMin, setRandomMin] = useState(config.typingSpeedRandomMin);
   const [randomMax, setRandomMax] = useState(config.typingSpeedRandomMax);
   const [showTyping, setShowTyping] = useState(config.showTypingIndicator);
+  const [typingRefreshSeconds, setTypingRefreshSeconds] = useState(config.typingIndicatorRefreshSeconds ?? 2);
 
   useEffect(() => {
     setSplitByNewline(config.splitByNewline);
@@ -3414,6 +3416,7 @@ function ReplySettings({
     setRandomMin(config.typingSpeedRandomMin);
     setRandomMax(config.typingSpeedRandomMax);
     setShowTyping(config.showTypingIndicator);
+    setTypingRefreshSeconds(config.typingIndicatorRefreshSeconds ?? 2);
   }, [config]);
 
   const save = () => void onSave({
@@ -3422,7 +3425,8 @@ function ReplySettings({
     typingSpeed,
     typingSpeedRandomMin: randomMin,
     typingSpeedRandomMax: randomMax,
-    showTypingIndicator: showTyping
+    showTypingIndicator: showTyping,
+    typingIndicatorRefreshSeconds: typingRefreshSeconds
   });
 
   return (
@@ -3529,7 +3533,25 @@ function ReplySettings({
             </label>
           </div>
         </div>
-        <div className="form-hint">模型思考和回复时显示"对方正在输入"</div>
+        <div style={{ opacity: showTyping ? 1 : 0.45, pointerEvents: showTyping ? "auto" : "none" }}>
+          <div className="form-group">
+            <div className="form-row">
+              <label>续期间隔</label>
+              <div className="slider-wrap">
+                <input
+                  type="range"
+                  min={1}
+                  max={10}
+                  step={1}
+                  value={typingRefreshSeconds}
+                  onChange={(event) => setTypingRefreshSeconds(Number(event.target.value))}
+                />
+                <span className="slider-val">{typingRefreshSeconds}s</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div className="form-hint">模型思考和回复时显示"对方正在输入"，并按续期间隔刷新，直到桌面端结束“正在思考”。</div>
       </div>
     </div>
   );

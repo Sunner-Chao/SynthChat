@@ -43,7 +43,8 @@
                    "active":  true,
                    "resources":  {
                                      "../skills":  "skills",
-                                     "../public/pet":  "public/pet"
+                                     "../public/pet":  "public/pet",
+                                     "../data/tts":  "data/tts"
                                  },
                    "targets":  "all",
                    "icon":  [

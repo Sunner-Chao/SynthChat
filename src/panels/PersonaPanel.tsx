@@ -421,7 +421,7 @@ export function PersonaPanel() {
             </div>
             <div className="form-section-title" style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
               <Mic size={15} style={{ color: "var(--primary)" }} />
-              微信语音回复
+              语音回复
             </div>
 
             {/* 语音回复总开关 */}
@@ -435,7 +435,7 @@ export function PersonaPanel() {
                   }))}
                   type="checkbox"
                 />
-                <span style={{ fontWeight: 500 }}>启用语音回复</span>
+                <span style={{ fontWeight: 500 }}>语音回复启用</span>
               </label>
             </div>
 
@@ -456,6 +456,8 @@ export function PersonaPanel() {
                     }))}
                   >
                     <option value="chattts">ChatTTS</option>
+                    <option value="edge">Edge TTS</option>
+                    <option value="local_command">本地命令 / Fish / IndexTTS</option>
                   </select>
                 </label>
                 <label>
@@ -472,6 +474,9 @@ export function PersonaPanel() {
                     }))}
                   />
                 </label>
+                <p className="form-hint" style={{ marginTop: 6, marginBottom: 0, fontSize: 11 }}>
+                  轻量方案可选 Edge TTS；Fish TTS 或 IndexTTS 可通过 SYNTHCHAT_LOCAL_TTS_COMMAND 接入。
+                </p>
               </div>
               <label style={{ marginBottom: 12 }}>
                 模型目录
@@ -481,7 +486,7 @@ export function PersonaPanel() {
                     ...current,
                     voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), modelDir: event.target.value }
                   }))}
-                  placeholder="留空使用环境变量 SYNTHCHAT_TTS_MODEL_DIR"
+                  placeholder="留空使用环境变量 SYNTHCHAT_CHATTTS_MODEL_DIR"
                 />
               </label>
               <label style={{ marginBottom: 0 }}>
@@ -492,7 +497,7 @@ export function PersonaPanel() {
                     ...current,
                     voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), pythonPath: event.target.value }
                   }))}
-                  placeholder="留空使用 SYNTHCHAT_TTS_PYTHON 或 python"
+                  placeholder="留空使用 python"
                 />
               </label>
             </div>

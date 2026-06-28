@@ -10,7 +10,54 @@ import wave
 from pathlib import Path
 
 
-DEFAULT_MODEL_DIR = Path(r"D:\pro_sunner\demo_vscode\models\ChatTTS")
+LEGACY_MODEL_DIR = Path(r"D:\pro_sunner\demo_vscode\models\ChatTTS")
+
+
+def _default_model_dir() -> Path:
+    for key in (
+        "SYNTHCHAT_CHATTTS_MODEL_DIR",
+        "SYNTHCHAT_TTS_MODEL_DIR",
+        "HERMES_CHATTTS_MODEL_DIR",
+        "HERMES_TTS_MODEL_DIR",
+        "CHAT_TTS_MODEL_DIR",
+        "CHATTTS_MODEL_DIR",
+    ):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return Path(value).expanduser()
+
+    candidates: list[Path] = []
+    roots: list[Path] = []
+    try:
+        roots.append(Path.cwd().resolve())
+    except Exception:
+        roots.append(Path.cwd())
+    try:
+        roots.extend(Path(__file__).resolve().parents)
+    except Exception:
+        pass
+    for root in roots:
+        candidates.append(root / "models" / "ChatTTS")
+        candidates.append(root / "ChatTTS")
+    candidates.extend(
+        [
+            Path(r"E:\SynthChat\ChatTTS"),
+            LEGACY_MODEL_DIR,
+        ]
+    )
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.exists():
+            return candidate
+    return LEGACY_MODEL_DIR
+
+
+DEFAULT_MODEL_DIR = _default_model_dir()
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -142,7 +189,8 @@ def _write_mp3(wav_path: Path) -> Path | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--text", required=True)
+    parser.add_argument("--text", default="")
+    parser.add_argument("--text-file", default="")
     parser.add_argument("--out", required=True)
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument(
@@ -161,9 +209,18 @@ def main() -> None:
     parser.add_argument("--refine-text", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--refine-prompt", default="")
     parser.add_argument("--refine-temperature", type=float, default=0.7)
+    parser.add_argument(
+        "--silk",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also encode the generated WAV to WeChat SILK at --out.",
+    )
     args = parser.parse_args()
 
-    text = _sanitize_tts_text(args.text)
+    raw_text = args.text
+    if args.text_file:
+        raw_text = Path(args.text_file).read_text(encoding="utf-8")
+    text = _sanitize_tts_text(raw_text)
     if not text:
         _fail("text is empty")
     out_path = Path(args.out)
@@ -238,11 +295,23 @@ def main() -> None:
     except Exception as exc:
         _fail(f"ChatTTS synthesis failed: {exc}")
 
-    try:
-        from graiax import silkcoder
-        silkcoder.encode(str(wav_path), str(out_path), rate=sample_rate, tencent=True)
-    except Exception as exc:
-        _fail(f"SILK encoding failed: {exc}")
+    if args.silk:
+        try:
+            from graiax import silkcoder
+            silkcoder.encode(str(wav_path), str(out_path), rate=sample_rate, tencent=True)
+        except Exception as exc:
+            _fail(f"SILK encoding failed: {exc}")
+    else:
+        if out_path.suffix.lower() == ".wav":
+            if out_path != wav_path:
+                shutil.copyfile(wav_path, out_path)
+        else:
+            mp3_candidate = _write_mp3(wav_path)
+            if mp3_candidate:
+                if mp3_candidate.resolve() != out_path.resolve():
+                    shutil.copyfile(mp3_candidate, out_path)
+            else:
+                shutil.copyfile(wav_path, out_path)
 
     mp3_path = _write_mp3(wav_path)
     result = {

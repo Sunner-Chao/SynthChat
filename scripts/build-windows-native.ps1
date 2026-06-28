@@ -44,6 +44,7 @@ if (-not $SkipPreflight) {
   Assert-RequiredPath $TauriConfigPath "Tauri config"
   Assert-RequiredPath "public\pet\index.html" "pet static entry"
   Assert-RequiredPath "public\pet\pet.js" "pet static script"
+  Assert-RequiredPath "data\tts\chattts_synth.py" "bundled ChatTTS synthesis script"
   Assert-RequiredPath "skills" "bundled skills directory"
   Assert-RequiredPath "node_modules" "node dependencies; run npm install first"
 
@@ -53,8 +54,8 @@ if (-not $SkipPreflight) {
     throw "Expected WebView2 offlineInstaller mode for fresh Windows packaging, got '$webviewMode'."
   }
   $resourceTargets = @($config.bundle.resources.PSObject.Properties | ForEach-Object { [string]$_.Value })
-  if (($resourceTargets -notcontains "skills") -or ($resourceTargets -notcontains "public/pet")) {
-    throw "Tauri bundle.resources must include skills and public/pet."
+  if (($resourceTargets -notcontains "skills") -or ($resourceTargets -notcontains "public/pet") -or ($resourceTargets -notcontains "data/tts")) {
+    throw "Tauri bundle.resources must include skills, public/pet, and data/tts."
   }
 }
 

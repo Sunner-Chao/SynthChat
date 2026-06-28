@@ -40,6 +40,9 @@ const DEFAULT_WECHAT_CHAT_THREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
 const MIN_WECHAT_CHAT_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 const MAX_WECHAT_CHAT_THREAD_STACK_SIZE: usize = 256 * 1024 * 1024;
 const WECHAT_QR_STATUS_TIMEOUT_SECONDS: u64 = 35;
+const DEFAULT_WECHAT_TYPING_REFRESH_SECONDS: u64 = 2;
+const MIN_WECHAT_TYPING_REFRESH_SECONDS: u64 = 1;
+const MAX_WECHAT_TYPING_REFRESH_SECONDS: u64 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -111,6 +114,13 @@ pub struct WechatInboundResult {
     pub messages: Vec<Value>,
     pub delivered: bool,
     pub delivery_error: Option<String>,
+}
+
+struct WechatTypingIndicator {
+    account: AccountConfig,
+    user_id: String,
+    ticket: String,
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -492,6 +502,191 @@ fn ensure_wechat_sendmessage_ok(raw: &Value, operation: &str) -> AppResult<()> {
     Err(AppError::BadRequest(format!(
         "{operation} failed code={code}: {errmsg}"
     )))
+}
+
+fn wechat_reply_typing_indicator_enabled(store: &AppStore) -> bool {
+    store
+        .config()
+        .ok()
+        .and_then(|config| {
+            config
+                .reply
+                .get("showTypingIndicator")
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(true)
+}
+
+fn wechat_typing_refresh_seconds(store: &AppStore) -> u64 {
+    store
+        .config()
+        .ok()
+        .and_then(|config| {
+            config
+                .reply
+                .get("typingIndicatorRefreshSeconds")
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(DEFAULT_WECHAT_TYPING_REFRESH_SECONDS)
+        .clamp(MIN_WECHAT_TYPING_REFRESH_SECONDS, MAX_WECHAT_TYPING_REFRESH_SECONDS)
+}
+
+async fn get_wechat_typing_ticket(
+    account: &AccountConfig,
+    to_user_id: &str,
+    context_token: Option<&str>,
+) -> AppResult<String> {
+    let base_url = normalize_base_url(if account.login_base_url.trim().is_empty() {
+        DEFAULT_WECHAT_BASE_URL
+    } else {
+        account.login_base_url.trim()
+    })?;
+    let mut payload = json!({
+        "ilink_user_id": to_user_id,
+        "to_user_id": to_user_id,
+        "base_info": wechat_base_info()
+    });
+    if let Some(token) = context_token
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        payload["context_token"] = Value::String(token.to_string());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|error| wechat_http_error("failed to create wechat typing HTTP client", error))?;
+    let raw: Value = client
+        .post(format!("{base_url}/ilink/bot/getconfig"))
+        .headers(ilink_headers_with_token(&account.bot_token)?)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| wechat_http_error("failed to request wechat typing config", error))?
+        .error_for_status()
+        .map_err(|error| wechat_http_error("wechat getconfig endpoint returned an error", error))?
+        .json()
+        .await
+        .map_err(|error| wechat_http_error("failed to read wechat typing config response", error))?;
+    ensure_wechat_sendmessage_ok(&raw, "getTypingConfig")?;
+    first_value_string(
+        &raw,
+        &[
+            &["typing_ticket"],
+            &["typingTicket"],
+            &["data", "typing_ticket"],
+            &["data", "typingTicket"],
+        ],
+    )
+    .filter(|ticket| !ticket.trim().is_empty())
+    .ok_or_else(|| AppError::BadRequest("wechat getconfig did not return typing_ticket".into()))
+}
+
+async fn send_wechat_typing_status(
+    account: &AccountConfig,
+    to_user_id: &str,
+    typing_ticket: &str,
+    status: i64,
+) -> AppResult<()> {
+    let base_url = normalize_base_url(if account.login_base_url.trim().is_empty() {
+        DEFAULT_WECHAT_BASE_URL
+    } else {
+        account.login_base_url.trim()
+    })?;
+    let payload = json!({
+        "ilink_user_id": to_user_id,
+        "to_user_id": to_user_id,
+        "typing_ticket": typing_ticket,
+        "status": status,
+        "base_info": wechat_base_info()
+    });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|error| wechat_http_error("failed to create wechat typing HTTP client", error))?;
+    let raw: Value = client
+        .post(format!("{base_url}/ilink/bot/sendtyping"))
+        .headers(ilink_headers_with_token(&account.bot_token)?)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| wechat_http_error("failed to send wechat typing status", error))?
+        .error_for_status()
+        .map_err(|error| wechat_http_error("wechat sendtyping endpoint returned an error", error))?
+        .json()
+        .await
+        .map_err(|error| wechat_http_error("failed to read wechat typing response", error))?;
+    ensure_wechat_sendmessage_ok(&raw, "sendTyping")?;
+    Ok(())
+}
+
+async fn start_wechat_typing_indicator(
+    store: &AppStore,
+    account: &AccountConfig,
+    to_user_id: &str,
+    context_token: Option<&str>,
+) -> Option<WechatTypingIndicator> {
+    if !wechat_reply_typing_indicator_enabled(store) {
+        return None;
+    }
+    let refresh_seconds = wechat_typing_refresh_seconds(store);
+    match get_wechat_typing_ticket(account, to_user_id, context_token).await {
+        Ok(ticket) => {
+            if let Err(error) = send_wechat_typing_status(account, to_user_id, &ticket, 1).await {
+                eprintln!("SynthChat wechat typing start failed: {error}");
+                return None;
+            }
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let keepalive_account = account.clone();
+            let keepalive_user_id = to_user_id.to_string();
+            let keepalive_ticket = ticket.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(Duration::from_secs(refresh_seconds));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = &mut stop_rx => break,
+                        _ = ticker.tick() => {
+                            if let Err(error) = send_wechat_typing_status(
+                                &keepalive_account,
+                                &keepalive_user_id,
+                                &keepalive_ticket,
+                                1,
+                            ).await {
+                                eprintln!("SynthChat wechat typing refresh failed: {error}");
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            Some(WechatTypingIndicator {
+                account: account.clone(),
+                user_id: to_user_id.to_string(),
+                ticket,
+                stop_tx: Some(stop_tx),
+            })
+        }
+        Err(error) => {
+            eprintln!("SynthChat wechat typing config failed: {error}");
+            None
+        }
+    }
+}
+
+async fn stop_wechat_typing_indicator(typing: Option<WechatTypingIndicator>) {
+    let Some(mut typing) = typing else {
+        return;
+    };
+    if let Some(stop_tx) = typing.stop_tx.take() {
+        let _ = stop_tx.send(());
+    }
+    if let Err(error) =
+        send_wechat_typing_status(&typing.account, &typing.user_id, &typing.ticket, 2).await
+    {
+        eprintln!("SynthChat wechat typing stop failed: {error}");
+    }
 }
 
 fn wechat_client_id() -> String {
@@ -3176,6 +3371,8 @@ pub async fn wechat_inbound_text_with_extras(
     )?;
     emit_wechat_user_message(app, &conversation_id, &persona.id, &user_message);
     emit_wechat_processing(app, &conversation_id, &persona.id, true);
+    let typing_indicator =
+        start_wechat_typing_indicator(store, &account, &user_id, context_token.as_deref()).await;
     let request_provider_data =
         wechat_provider_data_with_pre_persisted_user(provider_data.clone(), &user_message);
     let messages_result = run_wechat_chat_turn(
@@ -3195,6 +3392,7 @@ pub async fn wechat_inbound_text_with_extras(
         Ok(messages) => messages,
         Err(error) => {
             emit_wechat_processing(app, &conversation_id, &persona.id, false);
+            stop_wechat_typing_indicator(typing_indicator).await;
             return Err(error);
         }
     };
@@ -3237,6 +3435,7 @@ pub async fn wechat_inbound_text_with_extras(
         .unwrap_or_default();
     let (delivered, delivery_error) =
         dispatch_reply_to_wechat(&account, &user_id, &reply, context_token.as_deref()).await;
+    stop_wechat_typing_indicator(typing_indicator).await;
     Ok(WechatInboundResult {
         messages: messages
             .into_iter()

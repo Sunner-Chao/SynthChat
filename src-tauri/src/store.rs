@@ -2543,6 +2543,50 @@ mod tests {
     }
 
     #[test]
+    fn reload_from_disk_preserves_internal_subagent_bootstrap_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "synthchat-internal-subagent-reload-{}",
+            new_id("state")
+        ));
+        let path = dir.join("state.json");
+        let store = AppStore::new(path.clone()).unwrap();
+        let persona = store.persona(None).unwrap();
+        let conversation = store
+            .create_internal_subagent_conversation(
+                Some("bootstrap child".into()),
+                Some(persona.id.clone()),
+                "run-parent",
+                1,
+                "synthchat",
+            )
+            .unwrap();
+        let message = store
+            .append_message(ChatMessage::new(
+                conversation.id.clone(),
+                "user",
+                "bootstrap task".into(),
+                "desktop-subagent",
+            ))
+            .unwrap();
+
+        let stale_disk_state = PersistedState::default();
+        fs::write(&path, serde_json::to_vec_pretty(&stale_disk_state).unwrap()).unwrap();
+
+        store.reload_from_disk().unwrap();
+
+        assert_eq!(
+            store.conversation(&conversation.id).unwrap().id,
+            conversation.id
+        );
+        assert_eq!(
+            store.messages(&conversation.id, None).unwrap()[0].content,
+            message.content
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn reload_from_disk_preserves_in_memory_active_run() {
         let dir =
             std::env::temp_dir().join(format!("synthchat-active-run-reload-{}", new_id("state")));
@@ -5290,6 +5334,9 @@ fn normalize_persisted_config(state: &mut PersistedState) {
     }
     state.config.chat.llm_credential_pool_strategy =
         normalize_credential_pool_strategy(&state.config.chat.llm_credential_pool_strategy).into();
+    if state.config.reply.get("typingIndicatorRefreshSeconds").is_none() {
+        state.config.reply["typingIndicatorRefreshSeconds"] = json!(2);
+    }
 }
 
 fn import_legacy_v0_personas_if_needed(state: &mut PersistedState) -> AppResult<bool> {
@@ -5882,6 +5929,12 @@ fn merge_runtime_state_for_reload(state: &mut PersistedState, current: &Persiste
     for trace in &current.tool_router_traces {
         if protected_conversation_ids.contains(&trace.conversation_id) {
             upsert_tool_router_trace(&mut state.tool_router_traces, trace.clone());
+        }
+    }
+
+    for conversation in &current.conversations {
+        if conversation_is_internal_subagent(conversation) {
+            protected_conversation_ids.insert(conversation.id.clone());
         }
     }
 

@@ -322,6 +322,16 @@ function renderTextForMessage(content: string) {
     .trim();
 }
 
+function speechTextForMessage(content: string) {
+  return renderTextForMessage(plainText(content))
+    .replace(/\[\[audio_as_voice\]\]/gi, "")
+    .split(/\r?\n/)
+    .filter((line) => !isMediaDirectiveLine(line))
+    .join("\n")
+    .replace(/```[\s\S]*?```/g, "")
+    .trim();
+}
+
 function displayTextForMessage(content: string) {
   return stripToolDirectiveBlocks(content)
     .split(/\r?\n/)
@@ -906,6 +916,9 @@ export const ChatExperience = memo(function ChatExperience() {
   const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const voiceChunksRef = useRef<Blob[]>([]);
+  const voiceAudioRef = useRef<HTMLAudioElement | null>(null);
+  const spokenAssistantMessageIdsRef = useRef<Set<string>>(new Set());
+  const activeVoiceReplyRequestRef = useRef<string | null>(null);
   const sendingRef = useRef(false);
   const [isNearBottom, setIsNearBottom] = useState(true);
   const [unreadCount, setUnreadCount] = useState(0);
@@ -1376,9 +1389,11 @@ export const ChatExperience = memo(function ChatExperience() {
 
   useEffect(() => {
     if (activeSection === "chat") return;
+    activeVoiceReplyRequestRef.current = null;
     for (const message of messages) {
       if (message.role === "assistant") {
         notifiedAssistantMessageIdsRef.current.add(message.id);
+        spokenAssistantMessageIdsRef.current.add(message.id);
       }
     }
   }, [activeSection, messages]);
@@ -1434,6 +1449,80 @@ export const ChatExperience = memo(function ChatExperience() {
   const scrollRestoreTargetRef = useRef<{ conversationId: string; memory: ConversationScrollMemory } | null>(null);
   const conversationActivatedAtRef = useRef<number>(Date.now());
   const notifiedAssistantMessageIdsRef = useRef<Set<string>>(new Set());
+
+  const stopVoicePlayback = useCallback(() => {
+    const audio = voiceAudioRef.current;
+    if (audio) {
+      audio.pause();
+      audio.src = "";
+      voiceAudioRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => () => stopVoicePlayback(), [stopVoicePlayback]);
+
+  useEffect(() => {
+    if (activeSection === "chat") return;
+    activeVoiceReplyRequestRef.current = null;
+    stopVoicePlayback();
+  }, [activeSection, stopVoicePlayback]);
+
+  useEffect(() => {
+    if (activeConversationPersona?.voiceReply?.enabled) return;
+    activeVoiceReplyRequestRef.current = null;
+    stopVoicePlayback();
+  }, [activeConversationPersona?.voiceReply?.enabled, stopVoicePlayback]);
+
+  const speakAssistantReply = useCallback(async (message: ChatMessage) => {
+    const voiceReply = activeConversationPersona?.voiceReply;
+    if (!voiceReply?.enabled) return;
+    const text = speechTextForMessage(message.content);
+    if (!text) return;
+    const requestKey = `${message.id}:${message.content.length}`;
+    activeVoiceReplyRequestRef.current = requestKey;
+    setComposerError(null);
+    try {
+      const result = await api.speakChatText(text, {
+        format: "wav",
+        engine: voiceReply.engine || undefined,
+        speedScale: "chattts",
+        speed: voiceReply.speed,
+        modelDir: voiceReply.modelDir || undefined,
+        pythonPath: voiceReply.pythonPath || undefined,
+        sampleRate: voiceReply.sampleRate,
+        oral: voiceReply.oral,
+        laugh: voiceReply.laugh,
+        breakLevel: voiceReply.breakLevel,
+        speakerSeed: voiceReply.speakerSeed,
+        speakerEmbedding: voiceReply.speakerEmbedding || undefined,
+        temperature: voiceReply.temperature,
+        topP: voiceReply.topP,
+        topK: voiceReply.topK,
+        refineTextEnabled: voiceReply.refineTextEnabled,
+        refinePrompt: voiceReply.refinePrompt || undefined,
+        refineTemperature: voiceReply.refineTemperature
+      });
+      const dataUrl = String(result?.dataUrl ?? "");
+      if (!dataUrl) throw new Error("TTS 没有返回音频。");
+      if (activeVoiceReplyRequestRef.current !== requestKey) return;
+      stopVoicePlayback();
+      const audio = new Audio(dataUrl);
+      voiceAudioRef.current = audio;
+      audio.onended = () => {
+        if (voiceAudioRef.current === audio) voiceAudioRef.current = null;
+      };
+      audio.onerror = () => {
+        if (activeVoiceReplyRequestRef.current === requestKey) {
+          setComposerError("语音播放失败。");
+        }
+      };
+      await audio.play();
+    } catch (error) {
+      if (activeVoiceReplyRequestRef.current === requestKey) {
+        setComposerError(composerErrorText(error));
+      }
+    }
+  }, [activeConversationPersona?.voiceReply, stopVoicePlayback]);
 
   const getScrollAnchor = useCallback((element: HTMLDivElement): ConversationScrollMemory => {
     const base: ConversationScrollMemory = { top: element.scrollTop };
@@ -1549,6 +1638,8 @@ export const ChatExperience = memo(function ChatExperience() {
     if (activeConversationId !== prevConversationIdRef.current) {
       prevConversationIdRef.current = activeConversationId;
       conversationActivatedAtRef.current = Date.now();
+      activeVoiceReplyRequestRef.current = null;
+      stopVoicePlayback();
       setUnreadCount(0);
       setIsNearBottom(true);
       nearBottomRef.current = true;
@@ -1559,7 +1650,7 @@ export const ChatExperience = memo(function ChatExperience() {
         ? { conversationId: activeConversationId, memory: savedPosition }
         : null;
     }
-  }, [activeConversationId]);
+  }, [activeConversationId, stopVoicePlayback]);
 
   useEffect(() => {
     const previousSection = prevActiveSectionRef.current;
@@ -1668,6 +1759,27 @@ export const ChatExperience = memo(function ChatExperience() {
       setUnreadCount((c) => c + 1);
     }
   }, [activeConversationId, activeSection, bottomFollowThresholdPx, incrementConversationUnread, lastMessage, markConversationRead, scrollToBottom]);
+
+  useEffect(() => {
+    if (!activeConversationId || !lastMessage) return;
+    if (activeSection !== "chat") return;
+    if (scrollOnNextMessagesRef.current) return;
+    if (!activeConversationPersona?.voiceReply?.enabled) return;
+    if (isProcessing || hasStreamingContent) return;
+    if (lastMessage.role !== "assistant" || lastMessage.source === "desktop-stream") return;
+    if (spokenAssistantMessageIdsRef.current.has(lastMessage.id)) return;
+    const createdAt = new Date(lastMessage.createdAt).getTime();
+    if (!Number.isFinite(createdAt) || createdAt < conversationActivatedAtRef.current) {
+      spokenAssistantMessageIdsRef.current.add(lastMessage.id);
+      return;
+    }
+    if (!speechTextForMessage(lastMessage.content)) {
+      spokenAssistantMessageIdsRef.current.add(lastMessage.id);
+      return;
+    }
+    spokenAssistantMessageIdsRef.current.add(lastMessage.id);
+    void speakAssistantReply(lastMessage);
+  }, [activeConversationId, activeConversationPersona?.voiceReply?.enabled, activeSection, hasStreamingContent, isProcessing, lastMessage, speakAssistantReply]);
 
   useEffect(() => () => {
     saveCurrentScrollPosition(activeConversationId);
@@ -1991,7 +2103,14 @@ export const ChatExperience = memo(function ChatExperience() {
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
+      const preferredMimeType = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/ogg;codecs=opus"
+      ].find((mimeType) => MediaRecorder.isTypeSupported?.(mimeType));
+      const recorder = preferredMimeType
+        ? new MediaRecorder(stream, { mimeType: preferredMimeType })
+        : new MediaRecorder(stream);
       voiceChunksRef.current = [];
       mediaRecorderRef.current = recorder;
       recorder.ondataavailable = (event) => {
