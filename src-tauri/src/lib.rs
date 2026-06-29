@@ -1276,7 +1276,7 @@ fn save_persona(
     normalize_persona_string(
         &mut persona.voice_reply,
         "modelDir",
-        r"D:\pro_sunner\demo_vscode\models\ChatTTS",
+        r"E:\SynthChat\ChatTTS",
     );
     normalize_persona_string(&mut persona.voice_reply, "speakerEmbedding", "");
     normalize_persona_string(&mut persona.voice_reply, "refinePrompt", "");
@@ -5373,6 +5373,7 @@ pub fn run() {
     let store = AppStore::new(state_path()).expect("failed to initialize SynthChat state");
     sync_runtime_env_from_store(&store);
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(store)
         .manage(Mutex::new(PetDragState::default()))
         .manage(Mutex::new(PetVisionState::default()))

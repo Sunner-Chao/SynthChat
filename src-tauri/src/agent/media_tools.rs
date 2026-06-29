@@ -5773,6 +5773,11 @@ fn read_command_pipe(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle
     })
 }
 
+#[cfg(target_os = "windows")]
+fn escape_windows_batch_script(command_text: &str) -> String {
+    command_text.replace('%', "%%")
+}
+
 fn run_shell_command_with_timeout(command_text: &str, timeout_seconds: u64) -> AppResult<String> {
     #[cfg(target_os = "windows")]
     let script_path = {
@@ -5780,7 +5785,8 @@ fn run_shell_command_with_timeout(command_text: &str, timeout_seconds: u64) -> A
             "synthchat-local-audio-{}.cmd",
             timestamp_millis()?
         ));
-        fs::write(&path, format!("@echo off\r\n{command_text}\r\n"))?;
+        let command_script = escape_windows_batch_script(command_text);
+        fs::write(&path, format!("@echo off\r\n{command_script}\r\n"))?;
         Some(path)
     };
     #[cfg(not(target_os = "windows"))]

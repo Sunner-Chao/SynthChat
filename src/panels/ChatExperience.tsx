@@ -2315,8 +2315,8 @@ export const ChatExperience = memo(function ChatExperience() {
   };
 
   const copyMessage = async (message: ChatMessage) => {
-    const content = await api.getMessageContent(message.id).catch(() => message.content);
-    await navigator.clipboard?.writeText(displayTextForMessage(content.trim()));
+    const text = displayTextForMessage(message.content.trim());
+    if (text) await navigator.clipboard?.writeText(text);
     setCopiedMessageId(message.id);
     window.setTimeout(() => setCopiedMessageId(null), 1200);
   };

@@ -828,6 +828,27 @@ function behaviorPose(name, progress, options = {}) {
             ParamMouthOpenY: 0.08 * wave
         };
     }
+    if (name === "speaking") {
+        const envelope = Math.sin(progress * Math.PI);
+        const mouthPulse = Math.pow(Math.abs(Math.sin(progress * Math.PI * 16)), 0.72);
+        const mouthWave = (0.08 + mouthPulse * 0.56) * Math.max(0.18, envelope);
+        const syllableWave = Math.sin(progress * Math.PI * 8);
+        return {
+            ParamBodyAngleX: doubleWave * 2.2,
+            ParamBodyAngleY: 2.8 * wave,
+            ParamBodyAngleZ: smallWave * 1.2,
+            ParamAngleX: doubleWave * 3.2,
+            ParamAngleY: 2.4 * wave,
+            ParamEyeLOpen: 1 - 0.08 * wave,
+            ParamEyeROpen: 1 - 0.08 * wave,
+            ParamBrowLY: 0.12 * wave,
+            ParamBrowRY: 0.12 * wave,
+            ParamMouthOpenY: mouthWave,
+            ParamMouthForm: 0.18 * syllableWave,
+            ParamCheek: 0.12 * wave,
+            ParamBreath: 0.45 + 0.34 * wave
+        };
+    }
     if (name === "shy") {
         return {
             ParamBodyAngleX: doubleWave * 4,

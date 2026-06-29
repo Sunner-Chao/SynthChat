@@ -1,4 +1,5 @@
 import { convertFileSrc as tauriConvertFileSrc, invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type {
   ActionResult,
   AddHermesCredentialPoolEntryRequest,
@@ -1005,8 +1006,25 @@ export const api: Record<string, any> = {
     call<Persona>("clear_persona_avatar", { personaId }, () => ({ ...defaultPersona, id: personaId, avatarPath: "" })),
   importThemeCss: async () => [],
   exportThemesCss: async () => "",
-  pickFile: async () => null,
-  pickFolder: async () => null,
+  pickFile: async (title?: string, filterName?: string, extensions?: string[]) => {
+    if (!isTauri()) return null;
+    const selected = await openDialog({
+      title,
+      multiple: false,
+      directory: false,
+      filters: extensions?.length ? [{ name: filterName || "Files", extensions }] : undefined
+    });
+    return typeof selected === "string" ? selected : null;
+  },
+  pickFolder: async (title?: string) => {
+    if (!isTauri()) return null;
+    const selected = await openDialog({
+      title,
+      multiple: false,
+      directory: true
+    });
+    return typeof selected === "string" ? selected : null;
+  },
   installDocker: async () => ok(),
   startDockerDesktop: async () => ok(),
   setupWsl2: async () => ok(),

@@ -2078,6 +2078,26 @@ async fn send_wechat_voice_message_with_retry(
     }
 }
 
+async fn send_wechat_voice_reply_artifact_with_retry(
+    account: &AccountConfig,
+    to_user_id: &str,
+    audio_path: &str,
+    output_format: &str,
+    context_token: Option<&str>,
+) -> AppResult<Value> {
+    let extension = Path::new(audio_path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or(output_format)
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    if output_format.eq_ignore_ascii_case("silk") || extension == "silk" {
+        return send_wechat_voice_message_with_retry(account, to_user_id, audio_path, context_token)
+            .await;
+    }
+    send_wechat_file_message_with_retry(account, to_user_id, audio_path, context_token).await
+}
+
 async fn download_wechat_cdn_media(
     client: &reqwest::Client,
     media: &Value,
@@ -3250,7 +3270,7 @@ async fn dispatch_reply_to_wechat(
     let auto_voice_requested = voice_paths.is_empty()
         && !mobile_text.trim().is_empty()
         && persona.is_some_and(voice_reply_enabled);
-    if voice_paths.is_empty() && !mobile_text.trim().is_empty() {
+    if !auto_voice_requested && voice_paths.is_empty() && !mobile_text.trim().is_empty() {
         if let Some(persona) = persona {
             match synthesize_wechat_voice_reply(store, persona, &mobile_text).await {
                 Ok(Some(path)) => voice_paths.push(path),
@@ -3275,8 +3295,35 @@ async fn dispatch_reply_to_wechat(
     }
     let mut voice_errors = Vec::new();
     let mut voice_delivered = false;
+    if auto_voice_requested && voice_paths.is_empty() {
+        if let Some(persona) = persona {
+            let (delivered, mut fallback_errors) =
+                synthesize_and_send_wechat_voice_reply_with_fallback(
+                    store,
+                    persona,
+                    account,
+                    user_id,
+                    &mobile_text,
+                    context_token,
+                )
+                .await;
+            voice_delivered |= delivered;
+            voice_errors.append(&mut fallback_errors);
+        }
+    }
     for voice_path in &voice_paths {
-        match send_wechat_voice_message_with_retry(account, user_id, voice_path, context_token).await
+        let output_format = Path::new(voice_path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("wav");
+        match send_wechat_voice_reply_artifact_with_retry(
+            account,
+            user_id,
+            voice_path,
+            output_format,
+            context_token,
+        )
+        .await
         {
             Ok(_) => voice_delivered = true,
             Err(error) => voice_errors.push(format!("语音发送失败 {voice_path}: {error}")),
@@ -3339,13 +3386,41 @@ fn voice_reply_enabled(persona: &Persona) -> bool {
 fn wechat_voice_reply_toggle_command(text: &str) -> Option<bool> {
     let normalized = text
         .trim()
-        .trim_matches(|ch: char| ch.is_ascii_punctuation() || ch.is_whitespace())
-        .replace(char::is_whitespace, "");
+        .trim_matches(|ch: char| {
+            ch.is_ascii_punctuation()
+                || ch.is_whitespace()
+                || matches!(ch, '。' | '，' | '、' | '！' | '？' | '；' | '：' | '“' | '”' | '‘' | '’' | '《' | '》')
+        })
+        .chars()
+        .filter(|ch| {
+            !ch.is_whitespace()
+                && !ch.is_ascii_punctuation()
+                && !matches!(ch, '。' | '，' | '、' | '！' | '？' | '；' | '：' | '“' | '”' | '‘' | '’' | '《' | '》')
+        })
+        .collect::<String>();
     match normalized.as_str() {
-        "开启语音回复" | "打开语音回复" | "启用语音回复" | "语音回复开启" | "语音回复打开" => {
+        "开启语音回复"
+        | "打开语音回复"
+        | "启用语音回复"
+        | "语音回复开启"
+        | "语音回复打开"
+        | "开启微信语音回复"
+        | "打开微信语音回复"
+        | "启用微信语音回复"
+        | "微信语音回复开启"
+        | "微信语音回复打开" => {
             Some(true)
         }
-        "关闭语音回复" | "关掉语音回复" | "禁用语音回复" | "语音回复关闭" | "语音回复关掉" => {
+        "关闭语音回复"
+        | "关掉语音回复"
+        | "禁用语音回复"
+        | "语音回复关闭"
+        | "语音回复关掉"
+        | "关闭微信语音回复"
+        | "关掉微信语音回复"
+        | "禁用微信语音回复"
+        | "微信语音回复关闭"
+        | "微信语音回复关掉" => {
             Some(false)
         }
         _ => None,
@@ -3463,20 +3538,21 @@ fn voice_reply_payload(persona: &Persona, text: &str) -> Option<Value> {
     Some(payload)
 }
 
-async fn synthesize_wechat_voice_reply(
+fn wechat_voice_reply_formats() -> [&'static str; 3] {
+    ["silk", "wav", "mp3"]
+}
+
+async fn synthesize_wechat_voice_reply_with_format(
     store: &AppStore,
     persona: &Persona,
     text: &str,
+    output_format: &str,
 ) -> AppResult<Option<String>> {
-    let Some(payload) = voice_reply_payload(persona, text) else {
+    let Some(mut payload) = voice_reply_payload(persona, text) else {
         return Ok(None);
     };
+    payload["format"] = json!(output_format);
     let result = agent::text_to_speech_payload_for_desktop(store, &payload).await?;
-    let actual_format = first_value_string(&result, &[&["actualFormat"], &["format"]])
-        .unwrap_or_default()
-        .trim()
-        .trim_start_matches('.')
-        .to_ascii_lowercase();
     let path = first_value_string(
         &result,
         &[
@@ -3489,28 +3565,62 @@ async fn synthesize_wechat_voice_reply(
     )
     .filter(|value| PathBuf::from(value).is_file())
     .ok_or_else(|| AppError::BadRequest("TTS did not return a readable audio artifact".into()))?;
-    let path_format = Path::new(&path)
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .trim_start_matches('.')
-        .to_ascii_lowercase();
-    if actual_format != "silk" && path_format != "silk" {
-        let conversion_reason = result
-            .get("conversion")
-            .and_then(|conversion| conversion.get("reason"))
-            .and_then(Value::as_str)
-            .unwrap_or("TTS did not produce a WeChat SILK voice artifact");
-        return Err(AppError::BadRequest(format!(
-            "微信语音回复需要 SILK 音频，但 TTS 实际输出为 {}: {conversion_reason}",
-            if actual_format.is_empty() {
-                path_format.as_str()
-            } else {
-                actual_format.as_str()
-            }
-        )));
-    }
     Ok(Some(path))
+}
+
+async fn synthesize_wechat_voice_reply(
+    store: &AppStore,
+    persona: &Persona,
+    text: &str,
+) -> AppResult<Option<String>> {
+    let mut errors = Vec::new();
+    for output_format in wechat_voice_reply_formats() {
+        match synthesize_wechat_voice_reply_with_format(store, persona, text, output_format).await {
+            Ok(Some(path)) => return Ok(Some(path)),
+            Ok(None) => return Ok(None),
+            Err(error) => errors.push(format!("{output_format}: {error}")),
+        }
+    }
+    Err(AppError::BadRequest(format!(
+        "No desktop TTS backend succeeded for WeChat voice reply: {}",
+        errors.join("; ")
+    )))
+}
+
+async fn synthesize_and_send_wechat_voice_reply_with_fallback(
+    store: &AppStore,
+    persona: &Persona,
+    account: &AccountConfig,
+    user_id: &str,
+    text: &str,
+    context_token: Option<&str>,
+) -> (bool, Vec<String>) {
+    let mut errors = Vec::new();
+    for output_format in wechat_voice_reply_formats() {
+        match synthesize_wechat_voice_reply_with_format(store, persona, text, output_format).await {
+            Ok(Some(path)) => {
+                match send_wechat_voice_reply_artifact_with_retry(
+                    account,
+                    user_id,
+                    &path,
+                    output_format,
+                    context_token,
+                )
+                .await
+                {
+                    Ok(_) => return (true, errors),
+                    Err(error) => {
+                        errors.push(format!(
+                            "wechat audio delivery failed {output_format} {path}: {error}"
+                        ));
+                    }
+                }
+            }
+            Ok(None) => return (false, errors),
+            Err(error) => errors.push(format!("wechat voice synthesis failed {output_format}: {error}")),
+        }
+    }
+    (false, errors)
 }
 
 pub async fn wechat_poll_once(
@@ -4237,7 +4347,7 @@ pub fn dispatch_desktop_reply_to_wechat(
         let auto_voice_requested = voice_paths.is_empty()
             && !mobile_text.trim().is_empty()
             && persona.as_ref().is_some_and(voice_reply_enabled);
-        if voice_paths.is_empty() && !mobile_text.trim().is_empty() {
+        if !auto_voice_requested && voice_paths.is_empty() && !mobile_text.trim().is_empty() {
             if let Some(persona) = persona.as_ref() {
                 match synthesize_wechat_voice_reply(&store, persona, &mobile_text).await {
                     Ok(Some(path)) => voice_paths.push(path),
@@ -4255,8 +4365,35 @@ pub fn dispatch_desktop_reply_to_wechat(
         }
         let mut voice_errors = Vec::new();
         let mut voice_delivered = false;
+        if auto_voice_requested && voice_paths.is_empty() {
+            if let Some(persona) = persona.as_ref() {
+                let (delivered, mut fallback_errors) =
+                    synthesize_and_send_wechat_voice_reply_with_fallback(
+                        &store,
+                        persona,
+                        &account,
+                        &user_id,
+                        &mobile_text,
+                        token,
+                    )
+                    .await;
+                voice_delivered |= delivered;
+                voice_errors.append(&mut fallback_errors);
+            }
+        }
         for voice_path in &voice_paths {
-            match send_wechat_voice_message_with_retry(&account, &user_id, voice_path, token).await
+            let output_format = Path::new(voice_path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("wav");
+            match send_wechat_voice_reply_artifact_with_retry(
+                &account,
+                &user_id,
+                voice_path,
+                output_format,
+                token,
+            )
+            .await
             {
                 Ok(_) => voice_delivered = true,
                 Err(error) => voice_errors.push(format!("语音发送失败 {voice_path}: {error}")),
@@ -4455,6 +4592,8 @@ mod tests {
         assert_eq!(wechat_voice_reply_toggle_command("开启语音回复"), Some(true));
         assert_eq!(wechat_voice_reply_toggle_command("关闭语音回复"), Some(false));
         assert_eq!(wechat_voice_reply_toggle_command("  语音回复开启  "), Some(true));
+        assert_eq!(wechat_voice_reply_toggle_command("开启微信语音回复！"), Some(true));
+        assert_eq!(wechat_voice_reply_toggle_command("微信语音回复，关闭。"), Some(false));
         assert_eq!(wechat_voice_reply_toggle_command("不相关内容"), None);
     }
 

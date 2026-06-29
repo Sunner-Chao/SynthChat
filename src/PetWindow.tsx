@@ -46,6 +46,15 @@ const PET_STARTUP_MIN_VISIBLE_MS = 5600;
 const PET_STARTUP_MAX_VISIBLE_MS = 8600;
 const PET_STARTUP_EXIT_MS = 920;
 const PET_STARTUP_REVEAL_AFTER_EXIT_MS = 180;
+const PET_CLOUD_STREAM_INTERVAL_MS = 34;
+const PET_TTS_SEGMENT_MIN_CHARS = 12;
+const PET_TTS_SEGMENT_TARGET_CHARS = 44;
+const PET_TTS_SEGMENT_MAX_CHARS = 78;
+const PET_TTS_STREAM_MIN_CHARS = 6;
+const PET_TTS_STREAM_TARGET_CHARS = 18;
+const PET_TTS_STREAM_MAX_CHARS = 32;
+const PET_TTS_STRONG_PUNCTUATION = /[。！？!?；;]/;
+const PET_TTS_SOFT_PUNCTUATION = /[，,、：:]/;
 
 const AVAILABLE_MODELS = [
   { id: "tororo", name: "Tororo", path: "/pet/model/Tororo/tororo.model3.json", greeting: "Tororo 到啦。", headX: 0.5, headY: 0.24, tailGap: 28 },
@@ -200,11 +209,25 @@ type PetDragInertiaSnapshot = {
 
 type PetDockEdge = "left" | "right";
 type PetWindowMode = "model" | "orb";
-type PetBehaviorName = "idle" | "thinking" | "happy" | "stretch" | "error" | "curious" | "shy" | "sleepy" | "wave" | "nod" | "proud" | "listening" | "surprise";
+type PetBehaviorName = "idle" | "thinking" | "happy" | "stretch" | "error" | "curious" | "shy" | "sleepy" | "wave" | "nod" | "proud" | "listening" | "speaking" | "surprise";
 
 type PetAssistantMirrorState = {
   messageId: string;
   signature: string;
+};
+
+type PetAssistantStreamRuntime = {
+  conversationId: string;
+  messageId: string;
+  requestKey: string;
+  bubbleId: string;
+  tone: PetCloudBubble["tone"];
+  attachments?: PetCloudBubble["attachments"];
+  text: string;
+  ttsBuffer: string;
+  ttsQueue: string[];
+  ttsRunning: boolean;
+  finalized: boolean;
 };
 
 function formatCloudText(text: string) {
@@ -216,6 +239,113 @@ function formatCloudText(text: string) {
     .trim();
   if (!normalized) return "";
   return normalized.length > 360 ? `${normalized.slice(0, 360)}...` : normalized;
+}
+
+function splitPetSpeechSegments(text: string) {
+  const normalized = sanitizeSpeechText(text).replace(/\s+/g, " ").trim();
+  if (!normalized) return [];
+  const segments: string[] = [];
+  let buffer = "";
+
+  const pushBuffer = () => {
+    const value = buffer.trim();
+    buffer = "";
+    if (!value) return;
+    if (value.length <= PET_TTS_SEGMENT_MAX_CHARS) {
+      segments.push(value);
+      return;
+    }
+    for (let index = 0; index < value.length; index += PET_TTS_SEGMENT_TARGET_CHARS) {
+      const chunk = value.slice(index, index + PET_TTS_SEGMENT_TARGET_CHARS).trim();
+      if (chunk) segments.push(chunk);
+    }
+  };
+
+  for (const char of normalized) {
+    buffer += char;
+    const canBreakAtPunctuation = PET_TTS_STRONG_PUNCTUATION.test(char) && buffer.length >= PET_TTS_SEGMENT_MIN_CHARS;
+    const mustBreak = buffer.length >= PET_TTS_SEGMENT_MAX_CHARS;
+    if (canBreakAtPunctuation || mustBreak) {
+      pushBuffer();
+    }
+  }
+  pushBuffer();
+
+  if (segments.length <= 1) return segments;
+  const merged: string[] = [];
+  for (const segment of segments) {
+    const previous = merged[merged.length - 1];
+    if (previous && segment.length < PET_TTS_SEGMENT_MIN_CHARS && previous.length + segment.length <= PET_TTS_SEGMENT_MAX_CHARS) {
+      merged[merged.length - 1] = `${previous}${segment}`;
+    } else {
+      merged.push(segment);
+    }
+  }
+  return merged;
+}
+
+function takePetSpeechReadyPrefix(text: string, force = false) {
+  const normalized = sanitizeSpeechText(text).replace(/\s+/g, " ");
+  if (!normalized.trim()) return null;
+  let endIndex = -1;
+  let charCount = 0;
+  for (const [index, char] of Array.from(normalized).entries()) {
+    charCount = index + 1;
+    if (PET_TTS_STRONG_PUNCTUATION.test(char) && charCount >= PET_TTS_STREAM_MIN_CHARS) {
+      endIndex = index + 1;
+      break;
+    }
+    if (PET_TTS_SOFT_PUNCTUATION.test(char) && charCount >= PET_TTS_STREAM_TARGET_CHARS) {
+      endIndex = index + 1;
+      break;
+    }
+    if (charCount >= PET_TTS_STREAM_TARGET_CHARS && /\s/.test(char)) {
+      endIndex = index + 1;
+      break;
+    }
+    if (charCount >= PET_TTS_STREAM_MAX_CHARS) {
+      endIndex = index + 1;
+      break;
+    }
+  }
+  if (endIndex < 0 && force && charCount > 0) {
+    endIndex = charCount;
+  }
+  if (endIndex < 0) return null;
+  const chars = Array.from(normalized);
+  const ready = chars.slice(0, endIndex).join("").trim();
+  if (!ready) return null;
+  return {
+    ready,
+    rest: chars.slice(endIndex).join("")
+  };
+}
+
+function petVoiceReplySpeechOptions(voiceReply: NonNullable<Persona["voiceReply"]>) {
+  return {
+    format: "wav",
+    engine: voiceReply.engine || undefined,
+    language: voiceReply.language || undefined,
+    voice: voiceReply.voice || undefined,
+    volume: voiceReply.volume || undefined,
+    pitch: voiceReply.pitch || undefined,
+    speedScale: "chattts",
+    speed: voiceReply.speed,
+    modelDir: voiceReply.modelDir || undefined,
+    pythonPath: voiceReply.pythonPath || undefined,
+    sampleRate: voiceReply.sampleRate,
+    oral: voiceReply.oral,
+    laugh: voiceReply.laugh,
+    breakLevel: voiceReply.breakLevel,
+    speakerSeed: voiceReply.speakerSeed,
+    speakerEmbedding: voiceReply.speakerEmbedding || undefined,
+    temperature: voiceReply.temperature,
+    topP: voiceReply.topP,
+    topK: voiceReply.topK,
+    refineTextEnabled: voiceReply.refineTextEnabled,
+    refinePrompt: voiceReply.refinePrompt || undefined,
+    refineTemperature: voiceReply.refineTemperature
+  };
 }
 
 function clampPetCloudDurationSeconds(value: unknown) {
@@ -539,8 +669,12 @@ export function PetWindow() {
   const ignoreCursorEventsRef = useRef(false);
   const sendingRef = useRef(false);
   const cloudTimerRef = useRef<number | null>(null);
+  const cloudStreamTimerRef = useRef<number | null>(null);
+  const cloudTextDraftsRef = useRef<Map<string, string>>(new Map());
   const voiceAudioRef = useRef<HTMLAudioElement | null>(null);
   const activeVoiceReplyRequestRef = useRef<string | null>(null);
+  const assistantStreamRef = useRef<PetAssistantStreamRuntime | null>(null);
+  const streamedAssistantMessageIdsRef = useRef<Set<string>>(new Set());
   const petVoiceReplyEnabledRef = useRef(false);
   const petVoiceReplyConfigRef = useRef<NonNullable<Persona["voiceReply"]>>(defaultPetVoiceReplyConfig());
   const globalLookTimerRef = useRef<number | null>(null);
@@ -566,6 +700,7 @@ export function PetWindow() {
   const [visionIntervalSeconds, setVisionIntervalSeconds] = useState(readStoredPetVisionIntervalSeconds);
   const [petVoiceReplyEnabled, setPetVoiceReplyEnabled] = useState(readStoredPetVoiceReplyEnabled);
   const [petVoiceReplySaving, setPetVoiceReplySaving] = useState(false);
+  const [petVoicePlaybackActive, setPetVoicePlaybackActive] = useState(false);
   const [petVoicePersonaName, setPetVoicePersonaName] = useState("");
   const [petVoiceReplyConfig, setPetVoiceReplyConfig] = useState<NonNullable<Persona["voiceReply"]>>(defaultPetVoiceReplyConfig());
   const visionIntervalMs = clampPetVisionIntervalSeconds(visionIntervalSeconds) * 1000;
@@ -627,7 +762,11 @@ export function PetWindow() {
         const assistant = latestAssistantMessage(messages)
           ?? await waitForAssistantReply(context.conversationId, previousAssistantState);
         if (!stopped && assistant) {
-          showAssistantCloud(assistant, context.conversationId);
+          if (streamedAssistantMessageIdsRef.current.has(assistant.id)) {
+            finalizeAssistantStream(context.conversationId, assistant);
+          } else {
+            showAssistantCloud(assistant, context.conversationId);
+          }
         }
       } catch (err) {
         console.error("vision error:", err);
@@ -744,6 +883,7 @@ export function PetWindow() {
       document.documentElement.classList.remove("pet-window-html");
       clearPetStartupTimers();
       clearCloudTimer();
+      clearCloudStreamTimer();
       clearGlobalLookTimer();
       void syncPetPointerPassthrough(false);
       stopModelDrag();
@@ -1005,15 +1145,22 @@ export function PetWindow() {
       conversationId?: string;
       message?: ChatMessage;
       source?: string;
+      delta?: string;
+      isLast?: boolean;
     }>("synthchat-pet-event", (event) => {
       const payload = event.payload;
-      if ((payload.type !== "assistant_final" && payload.type !== "proactive_message") || !payload.message) return;
+      if (
+        payload.type !== "assistant_stream_delta"
+        && payload.type !== "assistant_stream_done"
+        && payload.type !== "assistant_final"
+        && payload.type !== "proactive_message"
+      ) return;
       const context = activeContextRef.current ?? readStoredPetActiveContext();
       const hasContext = Boolean(context?.conversationId);
       const isCurrentConversation = context?.conversationId === payload.conversationId;
-      const isWechat = payload.message.source === "wechat" || (payload as { source?: string }).source === "wechat";
+      const isWechat = payload.message?.source === "wechat" || (payload as { source?: string }).source === "wechat";
       if (!payload.conversationId) {
-        if (assistantMessageVisibleInCloud(payload.message)) showAssistantCloud(payload.message);
+        if (payload.message && assistantMessageVisibleInCloud(payload.message)) showAssistantCloud(payload.message);
         return;
       }
       const shouldAdoptConversation = !isCurrentConversation && (isWechat || !hasContext);
@@ -1029,6 +1176,23 @@ export function PetWindow() {
         });
       }
       if (!isCurrentConversation && !shouldAdoptConversation) return;
+      if (payload.type === "assistant_stream_delta" && payload.message) {
+        appendAssistantStreamDelta(payload.conversationId, payload.message, payload.delta ?? "");
+        return;
+      }
+      if (payload.type === "assistant_stream_done" && payload.message) {
+        finalizeAssistantStream(payload.conversationId, payload.message);
+        return;
+      }
+      if (!payload.message) return;
+      if (
+        payload.type === "assistant_final"
+        && payload.message.id
+        && streamedAssistantMessageIdsRef.current.has(payload.message.id)
+      ) {
+        finalizeAssistantStream(payload.conversationId, payload.message);
+        return;
+      }
       if (assistantMessageVisibleInCloud(payload.message)) {
         showAssistantCloud(payload.message, payload.conversationId);
       }
@@ -1303,6 +1467,13 @@ export function PetWindow() {
     }
   }
 
+  function clearCloudStreamTimer() {
+    if (cloudStreamTimerRef.current !== null) {
+      window.clearInterval(cloudStreamTimerRef.current);
+      cloudStreamTimerRef.current = null;
+    }
+  }
+
   function clearGlobalLookTimer() {
     if (globalLookTimerRef.current !== null) {
       window.clearInterval(globalLookTimerRef.current);
@@ -1445,22 +1616,123 @@ export function PetWindow() {
   function showCloud(text: string, tone: PetCloudBubble["tone"] = "soft", durationMs = 4200, attachments?: PetCloudBubble["attachments"]) {
     const formatted = formatCloudText(text);
     if (!formatted && !attachments?.length) return;
+    assistantStreamRef.current = null;
     clearCloudTimer();
+    clearCloudStreamTimer();
     setBrokenCloudImages({});
+    const bubbleId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    cloudTextDraftsRef.current.set(bubbleId, formatted || "");
     setCloudBubble({
-      id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      id: bubbleId,
       text: formatted || "",
       tone,
       attachments
     });
     cloudTimerRef.current = window.setTimeout(() => {
       setCloudBubble(null);
+      cloudTextDraftsRef.current.delete(bubbleId);
       cloudTimerRef.current = null;
     }, durationMs);
   }
 
-  function stopPetVoicePlayback() {
+  function scheduleCloudDismiss(bubbleId: string, durationMs: number) {
+    clearCloudTimer();
+    cloudTimerRef.current = window.setTimeout(() => {
+      setCloudBubble((current) => current?.id === bubbleId ? null : current);
+      cloudTextDraftsRef.current.delete(bubbleId);
+      cloudTimerRef.current = null;
+    }, durationMs);
+  }
+
+  function showStreamingCloud(
+    text: string,
+    tone: PetCloudBubble["tone"] = "soft",
+    durationMs = 4200,
+    attachments?: PetCloudBubble["attachments"]
+  ) {
+    const formatted = formatCloudText(text);
+    if (!formatted && !attachments?.length) return "";
+    clearCloudTimer();
+    clearCloudStreamTimer();
+    setBrokenCloudImages({});
+    const bubbleId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const initialLength = formatted.length > 0 ? Math.min(2, formatted.length) : 0;
+    cloudTextDraftsRef.current.set(bubbleId, formatted);
+    setCloudBubble({
+      id: bubbleId,
+      text: formatted.slice(0, initialLength),
+      tone,
+      attachments
+    });
+    if (initialLength >= formatted.length) {
+      scheduleCloudDismiss(bubbleId, durationMs);
+      return formatted;
+    }
+
+    let visibleChars = initialLength;
+    cloudStreamTimerRef.current = window.setInterval(() => {
+      const step = formatted.length > 140 ? 2 : 1;
+      visibleChars = Math.min(formatted.length, visibleChars + step);
+      setCloudBubble((current) => (
+        current?.id === bubbleId ? { ...current, text: formatted.slice(0, visibleChars) } : current
+      ));
+      if (visibleChars >= formatted.length) {
+        clearCloudStreamTimer();
+        scheduleCloudDismiss(bubbleId, durationMs);
+      }
+    }, PET_CLOUD_STREAM_INTERVAL_MS);
+    return formatted;
+  }
+
+  function showVoiceSyncedCloud(
+    text: string,
+    tone: PetCloudBubble["tone"] = "soft",
+    attachments?: PetCloudBubble["attachments"]
+  ) {
+    const formatted = formatCloudText(text);
+    if (!formatted && !attachments?.length) return null;
+    clearCloudTimer();
+    clearCloudStreamTimer();
+    setBrokenCloudImages({});
+    setCloudBubble(null);
+    const bubbleId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return { bubbleId, text: formatted, tone, attachments };
+  }
+
+  function appendCloudBubbleText(
+    bubbleId: string,
+    delta: string,
+    tone: PetCloudBubble["tone"] = "active",
+    attachments?: PetCloudBubble["attachments"]
+  ) {
+    const currentDraft = cloudTextDraftsRef.current.get(bubbleId) ?? "";
+    const nextDraft = `${currentDraft}${delta}`;
+    const nextText = formatCloudText(nextDraft);
+    if (!nextText && !attachments?.length) return;
+    cloudTextDraftsRef.current.set(bubbleId, nextDraft);
+    setCloudBubble((current) => {
+      if (current?.id === bubbleId) {
+        return {
+          ...current,
+          text: nextText,
+          attachments: attachments?.length ? attachments : current.attachments
+        };
+      }
+      if (current) return current;
+      return {
+        id: bubbleId,
+        text: nextText,
+        tone,
+        attachments
+      };
+    });
+  }
+
+  function stopPetVoicePlayback(options: { clearCloudStream?: boolean } = {}) {
     activeVoiceReplyRequestRef.current = null;
+    assistantStreamRef.current = null;
+    if (options.clearCloudStream) clearCloudStreamTimer();
+    setPetVoicePlaybackActive(false);
     if (isTauri()) {
       void api.stopChatAudio?.().catch((error: unknown) => {
         console.warn("pet native voice stop failed:", error);
@@ -1471,6 +1743,124 @@ export function PetWindow() {
       audio.pause();
       audio.src = "";
       voiceAudioRef.current = null;
+    }
+  }
+
+  function revealAssistantStreamText(runtime: PetAssistantStreamRuntime, delta: string) {
+    appendCloudBubbleText(runtime.bubbleId, delta, runtime.tone, runtime.attachments);
+  }
+
+  function enqueueAssistantStreamSpeech(runtime: PetAssistantStreamRuntime, delta: string, force = false) {
+    if (!petVoiceReplyEnabledRef.current) {
+      revealAssistantStreamText(runtime, delta);
+      return;
+    }
+    runtime.ttsBuffer += delta;
+    while (true) {
+      const next = takePetSpeechReadyPrefix(runtime.ttsBuffer, force);
+      if (!next) break;
+      runtime.ttsBuffer = next.rest;
+      runtime.ttsQueue.push(next.ready);
+      force = false;
+    }
+    void pumpAssistantStreamSpeech(runtime);
+  }
+
+  async function pumpAssistantStreamSpeech(runtime: PetAssistantStreamRuntime) {
+    if (runtime.ttsRunning || activeVoiceReplyRequestRef.current !== runtime.requestKey) return;
+    runtime.ttsRunning = true;
+    setPetVoicePlaybackActive(true);
+    let activeSegment = "";
+    try {
+      while (runtime.ttsQueue.length > 0 && activeVoiceReplyRequestRef.current === runtime.requestKey) {
+        const segment = runtime.ttsQueue.shift();
+        if (!segment) continue;
+        activeSegment = segment;
+        const result = await api.speakChatText(segment, petVoiceReplySpeechOptions(petVoiceReplyConfigRef.current));
+        playPetBehavior("speaking", { durationMs: Math.max(900, Math.min(4200, segment.length * 170)) });
+        await playPetVoiceResult(runtime.requestKey, result, segment, (revealed) => {
+          revealAssistantStreamText(runtime, revealed);
+        });
+        activeSegment = "";
+      }
+    } catch (error) {
+      if (activeVoiceReplyRequestRef.current === runtime.requestKey) {
+        console.error("pet stream voice reply failed:", error);
+        revealAssistantStreamText(runtime, `${activeSegment}${runtime.ttsQueue.join("")}${runtime.ttsBuffer}`);
+        runtime.ttsQueue = [];
+        runtime.ttsBuffer = "";
+      }
+    } finally {
+      runtime.ttsRunning = false;
+      if (runtime.finalized && runtime.ttsQueue.length === 0 && activeVoiceReplyRequestRef.current === runtime.requestKey) {
+        activeVoiceReplyRequestRef.current = null;
+        setPetVoicePlaybackActive(false);
+        scheduleCloudDismiss(runtime.bubbleId, assistantCloudDurationMsRef.current);
+      }
+    }
+  }
+
+  function appendAssistantStreamDelta(conversationId: string, message: ChatMessage, delta: string) {
+    const visibleDelta = delta;
+    if (!visibleDelta) return;
+    let runtime = assistantStreamRef.current;
+    if (!runtime || runtime.messageId !== message.id || runtime.conversationId !== conversationId) {
+      stopPetVoicePlayback({ clearCloudStream: true });
+      clearCloudTimer();
+      clearCloudStreamTimer();
+      setBrokenCloudImages({});
+      setCloudBubble(null);
+      const bubbleId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const requestKey = `stream:${message.id}`;
+      runtime = {
+        conversationId,
+        messageId: message.id,
+        requestKey,
+        bubbleId,
+        tone: "active",
+        text: "",
+        ttsBuffer: "",
+        ttsQueue: [],
+        ttsRunning: false,
+        finalized: false
+      };
+      assistantStreamRef.current = runtime;
+      activeVoiceReplyRequestRef.current = requestKey;
+      streamedAssistantMessageIdsRef.current.add(message.id);
+      playPetBehavior("speaking", { durationMs: 1600 });
+    }
+    runtime.text += visibleDelta;
+    enqueueAssistantStreamSpeech(runtime, visibleDelta);
+  }
+
+  function finalizeAssistantStream(conversationId: string, message: ChatMessage) {
+    const runtime = assistantStreamRef.current;
+    if (!runtime || runtime.messageId !== message.id || runtime.conversationId !== conversationId) {
+      if (message.id) streamedAssistantMessageIdsRef.current.add(message.id);
+      return;
+    }
+    const payload = assistantCloudPayload(message);
+    const finalText = payload?.text ?? formatCloudText(message.content);
+    const currentText = runtime.text;
+    const missing = finalText.startsWith(currentText) ? finalText.slice(currentText.length) : "";
+    if (missing) {
+      runtime.text += missing;
+      enqueueAssistantStreamSpeech(runtime, missing, true);
+    } else if (runtime.ttsBuffer.trim()) {
+      enqueueAssistantStreamSpeech(runtime, "", true);
+    }
+    runtime.finalized = true;
+    runtime.attachments = payload?.attachments.length ? payload.attachments : runtime.attachments;
+    rememberAssistantMirror(conversationId, message, payload?.signature ?? `${message.id}:${finalText}`);
+    setCloudBubble((current) => (
+      current?.id === runtime.bubbleId
+        ? { ...current, attachments: payload?.attachments.length ? payload.attachments : current.attachments }
+        : current
+    ));
+    if (!runtime.ttsRunning && runtime.ttsQueue.length === 0) {
+      activeVoiceReplyRequestRef.current = null;
+      setPetVoicePlaybackActive(false);
+      scheduleCloudDismiss(runtime.bubbleId, assistantCloudDurationMsRef.current);
     }
   }
 
@@ -1558,17 +1948,193 @@ export function PetWindow() {
     conversationId = message.conversationId,
     durationMs = assistantCloudDurationMsRef.current
   ) {
+    if (message.id && streamedAssistantMessageIdsRef.current.has(message.id)) {
+      finalizeAssistantStream(conversationId, message);
+      return;
+    }
     if (!assistantMessageVisibleInCloud(message)) return;
     const payload = assistantCloudPayload(message);
     if (!payload) return;
     if (!assistantChangedSinceMirror(conversationId, message, payload.signature)) return;
     rememberAssistantMirror(conversationId, message, payload.signature);
-    showCloud(payload.text, "active", durationMs, payload.attachments.length ? payload.attachments : undefined);
-    void speakPetAssistantReply(message, payload.text);
+    stopPetVoicePlayback({ clearCloudStream: true });
+    const requestKey = `${message.id}:${payload.signature}`;
+    const attachments = payload.attachments.length ? payload.attachments : undefined;
+    if (petVoiceReplyEnabledRef.current && payload.text.trim()) {
+      activeVoiceReplyRequestRef.current = requestKey;
+      const syncedCloud = showVoiceSyncedCloud(payload.text, "active", attachments);
+      if (syncedCloud) {
+        void speakPetAssistantReplyStream(
+          requestKey,
+          syncedCloud.text,
+          syncedCloud.bubbleId,
+          durationMs,
+          syncedCloud.tone,
+          syncedCloud.attachments
+        );
+      }
+    } else {
+      showStreamingCloud(payload.text, "active", durationMs, attachments);
+    }
     const behavior = behaviorForAssistantText(payload.text);
     playPetBehavior(behavior, {
       durationMs: behavior === "stretch" ? 2300 : behavior === "error" ? 1300 : 1650
     });
+  }
+
+  async function playPetVoiceResult(
+    requestKey: string,
+    result: Awaited<ReturnType<typeof api.speakChatText>>,
+    segmentText: string,
+    onReveal?: (text: string) => void
+  ) {
+    if (activeVoiceReplyRequestRef.current !== requestKey) return;
+    const dataUrl = String(result?.dataUrl ?? "");
+    const artifactPath = String(result?.artifact?.path ?? "");
+    if (!artifactPath && !dataUrl) {
+      onReveal?.(segmentText);
+      return;
+    }
+    const current = voiceAudioRef.current;
+    if (current) {
+      current.pause();
+      current.src = "";
+      voiceAudioRef.current = null;
+    }
+
+    const sources = [
+      artifactPath ? convertFileSrc(artifactPath) : "",
+      dataUrl
+    ].filter(Boolean);
+    const revealText = (durationMs: number) => {
+      if (!onReveal) return () => {};
+      const chars = Array.from(segmentText);
+      if (chars.length === 0) return () => {};
+      let revealed = 0;
+      const startedAt = performance.now();
+      const revealTo = (count: number) => {
+        const next = Math.max(0, Math.min(chars.length, count));
+        if (next <= revealed) return;
+        onReveal(chars.slice(revealed, next).join(""));
+        revealed = next;
+      };
+      const timer = window.setInterval(() => {
+        const ratio = Math.min(1, (performance.now() - startedAt) / Math.max(240, durationMs));
+        revealTo(Math.max(1, Math.floor(chars.length * ratio)));
+        if (ratio >= 1) window.clearInterval(timer);
+      }, 42);
+      return () => {
+        window.clearInterval(timer);
+        revealTo(chars.length);
+      };
+    };
+
+    for (const source of sources) {
+      if (activeVoiceReplyRequestRef.current !== requestKey) return;
+      const audio = new Audio(source);
+      audio.preload = "auto";
+      voiceAudioRef.current = audio;
+      try {
+        await new Promise<void>((resolve, reject) => {
+          let finishReveal: (() => void) | null = null;
+          const startReveal = () => {
+            if (finishReveal) return;
+            const durationMs = Number.isFinite(audio.duration) && audio.duration > 0
+              ? audio.duration * 1000
+              : Math.max(520, segmentText.length * 145);
+            finishReveal = revealText(durationMs);
+          };
+          audio.onplaying = startReveal;
+          audio.onended = () => {
+            finishReveal?.();
+            resolve();
+          };
+          audio.onerror = () => reject(new Error("pet voice audio playback failed"));
+          void audio.play().then(startReveal).catch(reject);
+        });
+        if (voiceAudioRef.current === audio) voiceAudioRef.current = null;
+        return;
+      } catch (error) {
+        if (voiceAudioRef.current === audio) voiceAudioRef.current = null;
+        console.warn("pet voice segment playback failed:", error);
+      }
+    }
+
+    if (artifactPath && isTauri() && activeVoiceReplyRequestRef.current === requestKey) {
+      const finishReveal = revealText(Math.max(700, segmentText.length * 145));
+      await api.playChatAudio?.(artifactPath);
+      await new Promise((resolve) => window.setTimeout(resolve, Math.max(700, segmentText.length * 130)));
+      finishReveal();
+      return;
+    }
+    if (activeVoiceReplyRequestRef.current === requestKey) onReveal?.(segmentText);
+  }
+
+  async function speakPetAssistantReplyStream(
+    requestKey: string,
+    text: string,
+    bubbleId?: string,
+    durationMs = assistantCloudDurationMsRef.current,
+    cloudTone: PetCloudBubble["tone"] = "active",
+    cloudAttachments?: PetCloudBubble["attachments"]
+  ) {
+    if (!petVoiceReplyEnabledRef.current || !text.trim()) {
+      if (activeVoiceReplyRequestRef.current === requestKey) activeVoiceReplyRequestRef.current = null;
+      return;
+    }
+    const voiceReply = petVoiceReplyConfigRef.current;
+    const speechSegments = splitPetSpeechSegments(text);
+    if (speechSegments.length === 0) {
+      if (activeVoiceReplyRequestRef.current === requestKey) activeVoiceReplyRequestRef.current = null;
+      return;
+    }
+    let revealedTextLength = 0;
+    const revealSegmentText = (chunk: string) => {
+      revealedTextLength += Array.from(chunk).length;
+      if (bubbleId) appendCloudBubbleText(bubbleId, chunk, cloudTone, cloudAttachments);
+    };
+    setPetVoicePlaybackActive(true);
+    try {
+      const synthesize = async (segment: string) => {
+        try {
+          return {
+            ok: true as const,
+            result: await api.speakChatText(segment, petVoiceReplySpeechOptions(voiceReply))
+          };
+        } catch (error) {
+          return { ok: false as const, error };
+        }
+      };
+      let nextResult = synthesize(speechSegments[0]);
+      for (let index = 0; index < speechSegments.length; index += 1) {
+        if (activeVoiceReplyRequestRef.current !== requestKey) return;
+        const segment = speechSegments[index];
+        const synthesized = await nextResult;
+        if (!synthesized.ok) throw synthesized.error;
+        const result = synthesized.result;
+        if (index + 1 < speechSegments.length) {
+          nextResult = synthesize(speechSegments[index + 1]);
+        }
+        playPetBehavior("speaking", { durationMs: Math.max(1200, Math.min(7200, segment.length * 180)) });
+        await playPetVoiceResult(requestKey, result, segment, bubbleId ? revealSegmentText : undefined);
+      }
+    } catch (error) {
+      if (activeVoiceReplyRequestRef.current === requestKey) {
+        console.error("pet voice reply failed:", error);
+        if (bubbleId) {
+          const remaining = Array.from(speechSegments.join("")).slice(revealedTextLength).join("");
+          appendCloudBubbleText(bubbleId, remaining, cloudTone, cloudAttachments);
+        } else {
+          showCloud("语音回复生成失败。", "error", 3000);
+        }
+      }
+    } finally {
+      if (activeVoiceReplyRequestRef.current === requestKey) {
+        activeVoiceReplyRequestRef.current = null;
+        setPetVoicePlaybackActive(false);
+        if (bubbleId) scheduleCloudDismiss(bubbleId, durationMs);
+      }
+    }
   }
 
   async function speakPetAssistantReply(message: ChatMessage, text: string) {
@@ -1908,7 +2474,11 @@ export function PetWindow() {
       const assistant = latestAssistantMessage(messages)
         ?? await waitForAssistantReply(context.conversationId, previousAssistantState);
       if (assistant) {
-        showAssistantCloud(assistant, context.conversationId);
+        if (streamedAssistantMessageIdsRef.current.has(assistant.id)) {
+          finalizeAssistantStream(context.conversationId, assistant);
+        } else {
+          showAssistantCloud(assistant, context.conversationId);
+        }
       } else {
         showCloud("处理中...", "soft", 2600);
         playPetBehavior("thinking", { durationMs: 1600 });
@@ -2501,7 +3071,7 @@ export function PetWindow() {
   }
 
   return (
-    <main className={`live2d-pet-shell${cloudBubble ? " is-speaking" : ""}${petWindowMode === "orb" ? " is-orb" : ""}${petAvatarRevealed ? " is-avatar-revealed" : " is-avatar-priming"}`}>
+    <main className={`live2d-pet-shell${cloudBubble || petVoicePlaybackActive ? " is-speaking" : ""}${petWindowMode === "orb" ? " is-orb" : ""}${petAvatarRevealed ? " is-avatar-revealed" : " is-avatar-priming"}`}>
       <iframe
         className="live2d-pet-frame"
         ref={frameRef}

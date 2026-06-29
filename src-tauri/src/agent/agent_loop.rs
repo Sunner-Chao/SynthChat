@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::{Duration, Instant},
 };
 
@@ -23,6 +26,276 @@ use super::*;
 
 static CHAT_TURN_LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     OnceLock::new();
+
+fn emit_assistant_stream_event(
+    app: &AppHandle,
+    conversation_id: &str,
+    persona_id: Option<&str>,
+    source: &str,
+    message: &ChatMessage,
+    delta: &str,
+    is_final: bool,
+) {
+    let _ = app.emit(
+        "synthchat-chat-event",
+        json!({
+            "type": "assistant_stream",
+            "source": source,
+            "personaId": persona_id,
+            "conversationId": conversation_id,
+            "message": message,
+            "delta": delta,
+            "isLast": is_final,
+        }),
+    );
+    let _ = app.emit(
+        "synthchat-pet-event",
+        json!({
+            "type": if is_final { "assistant_stream_done" } else { "assistant_stream_delta" },
+            "source": source,
+            "personaId": persona_id,
+            "conversationId": conversation_id,
+            "message": message,
+            "delta": delta,
+            "isLast": is_final,
+        }),
+    );
+}
+
+fn desktop_visible_stream_callback(
+    existing: Option<crate::llm::LlmDeltaCallback>,
+    app: Option<&AppHandle>,
+    conversation_id: &str,
+    persona_id: &str,
+    source: &str,
+    emit_pet_events: bool,
+) -> (
+    Option<crate::llm::LlmDeltaCallback>,
+    Arc<Mutex<ChatMessage>>,
+    Arc<AtomicBool>,
+) {
+    let stream_message = Arc::new(Mutex::new(ChatMessage::new(
+        conversation_id.to_string(),
+        "assistant",
+        String::new(),
+        source,
+    )));
+    let emitted_visible_text = Arc::new(AtomicBool::new(false));
+    let Some(app) = app.cloned() else {
+        return (existing, stream_message, emitted_visible_text);
+    };
+    let parser = Arc::new(Mutex::new(PlannerVisibleContentStream::default()));
+    let callback_message = Arc::clone(&stream_message);
+    let callback_started = Arc::clone(&emitted_visible_text);
+    let callback_existing = existing.clone();
+    let conversation_id = conversation_id.to_string();
+    let persona_id = persona_id.to_string();
+    let source = source.to_string();
+    let callback: crate::llm::LlmDeltaCallback = Arc::new(move |delta| {
+        if let Some(existing) = callback_existing.as_ref() {
+            existing(delta)?;
+        }
+        let visible_delta = parser
+            .lock()
+            .map(|mut parser| parser.push(delta))
+            .unwrap_or_default();
+        if visible_delta.is_empty() {
+            return Ok(());
+        }
+        let is_first_visible_delta = !callback_started.swap(true, Ordering::SeqCst);
+        let message = {
+            let mut message = callback_message
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if is_first_visible_delta {
+                message.created_at = now_iso();
+            }
+            message.content.push_str(&visible_delta);
+            message.clone()
+        };
+        let _ = app.emit(
+            "synthchat-chat-event",
+            json!({
+                "type": "assistant_stream",
+                "source": source,
+                "personaId": persona_id,
+                "conversationId": conversation_id,
+                "message": message,
+                "delta": visible_delta,
+                "isLast": false,
+            }),
+        );
+        if emit_pet_events {
+            let _ = app.emit(
+                "synthchat-pet-event",
+                json!({
+                    "type": "assistant_stream_delta",
+                    "source": source,
+                    "personaId": persona_id,
+                    "conversationId": conversation_id,
+                    "message": message,
+                    "delta": visible_delta,
+                    "isLast": false,
+                }),
+            );
+        }
+        Ok(())
+    });
+    (Some(callback), stream_message, emitted_visible_text)
+}
+
+#[derive(Debug, Default)]
+struct PlannerVisibleContentStream {
+    raw: String,
+    emitted: String,
+    completed_non_visible: bool,
+}
+
+impl PlannerVisibleContentStream {
+    fn push(&mut self, delta: &str) -> String {
+        if delta.is_empty() {
+            return String::new();
+        }
+        if self.completed_non_visible {
+            if delta.trim_start().is_empty() {
+                return String::new();
+            }
+            self.raw.clear();
+            self.emitted.clear();
+            self.completed_non_visible = false;
+        }
+        self.raw.push_str(delta);
+        if let Ok(value) = serde_json::from_str::<Value>(self.raw.trim_start()) {
+            self.completed_non_visible = final_content_from_planner_value(&value).is_none();
+        }
+        let visible = planner_visible_final_content_prefix(&self.raw);
+        if visible.len() <= self.emitted.len() || !visible.is_char_boundary(self.emitted.len()) {
+            return String::new();
+        }
+        let next = visible[self.emitted.len()..].to_string();
+        self.emitted = visible;
+        next
+    }
+}
+
+fn planner_visible_final_content_prefix(raw: &str) -> String {
+    let trimmed_start = raw.trim_start();
+    if !trimmed_start.starts_with('{') {
+        return raw.to_string();
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed_start) {
+        return final_content_from_planner_value(&value).unwrap_or_default();
+    }
+    extract_partial_final_content_from_json(trimmed_start).unwrap_or_default()
+}
+
+fn final_content_from_planner_value(value: &Value) -> Option<String> {
+    let action = value
+        .get("action")
+        .or_else(|| value.get("type"))
+        .or_else(|| value.get("decision"))
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(
+        action.as_str(),
+        "tool" | "use_tool" | "call_tool" | "tools" | "tool_call"
+    ) {
+        return None;
+    }
+    value
+        .get("content")
+        .or_else(|| value.get("answer"))
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn extract_partial_final_content_from_json(raw: &str) -> Option<String> {
+    if !raw_contains_final_action(raw) || raw_contains_tool_action(raw) {
+        return None;
+    }
+    for key in ["content", "answer", "message"] {
+        if let Some(value) = extract_partial_json_string_value(raw, key) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn raw_contains_final_action(raw: &str) -> bool {
+    let Some(action) = extract_partial_json_string_value(raw, "action") else {
+        return false;
+    };
+    matches!(
+        action.trim().to_ascii_lowercase().as_str(),
+        "final" | "answer" | "respond" | "finish" | "done"
+    )
+}
+
+fn raw_contains_tool_action(raw: &str) -> bool {
+    let Some(action) = extract_partial_json_string_value(raw, "action") else {
+        return false;
+    };
+    matches!(
+        action.trim().to_ascii_lowercase().as_str(),
+        "tool" | "use_tool" | "call_tool" | "tools" | "tool_call"
+    )
+}
+
+fn extract_partial_json_string_value(raw: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let key_index = raw.find(&needle)?;
+    let after_key = &raw[key_index + needle.len()..];
+    let colon_index = after_key.find(':')?;
+    let after_colon = after_key[colon_index + 1..].trim_start();
+    let mut chars = after_colon.char_indices();
+    let (_, quote) = chars.next()?;
+    if quote != '"' {
+        return None;
+    }
+    let mut value = String::new();
+    let mut escaped = false;
+    let mut iter = after_colon[quote.len_utf8()..].chars();
+    while let Some(ch) = iter.next() {
+        if escaped {
+            match ch {
+                '"' => value.push('"'),
+                '\\' => value.push('\\'),
+                '/' => value.push('/'),
+                'b' => value.push('\u{0008}'),
+                'f' => value.push('\u{000C}'),
+                'n' => value.push('\n'),
+                'r' => value.push('\r'),
+                't' => value.push('\t'),
+                'u' => {
+                    let mut hex = String::new();
+                    for _ in 0..4 {
+                        if let Some(digit) = iter.next() {
+                            hex.push(digit);
+                        }
+                    }
+                    if hex.len() == 4 {
+                        if let Ok(code) = u16::from_str_radix(&hex, 16) {
+                            if let Some(decoded) = char::from_u32(code as u32) {
+                                value.push(decoded);
+                            }
+                        }
+                    }
+                }
+                other => value.push(other),
+            }
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(value),
+            other => value.push(other),
+        }
+    }
+    Some(value)
+}
 
 /// Resolve the user-facing source label for a chat turn from its request
 /// `provider_data.source`, defaulting to "desktop". Mirrors the source logic
@@ -591,6 +864,22 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         _ => store.create_conversation(None, request.persona_id.clone())?,
     };
     let (persona, mut agent) = resolve_chat_turn_persona_and_agent(store, &conversation, &request)?;
+    let request_source = turn_source_label(&request);
+    let assistant_stream_source = if silent_pet_vision {
+        "pet-vision"
+    } else {
+        "desktop-agent"
+    };
+    let emit_pet_stream_events = request_source != "wechat";
+    let (stream_delta_callback, streaming_assistant_message, assistant_streamed_visible_text) =
+        desktop_visible_stream_callback(
+            stream_delta_callback,
+            desktop_app,
+            &conversation.id,
+            &persona.id,
+            assistant_stream_source,
+            emit_pet_stream_events,
+        );
     apply_persona_tool_policy_to_agent(&persona, &mut agent);
     apply_acp_session_mcp_scope(store, &conversation, &mut agent)?;
     if let Some(toolsets) = enabled_toolsets {
@@ -2083,6 +2372,12 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         assistant_text.clone(),
         "desktop-agent",
     );
+    if assistant_streamed_visible_text.load(Ordering::SeqCst) {
+        if let Ok(streaming_message) = streaming_assistant_message.lock() {
+            assistant_message.id = streaming_message.id.clone();
+            assistant_message.created_at = streaming_message.created_at.clone();
+        }
+    }
     assistant_message.provider_data = assistant_provider_data;
     if silent_pet_vision {
         assistant_message.source = "pet-vision".into();
@@ -2206,6 +2501,17 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         );
     }
     if let Some(app) = app.filter(|_| pet_event_source != "wechat") {
+        if assistant_streamed_visible_text.load(Ordering::SeqCst) {
+            emit_assistant_stream_event(
+                app,
+                &conversation.id,
+                Some(&persona.id),
+                &assistant.source,
+                &assistant,
+                "",
+                true,
+            );
+        }
         emit_pet_assistant_event(
             Some(app),
             "assistant_final",

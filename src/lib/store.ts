@@ -155,7 +155,11 @@ function sortMessagesForDisplay(messages: ChatMessage[]) {
     .map((message, index) => ({ message, index }))
     .sort((left, right) => {
       const timeDelta = messageTime(left.message) - messageTime(right.message);
-      return timeDelta === 0 ? left.index - right.index : timeDelta;
+      if (timeDelta !== 0) return timeDelta;
+      const leftRoleRank = left.message.role === "user" ? 0 : left.message.role === "assistant" ? 1 : 2;
+      const rightRoleRank = right.message.role === "user" ? 0 : right.message.role === "assistant" ? 1 : 2;
+      const roleDelta = leftRoleRank - rightRoleRank;
+      return roleDelta === 0 ? left.index - right.index : roleDelta;
     })
     .map((item) => item.message);
 }

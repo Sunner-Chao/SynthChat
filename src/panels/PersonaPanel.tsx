@@ -94,12 +94,8 @@ const EDGE_PITCH_OPTIONS: TextOption[] = [
 ];
 
 const CHATTTS_MODEL_DIR_OPTIONS: TextOption[] = [
-  { value: "D:\\pro_sunner\\demo_vscode\\models\\ChatTTS", label: "本机 models\\ChatTTS" },
   { value: "", label: "自动查找 / 环境变量" },
-  { value: "..\\models\\ChatTTS", label: "上级目录 models\\ChatTTS" },
-  { value: "models\\ChatTTS", label: "项目 models\\ChatTTS" },
-  { value: "ChatTTS", label: "项目 ChatTTS" },
-  { value: "resources\\models\\ChatTTS", label: "资源目录 models\\ChatTTS" }
+  { value: "E:\\SynthChat\\ChatTTS", label: "E:\\SynthChat\\ChatTTS" }
 ];
 
 const PYTHON_PATH_OPTIONS: TextOption[] = [
@@ -176,10 +172,16 @@ export function PersonaPanel() {
   const [saved, setSaved] = useState(false);
   const [catalogModels, setCatalogModels] = useState<ModelCatalogEntry[]>([]);
   const selectedIdRef = useRef(selectedId);
+  const draftRef = useRef(draft);
+  const voiceReplySaveQueueRef = useRef(Promise.resolve());
 
   useEffect(() => {
     selectedIdRef.current = selectedId;
   }, [selectedId]);
+
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
 
   useEffect(() => {
     const provider = llmProviders.find((p) => p.id === draft.llmProvider);
@@ -262,6 +264,18 @@ export function PersonaPanel() {
   const activeVoiceEngine = voiceReply.engine || "chattts";
   const activeEdgeLanguage = voiceReply.language || "zh-CN";
   const activeEdgeVoices = EDGE_VOICE_OPTIONS[activeEdgeLanguage] ?? EDGE_VOICE_OPTIONS["zh-CN"];
+  const chatttsModelDirOptions = useMemo(() => {
+    const options = [...CHATTTS_MODEL_DIR_OPTIONS];
+    if (voiceReply.modelDir && !options.some((option) => option.value === voiceReply.modelDir)) {
+      options.push({ value: voiceReply.modelDir, label: "当前自定义目录" });
+    }
+    return options;
+  }, [voiceReply.modelDir]);
+  const chatttsSpeakerMode = voiceReply.speakerEmbedding
+    ? "fixed"
+    : voiceReply.speakerSeed > 0
+      ? "seed"
+      : "random";
 
   useEffect(() => {
     const nextModel = (provider?.model || catalogModels[0]?.id || "").trim();
@@ -286,30 +300,51 @@ export function PersonaPanel() {
     voiceReply: { ...defaultVoiceReplyConfig(), ...(persona.voiceReply ?? {}), ...patch }
   });
 
-  const updateVoiceReply = (patch: Partial<VoiceReplyConfig>) => {
-    setDraft((current) => mergeVoiceReply(current, patch));
-  };
-
-  const updateWechatVoiceReplyEnabled = async (enabled: boolean) => {
-    const previous = draft;
-    const next = mergeVoiceReply(previous, { enabled });
-    setDraft(next);
+  const syncPersonaInStore = (next: Persona) => {
     useAppStore.setState((state) => ({
       personas: state.personas
         .map((item) => (item.id === next.id ? next : item))
         .concat(state.personas.some((item) => item.id === next.id) ? [] : [next])
         .sort((a, b) => a.name.localeCompare(b.name))
     }));
-    try {
-      const saved = await savePersona(next);
-      setDraft((current) => (current.id === saved.id ? saved : current));
-    } catch (error) {
-      setDraft(previous);
-      useAppStore.setState((state) => ({
-        personas: state.personas.map((item) => (item.id === previous.id ? previous : item))
-      }));
-      throw error;
-    }
+  };
+
+  const queueVoiceReplySave = (personaId: string, patch: Partial<VoiceReplyConfig>) => {
+    const patchSnapshot = { ...patch };
+    voiceReplySaveQueueRef.current = voiceReplySaveQueueRef.current
+      .then(async () => {
+        const localPersona =
+          useAppStore.getState().personas.find((persona) => persona.id === personaId)
+          ?? draftRef.current;
+        const latestPersona = personaId.startsWith("persona-")
+          ? localPersona
+          : await api.getPersona(personaId).catch(() => localPersona);
+        const next = mergeVoiceReply(latestPersona, patchSnapshot);
+        const saved = await savePersona(next);
+        if (saved.id === selectedIdRef.current) {
+          setDraft((current) => {
+            if (current.id !== saved.id) return current;
+            const merged = { ...current, voiceReply: saved.voiceReply };
+            draftRef.current = merged;
+            return merged;
+          });
+        }
+      })
+      .catch((error) => {
+        console.error("voice reply save failed:", error);
+      });
+  };
+
+  const updateVoiceReply = (patch: Partial<VoiceReplyConfig>) => {
+    const next = mergeVoiceReply(draftRef.current, patch);
+    draftRef.current = next;
+    setDraft(next);
+    syncPersonaInStore(next);
+    queueVoiceReplySave(next.id, patch);
+  };
+
+  const updateWechatVoiceReplyEnabled = (enabled: boolean) => {
+    updateVoiceReply({ enabled });
   };
 
   const save = async () => {
@@ -811,10 +846,7 @@ export function PersonaPanel() {
                         value={voiceReply.modelDir}
                         onChange={(event) => updateVoiceReply({ modelDir: event.target.value })}
                       >
-                        {!CHATTTS_MODEL_DIR_OPTIONS.some((option) => option.value === voiceReply.modelDir) && voiceReply.modelDir ? (
-                          <option value={voiceReply.modelDir}>当前自定义目录</option>
-                        ) : null}
-                        {CHATTTS_MODEL_DIR_OPTIONS.map((option) => (
+                        {chatttsModelDirOptions.map((option) => (
                           <option key={option.value || "auto"} value={option.value}>{option.label}</option>
                         ))}
                       </select>
@@ -890,31 +922,51 @@ export function PersonaPanel() {
                   </div>
                   <div className="two-column" style={{ marginBottom: 12 }}>
                     <label>
-                      音色种子
-                      <select
-                        value={voiceReply.speakerSeed}
-                        onChange={(event) => updateVoiceReply({ speakerSeed: Number(event.target.value) })}
-                      >
-                        {!CHATTTS_SPEAKER_SEED_OPTIONS.some((option) => option.value === voiceReply.speakerSeed) ? (
-                          <option value={voiceReply.speakerSeed}>当前种子 {voiceReply.speakerSeed}</option>
-                        ) : null}
-                        {CHATTTS_SPEAKER_SEED_OPTIONS.map((option) => (
-                          <option key={option.value} value={option.value}>{option.label}</option>
-                        ))}
-                      </select>
-                    </label>
-                    <label>
                       固定音色
                       <select
-                        value={voiceReply.speakerEmbedding ? "fixed" : "seed"}
-                        onChange={(event) => {
-                          if (event.target.value === "seed") updateVoiceReply({ speakerEmbedding: "" });
+                        value={chatttsSpeakerMode}
+                        onChange={async (event) => {
+                          const mode = event.target.value;
+                          if (mode === "fixed") {
+                            if (voiceReply.speakerEmbedding) {
+                              updateVoiceReply({ speakerSeed: 0 });
+                              return;
+                            }
+                            const path = await api.pickFile("选择 Speaker Embedding 文件", "Embedding 文件", ["pt", "pth", "safetensors"]);
+                            if (path) updateVoiceReply({ speakerEmbedding: path, speakerSeed: 0 });
+                            return;
+                          }
+                          if (mode === "random") {
+                            updateVoiceReply({ speakerEmbedding: "", speakerSeed: 0 });
+                            return;
+                          }
+                          updateVoiceReply({
+                            speakerEmbedding: "",
+                            speakerSeed: voiceReply.speakerSeed > 0 ? voiceReply.speakerSeed : 20240
+                          });
                         }}
                       >
+                        <option value="fixed">使用 embedding 固定音色</option>
+                        <option value="random">随机音色</option>
                         <option value="seed">使用音色种子</option>
-                        <option value="fixed" disabled={!voiceReply.speakerEmbedding}>使用已选择 embedding</option>
                       </select>
                     </label>
+                    {chatttsSpeakerMode === "seed" ? (
+                      <label>
+                        音色种子
+                        <select
+                          value={voiceReply.speakerSeed > 0 ? voiceReply.speakerSeed : 20240}
+                          onChange={(event) => updateVoiceReply({ speakerEmbedding: "", speakerSeed: Number(event.target.value) })}
+                        >
+                          {!CHATTTS_SPEAKER_SEED_OPTIONS.some((option) => option.value === voiceReply.speakerSeed) && voiceReply.speakerSeed > 0 ? (
+                            <option value={voiceReply.speakerSeed}>当前种子 {voiceReply.speakerSeed}</option>
+                          ) : null}
+                          {CHATTTS_SPEAKER_SEED_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value}>{option.label}</option>
+                          ))}
+                        </select>
+                      </label>
+                    ) : null}
                   </div>
                   <div style={{ padding: "12px", background: "var(--surface-2)", borderRadius: "var(--radius-md)", border: "1px solid var(--divider)" }}>
                     <div className="detail-row" style={{ paddingTop: 0, borderTop: 0 }}>
@@ -927,16 +979,19 @@ export function PersonaPanel() {
                       </strong>
                     </div>
                     <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center" }}>
-                      <input
-                        readOnly
-                        value={voiceReply.speakerEmbedding || "按音色种子随机"}
-                        style={{ fontFamily: "var(--font-mono)", fontSize: 13, flex: 1 }}
-                      />
+                        <input
+                          readOnly
+                          value={
+                            voiceReply.speakerEmbedding ||
+                            (chatttsSpeakerMode === "random" ? "随机音色" : "按音色种子")
+                          }
+                          style={{ fontFamily: "var(--font-mono)", fontSize: 13, flex: 1 }}
+                        />
                       <button
                         type="button"
                         onClick={async () => {
                           const path = await api.pickFile("选择 Speaker Embedding 文件", "Embedding 文件", ["pt", "pth", "safetensors"]);
-                          if (path) updateVoiceReply({ speakerEmbedding: path });
+                          if (path) updateVoiceReply({ speakerEmbedding: path, speakerSeed: 0 });
                         }}
                         style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "0 12px", height: 38, border: "1px solid var(--divider)", borderRadius: "var(--radius-sm)", background: "var(--card)", color: "var(--text-2)", cursor: "pointer", fontSize: 13, whiteSpace: "nowrap", flexShrink: 0 }}
                         title="浏览选择文件"
@@ -947,7 +1002,7 @@ export function PersonaPanel() {
                       {voiceReply.speakerEmbedding ? (
                         <button
                           type="button"
-                          onClick={() => updateVoiceReply({ speakerEmbedding: "" })}
+                          onClick={() => updateVoiceReply({ speakerEmbedding: "", speakerSeed: 20240 })}
                           style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "0 12px", height: 38, border: "1px solid var(--danger)", borderRadius: "var(--radius-sm)", background: "transparent", color: "var(--danger)", cursor: "pointer", fontSize: 13, whiteSpace: "nowrap", flexShrink: 0 }}
                           title="清除路径"
                         >
@@ -1398,7 +1453,7 @@ function defaultVoiceReplyConfig(): NonNullable<Persona["voiceReply"]> {
     volume: "+0%",
     pitch: "+0Hz",
     pythonPath: "",
-    modelDir: "D:\\pro_sunner\\demo_vscode\\models\\ChatTTS",
+    modelDir: "E:\\SynthChat\\ChatTTS",
     sampleRate: 16000,
     speed: 5,
     oral: 2,
