@@ -197,15 +197,19 @@ const defaultPersona: Persona = {
   voiceReply: {
     enabled: false,
     engine: "chattts",
+    language: "zh-CN",
+    voice: "zh-CN-XiaoxiaoNeural",
+    volume: "+0%",
+    pitch: "+0Hz",
     pythonPath: "",
-    modelDir: "E:\\SynthChat\\ChatTTS",
+    modelDir: "",
     sampleRate: 16000,
     speed: 5,
     oral: 2,
     laugh: 0,
     breakLevel: 4,
     speakerSeed: 20240,
-    speakerEmbedding: "E:\\SynthChat\\ChatTTS\\speaker\\speaker_20240.pt",
+    speakerEmbedding: "",
     temperature: 0.3,
     topP: 0.7,
     topK: 20,
@@ -792,11 +796,14 @@ export const api: Record<string, any> = {
   })),
   transcribeChatAudio: (dataUrl: string, mimeType?: string): Promise<{ ok: boolean; transcript: string; provider?: unknown; providerId?: unknown; mimeType?: string }> =>
     call("transcribe_chat_audio", { dataUrl, mimeType }, () => ({ ok: false, transcript: "" })),
-  speakChatText: (text: string, options?: { providerId?: string; voice?: string; format?: string; engine?: string; speedScale?: string; speed?: number; modelDir?: string; pythonPath?: string; sampleRate?: number; oral?: number; laugh?: number; breakLevel?: number; speakerSeed?: number; speakerEmbedding?: string; temperature?: number; topP?: number; topK?: number; refineTextEnabled?: boolean; refinePrompt?: string; refineTemperature?: number }): Promise<{ ok: boolean; dataUrl: string; mimeType?: string; provider?: unknown; providerId?: unknown; voice?: unknown }> =>
+  speakChatText: (text: string, options?: { providerId?: string; language?: string; voice?: string; volume?: string; pitch?: string; format?: string; engine?: string; speedScale?: string; speed?: number; modelDir?: string; pythonPath?: string; sampleRate?: number; oral?: number; laugh?: number; breakLevel?: number; speakerSeed?: number; speakerEmbedding?: string; temperature?: number; topP?: number; topK?: number; refineTextEnabled?: boolean; refinePrompt?: string; refineTemperature?: number }): Promise<{ ok: boolean; dataUrl: string; mimeType?: string; provider?: unknown; providerId?: unknown; voice?: unknown; format?: string; actualFormat?: string; voiceCompatible?: boolean; mediaTag?: string; conversion?: unknown; artifact?: { path?: string; sizeBytes?: number } }> =>
     call("speak_chat_text", {
       text,
       providerId: options?.providerId,
+      language: options?.language,
       voice: options?.voice,
+      volume: options?.volume,
+      pitch: options?.pitch,
       format: options?.format,
       engine: options?.engine,
       speedScale: options?.speedScale,
@@ -815,7 +822,11 @@ export const api: Record<string, any> = {
       refineTextEnabled: options?.refineTextEnabled,
       refinePrompt: options?.refinePrompt,
       refineTemperature: options?.refineTemperature
-    }, () => ({ ok: false, dataUrl: "" })),
+    }, () => ({ ok: false, dataUrl: "", artifact: {} })),
+  playChatAudio: (path: string): Promise<Record<string, unknown>> =>
+    call("play_chat_audio", { path }, () => ({ action: "voice_playback", status: "unavailable", path })),
+  stopChatAudio: (): Promise<Record<string, unknown>> =>
+    call("stop_chat_audio", {}, () => ({ action: "voice_playback", status: "stopped", stopped: false })),
   getMessageContent: async (messageId: string) => messageId,
   assetUrl: convertFileSrc,
   convertFileSrc,

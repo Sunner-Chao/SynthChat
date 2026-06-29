@@ -912,6 +912,10 @@ export interface Persona {
   voiceReply?: {
     enabled: boolean;
     engine: string;
+    language: string;
+    voice: string;
+    volume: string;
+    pitch: string;
     pythonPath: string;
     modelDir: string;
     sampleRate: number;

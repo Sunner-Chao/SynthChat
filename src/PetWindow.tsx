@@ -5,6 +5,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Eye, EyeOff, FileText, Loader2, Menu, Palette, SendHorizontal, Volume2, VolumeX, X } from "lucide-react";
 import { api, convertFileSrc, isTauri } from "./lib/api";
+import { isAttachmentContextLine, isMediaDirectiveLine, sanitizeSpeechText, stripToolDirectiveBlocks } from "./lib/messageText";
 import { PetStartupAwakening } from "./components/PetStartupAwakening";
 import type { AgentRunEvent, ChatAttachment, ChatMessage, Conversation, EmojiGroup, Persona } from "./lib/types";
 import {
@@ -32,6 +33,7 @@ const PET_EDGE_POINTER_THRESHOLD_PX = 96;
 const PET_ORB_CLICK_MOVE_TOLERANCE_PX = 5;
 const PET_DEFAULT_MODEL_STORAGE_KEY = "synthchat.pet.defaultModelId";
 const PET_VISION_INTERVAL_STORAGE_KEY = "synthchat.pet.visionIntervalSeconds";
+const PET_VOICE_REPLY_ENABLED_STORAGE_KEY = "synthchat.pet.voiceReplyEnabled";
 const DEFAULT_PET_VISION_INTERVAL_SECONDS = 60;
 const MIN_PET_VISION_INTERVAL_SECONDS = 30;
 const PET_VISION_BUSY_STATES = new Set(["started", "running", "pendingApproval", "needsClarification"]);
@@ -298,22 +300,6 @@ function messageToCloudText(message: ChatMessage | null | undefined) {
   return formatCloudText(textLines.join("\n"));
 }
 
-function isAttachmentContextLine(line: string) {
-  const trimmed = line.trim();
-  if (!trimmed.startsWith("{") || !trimmed.includes("\"attachment\"")) return false;
-  try {
-    const parsed = JSON.parse(trimmed) as { type?: string };
-    return parsed?.type === "attachment";
-  } catch {
-    return false;
-  }
-}
-
-function isMediaDirectiveLine(line: string) {
-  const trimmed = line.trim();
-  return trimmed.includes("[media attached:") || /^`?MEDIA:\s*(?:"[^"]+"|'[^']+'|`[^`]+`|.+)`?$/i.test(trimmed);
-}
-
 function extractCloudAttachments(message: ChatMessage | null | undefined): PetAttachment[] {
   const results = structuredMessageAttachments(message);
   for (const item of extractCloudAttachmentsFromContent(message?.content ?? "")) {
@@ -405,12 +391,6 @@ function assistantCloudPayload(message: ChatMessage | null | undefined) {
   return { text, attachments, signature };
 }
 
-function stripToolDirectiveBlocks(content: string) {
-  const match = /(^|\n)\s*<(?:tool_call|tool_calls|function=|function_call|function_calls|tool_result)(?:\s|>|=)/i.exec(content);
-  if (!match || match.index < 0) return content;
-  return content.slice(0, match.index).trimEnd();
-}
-
 function touchAreaCloudText(area: string | undefined, count: number) {
   const normalized = (area ?? "").toLowerCase();
   const variants = normalized === "head"
@@ -458,19 +438,41 @@ function readStoredPetVisionIntervalSeconds() {
   }
 }
 
+function readStoredPetVoiceReplyEnabled() {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem(PET_VOICE_REPLY_ENABLED_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function writeStoredPetVoiceReplyEnabled(enabled: boolean) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(PET_VOICE_REPLY_ENABLED_STORAGE_KEY, String(enabled));
+  } catch {
+    // ignore preference persistence failures
+  }
+}
+
 function defaultPetVoiceReplyConfig(): NonNullable<Persona["voiceReply"]> {
-  return {
-    enabled: false,
-    engine: "chattts",
-    pythonPath: "",
-    modelDir: "E:\\SynthChat\\ChatTTS",
+    return {
+      enabled: false,
+      engine: "chattts",
+      language: "zh-CN",
+      voice: "zh-CN-XiaoxiaoNeural",
+      volume: "+0%",
+      pitch: "+0Hz",
+      pythonPath: "",
+    modelDir: "",
     sampleRate: 16000,
     speed: 5,
     oral: 2,
     laugh: 0,
     breakLevel: 4,
     speakerSeed: 20240,
-    speakerEmbedding: "E:\\SynthChat\\ChatTTS\\speaker\\speaker_20240.pt",
+    speakerEmbedding: "",
     temperature: 0.3,
     topP: 0.7,
     topK: 20,
@@ -562,7 +564,7 @@ export function PetWindow() {
   const [emojiGroups, setEmojiGroups] = useState<EmojiGroup[]>([]);
   const [visionEnabled, setVisionEnabled] = useState(false);
   const [visionIntervalSeconds, setVisionIntervalSeconds] = useState(readStoredPetVisionIntervalSeconds);
-  const [petVoiceReplyEnabled, setPetVoiceReplyEnabled] = useState(false);
+  const [petVoiceReplyEnabled, setPetVoiceReplyEnabled] = useState(readStoredPetVoiceReplyEnabled);
   const [petVoiceReplySaving, setPetVoiceReplySaving] = useState(false);
   const [petVoicePersonaName, setPetVoicePersonaName] = useState("");
   const [petVoiceReplyConfig, setPetVoiceReplyConfig] = useState<NonNullable<Persona["voiceReply"]>>(defaultPetVoiceReplyConfig());
@@ -962,6 +964,26 @@ export function PetWindow() {
     return () => {
       if (unlisten) unlisten();
       window.removeEventListener("storage", onStorage);
+    };
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void listen<{
+      type?: string;
+      personaId?: string;
+    }>("synthchat-persona-event", (event) => {
+      const payload = event.payload;
+      if (payload.type !== "persona_updated") return;
+      const context = activeContextRef.current ?? readStoredPetActiveContext();
+      if (!payload.personaId || payload.personaId === context?.personaId) {
+        void refreshPetVoiceReplyState();
+      }
+    }).then((handler) => {
+      unlisten = handler;
+    });
+    return () => {
+      if (unlisten) unlisten();
     };
   }, []);
 
@@ -1439,6 +1461,11 @@ export function PetWindow() {
 
   function stopPetVoicePlayback() {
     activeVoiceReplyRequestRef.current = null;
+    if (isTauri()) {
+      void api.stopChatAudio?.().catch((error: unknown) => {
+        console.warn("pet native voice stop failed:", error);
+      });
+    }
     const audio = voiceAudioRef.current;
     if (audio) {
       audio.pause();
@@ -1451,19 +1478,14 @@ export function PetWindow() {
     try {
       const persona = await resolvePetVoicePersona();
       if (!persona) {
-        setPetVoiceReplyEnabled(false);
         setPetVoicePersonaName("");
         setPetVoiceReplyConfig(defaultPetVoiceReplyConfig());
-        stopPetVoicePlayback();
         return;
       }
       const voiceReply = normalizePetVoiceReplyConfig(persona.voiceReply);
-      petVoiceReplyEnabledRef.current = voiceReply.enabled;
       petVoiceReplyConfigRef.current = voiceReply;
-      setPetVoiceReplyEnabled(voiceReply.enabled);
       setPetVoicePersonaName(persona.name ?? "");
       setPetVoiceReplyConfig(voiceReply);
-      if (!voiceReply.enabled) stopPetVoicePlayback();
     } catch (error) {
       console.error("pet voice state refresh failed:", error);
     }
@@ -1473,28 +1495,16 @@ export function PetWindow() {
     if (petVoiceReplySaving) return;
     setPetVoiceReplySaving(true);
     try {
-      const persona = await resolvePetVoicePersona();
-      if (!persona) {
-        showCloud("还没有绑定角色，暂时不能开启语音回复。", "error", 3200);
-        return;
-      }
-      const voiceReply = normalizePetVoiceReplyConfig(persona.voiceReply);
-      const enabled = !voiceReply.enabled;
-      const saved = await api.savePersona({
-        ...persona,
-        voiceReply: { ...voiceReply, enabled }
-      });
-      const savedVoiceReply = normalizePetVoiceReplyConfig(saved.voiceReply);
-      petVoiceReplyEnabledRef.current = savedVoiceReply.enabled;
-      petVoiceReplyConfigRef.current = savedVoiceReply;
-      setPetVoiceReplyEnabled(savedVoiceReply.enabled);
-      setPetVoicePersonaName(saved.name ?? "");
-      setPetVoiceReplyConfig(savedVoiceReply);
-      if (!savedVoiceReply.enabled) stopPetVoicePlayback();
-      showCloud(savedVoiceReply.enabled ? "语音回复已开启。" : "语音回复已关闭。", "soft", 2400);
+      const enabled = !petVoiceReplyEnabledRef.current;
+      petVoiceReplyEnabledRef.current = enabled;
+      setPetVoiceReplyEnabled(enabled);
+      writeStoredPetVoiceReplyEnabled(enabled);
+      if (!enabled) stopPetVoicePlayback();
+      await refreshPetVoiceReplyState();
+      showCloud(enabled ? "Pet 语音回复已开启。" : "Pet 语音回复已关闭。", "soft", 2400);
     } catch (error) {
       console.error("pet voice toggle failed:", error);
-      showCloud("语音回复开关保存失败。", "error", 3200);
+      showCloud("Pet 语音回复开关保存失败。", "error", 3200);
     } finally {
       setPetVoiceReplySaving(false);
     }
@@ -1567,9 +1577,15 @@ export function PetWindow() {
     const requestKey = `${message.id}:${message.content.length}`;
     activeVoiceReplyRequestRef.current = requestKey;
     try {
-      const result = await api.speakChatText(text.trim(), {
+      const speechText = sanitizeSpeechText(text);
+      if (!speechText) return;
+      const result = await api.speakChatText(speechText, {
         format: "wav",
         engine: voiceReply.engine || undefined,
+        language: voiceReply.language || undefined,
+        voice: voiceReply.voice || undefined,
+        volume: voiceReply.volume || undefined,
+        pitch: voiceReply.pitch || undefined,
         speedScale: "chattts",
         speed: voiceReply.speed,
         modelDir: voiceReply.modelDir || undefined,
@@ -1588,13 +1604,23 @@ export function PetWindow() {
         refineTemperature: voiceReply.refineTemperature
       });
       const dataUrl = String(result?.dataUrl ?? "");
-      if (!dataUrl || activeVoiceReplyRequestRef.current !== requestKey) return;
+      const artifactPath = String(result?.artifact?.path ?? "");
+      if ((!artifactPath && !dataUrl) || activeVoiceReplyRequestRef.current !== requestKey) return;
       const current = voiceAudioRef.current;
       if (current) {
         current.pause();
         current.src = "";
       }
-      const audio = new Audio(dataUrl);
+      if (artifactPath && isTauri()) {
+        try {
+          await api.playChatAudio?.(artifactPath);
+          return;
+        } catch (error) {
+          console.warn("pet native voice playback failed, falling back to web audio:", error);
+        }
+      }
+      const primarySource = artifactPath ? convertFileSrc(artifactPath) : dataUrl;
+      const audio = new Audio(primarySource);
       voiceAudioRef.current = audio;
       audio.onended = () => {
         if (voiceAudioRef.current === audio) voiceAudioRef.current = null;
@@ -1604,7 +1630,17 @@ export function PetWindow() {
           showCloud("语音播放失败。", "error", 2600);
         }
       };
-      await audio.play();
+      try {
+        await audio.play();
+      } catch (error) {
+        if (primarySource !== dataUrl && dataUrl) {
+          const fallbackAudio = new Audio(dataUrl);
+          voiceAudioRef.current = fallbackAudio;
+          await fallbackAudio.play();
+          return;
+        }
+        throw error;
+      }
     } catch (error) {
       if (activeVoiceReplyRequestRef.current === requestKey) {
         console.error("pet voice reply failed:", error);
@@ -2668,7 +2704,7 @@ export function PetWindow() {
               title={petVoicePersonaName ? `当前角色：${petVoicePersonaName}` : "跟随当前 Pet 会话角色"}
             >
               {petVoiceReplySaving ? <Loader2 className="spin" size={16} /> : petVoiceReplyEnabled ? <Volume2 size={16} /> : <VolumeX size={16} />}
-              <span>语音回复 {petVoiceReplyEnabled ? "(开启)" : "(关闭)"}</span>
+              <span>桌面语音回复 {petVoiceReplyEnabled ? "(开启)" : "(关闭)"}</span>
             </button>
             <div style={{ gridColumn: "1 / -1", height: 1, background: "rgba(0,0,0,0.06)", margin: "4px 4px" }} />
             <div style={{ gridColumn: "1 / -1", padding: "4px 8px 6px", fontSize: "11px", color: "#64748b", fontWeight: 700, letterSpacing: "0.5px" }}>模型切换</div>

@@ -22194,6 +22194,13 @@ pub(crate) async fn text_to_speech_payload_for_desktop(
         "provider": result.get("provider").cloned().unwrap_or(Value::Null),
         "providerId": result.get("providerId").cloned().unwrap_or(Value::Null),
         "voice": result.get("voice").cloned().unwrap_or(Value::Null),
+        "format": result.get("format").cloned().unwrap_or(Value::Null),
+        "actualFormat": result.get("actualFormat").cloned().unwrap_or_else(|| json!(format)),
+        "voiceCompatible": result.get("voiceCompatible").cloned().unwrap_or(Value::Bool(false)),
+        "voice_compatible": result.get("voice_compatible").cloned().unwrap_or(Value::Bool(false)),
+        "mediaTag": result.get("mediaTag").cloned().unwrap_or(Value::Null),
+        "media_tag": result.get("media_tag").cloned().unwrap_or(Value::Null),
+        "conversion": result.get("conversion").cloned().unwrap_or(Value::Null),
         "artifact": result.get("artifact").cloned().unwrap_or(Value::Null),
         "schema": "synthchat_desktop_chat_tts_v1",
         "desktopAdaptation": true

@@ -270,6 +270,7 @@ pub(crate) use integrations::{
     start_mattermost_adapter, start_platform_adapter, stop_mattermost_adapter,
     stop_platform_adapter, text_to_speech_payload_for_desktop, transcribe_audio_payload_for_desktop,
 };
+pub(crate) use media_tools::{desktop_voice_playback_start_path, desktop_voice_playback_stop};
 use iteration_budget::IterationBudget;
 use kanban::{
     kanban_block_tool, kanban_bulk_update_tool, kanban_comment_tool, kanban_complete_tool,

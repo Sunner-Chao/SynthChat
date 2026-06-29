@@ -10,8 +10,6 @@ use std::{
 };
 
 use serde_json::{json, Value};
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt as WindowsCommandExt;
 
 use crate::{
     error::{AppError, AppResult},
@@ -272,6 +270,24 @@ fn voice_playback_start(agent: &AgentDefinition, payload: &Value) -> AppResult<S
             path.display()
         )));
     }
+    start_voice_playback_path(&path).map(|value| value.to_string())
+}
+
+pub fn desktop_voice_playback_start_path(path: &Path) -> AppResult<Value> {
+    if !path.is_file() {
+        return Err(AppError::BadRequest(format!(
+            "voice playback path is not a file: {}",
+            path.display()
+        )));
+    }
+    start_voice_playback_path(path)
+}
+
+pub fn desktop_voice_playback_stop() -> AppResult<Value> {
+    voice_playback_stop_value()
+}
+
+fn start_voice_playback_path(path: &Path) -> AppResult<Value> {
     let mut command = playback_command_for_path(&path)?;
     command.hide_window();
     command
@@ -291,18 +307,21 @@ fn voice_playback_start(agent: &AgentDefinition, payload: &Value) -> AppResult<S
         "path": path.to_string_lossy(),
         "processId": process_id
     })
-    .to_string())
+    )
 }
 
 fn voice_playback_stop() -> AppResult<String> {
+    voice_playback_stop_value().map(|value| value.to_string())
+}
+
+fn voice_playback_stop_value() -> AppResult<Value> {
     let mut guard = voice_playback_process_lock()?;
     let stopped = stop_voice_playback_locked(&mut guard)?;
     Ok(json!({
         "action": "voice_playback",
         "status": "stopped",
         "stopped": stopped
-    })
-    .to_string())
+    }))
 }
 
 fn voice_playback_status() -> AppResult<String> {
@@ -2100,6 +2119,16 @@ fn dedupe_existing_path(path: PathBuf, seen: &mut HashSet<String>) -> Option<Pat
     seen.insert(normalized).then_some(path)
 }
 
+fn push_payload_path_candidates(candidates: &mut Vec<PathBuf>, value: &str, roots: &[PathBuf]) {
+    let path = PathBuf::from(value);
+    candidates.push(path.clone());
+    if path.is_relative() {
+        for root in roots {
+            candidates.push(root.join(&path));
+        }
+    }
+}
+
 fn resolve_desktop_chattts_script() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(path) = env_path_value(&[
@@ -2146,8 +2175,15 @@ fn payload_string(payload: &Value, keys: &[&str]) -> Option<String> {
 
 fn resolve_desktop_chattts_model_dir(payload: &Value) -> Option<PathBuf> {
     let mut candidates = Vec::new();
+    let mut roots = Vec::new();
+    if let Ok(current_dir) = std::env::current_dir() {
+        push_path_with_ancestors(&mut roots, current_dir);
+    }
+    if let Some(exe_dir) = current_exe_dir() {
+        push_path_with_ancestors(&mut roots, exe_dir);
+    }
     if let Some(model_dir) = payload_string(payload, &["modelDir", "model_dir"]) {
-        candidates.push(PathBuf::from(model_dir));
+        push_payload_path_candidates(&mut candidates, &model_dir, &roots);
     }
     if let Some(path) = env_path_value(&[
         "SYNTHCHAT_CHATTTS_MODEL_DIR",
@@ -2159,36 +2195,17 @@ fn resolve_desktop_chattts_model_dir(payload: &Value) -> Option<PathBuf> {
     ]) {
         candidates.push(path);
     }
-    let mut roots = Vec::new();
-    if let Ok(current_dir) = std::env::current_dir() {
-        push_path_with_ancestors(&mut roots, current_dir);
-    }
-    if let Some(exe_dir) = current_exe_dir() {
-        push_path_with_ancestors(&mut roots, exe_dir);
-    }
     for root in roots {
         candidates.push(root.join("models").join("ChatTTS"));
         candidates.push(root.join("ChatTTS"));
         candidates.push(root.join("resources").join("models").join("ChatTTS"));
         candidates.push(root.join("resources").join("ChatTTS"));
     }
-    candidates.push(PathBuf::from(r"E:\SynthChat\ChatTTS"));
-
     let mut seen = HashSet::new();
     candidates
         .into_iter()
         .filter_map(|path| dedupe_existing_path(path, &mut seen))
         .find(|path| path.exists())
-}
-
-fn default_desktop_chattts_speaker_embedding(model_dir: &Path) -> Option<String> {
-    [
-        model_dir.join("speaker").join("speaker_20240.pt"),
-        PathBuf::from(r"E:\SynthChat\ChatTTS\speaker\speaker_20240.pt"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
-    .map(|path| path.to_string_lossy().to_string())
 }
 
 fn resolve_desktop_chattts_speaker_embedding(value: &str, model_dir: &Path) -> Option<String> {
@@ -2210,8 +2227,6 @@ fn resolve_desktop_chattts_speaker_embedding(value: &str, model_dir: &Path) -> O
     if let Some(parent) = model_dir.parent() {
         roots.push(parent.to_path_buf());
     }
-    roots.push(PathBuf::from(r"E:\SynthChat\ChatTTS"));
-    roots.push(PathBuf::from(r"E:\SynthChat"));
 
     let mut seen = HashSet::new();
     roots
@@ -2341,8 +2356,7 @@ fn desktop_chattts_command_template(payload: &Value) -> Option<String> {
             } else {
                 Some(value.to_string())
             }
-        })
-        .or_else(|| default_desktop_chattts_speaker_embedding(&model_path));
+        });
     let temperature = payload
         .get("temperature")
         .and_then(Value::as_f64)
@@ -2394,8 +2408,14 @@ fn desktop_chattts_command_template(payload: &Value) -> Option<String> {
     let refine_prompt_arg = refine_prompt
         .map(|value| format!(" --refine-prompt {}", shell_quote_value(&value)))
         .unwrap_or_default();
+    let output_format = tts_response_format(payload).unwrap_or_else(|_| "wav".into());
+    let silk_arg = if output_format == "silk" {
+        "--silk"
+    } else {
+        "--no-silk"
+    };
     Some(format!(
-        "{} {} --text-file {{input_path}} --out {{output_path}} --sample-rate {} --model-dir {} --speed {} --oral {} --laugh {} --break-level {}{}{} --temperature {} --top-p {} --top-k {} {}{} --refine-temperature {} --no-silk",
+        "{} {} --text-file {{input_path}} --out {{output_path}} --sample-rate {} --model-dir {} --speed {} --oral {} --laugh {} --break-level {}{}{} --temperature {} --top-p {} --top-k {} {}{} --refine-temperature {} {}",
         shell_quote_value(&python),
         shell_quote_path(&script),
         sample_rate,
@@ -2411,7 +2431,8 @@ fn desktop_chattts_command_template(payload: &Value) -> Option<String> {
         top_k,
         refine_text_arg,
         refine_prompt_arg,
-        refine_temperature
+        refine_temperature,
+        silk_arg
     ))
 }
 
@@ -3519,7 +3540,7 @@ pub(super) fn edge_text_to_speech(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("en-US-AriaNeural");
+        .unwrap_or("zh-CN-XiaoxiaoNeural");
     let speed = payload
         .get("speed")
         .map(|value| {
@@ -3531,6 +3552,18 @@ pub(super) fn edge_text_to_speech(
         })
         .unwrap_or_else(|| "1.0".into());
     let rate = edge_tts_rate_from_speed(&speed)?;
+    let volume = payload
+        .get("volume")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("+0%");
+    let pitch = payload
+        .get("pitch")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("+0Hz");
     let timeout_seconds = payload
         .get("timeoutSeconds")
         .or_else(|| payload.get("timeout_seconds"))
@@ -3549,9 +3582,18 @@ pub(super) fn edge_text_to_speech(
     fs::write(&input_path, text)?;
     let command_text = command_template
         .map(|template| {
-            render_edge_tts_command(&template, &input_path, &output_path, &format, voice, &rate)
+            render_edge_tts_command(
+                &template,
+                &input_path,
+                &output_path,
+                &format,
+                voice,
+                &rate,
+                volume,
+                pitch,
+            )
         })
-        .unwrap_or_else(|| default_edge_tts_command(&input_path, &output_path, voice, &rate));
+        .unwrap_or_else(|| default_edge_tts_command(&input_path, &output_path, voice, &rate, volume, pitch));
     let result = (|| {
         let _ = run_shell_command_with_timeout(&command_text, timeout_seconds)?;
         let audio = fs::read(&output_path).map_err(|error| {
@@ -3572,6 +3614,8 @@ pub(super) fn edge_text_to_speech(
             "providerId": provider.id,
             "voice": voice,
             "rate": rate,
+            "volume": volume,
+            "pitch": pitch,
             "format": format,
             "actualFormat": artifact.format,
             "voiceCompatible": artifact.voice_compatible,
@@ -3615,12 +3659,16 @@ pub(super) fn default_edge_tts_command(
     output_path: &Path,
     voice: &str,
     rate: &str,
+    volume: &str,
+    pitch: &str,
 ) -> String {
     format!(
-        "python -m edge_tts --file {} --voice {} --rate {} --write-media {}",
+        "python -m edge_tts --file {} --voice {} --rate {} --volume {} --pitch {} --write-media {}",
         shell_quote_path(input_path),
         shell_quote_value(voice),
         shell_quote_value(rate),
+        shell_quote_value(volume),
+        shell_quote_value(pitch),
         shell_quote_path(output_path)
     )
 }
@@ -3632,9 +3680,13 @@ fn render_edge_tts_command(
     format: &str,
     voice: &str,
     rate: &str,
+    volume: &str,
+    pitch: &str,
 ) -> String {
     render_local_tts_command(template, input_path, output_path, format, voice, "edge", "")
         .replace("{rate}", &shell_quote_value(rate))
+        .replace("{volume}", &shell_quote_value(volume))
+        .replace("{pitch}", &shell_quote_value(pitch))
 }
 
 pub(super) fn local_python_engine_text_to_speech(
@@ -4048,7 +4100,27 @@ fn finalize_tts_audio(
 ) -> AppResult<TtsAudioArtifact> {
     let source_format = normalize_tts_audio_format(source_format);
     let requested_format = normalize_tts_audio_format(requested_format);
+    if requested_format == "silk" && source_format != "silk" {
+        let converted = convert_tts_audio_to_silk(provider, audio, &source_format)?;
+        let path = store.save_tool_binary_artifact(run_id, "text_to_speech", "silk", &converted)?;
+        return Ok(TtsAudioArtifact {
+            path,
+            size: converted.len(),
+            voice_compatible: true,
+            format: "silk".into(),
+            conversion: json!({
+                "performed": true,
+                "from": source_format,
+                "to": "silk",
+                "tool": "graiax.silkcoder",
+                "tencent": true
+            }),
+        });
+    }
     if source_format == requested_format {
+        if requested_format == "silk" {
+            ensure_tencent_silk_audio(audio)?;
+        }
         let path =
             store.save_tool_binary_artifact(run_id, "text_to_speech", &requested_format, audio)?;
         return Ok(TtsAudioArtifact {
@@ -4084,6 +4156,11 @@ fn finalize_tts_audio(
             })
         }
         Err(error) => {
+            if requested_format == "silk" {
+                return Err(AppError::BadRequest(format!(
+                    "failed to convert TTS audio from {source_format} to silk: {error}"
+                )));
+            }
             let path =
                 store.save_tool_binary_artifact(run_id, "text_to_speech", &source_format, audio)?;
             Ok(TtsAudioArtifact {
@@ -4102,8 +4179,103 @@ fn finalize_tts_audio(
     }
 }
 
+pub(super) fn ensure_tencent_silk_audio(audio: &[u8]) -> AppResult<()> {
+    let header_window = &audio[..audio.len().min(16)];
+    if header_window
+        .windows(b"#!SILK_V3".len())
+        .any(|window| window == b"#!SILK_V3")
+    {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(
+            "SILK audio is missing #!SILK_V3 Tencent SILK header".into(),
+        ))
+    }
+}
+
+fn convert_tts_audio_to_silk(
+    provider: &str,
+    audio: &[u8],
+    source_format: &str,
+) -> AppResult<Vec<u8>> {
+    let ffmpeg_available = command_available("ffmpeg");
+    if !ffmpeg_available && source_format != "wav" {
+        return Err(AppError::BadRequest(
+            "ffmpeg not found; cannot prepare audio for SILK encoding".into(),
+        ));
+    }
+    let temp_dir = std::env::temp_dir().join(format!(
+        "synthchat-silk-{}-{}",
+        provider,
+        timestamp_millis()?
+    ));
+    fs::create_dir_all(&temp_dir)?;
+    let input_path = temp_dir.join(format!("input.{source_format}"));
+    let wav_path = temp_dir.join("input-16000-mono.wav");
+    let silk_path = temp_dir.join("output.silk");
+    fs::write(&input_path, audio)?;
+
+    let result = (|| {
+        if ffmpeg_available {
+            let ffmpeg_command = format!(
+                "ffmpeg -y -loglevel error -i {} -ar 16000 -ac 1 -acodec pcm_s16le {}",
+                shell_quote_path(&input_path),
+                shell_quote_path(&wav_path)
+            );
+            let _ = run_shell_command_with_timeout(&ffmpeg_command, 30)?;
+        } else if source_format == "wav" {
+            fs::copy(&input_path, &wav_path).map_err(|error| {
+                AppError::BadRequest(format!("failed to stage WAV for SILK encoding: {error}"))
+            })?;
+        }
+        encode_wav_to_tencent_silk(&wav_path, &silk_path)?;
+        let converted = fs::read(&silk_path).map_err(|error| {
+            AppError::BadRequest(format!("SILK encoder did not produce output: {error}"))
+        })?;
+        if converted.is_empty() {
+            return Err(AppError::BadRequest(
+                "SILK encoder produced empty output".into(),
+            ));
+        }
+        ensure_tencent_silk_audio(&converted)?;
+        Ok(converted)
+    })();
+    let _ = fs::remove_dir_all(temp_dir);
+    result
+}
+
+fn encode_wav_to_tencent_silk(wav_path: &Path, silk_path: &Path) -> AppResult<()> {
+    let python = std::env::var("SYNTHCHAT_TTS_PYTHON")
+        .ok()
+        .or_else(|| std::env::var("SYNTHCHAT_CHATTTS_PYTHON").ok())
+        .or_else(|| std::env::var("HERMES_TTS_PYTHON").ok())
+        .or_else(|| std::env::var("HERMES_CHATTTS_PYTHON").ok())
+        .unwrap_or_else(default_desktop_python_command);
+    let script_path = silk_path.with_file_name("encode_silk.py");
+    fs::write(
+        &script_path,
+        "import sys\nfrom graiax import silkcoder\nsilkcoder.encode(sys.argv[1], sys.argv[2], rate=16000, tencent=True)\n",
+    )?;
+    let command_text = format!(
+        "{} {} {} {}",
+        shell_quote_value(&python),
+        shell_quote_path(&script_path),
+        shell_quote_path(wav_path),
+        shell_quote_path(silk_path)
+    );
+    let _ = run_shell_command_with_timeout(&command_text, 30).map_err(|error| {
+        AppError::BadRequest(format!(
+            "graiax.silkcoder failed; install graiax-silkcoder in the configured TTS Python environment: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
 fn tts_format_is_voice_compatible(format: &str) -> bool {
-    matches!(normalize_tts_audio_format(format).as_str(), "opus" | "mp3" | "wav")
+    matches!(
+        normalize_tts_audio_format(format).as_str(),
+        "opus" | "mp3" | "wav" | "silk"
+    )
 }
 
 fn tts_media_tag(artifact: &TtsAudioArtifact) -> String {
@@ -4125,6 +4297,7 @@ fn normalize_tts_audio_format(format: &str) -> String {
         "ogg" | "opus" => "opus".into(),
         "wave" | "wav" => "wav".into(),
         "mpeg" | "mp3" => "mp3".into(),
+        "silk" => "silk".into(),
         other if other.is_empty() => "mp3".into(),
         other => other.to_string(),
     }
@@ -4135,6 +4308,7 @@ fn tts_audio_mime(format: &str) -> &'static str {
         "wav" => "audio/wav",
         "opus" => "audio/ogg",
         "mp3" => "audio/mpeg",
+        "silk" => "audio/silk",
         _ => "application/octet-stream",
     }
 }
@@ -4411,7 +4585,7 @@ pub(super) fn tts_response_format(payload: &Value) -> AppResult<String> {
         .unwrap_or("mp3")
         .to_lowercase();
     match format.as_str() {
-        "mp3" | "opus" | "aac" | "flac" | "wav" | "pcm" => Ok(format),
+        "mp3" | "opus" | "aac" | "flac" | "wav" | "pcm" | "silk" => Ok(format),
         _ => Err(AppError::BadRequest(format!(
             "unsupported text_to_speech format: {format}"
         ))),
@@ -5571,6 +5745,12 @@ fn shell_quote_value(value: &str) -> String {
 }
 
 fn default_desktop_python_command() -> String {
+    if command_available("python") {
+        return "python".into();
+    }
+    if command_available("py") {
+        return "py".into();
+    }
     [
         r"F:\python313\python.exe",
         r"F:\python312\python.exe",
@@ -5595,10 +5775,23 @@ fn read_command_pipe(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle
 
 fn run_shell_command_with_timeout(command_text: &str, timeout_seconds: u64) -> AppResult<String> {
     #[cfg(target_os = "windows")]
+    let script_path = {
+        let path = std::env::temp_dir().join(format!(
+            "synthchat-local-audio-{}.cmd",
+            timestamp_millis()?
+        ));
+        fs::write(&path, format!("@echo off\r\n{command_text}\r\n"))?;
+        Some(path)
+    };
+    #[cfg(not(target_os = "windows"))]
+    let script_path: Option<PathBuf> = None;
+    #[cfg(target_os = "windows")]
     let mut command = {
         let mut command = Command::new("cmd");
-        command.arg("/C");
-        command.raw_arg(command_text);
+        let script = script_path.as_ref().ok_or_else(|| {
+            AppError::BadRequest("failed to create local audio command script".into())
+        })?;
+        command.arg("/C").arg(script);
         command
     };
     #[cfg(not(target_os = "windows"))]
@@ -5612,9 +5805,17 @@ fn run_shell_command_with_timeout(command_text: &str, timeout_seconds: u64) -> A
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| {
-        AppError::BadRequest(format!("failed to start local audio command: {error}"))
-    })?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(path) = &script_path {
+                let _ = fs::remove_file(path);
+            }
+            return Err(AppError::BadRequest(format!(
+                "failed to start local audio command: {error}"
+            )));
+        }
+    };
     let stdout = child.stdout.take().map(read_command_pipe);
     let stderr = child.stderr.take().map(read_command_pipe);
     let started = Instant::now();
@@ -5627,11 +5828,21 @@ fn run_shell_command_with_timeout(command_text: &str, timeout_seconds: u64) -> A
             let stderr = stderr
                 .map(|handle| handle.join().unwrap_or_default())
                 .unwrap_or_default();
+            if let Some(path) = &script_path {
+                let _ = fs::remove_file(path);
+            }
             if !status.success() {
                 let stderr = String::from_utf8_lossy(&stderr);
+                let stdout = String::from_utf8_lossy(&stdout);
+                let output = [stderr.trim(), stdout.trim()]
+                    .into_iter()
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 return Err(AppError::BadRequest(format!(
-                    "local audio command exited with {status}: {}",
-                    truncate_output(&stderr, 2000)
+                    "local audio command exited with {status}: {} [command: {}]",
+                    truncate_output(&output, 2000),
+                    truncate_output(command_text, 1200)
                 )));
             }
             return Ok(String::from_utf8_lossy(&stdout).trim().to_string());
@@ -5645,6 +5856,9 @@ fn run_shell_command_with_timeout(command_text: &str, timeout_seconds: u64) -> A
             let stderr = stderr
                 .map(|handle| handle.join().unwrap_or_default())
                 .unwrap_or_default();
+            if let Some(path) = &script_path {
+                let _ = fs::remove_file(path);
+            }
             let stderr = String::from_utf8_lossy(&stderr);
             let stdout = String::from_utf8_lossy(&stdout);
             return Err(AppError::BadRequest(format!(
@@ -6179,6 +6393,8 @@ pub(super) fn audio_mime_from_extension(ext: &str) -> &'static str {
     match ext.trim_start_matches('.').to_ascii_lowercase().as_str() {
         "wav" => "audio/wav",
         "mp3" => "audio/mpeg",
+        "silk" => "audio/silk",
+        "amr" => "audio/amr",
         "m4a" | "mp4" => "audio/mp4",
         "mpeg" | "mpga" => "audio/mpeg",
         "webm" => "audio/webm",
@@ -6196,6 +6412,8 @@ pub(super) fn audio_extension_from_mime(mime: &str) -> &'static str {
         "audio/ogg" => "ogg",
         "audio/flac" => "flac",
         "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/silk" => "silk",
+        "audio/amr" => "amr",
         _ => "bin",
     }
 }

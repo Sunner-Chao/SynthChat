@@ -1215,7 +1215,11 @@ fn get_persona(store: State<'_, AppStore>, id: String) -> AppResult<Persona> {
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn save_persona(store: State<'_, AppStore>, mut persona: Persona) -> AppResult<Persona> {
+fn save_persona(
+    app: AppHandle,
+    store: State<'_, AppStore>,
+    mut persona: Persona,
+) -> AppResult<Persona> {
     persona.name = persona.name.trim().to_string();
     if persona.name.is_empty() {
         return Err(AppError::BadRequest("persona name is required".into()));
@@ -1264,13 +1268,17 @@ fn save_persona(store: State<'_, AppStore>, mut persona: Persona) -> AppResult<P
     normalize_persona_number(&mut persona.voice_reply, "topK", 1.0, 100.0);
     normalize_persona_number(&mut persona.voice_reply, "refineTemperature", 0.01, 2.0);
     normalize_persona_string(&mut persona.voice_reply, "engine", "chattts");
+    normalize_persona_string(&mut persona.voice_reply, "language", "zh-CN");
+    normalize_persona_string(&mut persona.voice_reply, "voice", "zh-CN-XiaoxiaoNeural");
+    normalize_persona_string(&mut persona.voice_reply, "volume", "+0%");
+    normalize_persona_string(&mut persona.voice_reply, "pitch", "+0Hz");
     normalize_persona_string(&mut persona.voice_reply, "pythonPath", "");
-    normalize_persona_string(&mut persona.voice_reply, "modelDir", r"E:\SynthChat\ChatTTS");
     normalize_persona_string(
         &mut persona.voice_reply,
-        "speakerEmbedding",
-        r"E:\SynthChat\ChatTTS\speaker\speaker_20240.pt",
+        "modelDir",
+        r"D:\pro_sunner\demo_vscode\models\ChatTTS",
     );
+    normalize_persona_string(&mut persona.voice_reply, "speakerEmbedding", "");
     normalize_persona_string(&mut persona.voice_reply, "refinePrompt", "");
     normalize_persona_bool(&mut persona.image_generation, "enabled", false);
     normalize_persona_string(&mut persona.image_generation, "provider", "");
@@ -1300,7 +1308,17 @@ fn save_persona(store: State<'_, AppStore>, mut persona: Persona) -> AppResult<P
             persona.avatar_path = existing.avatar_path.clone();
         }
     }
-    store.save_persona(persona)
+    let saved = store.save_persona(persona)?;
+    let _ = app.emit(
+        "synthchat-persona-event",
+        serde_json::json!({
+            "type": "persona_updated",
+            "source": "desktop",
+            "personaId": saved.id,
+            "persona": saved,
+        }),
+    );
+    Ok(saved)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -4078,7 +4096,10 @@ async fn speak_chat_text(
     store: State<'_, AppStore>,
     text: String,
     provider_id: Option<String>,
+    language: Option<String>,
     voice: Option<String>,
+    volume: Option<String>,
+    pitch: Option<String>,
     format: Option<String>,
     engine: Option<String>,
     speed_scale: Option<String>,
@@ -4108,11 +4129,29 @@ async fn speak_chat_text(
     {
         payload["providerId"] = json!(provider_id);
     }
+    if let Some(language) = language
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        payload["language"] = json!(language);
+    }
     if let Some(voice) = voice
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     {
         payload["voice"] = json!(voice);
+    }
+    if let Some(volume) = volume
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        payload["volume"] = json!(volume);
+    }
+    if let Some(pitch) = pitch
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        payload["pitch"] = json!(pitch);
     }
     if let Some(engine) = engine
         .map(|value| value.trim().to_string())
@@ -4184,6 +4223,17 @@ async fn speak_chat_text(
         payload["refineTemperature"] = json!(refine_temperature);
     }
     agent::text_to_speech_payload_for_desktop(&store, &payload).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn play_chat_audio(path: String) -> AppResult<Value> {
+    let path = PathBuf::from(path.trim_matches('"'));
+    agent::desktop_voice_playback_start_path(&path)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn stop_chat_audio() -> AppResult<Value> {
+    agent::desktop_voice_playback_stop()
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -5600,6 +5650,8 @@ pub fn run() {
             get_short_context_state,
             transcribe_chat_audio,
             speak_chat_text,
+            play_chat_audio,
+            stop_chat_audio,
             upload_chat_attachment,
             upload_chat_attachment_from_path,
             environment_check,

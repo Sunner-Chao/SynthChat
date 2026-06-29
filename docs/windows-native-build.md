@@ -71,7 +71,7 @@ SynthChat uses the lightweight recommended ChatTTS mode:
 - The installer bundles the SynthChat app and `data/tts/chattts_synth.py`.
 - The installer does not bundle the full `E:\SynthChat\ChatTTS` model/runtime directory.
 - ChatTTS model files, Python, `ChatTTS`, `torch`, `torchaudio`, `numpy`, and `ffmpeg` remain external user/runtime dependencies.
-- Runtime discovery checks configured paths first, then common local paths such as `ChatTTS`, `models/ChatTTS`, Tauri resource paths, and `E:\SynthChat\ChatTTS`.
+- Runtime discovery checks configured paths first, then common local paths such as `ChatTTS`, `models/ChatTTS`, and Tauri resource paths.
 
 For a fresh Windows machine, prepare the external ChatTTS directory and Python environment separately, then set the voice reply `模型目录` / `Python 路径` in the persona settings if auto-discovery does not find them.
 

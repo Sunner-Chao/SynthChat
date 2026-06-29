@@ -10,9 +10,6 @@ import wave
 from pathlib import Path
 
 
-LEGACY_MODEL_DIR = Path(r"D:\pro_sunner\demo_vscode\models\ChatTTS")
-
-
 def _default_model_dir() -> Path:
     for key in (
         "SYNTHCHAT_CHATTTS_MODEL_DIR",
@@ -39,13 +36,6 @@ def _default_model_dir() -> Path:
     for root in roots:
         candidates.append(root / "models" / "ChatTTS")
         candidates.append(root / "ChatTTS")
-    candidates.extend(
-        [
-            Path(r"E:\SynthChat\ChatTTS"),
-            LEGACY_MODEL_DIR,
-        ]
-    )
-
     seen: set[str] = set()
     for candidate in candidates:
         key = str(candidate).lower()
@@ -54,7 +44,7 @@ def _default_model_dir() -> Path:
         seen.add(key)
         if candidate.exists():
             return candidate
-    return LEGACY_MODEL_DIR
+    return Path("models") / "ChatTTS"
 
 
 DEFAULT_MODEL_DIR = _default_model_dir()

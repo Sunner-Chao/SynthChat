@@ -2,14 +2,14 @@ r"""Generate a ChatTTS speaker embedding from a seed and save as .pt file.
 
 Usage:
     python generate_speaker_embedding.py --seed 20240 --out speaker_20240.pt
-    python generate_speaker_embedding.py --seed 20240 --model-dir D:\pro_sunner\demo_vscode\models\ChatTTS
+    python generate_speaker_embedding.py --seed 20240 --model-dir .\models\ChatTTS
 """
 import argparse
 import json
 import sys
 from pathlib import Path
 
-DEFAULT_MODEL_DIR = Path(r"D:\pro_sunner\demo_vscode\models\ChatTTS")
+DEFAULT_MODEL_DIR = Path("models") / "ChatTTS"
 
 
 def main():

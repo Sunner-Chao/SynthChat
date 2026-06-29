@@ -41,6 +41,7 @@ import {
   X
 } from "lucide-react";
 import { api, isTauri } from "../lib/api";
+import { displayTextForMessage, renderTextForMessage, speechTextForMessage } from "../lib/messageText";
 import { resolvePersonaAgentBinding, resolvePersonaBoundAgent } from "../lib/personaAgentBinding";
 import { useAppStore } from "../lib/store";
 import type { AgentControlCommand, AgentDefinition, AgentRunPhase, AgentRunRecord, AgentRuntimeEvent, ChatAttachment, ChatMessage, LlmProvider, ManagedProcessEvent, ModelCatalogEntry, ToolEvent, ToolEventEnvelope } from "../lib/types";
@@ -134,6 +135,17 @@ function composerErrorText(error: unknown) {
   const text = raw.replace(/^bad request:\s*/i, "").trim();
   if (!text) return "发送失败。";
   return `发送失败：${text.length > 80 ? `${text.slice(0, 80)}...` : text}`;
+}
+
+async function playVoiceArtifact(path: string) {
+  if (!isTauri()) return false;
+  try {
+    await api.playChatAudio?.(path);
+    return true;
+  } catch (error) {
+    console.warn("chat voice playback failed, falling back to web audio:", error);
+    return false;
+  }
 }
 
 function normalizeToolDetailText(text: string) {
@@ -286,58 +298,6 @@ function parseManagedProcessEvent(content: string): ManagedProcessEvent | null {
     return null;
   }
   return null;
-}
-
-function plainText(content: string) {
-  return content.trim();
-}
-
-function isAttachmentContextLine(line: string) {
-  const trimmed = line.trim();
-  if (!trimmed.startsWith("{") || !trimmed.includes("\"attachment\"")) return false;
-  try {
-    const parsed = JSON.parse(trimmed) as { type?: string };
-    return parsed?.type === "attachment";
-  } catch {
-    return false;
-  }
-}
-
-function isMediaDirectiveLine(line: string) {
-  const trimmed = line.trim();
-  return trimmed.includes("[media attached:") || /^`?MEDIA:\s*(?:"[^"]+"|'[^']+'|`[^`]+`|.+)`?$/i.test(trimmed);
-}
-
-function stripToolDirectiveBlocks(content: string) {
-  const match = /(^|\n)\s*<(?:tool_call|tool_calls|function=|function_call|function_calls|tool_result)(?:\s|>|=)/i.exec(content);
-  if (!match || match.index < 0) return content;
-  return content.slice(0, match.index).trimEnd();
-}
-
-function renderTextForMessage(content: string) {
-  return stripToolDirectiveBlocks(content)
-    .split(/\r?\n/)
-    .filter((line) => !isAttachmentContextLine(line))
-    .join("\n")
-    .trim();
-}
-
-function speechTextForMessage(content: string) {
-  return renderTextForMessage(plainText(content))
-    .replace(/\[\[audio_as_voice\]\]/gi, "")
-    .split(/\r?\n/)
-    .filter((line) => !isMediaDirectiveLine(line))
-    .join("\n")
-    .replace(/```[\s\S]*?```/g, "")
-    .trim();
-}
-
-function displayTextForMessage(content: string) {
-  return stripToolDirectiveBlocks(content)
-    .split(/\r?\n/)
-    .filter((line) => !isAttachmentContextLine(line) && !isMediaDirectiveLine(line))
-    .join("\n")
-    .trim();
 }
 
 function formatTime(value?: string | number | null) {
@@ -1455,6 +1415,11 @@ export const ChatExperience = memo(function ChatExperience() {
   const preserveTopOnHistoryLoadRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
 
   const stopVoicePlayback = useCallback(() => {
+    if (isTauri()) {
+      void api.stopChatAudio?.().catch((error: unknown) => {
+        console.warn("chat native voice stop failed:", error);
+      });
+    }
     const audio = voiceAudioRef.current;
     if (audio) {
       audio.pause();
@@ -1513,6 +1478,10 @@ export const ChatExperience = memo(function ChatExperience() {
       const result = await api.speakChatText(text, {
         format: "wav",
         engine: voiceReply.engine || undefined,
+        language: voiceReply.language || undefined,
+        voice: voiceReply.voice || undefined,
+        volume: voiceReply.volume || undefined,
+        pitch: voiceReply.pitch || undefined,
         speedScale: "chattts",
         speed: voiceReply.speed,
         modelDir: voiceReply.modelDir || undefined,
@@ -1531,9 +1500,13 @@ export const ChatExperience = memo(function ChatExperience() {
         refineTemperature: voiceReply.refineTemperature
       });
       const dataUrl = String(result?.dataUrl ?? "");
+      const artifactPath = String(result?.artifact?.path ?? "");
       if (!dataUrl) throw new Error("TTS 没有返回音频。");
       if (activeVoiceReplyRequestRef.current !== requestKey) return;
       stopVoicePlayback();
+      if (artifactPath && (await playVoiceArtifact(artifactPath))) {
+        return;
+      }
       const audio = new Audio(dataUrl);
       voiceAudioRef.current = audio;
       audio.onended = () => {
@@ -1545,6 +1518,11 @@ export const ChatExperience = memo(function ChatExperience() {
         }
       };
       await audio.play();
+      if (activeVoiceReplyRequestRef.current !== requestKey) {
+        audio.pause();
+        audio.src = "";
+        return;
+      }
     } catch (error) {
       if (activeVoiceReplyRequestRef.current === requestKey) {
         setComposerError(composerErrorText(error));
@@ -2338,7 +2316,7 @@ export const ChatExperience = memo(function ChatExperience() {
 
   const copyMessage = async (message: ChatMessage) => {
     const content = await api.getMessageContent(message.id).catch(() => message.content);
-    await navigator.clipboard?.writeText(displayTextForMessage(plainText(content)));
+    await navigator.clipboard?.writeText(displayTextForMessage(content.trim()));
     setCopiedMessageId(message.id);
     window.setTimeout(() => setCopiedMessageId(null), 1200);
   };
@@ -2939,6 +2917,7 @@ export const ChatExperience = memo(function ChatExperience() {
               </div>
             ) : null}
           <textarea
+            rows={1}
             value={draft}
             onChange={(event) => {
               setDraft(event.target.value);
@@ -3150,7 +3129,7 @@ const MessageRow = memo(function MessageRow({
     : null;
   const processEvent = message.role === "tool" ? parseManagedProcessEvent(message.content) : null;
   const isUser = message.role === "user";
-  const text = previewText(renderTextForMessage(plainText(message.content)), previewCharLimit);
+  const text = previewText(renderTextForMessage(message.content.trim()), previewCharLimit);
   const isStreaming = !isUser && !toolEvent && !processEvent && (message.source === "desktop-stream" || animateText);
   const displayText = useRevealedText(text, isStreaming, streamCharsPerSecond, onAnimationDone);
   if (toolEvent && isCanceledToolEvent(toolEvent)) return null;

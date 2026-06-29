@@ -1,10 +1,156 @@
-import { ChangeEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { Camera, Check, FileAudio, FolderOpen, Image, ImagePlus, Mic, Pencil, Plus, Settings, Sparkles, Trash2, Wand2 } from "lucide-react";
 import { api } from "../lib/api";
 import { resolvePersonaAgentBinding } from "../lib/personaAgentBinding";
 import { useAppStore } from "../lib/store";
 import type { ChatConfig, ModelCatalogEntry, Persona } from "../lib/types";
 import { Avatar } from "../components/common";
+
+type VoiceReplyConfig = NonNullable<Persona["voiceReply"]>;
+type TextOption = { value: string; label: string };
+type NumberOption = { value: number; label: string };
+
+const TTS_ENGINE_OPTIONS: TextOption[] = [
+  { value: "chattts", label: "ChatTTS" },
+  { value: "edge", label: "Edge TTS" },
+  { value: "local_command", label: "本地命令" }
+];
+
+const EDGE_LANGUAGE_OPTIONS: TextOption[] = [
+  { value: "zh-CN", label: "中文（普通话）" },
+  { value: "en-US", label: "English（美国）" },
+  { value: "en-GB", label: "English（英国）" },
+  { value: "ja-JP", label: "日语" },
+  { value: "ko-KR", label: "韩语" },
+  { value: "zh-HK", label: "中文（粤语）" },
+  { value: "zh-TW", label: "中文（台湾）" }
+];
+
+const EDGE_VOICE_OPTIONS: Record<string, TextOption[]> = {
+  "zh-CN": [
+    { value: "zh-CN-XiaoxiaoNeural", label: "晓晓 · 女声 · 自然" },
+    { value: "zh-CN-XiaoyiNeural", label: "晓伊 · 女声 · 明亮" },
+    { value: "zh-CN-YunxiNeural", label: "云希 · 男声 · 温和" },
+    { value: "zh-CN-YunjianNeural", label: "云健 · 男声 · 稳重" },
+    { value: "zh-CN-YunyangNeural", label: "云扬 · 男声 · 播报" },
+    { value: "zh-CN-XiaobeiNeural", label: "晓北 · 女声 · 东北" },
+    { value: "zh-CN-XiaoniNeural", label: "晓妮 · 女声 · 陕西" },
+    { value: "zh-CN-XiaorouNeural", label: "晓柔 · 女声 · 四川" }
+  ],
+  "en-US": [
+    { value: "en-US-AriaNeural", label: "Aria · Female · Friendly" },
+    { value: "en-US-JennyNeural", label: "Jenny · Female · Natural" },
+    { value: "en-US-GuyNeural", label: "Guy · Male · Warm" },
+    { value: "en-US-AnaNeural", label: "Ana · Female · Young" },
+    { value: "en-US-AndrewNeural", label: "Andrew · Male · Conversational" },
+    { value: "en-US-EmmaNeural", label: "Emma · Female · Conversational" }
+  ],
+  "en-GB": [
+    { value: "en-GB-SoniaNeural", label: "Sonia · Female · Natural" },
+    { value: "en-GB-RyanNeural", label: "Ryan · Male · Natural" },
+    { value: "en-GB-LibbyNeural", label: "Libby · Female · Bright" }
+  ],
+  "ja-JP": [
+    { value: "ja-JP-NanamiNeural", label: "Nanami · Female" },
+    { value: "ja-JP-KeitaNeural", label: "Keita · Male" }
+  ],
+  "ko-KR": [
+    { value: "ko-KR-SunHiNeural", label: "SunHi · Female" },
+    { value: "ko-KR-InJoonNeural", label: "InJoon · Male" }
+  ],
+  "zh-HK": [
+    { value: "zh-HK-HiuMaanNeural", label: "曉曼 · 女声" },
+    { value: "zh-HK-WanLungNeural", label: "雲龍 · 男声" }
+  ],
+  "zh-TW": [
+    { value: "zh-TW-HsiaoChenNeural", label: "曉臻 · 女声" },
+    { value: "zh-TW-YunJheNeural", label: "雲哲 · 男声" }
+  ]
+};
+
+const EDGE_SPEED_OPTIONS: NumberOption[] = [
+  { value: 1, label: "极慢 · 0.50x" },
+  { value: 3, label: "慢速 · 0.75x" },
+  { value: 5, label: "标准 · 1.00x" },
+  { value: 7, label: "偏快 · 1.25x" },
+  { value: 9, label: "快速 · 1.50x" }
+];
+
+const EDGE_VOLUME_OPTIONS: TextOption[] = [
+  { value: "-20%", label: "安静 · -20%" },
+  { value: "-10%", label: "稍低 · -10%" },
+  { value: "+0%", label: "标准 · +0%" },
+  { value: "+10%", label: "稍高 · +10%" },
+  { value: "+20%", label: "响亮 · +20%" }
+];
+
+const EDGE_PITCH_OPTIONS: TextOption[] = [
+  { value: "-40Hz", label: "低沉 · -40Hz" },
+  { value: "-20Hz", label: "稍低 · -20Hz" },
+  { value: "+0Hz", label: "标准 · +0Hz" },
+  { value: "+20Hz", label: "稍高 · +20Hz" },
+  { value: "+40Hz", label: "明亮 · +40Hz" }
+];
+
+const CHATTTS_MODEL_DIR_OPTIONS: TextOption[] = [
+  { value: "D:\\pro_sunner\\demo_vscode\\models\\ChatTTS", label: "本机 models\\ChatTTS" },
+  { value: "", label: "自动查找 / 环境变量" },
+  { value: "..\\models\\ChatTTS", label: "上级目录 models\\ChatTTS" },
+  { value: "models\\ChatTTS", label: "项目 models\\ChatTTS" },
+  { value: "ChatTTS", label: "项目 ChatTTS" },
+  { value: "resources\\models\\ChatTTS", label: "资源目录 models\\ChatTTS" }
+];
+
+const PYTHON_PATH_OPTIONS: TextOption[] = [
+  { value: "", label: "自动选择 python" },
+  { value: "python", label: "python" },
+  { value: "py", label: "Windows py launcher" },
+  { value: ".venv\\Scripts\\python.exe", label: "项目 .venv" }
+];
+
+const CHATTTS_SAMPLE_RATE_OPTIONS: NumberOption[] = [
+  { value: 16000, label: "16 kHz · 微信更轻" },
+  { value: 24000, label: "24 kHz · 推荐" },
+  { value: 32000, label: "32 kHz · 清晰" },
+  { value: 48000, label: "48 kHz · 高质量" }
+];
+
+const CHATTTS_SPEED_OPTIONS: NumberOption[] = [
+  { value: 3, label: "慢速" },
+  { value: 4, label: "稍慢" },
+  { value: 5, label: "标准" },
+  { value: 6, label: "稍快" },
+  { value: 7, label: "快速" }
+];
+
+const CHATTTS_LEVEL_OPTIONS: NumberOption[] = Array.from({ length: 10 }, (_, value) => ({
+  value,
+  label: `${value}`
+}));
+
+const CHATTTS_SPEAKER_SEED_OPTIONS: NumberOption[] = [
+  { value: 20240, label: "默认种子 20240" },
+  { value: 42, label: "种子 42" },
+  { value: 4096, label: "种子 4096" },
+  { value: 7777, label: "种子 7777" },
+  { value: 114514, label: "种子 114514" }
+];
+
+const CHATTTS_STYLE_PRESETS: Array<{ value: string; label: string; patch: Partial<VoiceReplyConfig> }> = [
+  { value: "natural", label: "自然 · 少口语", patch: { oral: 2, laugh: 0, breakLevel: 4, refinePrompt: "[oral_2][laugh_0][break_4]" } },
+  { value: "chatty", label: "聊天 · 轻松", patch: { oral: 4, laugh: 1, breakLevel: 4, refinePrompt: "[oral_4][laugh_1][break_4]" } },
+  { value: "lively", label: "活泼 · 有笑声", patch: { oral: 6, laugh: 2, breakLevel: 3, refinePrompt: "[oral_6][laugh_2][break_3]" } },
+  { value: "calm", label: "温柔 · 慢停顿", patch: { oral: 1, laugh: 0, breakLevel: 6, speed: 4, refinePrompt: "[oral_1][laugh_0][break_6]" } },
+  { value: "crisp", label: "利落 · 少停顿", patch: { oral: 3, laugh: 0, breakLevel: 2, speed: 6, refinePrompt: "[oral_3][laugh_0][break_2]" } }
+];
+
+const CHATTTS_SAMPLER_PRESETS: Array<{ value: string; label: string; patch: Partial<VoiceReplyConfig> }> = [
+  { value: "stable", label: "稳定 · temperature 0.30", patch: { temperature: 0.3, topP: 0.7, topK: 20, refineTemperature: 0.7 } },
+  { value: "expressive", label: "表现力 · temperature 0.45", patch: { temperature: 0.45, topP: 0.8, topK: 30, refineTemperature: 0.8 } },
+  { value: "creative", label: "变化感 · temperature 0.60", patch: { temperature: 0.6, topP: 0.9, topK: 40, refineTemperature: 0.9 } }
+];
+
 export function PersonaPanel() {
   const {
     personas,
@@ -29,6 +175,11 @@ export function PersonaPanel() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [catalogModels, setCatalogModels] = useState<ModelCatalogEntry[]>([]);
+  const selectedIdRef = useRef(selectedId);
+
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
 
   useEffect(() => {
     const provider = llmProviders.find((p) => p.id === draft.llmProvider);
@@ -57,6 +208,37 @@ export function PersonaPanel() {
   }, [personas, selectedId]);
 
   useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void listen<{
+      type?: string;
+      personaId?: string;
+      source?: string;
+      persona?: Persona;
+    }>("synthchat-persona-event", (event) => {
+      const payload = event.payload;
+      if (payload.type !== "persona_updated") return;
+      const updated = payload.persona;
+      if (!updated) return;
+      useAppStore.setState((state) => ({
+        personas: state.personas
+          .map((item) => (item.id === updated.id ? updated : item))
+          .concat(state.personas.some((item) => item.id === updated.id) ? [] : [updated])
+          .sort((a, b) => a.name.localeCompare(b.name))
+      }));
+      if (updated.id !== selectedIdRef.current) return;
+      setDraft((current) => {
+        if (current.id !== updated.id) return current;
+        return updated;
+      });
+    }).then((handler) => {
+      unlisten = handler;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  useEffect(() => {
     void refreshProactiveStatuses();
   }, [refreshProactiveStatuses, personas.length]);
 
@@ -76,6 +258,10 @@ export function PersonaPanel() {
     ""
   ).trim();
   const effectiveImageModelId = (selectedImageProvider?.model ?? "").trim();
+  const voiceReply = { ...defaultVoiceReplyConfig(), ...(draft.voiceReply ?? {}) };
+  const activeVoiceEngine = voiceReply.engine || "chattts";
+  const activeEdgeLanguage = voiceReply.language || "zh-CN";
+  const activeEdgeVoices = EDGE_VOICE_OPTIONS[activeEdgeLanguage] ?? EDGE_VOICE_OPTIONS["zh-CN"];
 
   useEffect(() => {
     const nextModel = (provider?.model || catalogModels[0]?.id || "").trim();
@@ -93,6 +279,37 @@ export function PersonaPanel() {
 
   const updateDraft = <K extends keyof Persona>(key: K, value: Persona[K]) => {
     setDraft((current) => ({ ...current, [key]: value }));
+  };
+
+  const mergeVoiceReply = (persona: Persona, patch: Partial<VoiceReplyConfig>): Persona => ({
+    ...persona,
+    voiceReply: { ...defaultVoiceReplyConfig(), ...(persona.voiceReply ?? {}), ...patch }
+  });
+
+  const updateVoiceReply = (patch: Partial<VoiceReplyConfig>) => {
+    setDraft((current) => mergeVoiceReply(current, patch));
+  };
+
+  const updateWechatVoiceReplyEnabled = async (enabled: boolean) => {
+    const previous = draft;
+    const next = mergeVoiceReply(previous, { enabled });
+    setDraft(next);
+    useAppStore.setState((state) => ({
+      personas: state.personas
+        .map((item) => (item.id === next.id ? next : item))
+        .concat(state.personas.some((item) => item.id === next.id) ? [] : [next])
+        .sort((a, b) => a.name.localeCompare(b.name))
+    }));
+    try {
+      const saved = await savePersona(next);
+      setDraft((current) => (current.id === saved.id ? saved : current));
+    } catch (error) {
+      setDraft(previous);
+      useAppStore.setState((state) => ({
+        personas: state.personas.map((item) => (item.id === previous.id ? previous : item))
+      }));
+      throw error;
+    }
   };
 
   const save = async () => {
@@ -460,253 +677,438 @@ export function PersonaPanel() {
             </div>
             <div className="form-section-title" style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
               <Mic size={15} style={{ color: "var(--primary)" }} />
-              语音回复
+              微信语音回复
             </div>
 
-            {/* 语音回复总开关 */}
-            <div className="card" style={{ padding: "14px 16px", marginBottom: 12 }}>
-              <label className="checkbox-row" style={{ marginBottom: 0 }}>
-                <input
-                  checked={draft.voiceReply?.enabled ?? false}
-                  onChange={(event) => setDraft((current) => ({
-                    ...current,
-                    voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), enabled: event.target.checked }
-                  }))}
-                  type="checkbox"
-                />
-                <span style={{ fontWeight: 500 }}>语音回复启用</span>
-              </label>
-            </div>
-
-            {/* TTS 引擎配置 */}
-            <div className="card" style={{ padding: "14px 16px", marginBottom: 12 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12, fontSize: 13, fontWeight: 600, color: "var(--text-2)" }}>
-                <Settings size={14} />
-                TTS 引擎配置
-              </div>
-              <div className="two-column" style={{ marginBottom: 12 }}>
-                <label>
-                  TTS 引擎
-                  <select
-                    value={draft.voiceReply?.engine ?? "chattts"}
-                    onChange={(event) => setDraft((current) => ({
-                      ...current,
-                      voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), engine: event.target.value }
-                    }))}
-                  >
-                    <option value="chattts">ChatTTS</option>
-                    <option value="edge">Edge TTS</option>
-                    <option value="local_command">本地命令 / Fish / IndexTTS</option>
-                  </select>
-                </label>
-                <label>
-                  采样率
-                  <input
-                    min={8000}
-                    max={48000}
-                    step={1000}
-                    type="number"
-                    value={draft.voiceReply?.sampleRate ?? 16000}
-                    onChange={(event) => setDraft((current) => ({
-                      ...current,
-                      voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), sampleRate: Number(event.target.value) }
-                    }))}
-                  />
-                </label>
-                <p className="form-hint" style={{ marginTop: 6, marginBottom: 0, fontSize: 11 }}>
-                  轻量方案可选 Edge TTS；Fish TTS 或 IndexTTS 可通过 SYNTHCHAT_LOCAL_TTS_COMMAND 接入。
-                </p>
-              </div>
-              <label style={{ marginBottom: 12 }}>
-                模型目录
-                <input
-                  value={draft.voiceReply?.modelDir ?? ""}
-                  onChange={(event) => setDraft((current) => ({
-                    ...current,
-                    voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), modelDir: event.target.value }
-                  }))}
-                  placeholder="留空使用环境变量 SYNTHCHAT_CHATTTS_MODEL_DIR"
-                />
-              </label>
-              <label style={{ marginBottom: 0 }}>
-                Python 路径
-                <input
-                  value={draft.voiceReply?.pythonPath ?? ""}
-                  onChange={(event) => setDraft((current) => ({
-                    ...current,
-                    voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), pythonPath: event.target.value }
-                  }))}
-                  placeholder="留空使用 python"
-                />
-              </label>
-            </div>
-
-            {/* 音色配置 */}
-            <div className="card" style={{ padding: "14px 16px", marginBottom: 12 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12, fontSize: 13, fontWeight: 600, color: "var(--text-2)" }}>
-                <FileAudio size={14} />
-                音色配置
-              </div>
-              <div className="two-column" style={{ marginBottom: 12 }}>
-                <label>
-                  音色种子
-                  <input
-                    min={0}
-                    type="number"
-                    value={draft.voiceReply?.speakerSeed ?? 0}
-                    onChange={(event) => setDraft((current) => ({
-                      ...current,
-                      voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), speakerSeed: Number(event.target.value) }
-                    }))}
-                  />
-                </label>
-                <label>
-                  语速 {draft.voiceReply?.speed ?? 5}
-                  <input
-                    min={1}
-                    max={9}
-                    step={1}
-                    type="range"
-                    value={draft.voiceReply?.speed ?? 5}
-                    onChange={(event) => setDraft((current) => ({
-                      ...current,
-                      voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), speed: Number(event.target.value) }
-                    }))}
-                  />
-                </label>
-              </div>
-
-              {/* Speaker Embedding */}
-              <div style={{ padding: "12px", background: "var(--surface-2)", borderRadius: "var(--radius-md)", border: "1px solid var(--divider)" }}>
-                <div className="detail-row" style={{ paddingTop: 0, borderTop: 0 }}>
-                  <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <Sparkles size={13} style={{ color: "var(--primary)" }} />
-                    固定音色
-                  </span>
-                  <strong style={{ color: draft.voiceReply?.speakerEmbedding ? "var(--success)" : "var(--text-3)" }}>
-                    {draft.voiceReply?.speakerEmbedding ? "已固定" : "按种子随机"}
-                  </strong>
-                </div>
-                <label style={{ marginBottom: 0, marginTop: 8 }}>
-                  Embedding 文件路径
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <input
-                      value={draft.voiceReply?.speakerEmbedding ?? ""}
-                      onChange={(event) => setDraft((current) => ({
-                        ...current,
-                        voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), speakerEmbedding: event.target.value }
-                      }))}
-                      placeholder="点击右侧按钮浏览选择 .pt 文件"
-                      style={{ fontFamily: "var(--font-mono)", fontSize: 13, flex: 1 }}
-                    />
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        const path = await api.pickFile("选择 Speaker Embedding 文件", "Embedding 文件", ["pt"]);
-                        if (path) {
-                          setDraft((current) => ({
-                            ...current,
-                            voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), speakerEmbedding: path }
-                          }));
-                        }
-                      }}
-                      style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "0 12px", height: 38, border: "1px solid var(--divider)", borderRadius: "var(--radius-sm)", background: "var(--card)", color: "var(--text-2)", cursor: "pointer", fontSize: 13, whiteSpace: "nowrap", flexShrink: 0 }}
-                      title="浏览选择文件"
-                    >
-                      <FolderOpen size={14} />
-                      浏览
-                    </button>
-                    {draft.voiceReply?.speakerEmbedding ? (
-                      <button
-                        type="button"
-                        onClick={() => setDraft((current) => ({
-                          ...current,
-                          voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), speakerEmbedding: "" }
-                        }))}
-                        style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "0 12px", height: 38, border: "1px solid var(--danger)", borderRadius: "var(--radius-sm)", background: "transparent", color: "var(--danger)", cursor: "pointer", fontSize: 13, whiteSpace: "nowrap", flexShrink: 0 }}
-                        title="清除路径"
-                      >
-                        <Trash2 size={14} />
-                      </button>
-                    ) : null}
-                  </div>
-                </label>
-                <p className="form-hint" style={{ marginTop: 6, marginBottom: 0, fontSize: 11 }}>
-                  生成 embedding：运行 ChatTTS 脚本后在模型目录下产出 .pt 文件，浏览选择即可固定音色
-                </p>
-              </div>
-            </div>
-
-            {/* 语音风格参数 */}
-            <div className="card" style={{ padding: "14px 16px", marginBottom: 12 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12, fontSize: 13, fontWeight: 600, color: "var(--text-2)" }}>
-                <Wand2 size={14} />
-                语音风格
-              </div>
-              <div className="two-column" style={{ marginBottom: 12 }}>
-                <label>
-                  口语化 {draft.voiceReply?.oral ?? 2}
-                  <input min={0} max={9} step={1} type="range" value={draft.voiceReply?.oral ?? 2} onChange={(event) => setDraft((current) => ({ ...current, voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), oral: Number(event.target.value) } }))} />
-                </label>
-                <label>
-                  笑声 {draft.voiceReply?.laugh ?? 0}
-                  <input min={0} max={9} step={1} type="range" value={draft.voiceReply?.laugh ?? 0} onChange={(event) => setDraft((current) => ({ ...current, voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), laugh: Number(event.target.value) } }))} />
-                </label>
-              </div>
-              <label style={{ marginBottom: 12 }}>
-                停顿 {draft.voiceReply?.breakLevel ?? 4}
-                <input min={0} max={9} step={1} type="range" value={draft.voiceReply?.breakLevel ?? 4} onChange={(event) => setDraft((current) => ({ ...current, voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), breakLevel: Number(event.target.value) } }))} />
-              </label>
-              <div className="two-column" style={{ marginBottom: 0 }}>
-                <label>
-                  temperature
-                  <input min={0.01} max={2} step={0.01} type="number" value={draft.voiceReply?.temperature ?? 0.3} onChange={(event) => setDraft((current) => ({ ...current, voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), temperature: Number(event.target.value) } }))} />
-                </label>
-                <label>
-                  top_p
-                  <input min={0.01} max={1} step={0.01} type="number" value={draft.voiceReply?.topP ?? 0.7} onChange={(event) => setDraft((current) => ({ ...current, voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), topP: Number(event.target.value) } }))} />
-                </label>
-                <label>
-                  top_k
-                  <input min={1} max={100} type="number" value={draft.voiceReply?.topK ?? 20} onChange={(event) => setDraft((current) => ({ ...current, voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), topK: Number(event.target.value) } }))} />
-                </label>
-              </div>
-            </div>
-
-            {/* 文本润色 */}
             <div className="card" style={{ padding: "14px 16px", marginBottom: 12 }}>
               <label className="checkbox-row" style={{ marginBottom: 12 }}>
                 <input
-                  checked={draft.voiceReply?.refineTextEnabled ?? true}
-                  onChange={(event) => setDraft((current) => ({
-                    ...current,
-                    voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), refineTextEnabled: event.target.checked }
-                  }))}
+                  checked={voiceReply.enabled}
+                  onChange={(event) => {
+                    void updateWechatVoiceReplyEnabled(event.target.checked);
+                  }}
                   type="checkbox"
                 />
-                <span style={{ fontWeight: 500, display: "flex", alignItems: "center", gap: 6 }}>
-                  <Sparkles size={13} />
-                  启用文本润色
-                </span>
+                <span style={{ fontWeight: 500 }}>微信端发送语音回复</span>
               </label>
-              <div className="two-column" style={{ marginBottom: 12 }}>
+              <div className="two-column" style={{ marginBottom: 0 }}>
                 <label>
-                  润色 temperature
-                  <input min={0.01} max={2} step={0.01} type="number" value={draft.voiceReply?.refineTemperature ?? 0.7} onChange={(event) => setDraft((current) => ({ ...current, voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), refineTemperature: Number(event.target.value) } }))} />
+                  TTS 引擎
+                  <select
+                    value={activeVoiceEngine}
+                    onChange={(event) => {
+                      const engine = event.target.value;
+                      updateVoiceReply({
+                        engine,
+                        ...(engine === "edge" ? { language: activeEdgeLanguage, voice: activeEdgeVoices[0]?.value ?? "zh-CN-XiaoxiaoNeural" } : {})
+                      });
+                    }}
+                  >
+                    {TTS_ENGINE_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  桌面/Pet 播放格式
+                  <select value="wav" disabled>
+                    <option value="wav">WAV 本地播放</option>
+                  </select>
                 </label>
               </div>
-              <label style={{ marginBottom: 0 }}>
-                润色 Prompt
-                <input
-                  value={draft.voiceReply?.refinePrompt ?? ""}
-                  onChange={(event) => setDraft((current) => ({
-                    ...current,
-                    voiceReply: { ...(current.voiceReply ?? defaultVoiceReplyConfig()), refinePrompt: event.target.value }
-                  }))}
-                  placeholder="留空使用 oral/laugh/break 组合"
-                />
-              </label>
+              <p className="form-hint" style={{ marginTop: 8, marginBottom: 0, fontSize: 11 }}>
+                Pet 端的语音回复总开关仍在 Pet 窗口；这里仅控制微信端是否发送语音。
+              </p>
             </div>
+
+            {activeVoiceEngine === "edge" ? (
+              <div className="card" style={{ padding: "14px 16px", marginBottom: 12 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12, fontSize: 13, fontWeight: 600, color: "var(--text-2)" }}>
+                  <Settings size={14} />
+                  EdgeTTS 参数
+                </div>
+                <div className="two-column" style={{ marginBottom: 12 }}>
+                  <label>
+                    语言
+                    <select
+                      value={activeEdgeLanguage}
+                      onChange={(event) => {
+                        const language = event.target.value;
+                        const firstVoice = EDGE_VOICE_OPTIONS[language]?.[0]?.value ?? "zh-CN-XiaoxiaoNeural";
+                        updateVoiceReply({ language, voice: firstVoice });
+                      }}
+                    >
+                      {EDGE_LANGUAGE_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    音色
+                    <select
+                      value={voiceReply.voice}
+                      onChange={(event) => updateVoiceReply({ voice: event.target.value })}
+                    >
+                      {!activeEdgeVoices.some((option) => option.value === voiceReply.voice) && voiceReply.voice ? (
+                        <option value={voiceReply.voice}>当前音色 · {voiceReply.voice}</option>
+                      ) : null}
+                      {activeEdgeVoices.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    语速
+                    <select
+                      value={voiceReply.speed}
+                      onChange={(event) => updateVoiceReply({ speed: Number(event.target.value) })}
+                    >
+                      {EDGE_SPEED_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    音量
+                    <select
+                      value={voiceReply.volume || "+0%"}
+                      onChange={(event) => updateVoiceReply({ volume: event.target.value })}
+                    >
+                      {EDGE_VOLUME_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    音调
+                    <select
+                      value={voiceReply.pitch || "+0Hz"}
+                      onChange={(event) => updateVoiceReply({ pitch: event.target.value })}
+                    >
+                      {EDGE_PITCH_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                <p className="form-hint" style={{ margin: 0, fontSize: 11 }}>
+                  EdgeTTS 会使用当前语言和音色；英文回复不完整的问题已通过文本清洗和中文默认音色规避，标点与表情会先被清理再合成。
+                </p>
+              </div>
+            ) : null}
+
+            {activeVoiceEngine === "chattts" ? (
+              <>
+                <div className="card" style={{ padding: "14px 16px", marginBottom: 12 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12, fontSize: 13, fontWeight: 600, color: "var(--text-2)" }}>
+                    <Settings size={14} />
+                    ChatTTS 运行配置
+                  </div>
+                  <div className="two-column" style={{ marginBottom: 12 }}>
+                    <label>
+                      模型目录
+                      <select
+                        value={voiceReply.modelDir}
+                        onChange={(event) => updateVoiceReply({ modelDir: event.target.value })}
+                      >
+                        {!CHATTTS_MODEL_DIR_OPTIONS.some((option) => option.value === voiceReply.modelDir) && voiceReply.modelDir ? (
+                          <option value={voiceReply.modelDir}>当前自定义目录</option>
+                        ) : null}
+                        {CHATTTS_MODEL_DIR_OPTIONS.map((option) => (
+                          <option key={option.value || "auto"} value={option.value}>{option.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      Python
+                      <select
+                        value={voiceReply.pythonPath}
+                        onChange={(event) => updateVoiceReply({ pythonPath: event.target.value })}
+                      >
+                        {!PYTHON_PATH_OPTIONS.some((option) => option.value === voiceReply.pythonPath) && voiceReply.pythonPath ? (
+                          <option value={voiceReply.pythonPath}>当前自定义 Python</option>
+                        ) : null}
+                        {PYTHON_PATH_OPTIONS.map((option) => (
+                          <option key={option.value || "auto"} value={option.value}>{option.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      采样率
+                      <select
+                        value={voiceReply.sampleRate}
+                        onChange={(event) => updateVoiceReply({ sampleRate: Number(event.target.value) })}
+                      >
+                        {CHATTTS_SAMPLE_RATE_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>{option.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      语速
+                      <select
+                        value={voiceReply.speed}
+                        onChange={(event) => updateVoiceReply({ speed: Number(event.target.value) })}
+                      >
+                        {CHATTTS_SPEED_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>{option.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const path = await api.pickFolder("选择 ChatTTS 模型目录");
+                        if (path) updateVoiceReply({ modelDir: path });
+                      }}
+                      style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+                    >
+                      <FolderOpen size={14} />
+                      选择模型目录
+                    </button>
+                    {voiceReply.modelDir ? (
+                      <button
+                        className="ghost-button"
+                        type="button"
+                        onClick={() => updateVoiceReply({ modelDir: "" })}
+                      >
+                        使用自动查找
+                      </button>
+                    ) : null}
+                  </div>
+                  <p className="form-hint" style={{ marginTop: 8, marginBottom: 0, fontSize: 11 }}>
+                    留空时会按环境变量和常见目录查找；本机绝对路径可通过选择模型目录写入当前角色配置。
+                  </p>
+                </div>
+
+                <div className="card" style={{ padding: "14px 16px", marginBottom: 12 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12, fontSize: 13, fontWeight: 600, color: "var(--text-2)" }}>
+                    <FileAudio size={14} />
+                    ChatTTS 音色
+                  </div>
+                  <div className="two-column" style={{ marginBottom: 12 }}>
+                    <label>
+                      音色种子
+                      <select
+                        value={voiceReply.speakerSeed}
+                        onChange={(event) => updateVoiceReply({ speakerSeed: Number(event.target.value) })}
+                      >
+                        {!CHATTTS_SPEAKER_SEED_OPTIONS.some((option) => option.value === voiceReply.speakerSeed) ? (
+                          <option value={voiceReply.speakerSeed}>当前种子 {voiceReply.speakerSeed}</option>
+                        ) : null}
+                        {CHATTTS_SPEAKER_SEED_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>{option.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      固定音色
+                      <select
+                        value={voiceReply.speakerEmbedding ? "fixed" : "seed"}
+                        onChange={(event) => {
+                          if (event.target.value === "seed") updateVoiceReply({ speakerEmbedding: "" });
+                        }}
+                      >
+                        <option value="seed">使用音色种子</option>
+                        <option value="fixed" disabled={!voiceReply.speakerEmbedding}>使用已选择 embedding</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div style={{ padding: "12px", background: "var(--surface-2)", borderRadius: "var(--radius-md)", border: "1px solid var(--divider)" }}>
+                    <div className="detail-row" style={{ paddingTop: 0, borderTop: 0 }}>
+                      <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <Sparkles size={13} style={{ color: "var(--primary)" }} />
+                        Speaker Embedding
+                      </span>
+                      <strong style={{ color: voiceReply.speakerEmbedding ? "var(--success)" : "var(--text-3)" }}>
+                        {voiceReply.speakerEmbedding ? "已固定" : "未选择"}
+                      </strong>
+                    </div>
+                    <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center" }}>
+                      <input
+                        readOnly
+                        value={voiceReply.speakerEmbedding || "按音色种子随机"}
+                        style={{ fontFamily: "var(--font-mono)", fontSize: 13, flex: 1 }}
+                      />
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const path = await api.pickFile("选择 Speaker Embedding 文件", "Embedding 文件", ["pt", "pth", "safetensors"]);
+                          if (path) updateVoiceReply({ speakerEmbedding: path });
+                        }}
+                        style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "0 12px", height: 38, border: "1px solid var(--divider)", borderRadius: "var(--radius-sm)", background: "var(--card)", color: "var(--text-2)", cursor: "pointer", fontSize: 13, whiteSpace: "nowrap", flexShrink: 0 }}
+                        title="浏览选择文件"
+                      >
+                        <FolderOpen size={14} />
+                        浏览
+                      </button>
+                      {voiceReply.speakerEmbedding ? (
+                        <button
+                          type="button"
+                          onClick={() => updateVoiceReply({ speakerEmbedding: "" })}
+                          style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "0 12px", height: 38, border: "1px solid var(--danger)", borderRadius: "var(--radius-sm)", background: "transparent", color: "var(--danger)", cursor: "pointer", fontSize: 13, whiteSpace: "nowrap", flexShrink: 0 }}
+                          title="清除路径"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="card" style={{ padding: "14px 16px", marginBottom: 12 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12, fontSize: 13, fontWeight: 600, color: "var(--text-2)" }}>
+                    <Wand2 size={14} />
+                    ChatTTS 风格
+                  </div>
+                  <div className="two-column" style={{ marginBottom: 12 }}>
+                    <label>
+                      风格预设
+                      <select
+                        value=""
+                        onChange={(event) => {
+                          const preset = CHATTTS_STYLE_PRESETS.find((item) => item.value === event.target.value);
+                          if (preset) updateVoiceReply(preset.patch);
+                        }}
+                      >
+                        <option value="">选择后套用</option>
+                        {CHATTTS_STYLE_PRESETS.map((preset) => (
+                          <option key={preset.value} value={preset.value}>{preset.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      采样预设
+                      <select
+                        value=""
+                        onChange={(event) => {
+                          const preset = CHATTTS_SAMPLER_PRESETS.find((item) => item.value === event.target.value);
+                          if (preset) updateVoiceReply(preset.patch);
+                        }}
+                      >
+                        <option value="">选择后套用</option>
+                        {CHATTTS_SAMPLER_PRESETS.map((preset) => (
+                          <option key={preset.value} value={preset.value}>{preset.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      口语化
+                      <select value={voiceReply.oral} onChange={(event) => updateVoiceReply({ oral: Number(event.target.value) })}>
+                        {CHATTTS_LEVEL_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>{option.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      笑声
+                      <select value={voiceReply.laugh} onChange={(event) => updateVoiceReply({ laugh: Number(event.target.value) })}>
+                        {CHATTTS_LEVEL_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>{option.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      停顿
+                      <select value={voiceReply.breakLevel} onChange={(event) => updateVoiceReply({ breakLevel: Number(event.target.value) })}>
+                        {CHATTTS_LEVEL_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>{option.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      文本润色
+                      <select
+                        value={voiceReply.refineTextEnabled ? "on" : "off"}
+                        onChange={(event) => updateVoiceReply({ refineTextEnabled: event.target.value === "on" })}
+                      >
+                        <option value="on">启用</option>
+                        <option value="off">关闭</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div className="two-column" style={{ marginBottom: 0 }}>
+                    <label>
+                      temperature
+                      <select value={voiceReply.temperature} onChange={(event) => updateVoiceReply({ temperature: Number(event.target.value) })}>
+                        <option value={0.3}>0.30 · 稳定</option>
+                        <option value={0.45}>0.45 · 表现力</option>
+                        <option value={0.6}>0.60 · 变化感</option>
+                      </select>
+                    </label>
+                    <label>
+                      top_p
+                      <select value={voiceReply.topP} onChange={(event) => updateVoiceReply({ topP: Number(event.target.value) })}>
+                        <option value={0.7}>0.70 · 稳定</option>
+                        <option value={0.8}>0.80 · 均衡</option>
+                        <option value={0.9}>0.90 · 开放</option>
+                      </select>
+                    </label>
+                    <label>
+                      top_k
+                      <select value={voiceReply.topK} onChange={(event) => updateVoiceReply({ topK: Number(event.target.value) })}>
+                        <option value={20}>20 · 稳定</option>
+                        <option value={30}>30 · 均衡</option>
+                        <option value={40}>40 · 开放</option>
+                      </select>
+                    </label>
+                    <label>
+                      润色 temperature
+                      <select value={voiceReply.refineTemperature} onChange={(event) => updateVoiceReply({ refineTemperature: Number(event.target.value) })}>
+                        <option value={0.7}>0.70 · 稳定</option>
+                        <option value={0.8}>0.80 · 均衡</option>
+                        <option value={0.9}>0.90 · 更自然</option>
+                      </select>
+                    </label>
+                  </div>
+                  <p className="form-hint" style={{ marginTop: 8, marginBottom: 0, fontSize: 11 }}>
+                    当前 refine prompt：{voiceReply.refinePrompt || "[oral/laugh/break 自动组合]"}
+                  </p>
+                </div>
+              </>
+            ) : null}
+
+            {activeVoiceEngine === "local_command" ? (
+              <div className="card" style={{ padding: "14px 16px", marginBottom: 12 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12, fontSize: 13, fontWeight: 600, color: "var(--text-2)" }}>
+                  <Settings size={14} />
+                  本地命令 TTS
+                </div>
+                <div className="two-column" style={{ marginBottom: 12 }}>
+                  <label>
+                    音色参数
+                    <select
+                      value={voiceReply.voice || "default"}
+                      onChange={(event) => updateVoiceReply({ voice: event.target.value === "default" ? "" : event.target.value })}
+                    >
+                      {voiceReply.voice && !["female", "male", "default_voice"].includes(voiceReply.voice) ? (
+                        <option value={voiceReply.voice}>当前自定义音色 · {voiceReply.voice}</option>
+                      ) : null}
+                      <option value="default">使用命令默认音色</option>
+                      <option value="female">female</option>
+                      <option value="male">male</option>
+                      <option value="default_voice">default_voice</option>
+                    </select>
+                  </label>
+                  <label>
+                    语速
+                    <select
+                      value={voiceReply.speed}
+                      onChange={(event) => updateVoiceReply({ speed: Number(event.target.value) })}
+                    >
+                      {CHATTTS_SPEED_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                <p className="form-hint" style={{ margin: 0, fontSize: 11 }}>
+                  本地命令仍通过 SYNTHCHAT_LOCAL_TTS_COMMAND 或 HERMES_LOCAL_TTS_COMMAND 接入，模板可使用 {"{input_path}"}、{"{output_path}"}、{"{voice}"}、{"{speed}"}。
+                </p>
+              </div>
+            ) : null}
           </div>
         ) : null}
 
@@ -991,15 +1393,19 @@ function defaultVoiceReplyConfig(): NonNullable<Persona["voiceReply"]> {
   return {
     enabled: false,
     engine: "chattts",
+    language: "zh-CN",
+    voice: "zh-CN-XiaoxiaoNeural",
+    volume: "+0%",
+    pitch: "+0Hz",
     pythonPath: "",
-    modelDir: "E:\\SynthChat\\ChatTTS",
+    modelDir: "D:\\pro_sunner\\demo_vscode\\models\\ChatTTS",
     sampleRate: 16000,
     speed: 5,
     oral: 2,
     laugh: 0,
     breakLevel: 4,
     speakerSeed: 20240,
-    speakerEmbedding: "E:\\SynthChat\\ChatTTS\\speaker\\speaker_20240.pt",
+    speakerEmbedding: "",
     temperature: 0.3,
     topP: 0.7,
     topK: 20,

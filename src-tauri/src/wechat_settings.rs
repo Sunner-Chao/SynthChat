@@ -1241,6 +1241,160 @@ fn strip_wechat_media_marker_lines(text: &str) -> String {
         .to_string()
 }
 
+fn strip_markdown_links_for_speech(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('[') {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start + 1..];
+        let Some(label_end) = after_start.find(']') else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let after_label = &after_start[label_end + 1..];
+        if let Some(after_url) = after_label.strip_prefix('(') {
+            if let Some(url_end) = after_url.find(')') {
+                output.push_str(&after_start[..label_end]);
+                rest = &after_url[url_end + 1..];
+                continue;
+            }
+        }
+        output.push('[');
+        rest = after_start;
+    }
+    output.push_str(rest);
+    output
+}
+
+fn strip_code_blocks_for_speech(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("```") {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start + 3..];
+        if let Some(end) = after_start.find("```") {
+            output.push(' ');
+            rest = &after_start[end + 3..];
+        } else {
+            output.push(' ');
+            return output;
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
+fn strip_urls_for_speech(text: &str) -> String {
+    text.split_whitespace()
+        .map(|part| {
+            if part.starts_with("http://") || part.starts_with("https://") {
+                ""
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn strip_inline_code_for_speech(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '`' {
+            output.push(ch);
+            continue;
+        }
+        let mut code = String::new();
+        let mut closed = false;
+        while let Some(next) = chars.next() {
+            if next == '`' {
+                closed = true;
+                break;
+            }
+            if next == '\n' || code.chars().count() > 120 {
+                break;
+            }
+            code.push(next);
+        }
+        if closed {
+            output.push_str(&code);
+        } else {
+            output.push(' ');
+            output.push_str(&code);
+        }
+    }
+    output
+}
+
+fn strip_marker_brackets_for_speech(text: &str) -> String {
+    let markers = ["表情", "图片", "文件", "附件", "语音", "动作", "media", "emoji"];
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('[') {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find(']') else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let bracket = &after_start[..end];
+        if bracket.chars().count() <= 64
+            && markers.iter().any(|marker| bracket.to_ascii_lowercase().contains(marker))
+        {
+            output.push(' ');
+            rest = &after_start[end + 1..];
+        } else {
+            output.push('[');
+            rest = after_start;
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
+fn sanitize_wechat_speech_text(text: &str) -> String {
+    let without_media = strip_wechat_media_marker_lines(text);
+    let without_code_blocks = strip_code_blocks_for_speech(&without_media);
+    let without_inline_code = strip_inline_code_for_speech(&without_code_blocks);
+    let without_urls = strip_urls_for_speech(&without_inline_code);
+    let without_markdown_links = strip_markdown_links_for_speech(&without_urls);
+    let without_marker_brackets = strip_marker_brackets_for_speech(&without_markdown_links);
+    let without_emoji = without_marker_brackets
+        .chars()
+        .filter(|ch| {
+            let code = *ch as u32;
+            !((0x1F000..=0x1FAFF).contains(&code)
+                || (0x2600..=0x27BF).contains(&code)
+                || code == 0xFE0F)
+        })
+        .collect::<String>();
+    let cleaned = without_emoji
+        .replace(['*', '_', '~', '#', '>', '|'], " ")
+        .replace(['“', '”'], "\"")
+        .replace(['‘', '’'], "'")
+        .replace('（', "(")
+        .replace('）', ")")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    const LIMIT: usize = 420;
+    if cleaned.chars().count() <= LIMIT {
+        return cleaned;
+    }
+    let clipped = cleaned.chars().take(LIMIT).collect::<String>();
+    let sentence_end = ["。", "！", "？", ".", "!", "?"]
+        .iter()
+        .filter_map(|marker| clipped.rfind(marker).map(|index| index + marker.len()))
+        .max()
+        .unwrap_or(0);
+    if sentence_end > 80 {
+        clipped[..sentence_end].trim().to_string()
+    } else {
+        clipped.trim().to_string()
+    }
+}
+
 async fn upload_wechat_image(
     account: &AccountConfig,
     to_user_id: &str,
@@ -1474,13 +1628,36 @@ fn wechat_voice_metadata(path: &Path, bytes: &[u8]) -> (i64, i64, i64, i64) {
         .map(|value| value.to_ascii_lowercase())
         .as_deref()
     {
-        Some("silk") => (4, 16_000, 16, 0),
+        Some("silk") => {
+            let playtime_ms = estimate_voice_playtime_ms(bytes.len() as u64, 16_000, 16, 1);
+            (4, 16_000, 16, playtime_ms)
+        }
         Some("mp3") => (7, 24_000, 16, 0),
         Some("amr") => (5, 8_000, 16, 0),
         Some("ogg" | "opus") => (8, 24_000, 16, 0),
         Some("wav") => wav_voice_metadata(bytes).unwrap_or((1, 16_000, 16, 0)),
         _ => (7, 24_000, 16, 0),
     }
+}
+
+fn estimate_voice_playtime_ms(
+    byte_len: u64,
+    sample_rate: i64,
+    bits_per_sample: i64,
+    channels: i64,
+) -> i64 {
+    let sample_rate = sample_rate.max(1) as u64;
+    let bits_per_sample = bits_per_sample.max(1) as u64;
+    let channels = channels.max(1) as u64;
+    let bytes_per_second = sample_rate
+        .saturating_mul(channels)
+        .saturating_mul(bits_per_sample)
+        / 8;
+    if bytes_per_second == 0 {
+        return 1_000;
+    }
+    let playtime_ms = byte_len.saturating_mul(1000) / bytes_per_second;
+    playtime_ms.max(1_000) as i64
 }
 
 fn wav_voice_metadata(bytes: &[u8]) -> Option<(i64, i64, i64, i64)> {
@@ -3070,6 +3247,9 @@ async fn dispatch_reply_to_wechat(
     let file_paths = extract_wechat_file_paths(reply);
     let mobile_text = strip_wechat_media_marker_lines(reply);
     let mut errors = Vec::new();
+    let auto_voice_requested = voice_paths.is_empty()
+        && !mobile_text.trim().is_empty()
+        && persona.is_some_and(voice_reply_enabled);
     if voice_paths.is_empty() && !mobile_text.trim().is_empty() {
         if let Some(persona) = persona {
             match synthesize_wechat_voice_reply(store, persona, &mobile_text).await {
@@ -3093,11 +3273,13 @@ async fn dispatch_reply_to_wechat(
             errors.push(format!("图片发送失败 {image_path}: {error}"));
         }
     }
+    let mut voice_errors = Vec::new();
+    let mut voice_delivered = false;
     for voice_path in &voice_paths {
-        if let Err(error) =
-            send_wechat_voice_message_with_retry(account, user_id, voice_path, context_token).await
+        match send_wechat_voice_message_with_retry(account, user_id, voice_path, context_token).await
         {
-            errors.push(format!("语音发送失败 {voice_path}: {error}"));
+            Ok(_) => voice_delivered = true,
+            Err(error) => voice_errors.push(format!("语音发送失败 {voice_path}: {error}")),
         }
     }
     for file_path in &file_paths {
@@ -3107,7 +3289,9 @@ async fn dispatch_reply_to_wechat(
             errors.push(format!("文件发送失败 {file_path}: {error}"));
         }
     }
-    if !mobile_text.trim().is_empty() {
+    let mut text_delivered = false;
+    let should_send_text = !mobile_text.trim().is_empty() && (!auto_voice_requested || !voice_delivered);
+    if should_send_text {
         let text_token =
             if image_paths.is_empty() && voice_paths.is_empty() && file_paths.is_empty() {
                 context_token
@@ -3118,6 +3302,23 @@ async fn dispatch_reply_to_wechat(
             send_wechat_text_message_with_retry(account, user_id, &mobile_text, text_token).await
         {
             errors.push(format!("文本发送失败: {error}"));
+        } else {
+            text_delivered = true;
+        }
+    }
+    if !voice_errors.is_empty() {
+        if text_delivered {
+            eprintln!(
+                "SynthChat wechat voice delivery failed; text fallback delivered: {}",
+                voice_errors.join("\n")
+            );
+        } else if voice_delivered {
+            eprintln!(
+                "SynthChat wechat voice delivery partially failed after at least one voice was delivered: {}",
+                voice_errors.join("\n")
+            );
+        } else {
+            errors.extend(voice_errors);
         }
     }
     if errors.is_empty() {
@@ -3135,6 +3336,74 @@ fn voice_reply_enabled(persona: &Persona) -> bool {
         .unwrap_or(false)
 }
 
+fn wechat_voice_reply_toggle_command(text: &str) -> Option<bool> {
+    let normalized = text
+        .trim()
+        .trim_matches(|ch: char| ch.is_ascii_punctuation() || ch.is_whitespace())
+        .replace(char::is_whitespace, "");
+    match normalized.as_str() {
+        "开启语音回复" | "打开语音回复" | "启用语音回复" | "语音回复开启" | "语音回复打开" => {
+            Some(true)
+        }
+        "关闭语音回复" | "关掉语音回复" | "禁用语音回复" | "语音回复关闭" | "语音回复关掉" => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+fn set_wechat_voice_reply_enabled(
+    store: &AppStore,
+    app: &AppHandle,
+    mut persona: Persona,
+    enabled: bool,
+) -> AppResult<Persona> {
+    persona.voice_reply["enabled"] = json!(enabled);
+    let saved = store.save_persona(persona)?;
+    let _ = app.emit(
+        "synthchat-persona-event",
+        json!({
+            "type": "persona_updated",
+            "source": "wechat",
+            "personaId": saved.id,
+            "persona": saved,
+        }),
+    );
+    Ok(saved)
+}
+
+async fn handle_wechat_voice_reply_toggle_command(
+    store: &AppStore,
+    app: &AppHandle,
+    account: &AccountConfig,
+    user_id: &str,
+    context_token: Option<&str>,
+    persona: Persona,
+    enabled: bool,
+) -> AppResult<WechatInboundResult> {
+    let saved = set_wechat_voice_reply_enabled(store, app, persona, enabled)?;
+    let reply = if enabled {
+        "微信语音回复已开启。"
+    } else {
+        "微信语音回复已关闭。"
+    };
+    let delivery_error =
+        match send_wechat_text_message_with_retry(account, user_id, reply, context_token).await {
+            Ok(_) => None,
+            Err(error) => Some(format!("文本发送失败: {error}")),
+        };
+    Ok(WechatInboundResult {
+        messages: vec![json!({
+            "role": "assistant",
+            "source": "wechat-control",
+            "content": reply,
+            "personaId": saved.id,
+        })],
+        delivered: delivery_error.is_none(),
+        delivery_error,
+    })
+}
+
 fn voice_reply_string(config: &Value, key: &str) -> Option<String> {
     config
         .get(key)
@@ -3148,15 +3417,23 @@ fn voice_reply_payload(persona: &Persona, text: &str) -> Option<Value> {
     if !voice_reply_enabled(persona) {
         return None;
     }
+    let speech_text = sanitize_wechat_speech_text(text);
+    if speech_text.trim().is_empty() {
+        return None;
+    }
     let config = &persona.voice_reply;
     let mut payload = json!({
-        "text": text,
-        "format": "wav",
+        "text": speech_text,
+        "format": "silk",
         "engine": voice_reply_string(config, "engine").unwrap_or_else(|| "chattts".into()),
         "speedScale": "chattts",
     });
     for key in [
         "pythonPath",
+        "language",
+        "voice",
+        "volume",
+        "pitch",
         "modelDir",
         "sampleRate",
         "speed",
@@ -3195,6 +3472,11 @@ async fn synthesize_wechat_voice_reply(
         return Ok(None);
     };
     let result = agent::text_to_speech_payload_for_desktop(store, &payload).await?;
+    let actual_format = first_value_string(&result, &[&["actualFormat"], &["format"]])
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
     let path = first_value_string(
         &result,
         &[
@@ -3207,6 +3489,27 @@ async fn synthesize_wechat_voice_reply(
     )
     .filter(|value| PathBuf::from(value).is_file())
     .ok_or_else(|| AppError::BadRequest("TTS did not return a readable audio artifact".into()))?;
+    let path_format = Path::new(&path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    if actual_format != "silk" && path_format != "silk" {
+        let conversion_reason = result
+            .get("conversion")
+            .and_then(|conversion| conversion.get("reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("TTS did not produce a WeChat SILK voice artifact");
+        return Err(AppError::BadRequest(format!(
+            "微信语音回复需要 SILK 音频，但 TTS 实际输出为 {}: {conversion_reason}",
+            if actual_format.is_empty() {
+                path_format.as_str()
+            } else {
+                actual_format.as_str()
+            }
+        )));
+    }
     Ok(Some(path))
 }
 
@@ -3493,6 +3796,18 @@ pub async fn wechat_inbound_text_with_extras(
     }
     remember_wechat_reply_context(&account.id, &user_id, context_token.as_deref())?;
     let persona = store.persona(Some(account.linked_persona.as_str()))?;
+    if let Some(enabled) = wechat_voice_reply_toggle_command(&content) {
+        return handle_wechat_voice_reply_toggle_command(
+            store,
+            app,
+            &account,
+            &user_id,
+            context_token.as_deref(),
+            persona,
+            enabled,
+        )
+        .await;
+    }
     let conversation_id =
         find_or_create_wechat_conversation(store, &account.linked_persona, &account.id)?;
     let media = extract_and_save_wechat_media_with_extras(
@@ -3919,6 +4234,9 @@ pub fn dispatch_desktop_reply_to_wechat(
         };
         let mut errors = Vec::new();
         let mut voice_paths = voice_paths;
+        let auto_voice_requested = voice_paths.is_empty()
+            && !mobile_text.trim().is_empty()
+            && persona.as_ref().is_some_and(voice_reply_enabled);
         if voice_paths.is_empty() && !mobile_text.trim().is_empty() {
             if let Some(persona) = persona.as_ref() {
                 match synthesize_wechat_voice_reply(&store, persona, &mobile_text).await {
@@ -3935,11 +4253,13 @@ pub fn dispatch_desktop_reply_to_wechat(
                 errors.push(format!("图片发送失败 {image_path}: {error}"));
             }
         }
+        let mut voice_errors = Vec::new();
+        let mut voice_delivered = false;
         for voice_path in &voice_paths {
-            if let Err(error) =
-                send_wechat_voice_message_with_retry(&account, &user_id, voice_path, token).await
+            match send_wechat_voice_message_with_retry(&account, &user_id, voice_path, token).await
             {
-                errors.push(format!("语音发送失败 {voice_path}: {error}"));
+                Ok(_) => voice_delivered = true,
+                Err(error) => voice_errors.push(format!("语音发送失败 {voice_path}: {error}")),
             }
         }
         for file_path in &file_paths {
@@ -3949,7 +4269,9 @@ pub fn dispatch_desktop_reply_to_wechat(
                 errors.push(format!("文件发送失败 {file_path}: {error}"));
             }
         }
-        if !mobile_text.trim().is_empty() {
+        let mut text_delivered = false;
+        let should_send_text = !mobile_text.trim().is_empty() && (!auto_voice_requested || !voice_delivered);
+        if should_send_text {
             let text_token =
                 if image_paths.is_empty() && voice_paths.is_empty() && file_paths.is_empty() {
                     token
@@ -3961,6 +4283,23 @@ pub fn dispatch_desktop_reply_to_wechat(
                     .await
             {
                 errors.push(format!("文本发送失败: {error}"));
+            } else {
+                text_delivered = true;
+            }
+        }
+        if !voice_errors.is_empty() {
+            if text_delivered {
+                eprintln!(
+                    "SynthChat wechat desktop voice delivery failed; text fallback delivered: {}",
+                    voice_errors.join("\n")
+                );
+            } else if voice_delivered {
+                eprintln!(
+                    "SynthChat wechat desktop voice delivery partially failed after at least one voice was delivered: {}",
+                    voice_errors.join("\n")
+                );
+            } else {
+                errors.extend(voice_errors);
             }
         }
         if !errors.is_empty() {
@@ -4109,6 +4448,25 @@ mod tests {
         assert_eq!(extract_wechat_user_id(&raw).as_deref(), Some("wechat-user"));
         assert_eq!(extract_wechat_text(&raw).as_deref(), Some("你好"));
         assert_eq!(extract_wechat_context_token(&raw).as_deref(), Some("ctx-1"));
+    }
+
+    #[test]
+    fn wechat_voice_reply_toggle_command_recognizes_enable_disable_phrases() {
+        assert_eq!(wechat_voice_reply_toggle_command("开启语音回复"), Some(true));
+        assert_eq!(wechat_voice_reply_toggle_command("关闭语音回复"), Some(false));
+        assert_eq!(wechat_voice_reply_toggle_command("  语音回复开启  "), Some(true));
+        assert_eq!(wechat_voice_reply_toggle_command("不相关内容"), None);
+    }
+
+    #[test]
+    fn silk_voice_metadata_uses_nonzero_playtime() {
+        let dir = std::env::temp_dir().join(format!("synthchat-wechat-silk-{}", new_id("case")));
+        fs::create_dir_all(&dir).unwrap();
+        let silk = dir.join("ptt.silk");
+        fs::write(&silk, b"silk").unwrap();
+        let (_, _, _, playtime_ms) = wechat_voice_metadata(&silk, b"silk");
+        assert!(playtime_ms > 0);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -54812,6 +54812,8 @@ fn text_to_speech_helpers_normalize_url_format_and_json_audio() {
     )
     .unwrap();
     assert_eq!(minimax_audio, vec![1, 2, 3, 4]);
+    assert!(ensure_tencent_silk_audio(b"\x02#!SILK_V3\"\0payload").is_ok());
+    assert!(ensure_tencent_silk_audio(b"not silk").is_err());
 }
 
 #[tokio::test]
@@ -55197,6 +55199,8 @@ fn edge_text_to_speech_uses_edge_style_command_and_saves_audio() {
         &dir.join("output.mp3"),
         "en-US-AriaNeural",
         "+0%",
+        "+0%",
+        "+0Hz",
     );
     assert!(command.contains("edge_tts"));
     assert!(command.contains("--write-media"));
