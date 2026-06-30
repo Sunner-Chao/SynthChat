@@ -1021,13 +1021,19 @@ export function PetWindow() {
     void listen<{
       type?: string;
       personaId?: string;
+      source?: string;
       persona?: Persona;
     }>("synthchat-persona-event", (event) => {
       const payload = event.payload;
       if (payload.type !== "persona_updated") return;
       const context = activeContextRef.current ?? readStoredPetActiveContext();
-      if (payload.persona && applyPetVoiceReplyPersona(payload.persona)) return;
-      if (!payload.personaId || payload.personaId === context?.personaId) {
+      const updatedPersonaId = payload.persona?.id ?? payload.personaId ?? null;
+      const matchesActivePersona =
+        !updatedPersonaId
+        || !context?.personaId
+        || updatedPersonaId === context.personaId;
+      if (payload.source === "desktop-local" && payload.persona && applyPetVoiceReplyPersona(payload.persona)) return;
+      if (matchesActivePersona) {
         void refreshPetVoiceReplyState();
       }
     }).then((handler) => {
@@ -1739,8 +1745,10 @@ export function PetWindow() {
     try {
       const persona = await resolvePetVoicePersona();
       if (!persona) {
+        const fallback = defaultPetVoiceReplyConfig();
+        petVoiceReplyConfigRef.current = fallback;
         setPetVoicePersonaName("");
-        setPetVoiceReplyConfig(defaultPetVoiceReplyConfig());
+        setPetVoiceReplyConfig(fallback);
         return;
       }
       const voiceReply = normalizePetVoiceReplyConfig(persona.voiceReply);

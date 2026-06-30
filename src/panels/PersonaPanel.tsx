@@ -426,19 +426,23 @@ export function PersonaPanel() {
     updateVoiceReply({ enabled });
   };
 
+  const currentDraftSnapshot = () => draftRef.current;
+
   const save = async () => {
     setSaving(true);
     try {
+      const draftSnapshot = currentDraftSnapshot();
       const imageGeneration = {
-        ...(draft.imageGeneration ?? defaultImageGenerationConfig()),
+        ...(draftSnapshot.imageGeneration ?? defaultImageGenerationConfig()),
         model: ""
       };
       const saved = await savePersona({
-        ...draft,
-        llmModel: effectiveLlmModelId || draft.llmModel,
+        ...draftSnapshot,
+        llmModel: effectiveLlmModelId || draftSnapshot.llmModel,
         imageGeneration
       });
       setSelectedId(saved.id);
+      draftRef.current = saved;
       setDraft(saved);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
@@ -465,14 +469,17 @@ export function PersonaPanel() {
     const file = event.target.files?.[0];
     event.currentTarget.value = "";
     if (!file) return;
-    let targetId = draft.id;
-    if (draft.id.startsWith("persona-")) {
-      const savedPersona = await savePersona(draft);
+    const draftSnapshot = currentDraftSnapshot();
+    let targetId = draftSnapshot.id;
+    if (draftSnapshot.id.startsWith("persona-")) {
+      const savedPersona = await savePersona(draftSnapshot);
       setSelectedId(savedPersona.id);
+      draftRef.current = savedPersona;
       setDraft(savedPersona);
       targetId = savedPersona.id;
     }
     const saved = await uploadPersonaAvatar(targetId, file);
+    draftRef.current = saved;
     setDraft(saved);
   };
 
@@ -781,8 +788,11 @@ export function PersonaPanel() {
               </div>
               <button
                 onClick={async () => {
-                  await savePersona(draft);
-                  await triggerProactiveOnce(draft.id);
+                  const draftSnapshot = currentDraftSnapshot();
+                  const savedPersona = await savePersona(draftSnapshot);
+                  draftRef.current = savedPersona;
+                  setDraft(savedPersona);
+                  await triggerProactiveOnce(savedPersona.id);
                 }}
                 type="button"
               >
