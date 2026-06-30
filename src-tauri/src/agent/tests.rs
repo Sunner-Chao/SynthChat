@@ -55198,12 +55198,13 @@ fn edge_text_to_speech_uses_edge_style_command_and_saves_audio() {
         &dir.join("input.txt"),
         &dir.join("output.mp3"),
         "en-US-AriaNeural",
-        "+0%",
+        "-13%",
         "+0%",
         "+0Hz",
     );
     assert!(command.contains("edge_tts"));
     assert!(command.contains("--write-media"));
+    assert!(command.contains("--rate="));
 
     let raw = edge_text_to_speech(
         &store,

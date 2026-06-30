@@ -6,6 +6,7 @@ param(
   [string]$WebviewInstallMode = "offlineInstaller",
   [switch]$PreflightOnly,
   [switch]$SkipNpmInstall,
+  [switch]$FastIncremental,
   [switch]$StrictBundlerExitCode,
   [switch]$RetryWithDownloadBootstrapper,
   [switch]$OpenOutput
@@ -153,6 +154,9 @@ if (-not [string]::IsNullOrWhiteSpace($UpdateManifestUrl)) {
 if ($PreflightOnly) {
   $buildArgs += "-PreflightOnly"
 }
+if ($FastIncremental) {
+  $buildArgs += "-FastIncremental"
+}
 if (-not $StrictBundlerExitCode) {
   $buildArgs += "-AcceptExistingArtifactOnTimeout"
 }
@@ -174,6 +178,9 @@ if ($LASTEXITCODE -ne 0) {
     }
     if (-not $StrictBundlerExitCode) {
       $retryArgs += "-AcceptExistingArtifactOnTimeout"
+    }
+    if ($FastIncremental) {
+      $retryArgs += "-FastIncremental"
     }
     & powershell @retryArgs
     if ($LASTEXITCODE -ne 0) {

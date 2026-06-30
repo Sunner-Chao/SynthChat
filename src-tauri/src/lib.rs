@@ -1176,18 +1176,27 @@ fn save_profile(store: State<'_, AppStore>, profile: ProfileConfig) -> AppResult
     store.set_profile(profile)
 }
 
+fn dialog_file_path_to_string(path: tauri_plugin_dialog::FilePath) -> AppResult<String> {
+    path.into_path()
+        .map(|path| path.to_string_lossy().to_string())
+        .map_err(|error| AppError::BadRequest(format!("selected path is unavailable: {error}")))
+}
+
+fn dialog_selection_to_string(
+    selected: Option<tauri_plugin_dialog::FilePath>,
+) -> AppResult<Option<String>> {
+    selected.map(dialog_file_path_to_string).transpose()
+}
+
 #[tauri::command(rename_all = "camelCase")]
-fn pick_path(
-    app: AppHandle,
+async fn pick_path(
+    window: tauri::WebviewWindow,
     title: Option<String>,
     directory: bool,
     filter_name: Option<String>,
     extensions: Option<Vec<String>>,
 ) -> AppResult<Option<String>> {
-    let mut dialog = app.dialog().file();
-    if let Some(window) = app.get_webview_window("main") {
-        dialog = dialog.set_parent(&window);
-    }
+    let mut dialog = window.app_handle().dialog().file().set_parent(&window);
     if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
         dialog = dialog.set_title(title);
     }
@@ -1195,18 +1204,20 @@ fn pick_path(
         let extension_refs = extensions.iter().map(String::as_str).collect::<Vec<_>>();
         dialog = dialog.add_filter(filter_name.unwrap_or_else(|| "Files".into()), &extension_refs);
     }
-    let selected = if directory {
-        dialog.blocking_pick_folder()
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<AppResult<Option<String>>>();
+    if directory {
+        dialog.pick_folder(move |selected| {
+            let _ = tx.send(dialog_selection_to_string(selected));
+        });
     } else {
-        dialog.blocking_pick_file()
-    };
-    selected
-        .map(|path| {
-            path.into_path()
-                .map(|path| path.to_string_lossy().to_string())
-                .map_err(|error| AppError::BadRequest(format!("selected path is unavailable: {error}")))
-        })
-        .transpose()
+        dialog.pick_file(move |selected| {
+            let _ = tx.send(dialog_selection_to_string(selected));
+        });
+    }
+
+    rx.await
+        .map_err(|_| AppError::BadRequest("file dialog callback did not return a result".into()))?
 }
 
 #[tauri::command(rename_all = "camelCase")]

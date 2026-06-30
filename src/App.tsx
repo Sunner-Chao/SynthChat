@@ -406,6 +406,7 @@ export function App() {
         || payload.type === "assistant_message";
       const isVisibleMessageEvent =
         Boolean(payload.conversationId && payload.message && isVisibleChatEventMessage(payload.message));
+      let appliedInlineVisibleMessage = false;
       if (isMessageEvent && payload.conversationId && payload.message && isVisibleMessageEvent) {
         if (payload.message.role === "user" && messageSource === "desktop") {
           // Desktop sends its own user messages and handles optimistic UI locally.
@@ -436,6 +437,7 @@ export function App() {
           }
         }
         upsertIncomingMessage(payload.message);
+        appliedInlineVisibleMessage = true;
         if (isWechatUserMessage) {
           flushDeferredWechatMessages(payload.conversationId);
         }
@@ -444,6 +446,17 @@ export function App() {
         return;
       }
       if (payload.type === "tool_message") {
+        return;
+      }
+      if (
+        appliedInlineVisibleMessage
+        && messageSource === "pet"
+        && (payload.type === "new_message" || payload.type === "assistant_message")
+      ) {
+        // Pet turns already inserted the live message into the active chat view.
+        // A same-tick refresh can read a stale backend snapshot and temporarily
+        // wipe that just-rendered bubble before turn_finished does the
+        // authoritative reload.
         return;
       }
       if (

@@ -3663,7 +3663,7 @@ pub(super) fn default_edge_tts_command(
     pitch: &str,
 ) -> String {
     format!(
-        "python -m edge_tts --file {} --voice {} --rate {} --volume {} --pitch {} --write-media {}",
+        "python -m edge_tts --file {} --voice {} --rate={} --volume={} --pitch={} --write-media {}",
         shell_quote_path(input_path),
         shell_quote_value(voice),
         shell_quote_value(rate),

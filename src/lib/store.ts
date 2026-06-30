@@ -203,6 +203,37 @@ function messageTime(message: ChatMessage) {
   return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
+function normalizeMessageContentForMatch(content: string) {
+  return content.replace(/\r\n/g, "\n").trim();
+}
+
+function matchesPersistedUserMessage(liveMessage: ChatMessage, backendMessage: ChatMessage) {
+  if (liveMessage.role !== "user" || backendMessage.role !== "user") {
+    return false;
+  }
+  const liveContent = normalizeMessageContentForMatch(liveMessage.content);
+  if (!liveContent || liveContent !== normalizeMessageContentForMatch(backendMessage.content)) {
+    return false;
+  }
+  const liveSource = liveMessage.source?.trim() ?? "";
+  const backendSource = backendMessage.source?.trim() ?? "";
+  if (liveSource && backendSource && liveSource !== backendSource) {
+    return false;
+  }
+  const liveAccountId = liveMessage.accountId ?? null;
+  const backendAccountId = backendMessage.accountId ?? null;
+  if (liveAccountId && backendAccountId && liveAccountId !== backendAccountId) {
+    return false;
+  }
+  const liveCreatedAt = messageTime(liveMessage);
+  const backendCreatedAt = messageTime(backendMessage);
+  return !(
+    liveCreatedAt > 0
+    && backendCreatedAt > 0
+    && Math.abs(backendCreatedAt - liveCreatedAt) > 120_000
+  );
+}
+
 function mergeLocalUiMessages(backendMessages: ChatMessage[], currentMessages: ChatMessage[], conversationId: string | null, limit: number) {
   if (!conversationId) return displayMessages(backendMessages, limit);
   const backendIds = new Set(backendMessages.map((message) => message.id));
@@ -211,8 +242,11 @@ function mergeLocalUiMessages(backendMessages: ChatMessage[], currentMessages: C
       return false;
     }
     if (message.role === "user") {
-      const localContent = message.content.trim();
-      return !backendMessages.some((backend) => backend.role === "user" && backend.content.trim() === localContent);
+      const localContent = normalizeMessageContentForMatch(message.content);
+      return !backendMessages.some((backend) =>
+        backend.role === "user"
+        && normalizeMessageContentForMatch(backend.content) === localContent
+      );
     }
     if (isLocalStatusMessage(message)) {
       const localCreatedAt = messageTime(message);
@@ -220,8 +254,28 @@ function mergeLocalUiMessages(backendMessages: ChatMessage[], currentMessages: C
     }
     return false;
   });
-  if (localMessages.length === 0) return displayMessages(backendMessages, limit);
-  return displayMessages([...backendMessages, ...localMessages], limit);
+  const transientLiveMessages = currentMessages.filter((message) => {
+    if (message.conversationId !== conversationId || backendIds.has(message.id)) {
+      return false;
+    }
+    if (!isVisibleChatMessage(message) || isLocalUiMessage(message) || isLocalStatusMessage(message)) {
+      return false;
+    }
+    if (message.role !== "user") {
+      return false;
+    }
+    if (message.source !== "pet" && message.source !== "wechat") {
+      return false;
+    }
+    return !backendMessages.some((backend) => matchesPersistedUserMessage(message, backend));
+  });
+  if (localMessages.length === 0 && transientLiveMessages.length === 0) {
+    return displayMessages(backendMessages, limit);
+  }
+  return displayMessages(
+    [...backendMessages, ...localMessages, ...transientLiveMessages],
+    limit
+  );
 }
 
 function hasPendingAgentWork(state: AppState, conversationId: string | null) {
@@ -835,15 +889,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     const backendMessages = activeConversationId
       ? visibleChatMessages(await api.listMessages(activeConversationId, messageLimit, previewChars))
       : [];
-    const messages = mergeLocalUiMessages(backendMessages, state.messages, activeConversationId, messageLimit);
+    const liveState = get();
+    const messages = mergeLocalUiMessages(backendMessages, liveState.messages, activeConversationId, messageLimit);
     const latestMessage = messages.at(-1);
     const shouldClearProcessing =
       Boolean(activeConversationId && latestMessage?.role === "assistant")
       && !withinProcessingGrace(activeConversationId);
     if (
-      state.activeConversationId === activeConversationId
-      && sameConversations(state.conversations, conversations)
-      && sameMessages(state.messages, messages)
+      liveState.activeConversationId === activeConversationId
+      && sameConversations(liveState.conversations, conversations)
+      && sameMessages(liveState.messages, messages)
     ) {
       set((current) => ({
         agentQueue,
