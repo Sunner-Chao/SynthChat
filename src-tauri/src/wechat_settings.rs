@@ -28,6 +28,8 @@ use crate::{
 const DEFAULT_WECHAT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 const LEGACY_BAD_WECHAT_BASE_URL: &str = "http://127.0.0.1:5030";
 const WECHAT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
+const WECHAT_CHANNEL_VERSION: &str = "2.4.6";
+const WECHAT_ILINK_APP_CLIENT_VERSION: &str = "132102";
 const WECHAT_IMAGE_MEDIA_TYPE: i64 = 1;
 const WECHAT_FILE_MEDIA_TYPE: i64 = 3;
 const WECHAT_VOICE_MEDIA_TYPE: i64 = 4;
@@ -322,10 +324,24 @@ fn common_ilink_headers() -> reqwest::header::HeaderMap {
         "iLink-App-Id",
         reqwest::header::HeaderValue::from_static("bot"),
     );
+    let client_version = std::env::var("SYNTHCHAT_WECHAT_CLIENT_VERSION")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| WECHAT_ILINK_APP_CLIENT_VERSION.to_string());
     headers.insert(
         "iLink-App-ClientVersion",
-        reqwest::header::HeaderValue::from_static("132097"),
+        reqwest::header::HeaderValue::from_str(client_version.trim()).unwrap_or_else(|_| {
+            reqwest::header::HeaderValue::from_static(WECHAT_ILINK_APP_CLIENT_VERSION)
+        }),
     );
+    let mut uin_bytes = [0_u8; 4];
+    rand::rng().fill_bytes(&mut uin_bytes);
+    let uin = u32::from_be_bytes(uin_bytes).to_string();
+    if let Ok(value) =
+        reqwest::header::HeaderValue::from_str(&general_purpose::STANDARD.encode(uin.as_bytes()))
+    {
+        headers.insert("X-WECHAT-UIN", value);
+    }
     headers
 }
 
@@ -467,7 +483,11 @@ fn wechat_base_info() -> Value {
         "channel_version": std::env::var("SYNTHCHAT_WECHAT_CHANNEL_VERSION")
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "2.4.1".to_string()),
+            .unwrap_or_else(|| WECHAT_CHANNEL_VERSION.to_string()),
+        "bot_agent": std::env::var("SYNTHCHAT_WECHAT_BOT_AGENT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "OpenClaw".to_string()),
     })
 }
 
@@ -483,6 +503,16 @@ fn ensure_wechat_sendmessage_ok(raw: &Value, operation: &str) -> AppResult<()> {
         .get("errcode")
         .and_then(Value::as_i64)
         .or_else(|| raw.get("ret").and_then(Value::as_i64))
+        .or_else(|| {
+            raw.get("data")
+                .and_then(|data| data.get("errcode"))
+                .and_then(Value::as_i64)
+        })
+        .or_else(|| {
+            raw.get("data")
+                .and_then(|data| data.get("ret"))
+                .and_then(Value::as_i64)
+        })
         .unwrap_or(0);
     if code == 0 {
         return Ok(());
@@ -501,6 +531,77 @@ fn ensure_wechat_sendmessage_ok(raw: &Value, operation: &str) -> AppResult<()> {
     .unwrap_or_default();
     Err(AppError::BadRequest(format!(
         "{operation} failed code={code}: {errmsg}"
+    )))
+}
+
+fn wechat_sendmessage_delivery_message_id(raw: &Value) -> Option<String> {
+    let message_id_keys = [
+        "message_id",
+        "messageId",
+        "messageID",
+        "msg_id",
+        "msgId",
+        "msgID",
+        "msgid",
+        "new_msg_id",
+        "newMsgId",
+        "newMsgID",
+        "server_msg_id",
+        "serverMsgId",
+        "serverMsgID",
+        "server_id",
+        "serverId",
+    ];
+    first_value_string(
+        raw,
+        &[
+            &["message_id"],
+            &["messageId"],
+            &["messageID"],
+            &["msg_id"],
+            &["msgId"],
+            &["msgID"],
+            &["msgid"],
+            &["new_msg_id"],
+            &["newMsgId"],
+            &["newMsgID"],
+            &["server_msg_id"],
+            &["serverMsgId"],
+            &["serverMsgID"],
+            &["server_id"],
+            &["serverId"],
+            &["data", "message_id"],
+            &["data", "messageId"],
+            &["data", "messageID"],
+            &["data", "msg_id"],
+            &["data", "msgId"],
+            &["data", "msgID"],
+            &["data", "msgid"],
+            &["data", "new_msg_id"],
+            &["data", "newMsgId"],
+            &["data", "newMsgID"],
+            &["data", "server_msg_id"],
+            &["data", "serverMsgId"],
+            &["data", "serverMsgID"],
+            &["data", "server_id"],
+            &["data", "serverId"],
+        ],
+    )
+    .or_else(|| recursive_value_string(raw, &message_id_keys))
+    .filter(|value| !value.trim().is_empty())
+}
+
+fn wechat_sendmessage_has_delivery_confirmation(raw: &Value) -> bool {
+    wechat_sendmessage_delivery_message_id(raw).is_some()
+}
+
+fn ensure_wechat_sendmessage_confirmed(raw: &Value, operation: &str) -> AppResult<()> {
+    ensure_wechat_sendmessage_ok(raw, operation)?;
+    if wechat_sendmessage_has_delivery_confirmation(raw) {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(format!(
+        "{operation} accepted by HTTP but returned no voice delivery message id: {raw}"
     )))
 }
 
@@ -528,7 +629,10 @@ fn wechat_typing_refresh_seconds(store: &AppStore) -> u64 {
                 .and_then(Value::as_u64)
         })
         .unwrap_or(DEFAULT_WECHAT_TYPING_REFRESH_SECONDS)
-        .clamp(MIN_WECHAT_TYPING_REFRESH_SECONDS, MAX_WECHAT_TYPING_REFRESH_SECONDS)
+        .clamp(
+            MIN_WECHAT_TYPING_REFRESH_SECONDS,
+            MAX_WECHAT_TYPING_REFRESH_SECONDS,
+        )
 }
 
 async fn get_wechat_typing_ticket(
@@ -567,7 +671,9 @@ async fn get_wechat_typing_ticket(
         .map_err(|error| wechat_http_error("wechat getconfig endpoint returned an error", error))?
         .json()
         .await
-        .map_err(|error| wechat_http_error("failed to read wechat typing config response", error))?;
+        .map_err(|error| {
+            wechat_http_error("failed to read wechat typing config response", error)
+        })?;
     ensure_wechat_sendmessage_ok(&raw, "getTypingConfig")?;
     first_value_string(
         &raw,
@@ -641,8 +747,7 @@ async fn start_wechat_typing_indicator(
             let keepalive_user_id = to_user_id.to_string();
             let keepalive_ticket = ticket.clone();
             tauri::async_runtime::spawn(async move {
-                let mut ticker =
-                    tokio::time::interval(Duration::from_secs(refresh_seconds));
+                let mut ticker = tokio::time::interval(Duration::from_secs(refresh_seconds));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tokio::select! {
@@ -1328,7 +1433,9 @@ fn strip_inline_code_for_speech(text: &str) -> String {
 }
 
 fn strip_marker_brackets_for_speech(text: &str) -> String {
-    let markers = ["表情", "图片", "文件", "附件", "语音", "动作", "media", "emoji"];
+    let markers = [
+        "表情", "图片", "文件", "附件", "语音", "动作", "media", "emoji",
+    ];
     let mut output = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find('[') {
@@ -1340,7 +1447,9 @@ fn strip_marker_brackets_for_speech(text: &str) -> String {
         };
         let bracket = &after_start[..end];
         if bracket.chars().count() <= 64
-            && markers.iter().any(|marker| bracket.to_ascii_lowercase().contains(marker))
+            && markers
+                .iter()
+                .any(|marker| bracket.to_ascii_lowercase().contains(marker))
         {
             output.push(' ');
             rest = &after_start[end + 1..];
@@ -1670,7 +1779,9 @@ fn estimate_compressed_voice_playtime_ms(byte_len: u64, bitrate_bits_per_second:
 
 fn tencent_silk_playtime_ms(bytes: &[u8]) -> Option<i64> {
     let header = b"#!SILK_V3";
-    let header_start = bytes.windows(header.len()).position(|window| window == header)?;
+    let header_start = bytes
+        .windows(header.len())
+        .position(|window| window == header)?;
     let mut cursor = header_start + header.len();
     if bytes.get(cursor) == Some(&b'\n') {
         cursor += 1;
@@ -1711,8 +1822,8 @@ fn wav_voice_metadata(bytes: &[u8]) -> Option<(i64, i64, i64, i64)> {
         }
         let data_end = data_start.saturating_add(chunk_size).min(bytes.len());
         if chunk_id == b"fmt " && data_start.saturating_add(16) <= data_end {
-            channels = u16::from_le_bytes([bytes[data_start + 2], bytes[data_start + 3]])
-                .max(1) as u64;
+            channels =
+                u16::from_le_bytes([bytes[data_start + 2], bytes[data_start + 3]]).max(1) as u64;
             sample_rate = u32::from_le_bytes([
                 bytes[data_start + 4],
                 bytes[data_start + 5],
@@ -1726,7 +1837,9 @@ fn wav_voice_metadata(bytes: &[u8]) -> Option<(i64, i64, i64, i64)> {
             data_bytes = Some(chunk_size as u64);
             break;
         }
-        cursor = data_start.saturating_add(chunk_size).saturating_add(chunk_size % 2);
+        cursor = data_start
+            .saturating_add(chunk_size)
+            .saturating_add(chunk_size % 2);
     }
     let data_bytes = data_bytes?;
     let bytes_per_second = sample_rate
@@ -2072,6 +2185,52 @@ async fn send_wechat_voice_message(
     context_token: Option<&str>,
 ) -> AppResult<Value> {
     let cdn_info = upload_wechat_voice(account, to_user_id, voice_path).await?;
+    send_wechat_voice_cdn_message(
+        account,
+        to_user_id,
+        &cdn_info,
+        context_token,
+        "sendVoiceMessage",
+    )
+    .await
+}
+
+async fn send_wechat_voice_message_from_file_upload(
+    account: &AccountConfig,
+    to_user_id: &str,
+    voice_path: &str,
+    context_token: Option<&str>,
+) -> AppResult<Value> {
+    let file_info = upload_wechat_file(account, to_user_id, voice_path).await?;
+    let path = PathBuf::from(voice_path);
+    let bytes = fs::read(&path)?;
+    let (encode_type, sample_rate, bits_per_sample, playtime_ms) =
+        wechat_voice_metadata(&path, &bytes);
+    let cdn_info = WechatCdnVoiceInfo {
+        encrypt_query_param: file_info.encrypt_query_param,
+        aes_key: file_info.aes_key,
+        encode_type,
+        bits_per_sample,
+        sample_rate,
+        playtime_ms,
+    };
+    send_wechat_voice_cdn_message(
+        account,
+        to_user_id,
+        &cdn_info,
+        context_token,
+        "sendVoiceMessageFileUpload",
+    )
+    .await
+}
+
+async fn send_wechat_voice_cdn_message(
+    account: &AccountConfig,
+    to_user_id: &str,
+    cdn_info: &WechatCdnVoiceInfo,
+    context_token: Option<&str>,
+    operation: &str,
+) -> AppResult<Value> {
     let base_url = normalize_base_url(if account.login_base_url.trim().is_empty() {
         DEFAULT_WECHAT_BASE_URL
     } else {
@@ -2120,7 +2279,7 @@ async fn send_wechat_voice_message(
         .json()
         .await
         .map_err(|error| wechat_http_error("failed to read wechat voice send response", error))?;
-    ensure_wechat_sendmessage_ok(&raw, "sendVoiceMessage")?;
+    ensure_wechat_sendmessage_confirmed(&raw, operation)?;
     Ok(raw)
 }
 
@@ -2139,6 +2298,23 @@ async fn send_wechat_voice_message_with_retry(
     }
 }
 
+async fn send_wechat_voice_message_from_file_upload_with_retry(
+    account: &AccountConfig,
+    to_user_id: &str,
+    voice_path: &str,
+    context_token: Option<&str>,
+) -> AppResult<Value> {
+    match send_wechat_voice_message_from_file_upload(account, to_user_id, voice_path, context_token)
+        .await
+    {
+        Ok(raw) => Ok(raw),
+        Err(_) if context_token.is_some() => {
+            send_wechat_voice_message_from_file_upload(account, to_user_id, voice_path, None).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn send_wechat_voice_reply_artifact_with_retry(
     account: &AccountConfig,
     to_user_id: &str,
@@ -2150,14 +2326,47 @@ async fn send_wechat_voice_reply_artifact_with_retry(
         .trim()
         .trim_start_matches('.')
         .to_ascii_lowercase();
-    if is_wechat_voice_upload_path(audio_path)
-        || matches!(
-            requested_format.as_str(),
-            "silk" | "amr" | "mp3" | "wav" | "ogg" | "opus"
+    let extension = Path::new(audio_path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.trim_start_matches('.').to_ascii_lowercase())
+        .unwrap_or_default();
+    let send_as_voice_item = matches!(requested_format.as_str(), "silk" | "amr")
+        || matches!(extension.as_str(), "silk" | "amr");
+    if send_as_voice_item {
+        let mut errors = Vec::new();
+        match send_wechat_voice_message_with_retry(account, to_user_id, audio_path, context_token)
+            .await
+        {
+            Ok(raw) => return Ok(raw),
+            Err(error) => {
+                let message = format!("voice upload voice_item failed: {error}");
+                eprintln!(
+                    "SynthChat wechat voice reply voice_item attempt failed path={} error={}",
+                    audio_path, message
+                );
+                errors.push(message);
+            }
+        }
+        match send_wechat_voice_message_from_file_upload_with_retry(
+            account,
+            to_user_id,
+            audio_path,
+            context_token,
         )
-    {
-        return send_wechat_voice_message_with_retry(account, to_user_id, audio_path, context_token)
-            .await;
+        .await
+        {
+            Ok(raw) => return Ok(raw),
+            Err(error) => {
+                let message = format!("file upload voice_item failed: {error}");
+                eprintln!(
+                    "SynthChat wechat voice reply voice_item file-upload attempt failed path={} error={}",
+                    audio_path, message
+                );
+                errors.push(message);
+            }
+        }
+        return Err(AppError::BadRequest(errors.join("; ")));
     }
     send_wechat_file_message_with_retry(account, to_user_id, audio_path, context_token).await
 }
@@ -3334,6 +3543,14 @@ async fn dispatch_reply_to_wechat(
     let auto_voice_requested = voice_paths.is_empty()
         && !mobile_text.trim().is_empty()
         && persona.is_some_and(voice_reply_enabled);
+    if let Some(persona) = persona {
+        eprintln!(
+            "SynthChat wechat voice reply dispatch: persona={} enabled={} auto_voice_requested={}",
+            persona.id,
+            voice_reply_enabled(persona),
+            auto_voice_requested
+        );
+    }
     if !auto_voice_requested && voice_paths.is_empty() && !mobile_text.trim().is_empty() {
         if let Some(persona) = persona {
             match synthesize_wechat_voice_reply(store, persona, &mobile_text).await {
@@ -3422,7 +3639,8 @@ async fn dispatch_reply_to_wechat(
         }
     }
     let mut text_delivered = false;
-    let should_send_text = !mobile_text.trim().is_empty() && (!auto_voice_requested || !voice_delivered);
+    let should_send_text =
+        !mobile_text.trim().is_empty() && (!auto_voice_requested || !voice_delivered);
     if should_send_text {
         let text_token =
             if image_paths.is_empty() && voice_paths.is_empty() && file_paths.is_empty() {
@@ -3474,13 +3692,41 @@ fn wechat_voice_reply_toggle_command(text: &str) -> Option<bool> {
         .trim_matches(|ch: char| {
             ch.is_ascii_punctuation()
                 || ch.is_whitespace()
-                || matches!(ch, '。' | '，' | '、' | '！' | '？' | '；' | '：' | '“' | '”' | '‘' | '’' | '《' | '》')
+                || matches!(
+                    ch,
+                    '。' | '，'
+                        | '、'
+                        | '！'
+                        | '？'
+                        | '；'
+                        | '：'
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                        | '《'
+                        | '》'
+                )
         })
         .chars()
         .filter(|ch| {
             !ch.is_whitespace()
                 && !ch.is_ascii_punctuation()
-                && !matches!(ch, '。' | '，' | '、' | '！' | '？' | '；' | '：' | '“' | '”' | '‘' | '’' | '《' | '》')
+                && !matches!(
+                    ch,
+                    '。' | '，'
+                        | '、'
+                        | '！'
+                        | '？'
+                        | '；'
+                        | '：'
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                        | '《'
+                        | '》'
+                )
         })
         .collect::<String>();
     match normalized.as_str() {
@@ -3493,9 +3739,7 @@ fn wechat_voice_reply_toggle_command(text: &str) -> Option<bool> {
         | "打开微信语音回复"
         | "启用微信语音回复"
         | "微信语音回复开启"
-        | "微信语音回复打开" => {
-            Some(true)
-        }
+        | "微信语音回复打开" => Some(true),
         "关闭语音回复"
         | "关掉语音回复"
         | "禁用语音回复"
@@ -3505,9 +3749,7 @@ fn wechat_voice_reply_toggle_command(text: &str) -> Option<bool> {
         | "关掉微信语音回复"
         | "禁用微信语音回复"
         | "微信语音回复关闭"
-        | "微信语音回复关掉" => {
-            Some(false)
-        }
+        | "微信语音回复关掉" => Some(false),
         _ => None,
     }
 }
@@ -3525,6 +3767,11 @@ fn set_wechat_voice_reply_enabled(
         object.insert("enabled".into(), json!(enabled));
     }
     let saved = store.save_persona(persona)?;
+    eprintln!(
+        "SynthChat wechat voice reply toggle saved: persona={} enabled={}",
+        saved.id,
+        voice_reply_enabled(&saved)
+    );
     let _ = app.emit(
         "synthchat-persona-event",
         json!({
@@ -3633,10 +3880,7 @@ fn wechat_voice_reply_formats() -> [&'static str; 3] {
 }
 
 fn wechat_audio_file_fallback_rank(format: &str, path: &str) -> u8 {
-    let normalized = format
-        .trim()
-        .trim_start_matches('.')
-        .to_ascii_lowercase();
+    let normalized = format.trim().trim_start_matches('.').to_ascii_lowercase();
     let extension = Path::new(path)
         .extension()
         .and_then(|value| value.to_str())
@@ -3730,7 +3974,13 @@ async fn synthesize_and_send_wechat_voice_reply_with_fallback(
                 )
                 .await
                 {
-                    Ok(_) => return (true, errors),
+                    Ok(_) => {
+                        eprintln!(
+                            "SynthChat wechat voice reply delivered audio artifact format={} path={}",
+                            output_format, path
+                        );
+                        return (true, errors);
+                    }
                     Err(error) => {
                         errors.push(format!(
                             "wechat audio delivery failed {output_format} {path}: {error}"
@@ -3761,9 +4011,12 @@ async fn synthesize_and_send_wechat_voice_reply_with_fallback(
                 );
                 return (true, errors);
             }
-            Err(error) => errors.push(format!(
-                "wechat audio file fallback failed {output_format} {path}: {error}"
-            )),
+            Err(error) => {
+                let message =
+                    format!("wechat audio file fallback failed {output_format} {path}: {error}");
+                eprintln!("SynthChat wechat voice reply {}", message);
+                errors.push(message);
+            }
         }
     }
     (false, errors)
@@ -3907,10 +4160,17 @@ pub async fn wechat_poll_once(
                 continue;
             }
         };
-        eprintln!(
-            "SynthChat wechat inbound processed: account={} user={} delivered={}",
-            account_id, user_id, result.delivered
-        );
+        if let Some(error) = result.delivery_error.as_deref() {
+            eprintln!(
+                "SynthChat wechat inbound processed: account={} user={} delivered={} error={}",
+                account_id, user_id, result.delivered, error
+            );
+        } else {
+            eprintln!(
+                "SynthChat wechat inbound processed: account={} user={} delivered={}",
+                account_id, user_id, result.delivered
+            );
+        }
         processed.push(WechatProcessedInbound {
             user_id,
             text: result
@@ -4158,16 +4418,15 @@ pub async fn wechat_inbound_text_with_extras(
         .as_ref()
         .map(|message| message.content.clone())
         .unwrap_or_default();
-    let (delivered, delivery_error) =
-        dispatch_reply_to_wechat(
-            store,
-            Some(&persona),
-            &account,
-            &user_id,
-            &reply,
-            context_token.as_deref(),
-        )
-        .await;
+    let (delivered, delivery_error) = dispatch_reply_to_wechat(
+        store,
+        Some(&persona),
+        &account,
+        &user_id,
+        &reply,
+        context_token.as_deref(),
+    )
+    .await;
     stop_wechat_typing_indicator(typing_indicator).await;
     Ok(WechatInboundResult {
         messages: messages
@@ -4622,11 +4881,7 @@ mod tests {
             vec![m4a.to_string_lossy().to_string()]
         );
 
-        let native_voice = format!(
-            "MEDIA:\"{}\"\nMEDIA:\"{}\"",
-            silk.display(),
-            amr.display()
-        );
+        let native_voice = format!("MEDIA:\"{}\"\nMEDIA:\"{}\"", silk.display(), amr.display());
         assert_eq!(
             extract_wechat_voice_paths(&native_voice),
             vec![
@@ -4662,12 +4917,52 @@ mod tests {
 
     #[test]
     fn wechat_voice_reply_toggle_command_recognizes_enable_disable_phrases() {
-        assert_eq!(wechat_voice_reply_toggle_command("开启语音回复"), Some(true));
-        assert_eq!(wechat_voice_reply_toggle_command("关闭语音回复"), Some(false));
-        assert_eq!(wechat_voice_reply_toggle_command("  语音回复开启  "), Some(true));
-        assert_eq!(wechat_voice_reply_toggle_command("开启微信语音回复！"), Some(true));
-        assert_eq!(wechat_voice_reply_toggle_command("微信语音回复，关闭。"), Some(false));
+        assert_eq!(
+            wechat_voice_reply_toggle_command("开启语音回复"),
+            Some(true)
+        );
+        assert_eq!(
+            wechat_voice_reply_toggle_command("关闭语音回复"),
+            Some(false)
+        );
+        assert_eq!(
+            wechat_voice_reply_toggle_command("  语音回复开启  "),
+            Some(true)
+        );
+        assert_eq!(
+            wechat_voice_reply_toggle_command("开启微信语音回复！"),
+            Some(true)
+        );
+        assert_eq!(
+            wechat_voice_reply_toggle_command("微信语音回复，关闭。"),
+            Some(false)
+        );
         assert_eq!(wechat_voice_reply_toggle_command("不相关内容"), None);
+    }
+
+    #[test]
+    fn sendmessage_response_needs_message_id_for_voice_delivery_confirmation() {
+        let empty = json!({});
+        assert!(ensure_wechat_sendmessage_ok(&empty, "sendMessage").is_ok());
+        assert!(!wechat_sendmessage_has_delivery_confirmation(&empty));
+        assert!(ensure_wechat_sendmessage_confirmed(&empty, "sendVoiceMessage").is_err());
+
+        let ok_without_message_id = json!({ "ret": 0 });
+        assert!(ensure_wechat_sendmessage_ok(&ok_without_message_id, "sendMessage").is_ok());
+        assert!(!wechat_sendmessage_has_delivery_confirmation(
+            &ok_without_message_id
+        ));
+        assert!(
+            ensure_wechat_sendmessage_confirmed(&ok_without_message_id, "sendVoiceMessage")
+                .is_err()
+        );
+
+        assert!(wechat_sendmessage_has_delivery_confirmation(&json!({
+            "data": { "message_id": "msg-1" }
+        })));
+        assert!(wechat_sendmessage_has_delivery_confirmation(&json!({
+            "data": { "items": [{ "serverMsgId": "server-msg-1" }] }
+        })));
     }
 
     #[test]
@@ -4802,8 +5097,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_wechat_voice_upload_and_send_uses_saved_account() {
-        let voice_path = std::env::var("SYNTHCHAT_LIVE_WECHAT_VOICE_FILE")
-            .unwrap_or_else(|_| r"C:\Users\Sun\AppData\Local\Temp\synthchat-f-python-repro.wav".into());
+        let voice_path = std::env::var("SYNTHCHAT_LIVE_WECHAT_VOICE_FILE").unwrap_or_else(|_| {
+            r"C:\Users\Sun\AppData\Local\Temp\synthchat-f-python-repro.wav".into()
+        });
         let account_id = std::env::var("SYNTHCHAT_LIVE_WECHAT_ACCOUNT_ID").ok();
         let to_user_id = std::env::var("SYNTHCHAT_LIVE_WECHAT_TO_USER_ID").ok();
         let context_token = std::env::var("SYNTHCHAT_LIVE_WECHAT_CONTEXT_TOKEN").ok();
@@ -4815,12 +5111,18 @@ mod tests {
             .cloned()
             .expect("no saved online WeChat account");
         let to_user_id = to_user_id
-            .or_else(|| (!account.last_wechat_user_id.trim().is_empty()).then(|| account.last_wechat_user_id.clone()))
-            .or_else(|| (!account.ilink_user_id.trim().is_empty()).then(|| account.ilink_user_id.clone()))
+            .or_else(|| {
+                (!account.last_wechat_user_id.trim().is_empty())
+                    .then(|| account.last_wechat_user_id.clone())
+            })
+            .or_else(|| {
+                (!account.ilink_user_id.trim().is_empty()).then(|| account.ilink_user_id.clone())
+            })
             .expect("no target user id; set SYNTHCHAT_LIVE_WECHAT_TO_USER_ID");
-        let context_token = context_token
-            .as_deref()
-            .or_else(|| (!account.last_context_token.trim().is_empty()).then_some(account.last_context_token.as_str()));
+        let context_token = context_token.as_deref().or_else(|| {
+            (!account.last_context_token.trim().is_empty())
+                .then_some(account.last_context_token.as_str())
+        });
         let raw =
             send_wechat_voice_message_with_retry(&account, &to_user_id, &voice_path, context_token)
                 .await
@@ -4842,26 +5144,29 @@ mod tests {
             .cloned()
             .expect("no saved online WeChat account");
         let to_user_id = to_user_id
-            .or_else(|| (!account.last_wechat_user_id.trim().is_empty()).then(|| account.last_wechat_user_id.clone()))
-            .or_else(|| (!account.ilink_user_id.trim().is_empty()).then(|| account.ilink_user_id.clone()))
+            .or_else(|| {
+                (!account.last_wechat_user_id.trim().is_empty())
+                    .then(|| account.last_wechat_user_id.clone())
+            })
+            .or_else(|| {
+                (!account.ilink_user_id.trim().is_empty()).then(|| account.ilink_user_id.clone())
+            })
             .expect("no target user id; set SYNTHCHAT_LIVE_WECHAT_TO_USER_ID");
-        let context_token = context_token
-            .as_deref()
-            .or_else(|| (!account.last_context_token.trim().is_empty()).then_some(account.last_context_token.as_str()));
-        let dir = std::env::temp_dir()
-            .join(format!("synthchat-live-wechat-tts-{}", new_id("case")));
+        let context_token = context_token.as_deref().or_else(|| {
+            (!account.last_context_token.trim().is_empty())
+                .then_some(account.last_context_token.as_str())
+        });
+        let dir =
+            std::env::temp_dir().join(format!("synthchat-live-wechat-tts-{}", new_id("case")));
         fs::create_dir_all(&dir).unwrap();
         let store = AppStore::new(dir.join("state.json")).unwrap();
         let mut persona = Persona::default();
         persona.voice_reply["enabled"] = json!(true);
-        let voice_path = synthesize_wechat_voice_reply(
-            &store,
-            &persona,
-            "SynthChat 微信语音回复测试。",
-        )
-        .await
-        .unwrap()
-        .expect("voice reply should synthesize an audio file");
+        let voice_path =
+            synthesize_wechat_voice_reply(&store, &persona, "SynthChat 微信语音回复测试。")
+                .await
+                .unwrap()
+                .expect("voice reply should synthesize an audio file");
         assert!(PathBuf::from(&voice_path).is_file());
         let raw =
             send_wechat_voice_message_with_retry(&account, &to_user_id, &voice_path, context_token)
@@ -4881,23 +5186,18 @@ mod tests {
             voice_reply_enabled(&persona),
             "saved default persona voice reply is disabled"
         );
-        let voice_path = synthesize_wechat_voice_reply(
-            &store,
-            &persona,
-            "SynthChat 保存角色语音回复配置测试。",
-        )
-        .await
-        .unwrap()
-        .expect("saved persona should synthesize an audio file");
+        let voice_path =
+            synthesize_wechat_voice_reply(&store, &persona, "SynthChat 保存角色语音回复配置测试。")
+                .await
+                .unwrap()
+                .expect("saved persona should synthesize an audio file");
         assert!(PathBuf::from(&voice_path).is_file());
     }
 
     #[test]
     fn ensure_wechat_user_message_visible_persists_once() {
-        let dir = std::env::temp_dir().join(format!(
-            "synthchat-wechat-visible-user-{}",
-            new_id("case")
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("synthchat-wechat-visible-user-{}", new_id("case")));
         fs::create_dir_all(&dir).unwrap();
         let store = AppStore::new(dir.join("state.json")).unwrap();
         let conversation = store

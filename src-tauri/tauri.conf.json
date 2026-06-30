@@ -44,7 +44,8 @@
                    "resources":  {
                                      "../skills":  "skills",
                                      "../public/pet":  "public/pet",
-                                     "../data/tts":  "data/tts"
+                                     "../data/tts":  "data/tts",
+                                     "../data/emoji":  "data/emoji"
                                  },
                    "targets":  "all",
                    "icon":  [

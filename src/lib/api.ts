@@ -256,6 +256,16 @@ async function call<T>(cmd: string, args: Record<string, unknown> = {}, fallback
   return fallback();
 }
 
+function dialogSelectionToPath(selection: unknown): string | null {
+  if (typeof selection === "string") return selection;
+  if (Array.isArray(selection)) return dialogSelectionToPath(selection[0]);
+  if (selection && typeof selection === "object") {
+    const path = (selection as { path?: unknown }).path;
+    return typeof path === "string" ? path : null;
+  }
+  return null;
+}
+
 function ok(message = "standalone mock"): ActionResult {
   return { success: true, message };
 }
@@ -1014,9 +1024,19 @@ export const api: Record<string, any> = {
         directory: false,
         filters: extensions?.length ? [{ name: filterName || "Files", extensions }] : undefined
       });
-      return typeof selected === "string" ? selected : null;
+      return dialogSelectionToPath(selected);
     } catch (error) {
-      console.error("open file dialog failed:", error);
+      console.warn("plugin file dialog failed, falling back to native command:", error);
+    }
+    try {
+      const selected = await call<string | null>(
+        "pick_path",
+        { title, directory: false, filterName, extensions },
+        () => null
+      );
+      return selected;
+    } catch (error) {
+      console.error("native file dialog command failed:", error);
       return null;
     }
   },
@@ -1027,9 +1047,19 @@ export const api: Record<string, any> = {
         multiple: false,
         directory: true
       });
-      return typeof selected === "string" ? selected : null;
+      return dialogSelectionToPath(selected);
     } catch (error) {
-      console.error("open folder dialog failed:", error);
+      console.warn("plugin folder dialog failed, falling back to native command:", error);
+    }
+    try {
+      const selected = await call<string | null>(
+        "pick_path",
+        { title, directory: true, filterName: null, extensions: null },
+        () => null
+      );
+      return selected;
+    } catch (error) {
+      console.error("native folder dialog command failed:", error);
       return null;
     }
   },

@@ -1,5 +1,5 @@
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { Camera, Check, FileAudio, FolderOpen, Image, ImagePlus, Mic, Pencil, Plus, Settings, Sparkles, Trash2, Wand2 } from "lucide-react";
 import { api } from "../lib/api";
 import { resolvePersonaAgentBinding } from "../lib/personaAgentBinding";
@@ -166,12 +166,16 @@ export function PersonaPanel() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [catalogModels, setCatalogModels] = useState<ModelCatalogEntry[]>([]);
+  const [remoteVoiceReplyEnabled, setRemoteVoiceReplyEnabled] = useState<boolean | null>(null);
   const selectedIdRef = useRef(selectedId);
   const draftRef = useRef(draft);
   const voiceReplySaveQueueRef = useRef(Promise.resolve());
+  const pendingVoiceReplySaveCountsRef = useRef(new Map<string, number>());
+  const latestVoiceReplySaveRef = useRef(new Map<string, VoiceReplyConfig>());
 
   useEffect(() => {
     selectedIdRef.current = selectedId;
+    setRemoteVoiceReplyEnabled(null);
   }, [selectedId]);
 
   useEffect(() => {
@@ -216,16 +220,41 @@ export function PersonaPanel() {
       if (payload.type !== "persona_updated") return;
       const updated = payload.persona;
       if (!updated) return;
+      const preservePendingVoiceReply =
+        payload.source !== "wechat" && (pendingVoiceReplySaveCountsRef.current.get(updated.id) ?? 0) > 0;
       useAppStore.setState((state) => ({
         personas: state.personas
-          .map((item) => (item.id === updated.id ? updated : item))
-          .concat(state.personas.some((item) => item.id === updated.id) ? [] : [updated])
+          .map((item) => (
+            item.id === updated.id
+              ? {
+                  ...updated,
+                  voiceReply: preservePendingVoiceReply && item.voiceReply ? item.voiceReply : updated.voiceReply
+                }
+              : item
+          ))
+          .concat(state.personas.some((item) => item.id === updated.id)
+            ? []
+            : [{
+                ...updated,
+                voiceReply: preservePendingVoiceReply && draftRef.current.id === updated.id
+                  ? draftRef.current.voiceReply
+                  : updated.voiceReply
+              }])
           .sort((a, b) => a.name.localeCompare(b.name))
       }));
       if (updated.id !== selectedIdRef.current) return;
+      const updatedVoiceReplyEnabled = updated.voiceReply?.enabled;
+      if (typeof updatedVoiceReplyEnabled === "boolean") {
+        setRemoteVoiceReplyEnabled(updatedVoiceReplyEnabled);
+      }
       setDraft((current) => {
         if (current.id !== updated.id) return current;
-        return updated;
+        const next = {
+          ...updated,
+          voiceReply: preservePendingVoiceReply && current.voiceReply ? current.voiceReply : updated.voiceReply
+        };
+        draftRef.current = next;
+        return next;
       });
     }).then((handler) => {
       unlisten = handler;
@@ -256,8 +285,7 @@ export function PersonaPanel() {
   ).trim();
   const effectiveImageModelId = (selectedImageProvider?.model ?? "").trim();
   const voiceReply = { ...defaultVoiceReplyConfig(), ...(draft.voiceReply ?? {}) };
-  const storedPersona = personas.find((persona) => persona.id === draft.id) ?? null;
-  const voiceReplyEnabled = storedPersona?.voiceReply?.enabled ?? voiceReply.enabled;
+  const voiceReplyEnabled = remoteVoiceReplyEnabled ?? voiceReply.enabled;
   const activeVoiceEngine = voiceReply.engine || "chattts";
   const activeEdgeLanguage = voiceReply.language || "zh-CN";
   const activeEdgeVoices = EDGE_VOICE_OPTIONS[activeEdgeLanguage] ?? EDGE_VOICE_OPTIONS["zh-CN"];
@@ -290,21 +318,6 @@ export function PersonaPanel() {
     voiceReply: { ...defaultVoiceReplyConfig(), ...(persona.voiceReply ?? {}), ...patch }
   });
 
-  const applyVoiceReplyEnabled = (personaId: string, enabled: boolean) => {
-    useAppStore.setState((state) => ({
-      personas: state.personas.map((persona) => (
-        persona.id === personaId ? mergeVoiceReply(persona, { enabled }) : persona
-      ))
-    }));
-    if (personaId !== selectedIdRef.current) return;
-    setDraft((current) => {
-      if (current.id !== personaId) return current;
-      const next = mergeVoiceReply(current, { enabled });
-      draftRef.current = next;
-      return next;
-    });
-  };
-
   useEffect(() => {
     if (tab !== "behavior" || draft.id.startsWith("persona-")) return;
     let cancelled = false;
@@ -314,8 +327,8 @@ export function PersonaPanel() {
       try {
         const latest = await api.getPersona(personaId);
         const enabled = latest.voiceReply?.enabled;
-        if (!cancelled && typeof enabled === "boolean") {
-          applyVoiceReplyEnabled(personaId, enabled);
+        if (!cancelled && personaId === selectedIdRef.current && typeof enabled === "boolean") {
+          setRemoteVoiceReplyEnabled(enabled);
         }
       } catch (error) {
         console.warn("persona voice reply refresh failed:", error);
@@ -340,8 +353,17 @@ export function PersonaPanel() {
     }));
   };
 
-  const queueVoiceReplySave = (personaId: string, patch: Partial<VoiceReplyConfig>) => {
-    const patchSnapshot = { ...patch };
+  const queueVoiceReplySave = (
+    personaId: string,
+    voiceReply: VoiceReplyConfig,
+    options: { preserveEnabled?: boolean } = {}
+  ) => {
+    const voiceReplySnapshot = { ...defaultVoiceReplyConfig(), ...voiceReply };
+    latestVoiceReplySaveRef.current.set(personaId, voiceReplySnapshot);
+    pendingVoiceReplySaveCountsRef.current.set(
+      personaId,
+      (pendingVoiceReplySaveCountsRef.current.get(personaId) ?? 0) + 1
+    );
     voiceReplySaveQueueRef.current = voiceReplySaveQueueRef.current
       .then(async () => {
         const localPersona =
@@ -350,8 +372,14 @@ export function PersonaPanel() {
         const latestPersona = personaId.startsWith("persona-")
           ? localPersona
           : await api.getPersona(personaId).catch(() => localPersona);
-        const next = mergeVoiceReply(latestPersona, patchSnapshot);
-        const saved = await savePersona(next);
+        const latestVoiceReply = { ...defaultVoiceReplyConfig(), ...(latestPersona.voiceReply ?? {}) };
+        const voiceReplyToSave = options.preserveEnabled && typeof latestVoiceReply.enabled === "boolean"
+          ? { ...voiceReplySnapshot, enabled: latestVoiceReply.enabled }
+          : voiceReplySnapshot;
+        const next = { ...latestPersona, voiceReply: voiceReplyToSave };
+        const saved = await api.savePersona(next);
+        if (latestVoiceReplySaveRef.current.get(personaId) !== voiceReplySnapshot) return;
+        syncPersonaInStore(saved);
         if (saved.id === selectedIdRef.current) {
           setDraft((current) => {
             if (current.id !== saved.id) return current;
@@ -363,15 +391,35 @@ export function PersonaPanel() {
       })
       .catch((error) => {
         console.error("voice reply save failed:", error);
+      })
+      .finally(() => {
+        const count = pendingVoiceReplySaveCountsRef.current.get(personaId) ?? 0;
+        if (count <= 1) {
+          pendingVoiceReplySaveCountsRef.current.delete(personaId);
+          if (latestVoiceReplySaveRef.current.get(personaId) === voiceReplySnapshot) {
+            latestVoiceReplySaveRef.current.delete(personaId);
+          }
+        } else {
+          pendingVoiceReplySaveCountsRef.current.set(personaId, count - 1);
+        }
       });
   };
 
   const updateVoiceReply = (patch: Partial<VoiceReplyConfig>) => {
+    if ("enabled" in patch) setRemoteVoiceReplyEnabled(null);
     const next = mergeVoiceReply(draftRef.current, patch);
     draftRef.current = next;
     setDraft(next);
     syncPersonaInStore(next);
-    queueVoiceReplySave(next.id, patch);
+    void emit("synthchat-persona-event", {
+      type: "persona_updated",
+      source: "desktop-local",
+      personaId: next.id,
+      persona: next
+    });
+    queueVoiceReplySave(next.id, next.voiceReply ?? defaultVoiceReplyConfig(), {
+      preserveEnabled: !("enabled" in patch)
+    });
   };
 
   const updateWechatVoiceReplyEnabled = (enabled: boolean) => {

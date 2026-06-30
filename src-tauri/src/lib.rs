@@ -42,6 +42,7 @@ use tauri::{
     App, AppHandle, DragDropEvent, Emitter, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
     State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
+use tauri_plugin_dialog::DialogExt;
 use tokio::io::AsyncWriteExt;
 
 const REMOTE_SKILL_FETCH_TIMEOUT_SECS: u64 = 20;
@@ -1176,6 +1177,39 @@ fn save_profile(store: State<'_, AppStore>, profile: ProfileConfig) -> AppResult
 }
 
 #[tauri::command(rename_all = "camelCase")]
+fn pick_path(
+    app: AppHandle,
+    title: Option<String>,
+    directory: bool,
+    filter_name: Option<String>,
+    extensions: Option<Vec<String>>,
+) -> AppResult<Option<String>> {
+    let mut dialog = app.dialog().file();
+    if let Some(window) = app.get_webview_window("main") {
+        dialog = dialog.set_parent(&window);
+    }
+    if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
+        dialog = dialog.set_title(title);
+    }
+    if let Some(extensions) = extensions.filter(|items| !items.is_empty()) {
+        let extension_refs = extensions.iter().map(String::as_str).collect::<Vec<_>>();
+        dialog = dialog.add_filter(filter_name.unwrap_or_else(|| "Files".into()), &extension_refs);
+    }
+    let selected = if directory {
+        dialog.blocking_pick_folder()
+    } else {
+        dialog.blocking_pick_file()
+    };
+    selected
+        .map(|path| {
+            path.into_path()
+                .map(|path| path.to_string_lossy().to_string())
+                .map_err(|error| AppError::BadRequest(format!("selected path is unavailable: {error}")))
+        })
+        .transpose()
+}
+
+#[tauri::command(rename_all = "camelCase")]
 fn upload_profile_avatar(
     store: State<'_, AppStore>,
     file_name: String,
@@ -1267,6 +1301,7 @@ fn save_persona(
     normalize_persona_number(&mut persona.voice_reply, "topP", 0.01, 1.0);
     normalize_persona_number(&mut persona.voice_reply, "topK", 1.0, 100.0);
     normalize_persona_number(&mut persona.voice_reply, "refineTemperature", 0.01, 2.0);
+    normalize_persona_bool(&mut persona.voice_reply, "enabled", false);
     normalize_persona_string(&mut persona.voice_reply, "engine", "chattts");
     normalize_persona_string(&mut persona.voice_reply, "language", "zh-CN");
     normalize_persona_string(&mut persona.voice_reply, "voice", "zh-CN-XiaoxiaoNeural");
@@ -4488,6 +4523,29 @@ fn bundled_emoji_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
         .filter(|path| path.is_dir())
         .or_else(|| {
+            std::env::current_exe().ok().and_then(|exe| {
+                let parent = exe.parent()?;
+                [
+                    parent.join("data").join("emoji"),
+                    parent.join("resources").join("data").join("emoji"),
+                    parent.join("resources").join("emoji"),
+                ]
+                .into_iter()
+                .find(|path| path.is_dir())
+                .or_else(|| {
+                    parent.parent().and_then(|grandparent| {
+                        [
+                            grandparent.join("data").join("emoji"),
+                            grandparent.join("resources").join("data").join("emoji"),
+                            grandparent.join("resources").join("emoji"),
+                        ]
+                        .into_iter()
+                        .find(|path| path.is_dir())
+                    })
+                })
+            })
+        })
+        .or_else(|| {
             std::env::current_dir()
                 .ok()
                 .map(|dir| dir.join("data").join("emoji"))
@@ -5469,6 +5527,7 @@ pub fn run() {
             cleanup_historical_resources,
             capture_screen_base64,
             set_pet_vision_active,
+            pick_path,
             get_profile,
             save_profile,
             upload_profile_avatar,

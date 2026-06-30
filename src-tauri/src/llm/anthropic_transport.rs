@@ -731,6 +731,10 @@ pub(super) fn anthropic_headers(
         let bearer = HeaderValue::from_str(&format!("Bearer {key}"))
             .map_err(|e| AppError::Llm(format!("invalid authorization header: {e}")))?;
         headers.insert(AUTHORIZATION, bearer);
+    } else if anthropic_uses_api_key_header(effective_base_url) {
+        let api_key = HeaderValue::from_str(key)
+            .map_err(|e| AppError::Llm(format!("invalid api-key header: {e}")))?;
+        headers.insert("api-key", api_key);
     } else {
         let x_api_key = HeaderValue::from_str(key)
             .map_err(|e| AppError::Llm(format!("invalid x-api-key header: {e}")))?;
@@ -769,6 +773,12 @@ pub(super) fn anthropic_oauth_token(key: &str) -> bool {
     !key.is_empty()
         && !key.starts_with("sk-ant-api")
         && (key.starts_with("sk-ant-") || key.starts_with("eyJ") || key.starts_with("cc-"))
+}
+
+pub(super) fn anthropic_uses_api_key_header(base_url: &str) -> bool {
+    host_matches(base_url, "token-plan-sgp.xiaomimimo.com")
+        || host_matches(base_url, "token-plan-hk.xiaomimimo.com")
+        || host_matches(base_url, "api.xiaomimimo.com")
 }
 
 pub(super) fn direct_anthropic_endpoint(base_url: &str) -> bool {
@@ -1155,5 +1165,37 @@ mod tests {
         assert_eq!(calls[0]["id"], "toolu_123");
         assert_eq!(calls[0]["function"]["name"], "terminal");
         assert_eq!(calls[0]["function"]["arguments"], json!({"command": "pwd"}));
+    }
+
+    #[test]
+    fn anthropic_headers_use_mimo_api_key_header() {
+        let provider = LlmProvider {
+            id: "local-echo".into(),
+            name: "MiMo".into(),
+            provider_type: "anthropic".into(),
+            preset: Some("anthropic".into()),
+            base_url: "https://token-plan-sgp.xiaomimimo.com/anthropic".into(),
+            append_chat_path: true,
+            api_key_env: String::new(),
+            api_key: Some("tp-test-key".into()),
+            model: "mimo-v2.5".into(),
+            enabled: true,
+            timeout_seconds: 60,
+            request_timeout_seconds: None,
+            stale_timeout_seconds: None,
+            models: json!({}),
+            prompt_cache_mode: "off".into(),
+            prompt_cache_ttl: "5m".into(),
+            prompt_cache_layout: "native".into(),
+        };
+        let headers =
+            anthropic_headers(&provider, Some("tp-test-key"), &provider.base_url).unwrap();
+
+        assert_eq!(
+            headers.get("api-key").unwrap().to_str().unwrap(),
+            "tp-test-key"
+        );
+        assert!(headers.get("x-api-key").is_none());
+        assert!(headers.get(AUTHORIZATION).is_none());
     }
 }

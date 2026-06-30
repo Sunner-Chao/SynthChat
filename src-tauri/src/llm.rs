@@ -1199,15 +1199,21 @@ fn provider_api_key_env_candidates(provider: &LlmProvider) -> Vec<&'static str> 
     if haystack.contains("openrouter") {
         return vec!["OPENROUTER_API_KEY", "OPENAI_API_KEY"];
     }
+    if haystack.contains("gemini") || haystack.contains("google") {
+        return vec!["GOOGLE_API_KEY", "GEMINI_API_KEY"];
+    }
+    if haystack.contains("xiaomi")
+        || haystack.contains("mimo")
+        || haystack.contains("xiaomimimo.com")
+    {
+        return vec!["MIMO_API_KEY", "XIAOMI_API_KEY"];
+    }
     if haystack.contains("anthropic") || model.contains("claude") {
         return vec![
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN",
         ];
-    }
-    if haystack.contains("gemini") || haystack.contains("google") {
-        return vec!["GOOGLE_API_KEY", "GEMINI_API_KEY"];
     }
     if haystack.contains("kimi") || haystack.contains("moonshot") {
         return vec![
@@ -1255,9 +1261,6 @@ fn provider_api_key_env_candidates(provider: &LlmProvider) -> Vec<&'static str> 
     }
     if haystack.contains("nvidia") || haystack.contains("nemotron") {
         return vec!["NVIDIA_API_KEY"];
-    }
-    if haystack.contains("xiaomi") || haystack.contains("mimo") {
-        return vec!["XIAOMI_API_KEY"];
     }
     if haystack.contains("tencent") || haystack.contains("tokenhub") {
         return vec!["TOKENHUB_API_KEY"];
@@ -1353,6 +1356,7 @@ fn home_dir() -> Option<std::path::PathBuf> {
 fn looks_like_inline_api_key(value: &str) -> bool {
     value.starts_with("sk-")
         || value.starts_with("sk_")
+        || value.starts_with("tp-")
         || value.starts_with("pk-")
         || value.starts_with("AIza")
         || value.len() > 48 && !value.chars().any(char::is_whitespace)
@@ -3264,9 +3268,13 @@ mod tests {
         assert!(!usable_secret_value("changeme"));
         assert!(!usable_secret_value("none"));
         assert!(usable_secret_value("sk-real-key"));
+        assert!(looks_like_inline_api_key("tp-real-key"));
 
         provider.api_key = Some("sk-real-key".into());
         assert_eq!(resolve_api_key(&provider).as_deref(), Some("sk-real-key"));
+        provider.api_key = None;
+        provider.api_key_env = "tp-real-key".into();
+        assert_eq!(resolve_api_key(&provider).as_deref(), Some("tp-real-key"));
     }
 
     #[test]
@@ -3441,6 +3449,16 @@ mod tests {
         assert_eq!(
             provider_api_key_env_candidates(&provider),
             vec!["GOOGLE_API_KEY", "GEMINI_API_KEY"]
+        );
+
+        provider.id = "local-echo".into();
+        provider.provider_type = "anthropic".into();
+        provider.preset = Some("anthropic".into());
+        provider.base_url = "https://token-plan-sgp.xiaomimimo.com/anthropic".into();
+        provider.model = "mimo-v2.5".into();
+        assert_eq!(
+            provider_api_key_env_candidates(&provider),
+            vec!["MIMO_API_KEY", "XIAOMI_API_KEY"]
         );
 
         provider.id = "kimi".into();
