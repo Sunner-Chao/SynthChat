@@ -4,6 +4,7 @@
     [string[]]$ReleaseAsset,
     [string]$ReleaseTitle,
     [string]$ReleaseNotes,
+    [string]$GitHubRepo,
     [switch]$Draft,
     [switch]$Prerelease
 )
@@ -22,6 +23,11 @@ try {
 
     . (Join-Path $ScriptRoot 'git-script-profile.ps1')
     $ProfileDefaults = Get-GitScriptProfile
+    if (-not $GitHubRepo -or -not $GitHubRepo.Trim()) {
+        $GitHubRepo = if ($ProfileDefaults.Repository) { $ProfileDefaults.Repository.Trim() } else { 'Sunner-Chao/SynthChat' }
+    } else {
+        $GitHubRepo = $GitHubRepo.Trim()
+    }
 
     function Get-CurrentBranch {
         $branchOutput = & git branch --show-current 2>$null
@@ -276,14 +282,14 @@ try {
         $prevErrorPref = $ErrorActionPreference
         try {
             $ErrorActionPreference = 'SilentlyContinue'
-            & gh release view $VersionTag 1>$null 2>$null
+            & gh release view $VersionTag --repo $GitHubRepo 1>$null 2>$null
             $releaseExists = ($LASTEXITCODE -eq 0)
         } finally {
             $ErrorActionPreference = $prevErrorPref
         }
         if ($releaseExists) {
             Write-Host "[push-github] GitHub Release 已存在，更新标题/说明并上传资产: $VersionTag" -ForegroundColor Cyan
-            $editArgs = @("release", "edit", $VersionTag, "--title", $title, "--notes", $notes)
+            $editArgs = @("release", "edit", $VersionTag, "--repo", $GitHubRepo, "--title", $title, "--notes", $notes)
             if ($Draft) { $editArgs += "--draft" }
             if ($Prerelease) { $editArgs += "--prerelease" }
             & gh @editArgs
@@ -292,7 +298,7 @@ try {
             }
             if ($validAssets.Count -gt 0) {
                 Write-Host "[push-github] 上传 Release 资产..." -ForegroundColor Cyan
-                & gh release upload $VersionTag @validAssets --clobber
+                & gh release upload $VersionTag @validAssets --clobber --repo $GitHubRepo
                 if ($LASTEXITCODE -ne 0) {
                     throw "gh release upload 失败。"
                 }
@@ -301,7 +307,7 @@ try {
         }
 
         Write-Host "[push-github] 创建 GitHub Release: $VersionTag" -ForegroundColor Cyan
-        $createArgs = @("release", "create", $VersionTag, "--title", $title, "--notes", $notes)
+        $createArgs = @("release", "create", $VersionTag, "--repo", $GitHubRepo, "--title", $title, "--notes", $notes)
         if ($Draft) { $createArgs += "--draft" }
         if ($Prerelease) { $createArgs += "--prerelease" }
         if ($validAssets.Count -gt 0) { $createArgs += $validAssets }
