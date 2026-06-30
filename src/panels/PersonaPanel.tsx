@@ -366,17 +366,20 @@ export function PersonaPanel() {
     );
     voiceReplySaveQueueRef.current = voiceReplySaveQueueRef.current
       .then(async () => {
+        if (latestVoiceReplySaveRef.current.get(personaId) !== voiceReplySnapshot) return;
         const localPersona =
           useAppStore.getState().personas.find((persona) => persona.id === personaId)
           ?? draftRef.current;
         const latestPersona = personaId.startsWith("persona-")
           ? localPersona
           : await api.getPersona(personaId).catch(() => localPersona);
+        if (latestVoiceReplySaveRef.current.get(personaId) !== voiceReplySnapshot) return;
         const latestVoiceReply = { ...defaultVoiceReplyConfig(), ...(latestPersona.voiceReply ?? {}) };
         const voiceReplyToSave = options.preserveEnabled && typeof latestVoiceReply.enabled === "boolean"
           ? { ...voiceReplySnapshot, enabled: latestVoiceReply.enabled }
           : voiceReplySnapshot;
         const next = { ...latestPersona, voiceReply: voiceReplyToSave };
+        if (latestVoiceReplySaveRef.current.get(personaId) !== voiceReplySnapshot) return;
         const saved = await api.savePersona(next);
         if (latestVoiceReplySaveRef.current.get(personaId) !== voiceReplySnapshot) return;
         syncPersonaInStore(saved);
@@ -431,6 +434,7 @@ export function PersonaPanel() {
   const save = async () => {
     setSaving(true);
     try {
+      await voiceReplySaveQueueRef.current;
       const draftSnapshot = currentDraftSnapshot();
       const imageGeneration = {
         ...(draftSnapshot.imageGeneration ?? defaultImageGenerationConfig()),

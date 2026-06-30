@@ -1760,6 +1760,23 @@ export function PetWindow() {
     }
   }
 
+  async function resolveLatestPetVoiceReplyConfig() {
+    try {
+      const persona = await resolvePetVoicePersona();
+      if (!persona) {
+        return petVoiceReplyConfigRef.current;
+      }
+      const voiceReply = normalizePetVoiceReplyConfig(persona.voiceReply);
+      petVoiceReplyConfigRef.current = voiceReply;
+      setPetVoicePersonaName(persona.name ?? "");
+      setPetVoiceReplyConfig(voiceReply);
+      return voiceReply;
+    } catch (error) {
+      console.warn("pet latest voice reply config refresh failed:", error);
+      return petVoiceReplyConfigRef.current;
+    }
+  }
+
   function applyPetVoiceReplyPersona(persona: Persona) {
     const context = activeContextRef.current ?? readStoredPetActiveContext();
     if (context?.personaId && context.personaId !== persona.id) return false;
@@ -1975,7 +1992,7 @@ export function PetWindow() {
     }
     setPetVoicePlaybackActive(true);
     try {
-      const voiceReplyConfig = petVoiceReplyConfigRef.current;
+      const voiceReplyConfig = await resolveLatestPetVoiceReplyConfig();
       console.info(
         "SynthChat pet voice reply speak:",
         `engine=${voiceReplyConfig.engine || "default"}`,
