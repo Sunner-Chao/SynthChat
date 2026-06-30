@@ -1007,23 +1007,31 @@ export const api: Record<string, any> = {
   importThemeCss: async () => [],
   exportThemesCss: async () => "",
   pickFile: async (title?: string, filterName?: string, extensions?: string[]) => {
-    if (!isTauri()) return null;
-    const selected = await openDialog({
-      title,
-      multiple: false,
-      directory: false,
-      filters: extensions?.length ? [{ name: filterName || "Files", extensions }] : undefined
-    });
-    return typeof selected === "string" ? selected : null;
+    try {
+      const selected = await openDialog({
+        title,
+        multiple: false,
+        directory: false,
+        filters: extensions?.length ? [{ name: filterName || "Files", extensions }] : undefined
+      });
+      return typeof selected === "string" ? selected : null;
+    } catch (error) {
+      console.error("open file dialog failed:", error);
+      return null;
+    }
   },
   pickFolder: async (title?: string) => {
-    if (!isTauri()) return null;
-    const selected = await openDialog({
-      title,
-      multiple: false,
-      directory: true
-    });
-    return typeof selected === "string" ? selected : null;
+    try {
+      const selected = await openDialog({
+        title,
+        multiple: false,
+        directory: true
+      });
+      return typeof selected === "string" ? selected : null;
+    } catch (error) {
+      console.error("open folder dialog failed:", error);
+      return null;
+    }
   },
   installDocker: async () => ok(),
   startDockerDesktop: async () => ok(),

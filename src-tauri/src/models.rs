@@ -415,7 +415,7 @@ fn default_proactive_config() -> Value {
 }
 
 fn default_voice_reply_config() -> Value {
-    json!({"enabled": false, "engine": "chattts", "language": "zh-CN", "voice": "zh-CN-XiaoxiaoNeural", "volume": "+0%", "pitch": "+0Hz", "pythonPath": "", "modelDir": r"E:\SynthChat\ChatTTS", "sampleRate": 16000, "speed": 5, "oral": 2, "laugh": 0, "breakLevel": 4, "speakerSeed": 20240, "speakerEmbedding": "", "temperature": 0.3, "topP": 0.7, "topK": 20, "refineTextEnabled": true, "refinePrompt": "[oral_2][laugh_0][break_4]", "refineTemperature": 0.7})
+    json!({"enabled": false, "engine": "chattts", "language": "zh-CN", "voice": "zh-CN-XiaoxiaoNeural", "volume": "+0%", "pitch": "+0Hz", "pythonPath": "", "modelDir": "", "sampleRate": 16000, "speed": 5, "oral": 2, "laugh": 0, "breakLevel": 4, "speakerSeed": 20240, "speakerEmbedding": "", "temperature": 0.3, "topP": 0.7, "topK": 20, "refineTextEnabled": true, "refinePrompt": "[oral_2][laugh_0][break_4]", "refineTemperature": 0.7})
 }
 
 fn default_image_generation_config() -> Value {

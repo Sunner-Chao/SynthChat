@@ -1629,45 +1629,106 @@ fn wechat_voice_metadata(path: &Path, bytes: &[u8]) -> (i64, i64, i64, i64) {
         .as_deref()
     {
         Some("silk") => {
-            let playtime_ms = estimate_voice_playtime_ms(bytes.len() as u64, 16_000, 16, 1);
-            (4, 16_000, 16, playtime_ms)
+            let playtime_ms = tencent_silk_playtime_ms(bytes).unwrap_or_else(|| {
+                estimate_compressed_voice_playtime_ms(bytes.len() as u64, 16_000)
+            });
+            (6, 16_000, 16, playtime_ms)
         }
-        Some("mp3") => (7, 24_000, 16, 0),
-        Some("amr") => (5, 8_000, 16, 0),
-        Some("ogg" | "opus") => (8, 24_000, 16, 0),
-        Some("wav") => wav_voice_metadata(bytes).unwrap_or((1, 16_000, 16, 0)),
-        _ => (7, 24_000, 16, 0),
+        Some("mp3") => (
+            7,
+            24_000,
+            16,
+            estimate_compressed_voice_playtime_ms(bytes.len() as u64, 24_000),
+        ),
+        Some("amr") => (
+            5,
+            8_000,
+            16,
+            estimate_compressed_voice_playtime_ms(bytes.len() as u64, 12_200),
+        ),
+        Some("ogg" | "opus") => (
+            8,
+            24_000,
+            16,
+            estimate_compressed_voice_playtime_ms(bytes.len() as u64, 24_000),
+        ),
+        Some("wav") => wav_voice_metadata(bytes).unwrap_or((1, 16_000, 16, 1_000)),
+        _ => (
+            7,
+            24_000,
+            16,
+            estimate_compressed_voice_playtime_ms(bytes.len() as u64, 24_000),
+        ),
     }
 }
 
-fn estimate_voice_playtime_ms(
-    byte_len: u64,
-    sample_rate: i64,
-    bits_per_sample: i64,
-    channels: i64,
-) -> i64 {
-    let sample_rate = sample_rate.max(1) as u64;
-    let bits_per_sample = bits_per_sample.max(1) as u64;
-    let channels = channels.max(1) as u64;
-    let bytes_per_second = sample_rate
-        .saturating_mul(channels)
-        .saturating_mul(bits_per_sample)
-        / 8;
-    if bytes_per_second == 0 {
-        return 1_000;
-    }
+fn estimate_compressed_voice_playtime_ms(byte_len: u64, bitrate_bits_per_second: u64) -> i64 {
+    let bytes_per_second = (bitrate_bits_per_second.max(1) / 8).max(1);
     let playtime_ms = byte_len.saturating_mul(1000) / bytes_per_second;
     playtime_ms.max(1_000) as i64
+}
+
+fn tencent_silk_playtime_ms(bytes: &[u8]) -> Option<i64> {
+    let header = b"#!SILK_V3";
+    let header_start = bytes.windows(header.len()).position(|window| window == header)?;
+    let mut cursor = header_start + header.len();
+    if bytes.get(cursor) == Some(&b'\n') {
+        cursor += 1;
+    }
+    let mut frames = 0_u64;
+    while cursor.saturating_add(2) <= bytes.len() {
+        let frame_len = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
+        cursor += 2;
+        if frame_len == 0 || cursor.saturating_add(frame_len) > bytes.len() {
+            break;
+        }
+        frames += 1;
+        cursor += frame_len;
+    }
+    (frames > 0).then_some(frames.saturating_mul(20).max(1_000) as i64)
 }
 
 fn wav_voice_metadata(bytes: &[u8]) -> Option<(i64, i64, i64, i64)> {
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return None;
     }
-    let channels = u16::from_le_bytes([bytes[22], bytes[23]]).max(1) as u64;
-    let sample_rate = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]) as u64;
-    let bits_per_sample = u16::from_le_bytes([bytes[34], bytes[35]]) as u64;
-    let data_bytes = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as u64;
+    let mut cursor = 12usize;
+    let mut channels = 1u64;
+    let mut sample_rate = 16_000u64;
+    let mut bits_per_sample = 16u64;
+    let mut data_bytes = None;
+    while cursor.saturating_add(8) <= bytes.len() {
+        let chunk_id = &bytes[cursor..cursor + 4];
+        let chunk_size = u32::from_le_bytes([
+            bytes[cursor + 4],
+            bytes[cursor + 5],
+            bytes[cursor + 6],
+            bytes[cursor + 7],
+        ]) as usize;
+        let data_start = cursor + 8;
+        if data_start > bytes.len() {
+            break;
+        }
+        let data_end = data_start.saturating_add(chunk_size).min(bytes.len());
+        if chunk_id == b"fmt " && data_start.saturating_add(16) <= data_end {
+            channels = u16::from_le_bytes([bytes[data_start + 2], bytes[data_start + 3]])
+                .max(1) as u64;
+            sample_rate = u32::from_le_bytes([
+                bytes[data_start + 4],
+                bytes[data_start + 5],
+                bytes[data_start + 6],
+                bytes[data_start + 7],
+            ])
+            .max(1) as u64;
+            bits_per_sample =
+                u16::from_le_bytes([bytes[data_start + 14], bytes[data_start + 15]]).max(1) as u64;
+        } else if chunk_id == b"data" {
+            data_bytes = Some(chunk_size as u64);
+            break;
+        }
+        cursor = data_start.saturating_add(chunk_size).saturating_add(chunk_size % 2);
+    }
+    let data_bytes = data_bytes?;
     let bytes_per_second = sample_rate
         .saturating_mul(channels)
         .saturating_mul(bits_per_sample)
@@ -1681,7 +1742,7 @@ fn wav_voice_metadata(bytes: &[u8]) -> Option<(i64, i64, i64, i64)> {
         1,
         sample_rate as i64,
         bits_per_sample as i64,
-        playtime_ms as i64,
+        playtime_ms.max(1_000) as i64,
     ))
 }
 
@@ -2085,13 +2146,16 @@ async fn send_wechat_voice_reply_artifact_with_retry(
     output_format: &str,
     context_token: Option<&str>,
 ) -> AppResult<Value> {
-    let extension = Path::new(audio_path)
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or(output_format)
+    let requested_format = output_format
+        .trim()
         .trim_start_matches('.')
         .to_ascii_lowercase();
-    if output_format.eq_ignore_ascii_case("silk") || extension == "silk" {
+    if is_wechat_voice_upload_path(audio_path)
+        || matches!(
+            requested_format.as_str(),
+            "silk" | "amr" | "mp3" | "wav" | "ogg" | "opus"
+        )
+    {
         return send_wechat_voice_message_with_retry(account, to_user_id, audio_path, context_token)
             .await;
     }
@@ -3326,7 +3390,28 @@ async fn dispatch_reply_to_wechat(
         .await
         {
             Ok(_) => voice_delivered = true,
-            Err(error) => voice_errors.push(format!("语音发送失败 {voice_path}: {error}")),
+            Err(error) => {
+                let voice_error = format!("语音发送失败 {voice_path}: {error}");
+                match send_wechat_file_message_with_retry(
+                    account,
+                    user_id,
+                    voice_path,
+                    context_token,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        voice_delivered = true;
+                        eprintln!(
+                            "SynthChat wechat voice delivery failed; audio file fallback delivered: {}",
+                            voice_error
+                        );
+                    }
+                    Err(file_error) => voice_errors.push(format!(
+                        "{voice_error}; 音频文件兜底失败 {voice_path}: {file_error}"
+                    )),
+                }
+            }
         }
     }
     for file_path in &file_paths {
@@ -3433,7 +3518,12 @@ fn set_wechat_voice_reply_enabled(
     mut persona: Persona,
     enabled: bool,
 ) -> AppResult<Persona> {
-    persona.voice_reply["enabled"] = json!(enabled);
+    if !persona.voice_reply.is_object() {
+        persona.voice_reply = json!({});
+    }
+    if let Some(object) = persona.voice_reply.as_object_mut() {
+        object.insert("enabled".into(), json!(enabled));
+    }
     let saved = store.save_persona(persona)?;
     let _ = app.emit(
         "synthchat-persona-event",
@@ -3542,6 +3632,32 @@ fn wechat_voice_reply_formats() -> [&'static str; 3] {
     ["silk", "wav", "mp3"]
 }
 
+fn wechat_audio_file_fallback_rank(format: &str, path: &str) -> u8 {
+    let normalized = format
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    match normalized
+        .as_str()
+        .trim()
+        .is_empty()
+        .then_some(extension.as_str())
+        .unwrap_or(normalized.as_str())
+    {
+        "wav" => 0,
+        "mp3" => 1,
+        "silk" => 2,
+        "amr" => 3,
+        "ogg" | "opus" => 4,
+        _ => 5,
+    }
+}
+
 async fn synthesize_wechat_voice_reply_with_format(
     store: &AppStore,
     persona: &Persona,
@@ -3596,9 +3712,15 @@ async fn synthesize_and_send_wechat_voice_reply_with_fallback(
     context_token: Option<&str>,
 ) -> (bool, Vec<String>) {
     let mut errors = Vec::new();
+    let mut audio_file_fallbacks = Vec::<(String, String)>::new();
     for output_format in wechat_voice_reply_formats() {
         match synthesize_wechat_voice_reply_with_format(store, persona, text, output_format).await {
             Ok(Some(path)) => {
+                audio_file_fallbacks.push((output_format.to_string(), path.clone()));
+                eprintln!(
+                    "SynthChat wechat voice reply trying format={} path={}",
+                    output_format, path
+                );
                 match send_wechat_voice_reply_artifact_with_retry(
                     account,
                     user_id,
@@ -3617,7 +3739,31 @@ async fn synthesize_and_send_wechat_voice_reply_with_fallback(
                 }
             }
             Ok(None) => return (false, errors),
-            Err(error) => errors.push(format!("wechat voice synthesis failed {output_format}: {error}")),
+            Err(error) => errors.push(format!(
+                "wechat voice synthesis failed {output_format}: {error}"
+            )),
+        }
+    }
+    audio_file_fallbacks.sort_by_key(|(format, path)| {
+        wechat_audio_file_fallback_rank(format.as_str(), path.as_str())
+    });
+    let mut attempted_paths = Vec::<String>::new();
+    for (output_format, path) in audio_file_fallbacks {
+        if attempted_paths.iter().any(|attempted| attempted == &path) {
+            continue;
+        }
+        attempted_paths.push(path.clone());
+        match send_wechat_file_message_with_retry(account, user_id, &path, context_token).await {
+            Ok(_) => {
+                eprintln!(
+                    "SynthChat wechat voice reply sent audio file fallback format={} path={}",
+                    output_format, path
+                );
+                return (true, errors);
+            }
+            Err(error) => errors.push(format!(
+                "wechat audio file fallback failed {output_format} {path}: {error}"
+            )),
         }
     }
     (false, errors)
@@ -4295,14 +4441,11 @@ pub fn dispatch_desktop_reply_to_wechat(
     text: &str,
 ) {
     let reply = text.trim().to_string();
-    let image_paths = extract_wechat_image_paths(&reply);
-    let voice_paths = extract_wechat_voice_paths(&reply);
-    let file_paths = extract_wechat_file_paths(&reply);
     let mobile_text = strip_wechat_media_marker_lines(&reply);
     if mobile_text.trim().is_empty()
-        && image_paths.is_empty()
-        && voice_paths.is_empty()
-        && file_paths.is_empty()
+        && extract_wechat_image_paths(&reply).is_empty()
+        && extract_wechat_voice_paths(&reply).is_empty()
+        && extract_wechat_file_paths(&reply).is_empty()
     {
         return;
     }
@@ -4336,116 +4479,46 @@ pub fn dispatch_desktop_reply_to_wechat(
     let context_token = account.last_context_token.trim().to_string();
     let store = store.clone();
     let persona = store.persona(conversation.persona_id.as_deref()).ok();
-    tauri::async_runtime::spawn(async move {
-        let token = if context_token.trim().is_empty() {
-            None
-        } else {
-            Some(context_token.as_str())
-        };
-        let mut errors = Vec::new();
-        let mut voice_paths = voice_paths;
-        let auto_voice_requested = voice_paths.is_empty()
-            && !mobile_text.trim().is_empty()
-            && persona.as_ref().is_some_and(voice_reply_enabled);
-        if !auto_voice_requested && voice_paths.is_empty() && !mobile_text.trim().is_empty() {
-            if let Some(persona) = persona.as_ref() {
-                match synthesize_wechat_voice_reply(&store, persona, &mobile_text).await {
-                    Ok(Some(path)) => voice_paths.push(path),
-                    Ok(None) => {}
-                    Err(error) => errors.push(format!("语音合成失败: {error}")),
-                }
-            }
-        }
-        for image_path in &image_paths {
-            if let Err(error) =
-                send_wechat_image_message_with_retry(&account, &user_id, image_path, token).await
+    if let Err(error) = thread::Builder::new()
+        .name("synthchat-wechat-desktop-delivery".to_string())
+        .stack_size(wechat_chat_thread_stack_size())
+        .spawn(move || {
+            let result = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
             {
-                errors.push(format!("图片发送失败 {image_path}: {error}"));
-            }
-        }
-        let mut voice_errors = Vec::new();
-        let mut voice_delivered = false;
-        if auto_voice_requested && voice_paths.is_empty() {
-            if let Some(persona) = persona.as_ref() {
-                let (delivered, mut fallback_errors) =
-                    synthesize_and_send_wechat_voice_reply_with_fallback(
+                Ok(runtime) => runtime.block_on(async {
+                    let token = if context_token.trim().is_empty() {
+                        None
+                    } else {
+                        Some(context_token.as_str())
+                    };
+                    let (_, delivery_error) = dispatch_reply_to_wechat(
                         &store,
-                        persona,
+                        persona.as_ref(),
                         &account,
                         &user_id,
-                        &mobile_text,
+                        &reply,
                         token,
                     )
                     .await;
-                voice_delivered |= delivered;
-                voice_errors.append(&mut fallback_errors);
+                    if let Some(error) = delivery_error {
+                        Err(AppError::BadRequest(error))
+                    } else {
+                        Ok(())
+                    }
+                }),
+                Err(error) => Err(AppError::BadRequest(format!(
+                    "failed to create wechat desktop delivery runtime: {error}"
+                ))),
+            };
+            if let Err(error) = result {
+                eprintln!("SynthChat wechat desktop delivery failed: {error}");
             }
-        }
-        for voice_path in &voice_paths {
-            let output_format = Path::new(voice_path)
-                .extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or("wav");
-            match send_wechat_voice_reply_artifact_with_retry(
-                &account,
-                &user_id,
-                voice_path,
-                output_format,
-                token,
-            )
-            .await
-            {
-                Ok(_) => voice_delivered = true,
-                Err(error) => voice_errors.push(format!("语音发送失败 {voice_path}: {error}")),
-            }
-        }
-        for file_path in &file_paths {
-            if let Err(error) =
-                send_wechat_file_message_with_retry(&account, &user_id, file_path, token).await
-            {
-                errors.push(format!("文件发送失败 {file_path}: {error}"));
-            }
-        }
-        let mut text_delivered = false;
-        let should_send_text = !mobile_text.trim().is_empty() && (!auto_voice_requested || !voice_delivered);
-        if should_send_text {
-            let text_token =
-                if image_paths.is_empty() && voice_paths.is_empty() && file_paths.is_empty() {
-                    token
-                } else {
-                    None
-                };
-            if let Err(error) =
-                send_wechat_text_message_with_retry(&account, &user_id, &mobile_text, text_token)
-                    .await
-            {
-                errors.push(format!("文本发送失败: {error}"));
-            } else {
-                text_delivered = true;
-            }
-        }
-        if !voice_errors.is_empty() {
-            if text_delivered {
-                eprintln!(
-                    "SynthChat wechat desktop voice delivery failed; text fallback delivered: {}",
-                    voice_errors.join("\n")
-                );
-            } else if voice_delivered {
-                eprintln!(
-                    "SynthChat wechat desktop voice delivery partially failed after at least one voice was delivered: {}",
-                    voice_errors.join("\n")
-                );
-            } else {
-                errors.extend(voice_errors);
-            }
-        }
-        if !errors.is_empty() {
-            eprintln!(
-                "SynthChat wechat desktop delivery failed: {}",
-                errors.join("\n")
-            );
-        }
-    });
+        })
+    {
+        eprintln!("SynthChat failed to spawn wechat desktop delivery thread: {error}");
+    }
 }
 
 #[allow(dead_code)]
@@ -4603,9 +4676,36 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let silk = dir.join("ptt.silk");
         fs::write(&silk, b"silk").unwrap();
-        let (_, _, _, playtime_ms) = wechat_voice_metadata(&silk, b"silk");
+        let (encode_type, _, _, playtime_ms) = wechat_voice_metadata(&silk, b"silk");
+        assert_eq!(encode_type, 6);
         assert!(playtime_ms > 0);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wav_voice_metadata_scans_data_chunk_after_list_metadata() {
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&24_000u32.to_le_bytes());
+        wav.extend_from_slice(&48_000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"LIST");
+        wav.extend_from_slice(&4u32.to_le_bytes());
+        wav.extend_from_slice(b"INFO");
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&48_000u32.to_le_bytes());
+        wav.extend(std::iter::repeat(0).take(48_000));
+        let riff_size = (wav.len() - 8) as u32;
+        wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
+
+        assert_eq!(wav_voice_metadata(&wav), Some((1, 24_000, 16, 1_000)));
     }
 
     #[test]

@@ -1466,70 +1466,6 @@ export const ChatExperience = memo(function ChatExperience() {
     stopVoicePlayback();
   }, [activeConversationPersona?.voiceReply?.enabled, stopVoicePlayback]);
 
-  const speakAssistantReply = useCallback(async (message: ChatMessage) => {
-    const voiceReply = activeConversationPersona?.voiceReply;
-    if (!voiceReply?.enabled) return;
-    const text = speechTextForMessage(message.content);
-    if (!text) return;
-    const requestKey = `${message.id}:${message.content.length}`;
-    activeVoiceReplyRequestRef.current = requestKey;
-    setComposerError(null);
-    try {
-      const result = await api.speakChatText(text, {
-        format: "wav",
-        engine: voiceReply.engine || undefined,
-        language: voiceReply.language || undefined,
-        voice: voiceReply.voice || undefined,
-        volume: voiceReply.volume || undefined,
-        pitch: voiceReply.pitch || undefined,
-        speedScale: "chattts",
-        speed: voiceReply.speed,
-        modelDir: voiceReply.modelDir || undefined,
-        pythonPath: voiceReply.pythonPath || undefined,
-        sampleRate: voiceReply.sampleRate,
-        oral: voiceReply.oral,
-        laugh: voiceReply.laugh,
-        breakLevel: voiceReply.breakLevel,
-        speakerSeed: voiceReply.speakerSeed,
-        speakerEmbedding: voiceReply.speakerEmbedding || undefined,
-        temperature: voiceReply.temperature,
-        topP: voiceReply.topP,
-        topK: voiceReply.topK,
-        refineTextEnabled: voiceReply.refineTextEnabled,
-        refinePrompt: voiceReply.refinePrompt || undefined,
-        refineTemperature: voiceReply.refineTemperature
-      });
-      const dataUrl = String(result?.dataUrl ?? "");
-      const artifactPath = String(result?.artifact?.path ?? "");
-      if (!dataUrl) throw new Error("TTS 没有返回音频。");
-      if (activeVoiceReplyRequestRef.current !== requestKey) return;
-      stopVoicePlayback();
-      if (artifactPath && (await playVoiceArtifact(artifactPath))) {
-        return;
-      }
-      const audio = new Audio(dataUrl);
-      voiceAudioRef.current = audio;
-      audio.onended = () => {
-        if (voiceAudioRef.current === audio) voiceAudioRef.current = null;
-      };
-      audio.onerror = () => {
-        if (activeVoiceReplyRequestRef.current === requestKey) {
-          setComposerError("语音播放失败。");
-        }
-      };
-      await audio.play();
-      if (activeVoiceReplyRequestRef.current !== requestKey) {
-        audio.pause();
-        audio.src = "";
-        return;
-      }
-    } catch (error) {
-      if (activeVoiceReplyRequestRef.current === requestKey) {
-        setComposerError(composerErrorText(error));
-      }
-    }
-  }, [activeConversationPersona?.voiceReply, stopVoicePlayback]);
-
   const getScrollAnchor = useCallback((element: HTMLDivElement): ConversationScrollMemory => {
     const base: ConversationScrollMemory = { top: element.scrollTop };
     const nodes = element.querySelectorAll<HTMLElement>("[data-message-id]");
@@ -1784,27 +1720,6 @@ export const ChatExperience = memo(function ChatExperience() {
       setUnreadCount((c) => c + 1);
     }
   }, [activeConversationId, activeSection, bottomFollowThresholdPx, incrementConversationUnread, lastMessage, markConversationRead, scrollToBottom]);
-
-  useEffect(() => {
-    if (!activeConversationId || !lastMessage) return;
-    if (activeSection !== "chat") return;
-    if (scrollOnNextMessagesRef.current) return;
-    if (!activeConversationPersona?.voiceReply?.enabled) return;
-    if (isProcessing || hasStreamingContent) return;
-    if (lastMessage.role !== "assistant" || lastMessage.source === "desktop-stream") return;
-    if (spokenAssistantMessageIdsRef.current.has(lastMessage.id)) return;
-    const createdAt = new Date(lastMessage.createdAt).getTime();
-    if (!Number.isFinite(createdAt) || createdAt < conversationActivatedAtRef.current) {
-      spokenAssistantMessageIdsRef.current.add(lastMessage.id);
-      return;
-    }
-    if (!speechTextForMessage(lastMessage.content)) {
-      spokenAssistantMessageIdsRef.current.add(lastMessage.id);
-      return;
-    }
-    spokenAssistantMessageIdsRef.current.add(lastMessage.id);
-    void speakAssistantReply(lastMessage);
-  }, [activeConversationId, activeConversationPersona?.voiceReply?.enabled, activeSection, hasStreamingContent, isProcessing, lastMessage, speakAssistantReply]);
 
   useEffect(() => () => {
     saveCurrentScrollPosition(activeConversationId);

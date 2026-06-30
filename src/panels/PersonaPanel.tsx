@@ -93,11 +93,6 @@ const EDGE_PITCH_OPTIONS: TextOption[] = [
   { value: "+40Hz", label: "明亮 · +40Hz" }
 ];
 
-const CHATTTS_MODEL_DIR_OPTIONS: TextOption[] = [
-  { value: "", label: "自动查找 / 环境变量" },
-  { value: "E:\\SynthChat\\ChatTTS", label: "E:\\SynthChat\\ChatTTS" }
-];
-
 const PYTHON_PATH_OPTIONS: TextOption[] = [
   { value: "", label: "自动选择 python" },
   { value: "python", label: "python" },
@@ -261,16 +256,11 @@ export function PersonaPanel() {
   ).trim();
   const effectiveImageModelId = (selectedImageProvider?.model ?? "").trim();
   const voiceReply = { ...defaultVoiceReplyConfig(), ...(draft.voiceReply ?? {}) };
+  const storedPersona = personas.find((persona) => persona.id === draft.id) ?? null;
+  const voiceReplyEnabled = storedPersona?.voiceReply?.enabled ?? voiceReply.enabled;
   const activeVoiceEngine = voiceReply.engine || "chattts";
   const activeEdgeLanguage = voiceReply.language || "zh-CN";
   const activeEdgeVoices = EDGE_VOICE_OPTIONS[activeEdgeLanguage] ?? EDGE_VOICE_OPTIONS["zh-CN"];
-  const chatttsModelDirOptions = useMemo(() => {
-    const options = [...CHATTTS_MODEL_DIR_OPTIONS];
-    if (voiceReply.modelDir && !options.some((option) => option.value === voiceReply.modelDir)) {
-      options.push({ value: voiceReply.modelDir, label: "当前自定义目录" });
-    }
-    return options;
-  }, [voiceReply.modelDir]);
   const chatttsSpeakerMode = voiceReply.speakerEmbedding
     ? "fixed"
     : voiceReply.speakerSeed > 0
@@ -299,6 +289,47 @@ export function PersonaPanel() {
     ...persona,
     voiceReply: { ...defaultVoiceReplyConfig(), ...(persona.voiceReply ?? {}), ...patch }
   });
+
+  const applyVoiceReplyEnabled = (personaId: string, enabled: boolean) => {
+    useAppStore.setState((state) => ({
+      personas: state.personas.map((persona) => (
+        persona.id === personaId ? mergeVoiceReply(persona, { enabled }) : persona
+      ))
+    }));
+    if (personaId !== selectedIdRef.current) return;
+    setDraft((current) => {
+      if (current.id !== personaId) return current;
+      const next = mergeVoiceReply(current, { enabled });
+      draftRef.current = next;
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    if (tab !== "behavior" || draft.id.startsWith("persona-")) return;
+    let cancelled = false;
+    const refreshVoiceReplyEnabled = async () => {
+      const personaId = selectedIdRef.current;
+      if (!personaId || personaId.startsWith("persona-")) return;
+      try {
+        const latest = await api.getPersona(personaId);
+        const enabled = latest.voiceReply?.enabled;
+        if (!cancelled && typeof enabled === "boolean") {
+          applyVoiceReplyEnabled(personaId, enabled);
+        }
+      } catch (error) {
+        console.warn("persona voice reply refresh failed:", error);
+      }
+    };
+    void refreshVoiceReplyEnabled();
+    const timer = window.setInterval(() => {
+      void refreshVoiceReplyEnabled();
+    }, 1200);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [draft.id, tab]);
 
   const syncPersonaInStore = (next: Persona) => {
     useAppStore.setState((state) => ({
@@ -718,7 +749,7 @@ export function PersonaPanel() {
             <div className="card" style={{ padding: "14px 16px", marginBottom: 12 }}>
               <label className="checkbox-row" style={{ marginBottom: 12 }}>
                 <input
-                  checked={voiceReply.enabled}
+                  checked={voiceReplyEnabled}
                   onChange={(event) => {
                     void updateWechatVoiceReplyEnabled(event.target.checked);
                   }}
@@ -840,17 +871,31 @@ export function PersonaPanel() {
                     ChatTTS 运行配置
                   </div>
                   <div className="two-column" style={{ marginBottom: 12 }}>
-                    <label>
-                      模型目录
-                      <select
-                        value={voiceReply.modelDir}
-                        onChange={(event) => updateVoiceReply({ modelDir: event.target.value })}
-                      >
-                        {chatttsModelDirOptions.map((option) => (
-                          <option key={option.value || "auto"} value={option.value}>{option.label}</option>
-                        ))}
-                      </select>
-                    </label>
+                    <div style={{ display: "grid", gap: 6 }}>
+                      <span>模型目录</span>
+                      <div className="model-select-row">
+                        <input
+                          id="chattts-model-dir"
+                          readOnly
+                          value={voiceReply.modelDir}
+                          placeholder="点击右侧浏览选择 ChatTTS 目录"
+                        />
+                        <button
+                          type="button"
+                          onClick={async (event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            const path = await api.pickFolder("选择 ChatTTS 模型目录");
+                            if (path) updateVoiceReply({ modelDir: path });
+                          }}
+                          style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+                          title="浏览选择 ChatTTS 模型目录"
+                        >
+                          <FolderOpen size={14} />
+                          浏览
+                        </button>
+                      </div>
+                    </div>
                     <label>
                       Python
                       <select
@@ -888,30 +933,8 @@ export function PersonaPanel() {
                       </select>
                     </label>
                   </div>
-                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        const path = await api.pickFolder("选择 ChatTTS 模型目录");
-                        if (path) updateVoiceReply({ modelDir: path });
-                      }}
-                      style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
-                    >
-                      <FolderOpen size={14} />
-                      选择模型目录
-                    </button>
-                    {voiceReply.modelDir ? (
-                      <button
-                        className="ghost-button"
-                        type="button"
-                        onClick={() => updateVoiceReply({ modelDir: "" })}
-                      >
-                        使用自动查找
-                      </button>
-                    ) : null}
-                  </div>
                   <p className="form-hint" style={{ marginTop: 8, marginBottom: 0, fontSize: 11 }}>
-                    留空时会按环境变量和常见目录查找；本机绝对路径可通过选择模型目录写入当前角色配置。
+                    请选择 ChatTTS 的安装目录，路径会直接写入当前角色配置。
                   </p>
                 </div>
 
@@ -1453,7 +1476,7 @@ function defaultVoiceReplyConfig(): NonNullable<Persona["voiceReply"]> {
     volume: "+0%",
     pitch: "+0Hz",
     pythonPath: "",
-    modelDir: "E:\\SynthChat\\ChatTTS",
+    modelDir: "",
     sampleRate: 16000,
     speed: 5,
     oral: 2,

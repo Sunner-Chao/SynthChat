@@ -1276,7 +1276,7 @@ fn save_persona(
     normalize_persona_string(
         &mut persona.voice_reply,
         "modelDir",
-        r"E:\SynthChat\ChatTTS",
+        "",
     );
     normalize_persona_string(&mut persona.voice_reply, "speakerEmbedding", "");
     normalize_persona_string(&mut persona.voice_reply, "refinePrompt", "");
