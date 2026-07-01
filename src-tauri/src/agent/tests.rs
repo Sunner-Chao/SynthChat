@@ -8749,7 +8749,7 @@ fn plugins_control_reply_lists_and_filters_plugins() {
 }
 
 #[test]
-fn model_control_command_updates_agent_model_override() {
+fn model_control_command_updates_persona_model_id() {
     let dir = std::env::temp_dir().join(format!("synthchat-model-{}", new_id("test")));
     fs::create_dir_all(&dir).unwrap();
     let store = AppStore::new(dir.join("state.json")).unwrap();
@@ -8774,35 +8774,44 @@ fn model_control_command_updates_agent_model_override() {
         prompt_cache_layout: "system_tools".into(),
     });
     store.set_providers(providers).unwrap();
-    let persona = store.persona(None).unwrap();
+    let mut persona = store.persona(None).unwrap();
+    persona.llm_provider = "openai-main".into();
+    persona.llm_model = "gpt-default".into();
+    let persona = store.save_persona(persona).unwrap();
     let conversation = store
         .create_conversation(Some("Model Test".into()), Some(persona.id.clone()))
         .unwrap();
 
     let status = handle_model_control_command(&store, &conversation, &persona, "").unwrap();
     assert!(status.contains("当前模型设置"));
-    assert!(status.contains("activeProvider: 本地回显"));
+    assert!(status.contains("activeProvider: OpenAI Main"));
 
     let updated =
-        handle_model_control_command(&store, &conversation, &persona, "gpt-4.1 -p openai").unwrap();
-    assert!(updated.contains("已更新当前 agent 的模型设置"));
+        handle_model_control_command(&store, &conversation, &persona, "gpt-4.1 -p openai-main").unwrap();
+    assert!(updated.contains("已更新当前角色的模型设置"));
     assert!(updated.contains("activeProvider: OpenAI Main"));
     assert!(updated.contains("effectiveModel: gpt-4.1"));
-    let saved = store.agent(Some(&conversation.agent_id)).unwrap();
-    assert_eq!(saved.llm_provider, "openai-main");
-    assert_eq!(saved.llm_model, "gpt-4.1");
+    let saved_persona = store.persona(Some(&persona.id)).unwrap();
+    let saved_agent = store.agent(Some(&conversation.agent_id)).unwrap();
+    assert_eq!(saved_persona.llm_provider, "openai-main");
+    assert_eq!(saved_persona.llm_model, "gpt-4.1");
+    assert_eq!(saved_agent.llm_provider, "openai-main");
+    assert_eq!(saved_agent.llm_model, "gpt-4.1");
 
-    let reset = handle_model_control_command(&store, &conversation, &persona, "reset").unwrap();
-    assert!(reset.contains("已清除当前 agent 的模型覆盖"));
-    let saved = store.agent(Some(&conversation.agent_id)).unwrap();
-    assert!(saved.llm_provider.is_empty());
-    assert!(saved.llm_model.is_empty());
+    let reset = handle_model_control_command(&store, &conversation, &saved_persona, "reset").unwrap();
+    assert!(reset.contains("已清除当前角色的模型 ID"));
+    let saved_persona = store.persona(Some(&persona.id)).unwrap();
+    let saved_agent = store.agent(Some(&conversation.agent_id)).unwrap();
+    assert_eq!(saved_persona.llm_provider, "openai-main");
+    assert!(saved_persona.llm_model.is_empty());
+    assert_eq!(saved_agent.llm_provider, "openai-main");
+    assert!(saved_agent.llm_model.is_empty());
 
     let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
-fn model_control_command_resolves_aliases_and_provider_handoffs() {
+fn model_control_command_resolves_aliases_without_provider_handoffs() {
     let dir = std::env::temp_dir().join(format!("synthchat-model-alias-{}", new_id("test")));
     fs::create_dir_all(&dir).unwrap();
     let store = AppStore::new(dir.join("state.json")).unwrap();
@@ -8848,37 +8857,50 @@ fn model_control_command_resolves_aliases_and_provider_handoffs() {
             },
         ])
         .unwrap();
-    let persona = store.persona(None).unwrap();
+    let mut persona = store.persona(None).unwrap();
+    persona.llm_provider = "openai-main".into();
+    persona.llm_model = "gpt-default".into();
+    let persona = store.save_persona(persona).unwrap();
     let conversation = store
         .create_conversation(Some("Model Alias".into()), Some(persona.id.clone()))
         .unwrap();
 
     let provider_only =
         handle_model_control_command(&store, &conversation, &persona, "anthropic").unwrap();
-    assert!(provider_only.contains("已切换当前 agent 的 LLM provider"));
-    let saved = store.agent(Some(&conversation.agent_id)).unwrap();
-    assert_eq!(saved.llm_provider, "anthropic-main");
-    assert!(saved.llm_model.is_empty());
+    assert!(provider_only.contains("服务商由通讯录配置固定"));
+    let saved_persona = store.persona(Some(&persona.id)).unwrap();
+    let saved_agent = store.agent(Some(&conversation.agent_id)).unwrap();
+    assert_eq!(saved_persona.llm_provider, "openai-main");
+    assert_eq!(saved_persona.llm_model, "gpt-default");
+    assert_eq!(saved_agent.llm_provider, "openai-main");
+    assert_eq!(saved_agent.llm_model, "gpt-default");
 
     let alias = handle_model_control_command(&store, &conversation, &persona, "4o").unwrap();
     assert!(alias.contains("resolvedAlias: 4o"));
-    let saved = store.agent(Some(&conversation.agent_id)).unwrap();
-    assert_eq!(saved.llm_provider, "openai-main");
-    assert_eq!(saved.llm_model, "gpt-4o");
+    let saved_persona = store.persona(Some(&persona.id)).unwrap();
+    let saved_agent = store.agent(Some(&conversation.agent_id)).unwrap();
+    assert_eq!(saved_persona.llm_provider, "openai-main");
+    assert_eq!(saved_persona.llm_model, "gpt-4o");
+    assert_eq!(saved_agent.llm_provider, "openai-main");
+    assert_eq!(saved_agent.llm_model, "gpt-4o");
 
-    handle_model_control_command(&store, &conversation, &persona, "reset").unwrap();
+    handle_model_control_command(&store, &conversation, &saved_persona, "reset").unwrap();
+    let reset_persona = store.persona(Some(&persona.id)).unwrap();
     let explicit =
-        handle_model_control_command(&store, &conversation, &persona, "sonnet -p openai").unwrap();
+        handle_model_control_command(&store, &conversation, &reset_persona, "sonnet -p openai").unwrap();
     assert!(!explicit.contains("resolvedAlias"));
-    let saved = store.agent(Some(&conversation.agent_id)).unwrap();
-    assert_eq!(saved.llm_provider, "openai-main");
-    assert_eq!(saved.llm_model, "sonnet");
+    let saved_persona = store.persona(Some(&persona.id)).unwrap();
+    let saved_agent = store.agent(Some(&conversation.agent_id)).unwrap();
+    assert_eq!(saved_persona.llm_provider, "openai-main");
+    assert_eq!(saved_persona.llm_model, "sonnet");
+    assert_eq!(saved_agent.llm_provider, "openai-main");
+    assert_eq!(saved_agent.llm_model, "sonnet");
 
     let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
-fn effective_llm_persona_prefers_persona_route_before_agent() {
+fn effective_llm_persona_uses_persona_route_only() {
     let mut persona = Persona::default();
     persona.llm_provider.clear();
     persona.llm_model.clear();
@@ -8888,9 +8910,9 @@ fn effective_llm_persona_prefers_persona_route_before_agent() {
 
     let effective = effective_llm_persona(&persona, &agent);
 
-    assert_eq!(selected_provider_id(&persona, &agent), Some("provider-a"));
-    assert_eq!(effective.llm_provider, "provider-a");
-    assert_eq!(effective.llm_model, "model-a");
+    assert_eq!(selected_provider_id(&persona, &agent), None);
+    assert!(effective.llm_provider.is_empty());
+    assert!(effective.llm_model.is_empty());
 
     persona.llm_provider = "provider-persona".into();
     persona.llm_model = "model-persona".into();
@@ -8939,7 +8961,7 @@ fn save_persona_rebinds_existing_conversations_to_agent() {
 }
 
 #[test]
-fn save_persona_syncs_bound_agent_route_fields_without_blank_override() {
+fn save_persona_syncs_bound_agent_route_fields() {
     let dir = std::env::temp_dir().join(format!("synthchat-persona-sync-{}", new_id("test")));
     fs::create_dir_all(&dir).unwrap();
     let store = AppStore::new(dir.join("state.json")).unwrap();
@@ -8967,8 +8989,8 @@ fn save_persona_syncs_bound_agent_route_fields_without_blank_override() {
     store.save_persona(persona).unwrap();
 
     let saved_agent = store.agent(Some("coder")).unwrap();
-    assert_eq!(saved_agent.llm_provider, "provider-b");
-    assert_eq!(saved_agent.llm_model, "model-b");
+    assert!(saved_agent.llm_provider.is_empty());
+    assert!(saved_agent.llm_model.is_empty());
 
     let _ = fs::remove_dir_all(dir);
 }

@@ -947,6 +947,7 @@ export interface Persona {
 export interface MemoryEntry {
   id: string;
   personaId: string;
+  target?: "memory" | "user" | "session" | string;
   summary: string;
   importance: number;
   createdAt: string;

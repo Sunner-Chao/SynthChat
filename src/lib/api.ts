@@ -776,7 +776,7 @@ export const api: Record<string, any> = {
     blockedBySecurityScan: 0,
     promptInjected: 0
   })),
-  saveMemory: (memory: MemoryEntry) => call("save_memory", { memory }, () => memory),
+  saveMemory: (memory: Partial<MemoryEntry> & { personaId: string; summary: string; importance: number; target?: string }) => call("save_memory", { memory }, () => memory),
   deleteMemory: (id: string) => call("delete_memory", { id }, () => undefined),
   listWorldbooks: () => call("list_worldbooks", {}, () => []),
   saveWorldbook: (book: unknown) => call("save_worldbook", { book }, () => book),

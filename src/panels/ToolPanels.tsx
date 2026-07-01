@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { BookOpen, Bot, ChevronRight, Download, Edit3, ExternalLink, Globe, PlugZap, Plus, Puzzle, RefreshCw, Search, Sparkles, Terminal, Trash2, XCircle } from "lucide-react";
+import { BookOpen, Bot, Brain, ChevronDown, ChevronRight, Clock, Download, Edit3, ExternalLink, Globe, Hash, Layers, PlugZap, Plus, Puzzle, RefreshCw, Search, Shield, Sparkles, Star, Terminal, Trash2, XCircle } from "lucide-react";
 
 // Mock listen function for standalone frontend
 function listen<T>(event: string, handler: (event: { payload: T }) => void): Promise<() => void> {
@@ -106,111 +106,273 @@ function fallbackSkillUrlPresetLabel(url: string) {
 
 export function MemoryPanel() {
   const { memories, personas, saveMemory, deleteMemory, goBack } = useAppStore();
-  const [personaId, setPersonaId] = useState("default");
+  const [activePersonaId, setActivePersonaId] = useState(personas[0]?.id ?? "default");
   const [summary, setSummary] = useState("");
   const [importance, setImportance] = useState(3);
   const [expandedMemoryId, setExpandedMemoryId] = useState<string | null>(null);
   const [memoryStatus, setMemoryStatus] = useState<MemoryStatus | null>(null);
+  const [showAddForm, setShowAddForm] = useState(false);
 
-  const refreshMemoryStatus = async (id = personaId) => {
+  const activePersona = personas.find((p) => p.id === activePersonaId);
+
+  const filteredMemories = useMemo(
+    () => memories.filter((m) => m.personaId === activePersonaId),
+    [memories, activePersonaId]
+  );
+
+  const refreshMemoryStatus = async (id = activePersonaId) => {
     const status = await api.getMemoryStatus(id);
     setMemoryStatus(status);
   };
 
   useEffect(() => {
-    void refreshMemoryStatus(personaId);
-  }, [personaId, memories.length]);
+    void refreshMemoryStatus(activePersonaId);
+    setExpandedMemoryId(null);
+  }, [activePersonaId, memories.length]);
 
   const submit = async () => {
     const value = summary.trim();
     if (!value) return;
-    await saveMemory({ personaId, summary: value, importance });
-    await refreshMemoryStatus(personaId);
+    await saveMemory({ personaId: activePersonaId, target: "memory", summary: value, importance });
+    await refreshMemoryStatus(activePersonaId);
     setSummary("");
+    setShowAddForm(false);
   };
 
   const removeMemory = async (id: string) => {
     await deleteMemory(id);
-    await refreshMemoryStatus(personaId);
+    await refreshMemoryStatus(activePersonaId);
+  };
+
+  const formatDate = (iso: string) => {
+    const d = new Date(iso);
+    const now = new Date();
+    const diffMs = now.getTime() - d.getTime();
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMs / 3600000);
+    const diffDays = Math.floor(diffMs / 86400000);
+    if (diffMins < 1) return "刚刚";
+    if (diffMins < 60) return `${diffMins} 分钟前`;
+    if (diffHours < 24) return `${diffHours} 小时前`;
+    if (diffDays < 7) return `${diffDays} 天前`;
+    return d.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
+  };
+
+  const importanceLabel = (level: number) => {
+    const labels = ["", "低", "一般", "中", "高", "关键"];
+    return labels[level] ?? "中";
+  };
+
+  const importanceColorClass = (level: number) => {
+    const classes = ["", "imp-low", "imp-normal", "imp-medium", "imp-high", "imp-critical"];
+    return classes[level] ?? "imp-medium";
   };
 
   return (
     <section className="primary-panel embedded-panel">
       <div className="panel-title action-title">
-        <button className="icon-only-btn" onClick={goBack} title="返回" type="button"><ChevronRight size={19} style={{ transform: "rotate(180deg)" }} /></button>
-        <div className="panel-title-text"><BookOpen size={16} className="panel-title-icon" /><span>Memory</span><strong>长期记忆</strong></div>
-      </div>
-      <div className="card" style={{ margin: "0 16px 12px" }}>
-        <div className="card-header">添加记忆</div>
-        <div className="settings-form">
-          <div className="form-group">
-            <div className="form-row">
-              <label>角色</label>
-              <select value={personaId} onChange={(event) => setPersonaId(event.target.value)}>
-                {personas.map((persona) => (
-                  <option key={persona.id} value={persona.id}>{persona.name}</option>
-                ))}
-              </select>
-            </div>
-          </div>
-          <div className="form-group">
-            <div className="form-row">
-              <label>重要性</label>
-              <input min={1} max={5} type="number" value={importance} onChange={(event) => setImportance(Number(event.target.value))} />
-            </div>
-          </div>
-          <div className="form-group">
-            <label>记忆内容</label>
-            <textarea value={summary} onChange={(event) => setSummary(event.target.value)} />
-          </div>
-          <div style={{ padding: "0 16px 12px" }}>
-            <button className="btn-primary" onClick={submit} type="button">添加记忆</button>
-          </div>
+        <button className="icon-only-btn" onClick={goBack} title="返回" type="button">
+          <ChevronRight size={19} style={{ transform: "rotate(180deg)" }} />
+        </button>
+        <div className="panel-title-text">
+          <Brain size={16} className="panel-title-icon" />
+          <span>Memory</span>
+          <strong>记忆管理</strong>
         </div>
       </div>
+
+      {/* ── Persona Tabs ── */}
+      <div className="memory-persona-tabs-wrap">
+        <div className="memory-persona-tabs">
+          {personas.map((persona) => {
+            const isActive = persona.id === activePersonaId;
+            const personaMemoryCount = memories.filter((m) => m.personaId === persona.id).length;
+            return (
+              <button
+                key={persona.id}
+                className={`memory-persona-tab ${isActive ? "active" : ""}`}
+                onClick={() => setActivePersonaId(persona.id)}
+                type="button"
+              >
+                <span className="memory-tab-avatar">
+                  {persona.avatarPath
+                    ? <img src={api.assetUrl(persona.avatarPath)} alt="" />
+                    : (persona.name || "?").slice(0, 1).toUpperCase()
+                  }
+                </span>
+                <span className="memory-tab-name">{persona.name}</span>
+                {personaMemoryCount > 0 && (
+                  <span className="memory-tab-badge">{personaMemoryCount}</span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* ── Stats Dashboard ── */}
       {memoryStatus ? (
-        <div className="card" style={{ margin: "0 16px 12px" }}>
-          <div className="card-header">记忆状态</div>
-          <div className="settings-form">
-            <div className="adapter-row trace-row">
-              <span className={`status-badge ${memoryStatus.enabled ? "enabled" : "disabled"}`}>
-                {memoryStatus.enabled ? "enabled" : "disabled"}
-              </span>
-              <div className="adapter-info">
-                <strong>{memoryStatus.personaName}</strong>
-                <small>
-                  prompt {memoryStatus.promptInjected}/{memoryStatus.maxMemories} · safe {memoryStatus.promptSafe}/{memoryStatus.total} · blocked {memoryStatus.blockedBySecurityScan}
-                </small>
-                <code>includeInPrompt={String(memoryStatus.includeInPrompt)} · triggerRounds={memoryStatus.triggerRounds}</code>
-              </div>
+        <div className="memory-stats-grid">
+          <div className="memory-stat-card">
+            <div className="memory-stat-icon"><Layers size={16} /></div>
+            <div className="memory-stat-body">
+              <span className="memory-stat-value">{memoryStatus.total}</span>
+              <span className="memory-stat-label">总记忆</span>
+            </div>
+          </div>
+          <div className="memory-stat-card">
+            <div className="memory-stat-icon stat-icon-active"><Sparkles size={16} /></div>
+            <div className="memory-stat-body">
+              <span className="memory-stat-value">{memoryStatus.promptInjected}</span>
+              <span className="memory-stat-label">已注入</span>
+            </div>
+          </div>
+          <div className="memory-stat-card">
+            <div className="memory-stat-icon stat-icon-safe"><Shield size={16} /></div>
+            <div className="memory-stat-body">
+              <span className="memory-stat-value">{memoryStatus.promptSafe}</span>
+              <span className="memory-stat-label">安全</span>
+            </div>
+          </div>
+          <div className="memory-stat-card">
+            <div className="memory-stat-icon stat-icon-blocked"><XCircle size={16} /></div>
+            <div className="memory-stat-body">
+              <span className="memory-stat-value">{memoryStatus.blockedBySecurityScan}</span>
+              <span className="memory-stat-label">已拦截</span>
             </div>
           </div>
         </div>
       ) : null}
-      <div className="card" style={{ margin: "0 16px 12px" }}>
-        <div className="card-header">记忆列表</div>
-        {memories.length === 0 ? (
-          <div className="form-hint" style={{ padding: "12px 16px" }}>暂无记忆</div>
+
+      {/* ── Add Memory ── */}
+      <div className="memory-add-section">
+        {!showAddForm ? (
+          <button className="memory-add-trigger" onClick={() => setShowAddForm(true)} type="button">
+            <Plus size={16} />
+            <span>为 {activePersona?.name ?? "当前角色"} 添加记忆</span>
+          </button>
         ) : (
-          <div className="memory-list">
-            {memories.map((memory) => {
+          <div className="memory-add-form">
+            <div className="memory-add-form-header">
+              <span>添加新记忆</span>
+              <button className="icon-only-btn" onClick={() => setShowAddForm(false)} type="button">
+                <XCircle size={16} />
+              </button>
+            </div>
+            <textarea
+              className="memory-add-textarea"
+              value={summary}
+              onChange={(e) => setSummary(e.target.value)}
+              placeholder="输入要记住的内容..."
+              rows={3}
+            />
+            <div className="memory-add-footer">
+              <div className="memory-importance-picker">
+                <span className="memory-importance-label">重要性</span>
+                <div className="memory-importance-stars">
+                  {[1, 2, 3, 4, 5].map((level) => (
+                    <button
+                      key={level}
+                      className={`memory-star-btn ${level <= importance ? "active" : ""}`}
+                      onClick={() => setImportance(level)}
+                      type="button"
+                      title={importanceLabel(level)}
+                    >
+                      <Star size={14} />
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <button className="memory-submit-btn" onClick={submit} type="button" disabled={!summary.trim()}>
+                <Plus size={14} />
+                <span>添加</span>
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── Memory List (Dropdown) ── */}
+      <div className="memory-list-section">
+        <div className="memory-list-header">
+          <span className="memory-list-title">
+            <BookOpen size={14} />
+            <span>记忆列表</span>
+            <span className="memory-list-count">{filteredMemories.length}</span>
+          </span>
+        </div>
+        {filteredMemories.length === 0 ? (
+          <div className="memory-empty-state">
+            <Brain size={32} />
+            <p>暂无记忆</p>
+            <small>为此角色添加记忆，让它记住重要的事情</small>
+          </div>
+        ) : (
+          <div className="memory-dropdown-list">
+            {filteredMemories.map((memory) => {
               const isExpanded = expandedMemoryId === memory.id;
-              const truncated = memory.summary.length > 50 ? memory.summary.slice(0, 50) + "..." : memory.summary;
+              const truncated = memory.summary.length > 60
+                ? memory.summary.slice(0, 60) + "..."
+                : memory.summary;
               return (
-                <div className="memory-item" key={memory.id} style={{ flexDirection: "column", alignItems: "stretch" }}>
-                  <div
-                    className="memory-content"
-                    style={{ cursor: "pointer" }}
+                <div className={`memory-dropdown-item ${isExpanded ? "expanded" : ""}`} key={memory.id}>
+                  <button
+                    className="memory-dropdown-trigger"
                     onClick={() => setExpandedMemoryId(isExpanded ? null : memory.id)}
+                    type="button"
                   >
-                    <strong style={{ fontSize: "13px" }}>{isExpanded ? memory.summary : truncated}</strong>
-                    <span className="memory-meta">{memory.personaId} · 重要度 {memory.importance} · {new Date(memory.createdAt).toLocaleString()}</span>
-                  </div>
-                  {isExpanded ? (
-                    <div style={{ padding: "8px 0 4px", display: "flex", justifyContent: "flex-end" }}>
-                      <button className="btn-danger-outline-sm" onClick={() => void removeMemory(memory.id)} type="button">删除</button>
+                    <span className={`memory-importance-dot ${importanceColorClass(memory.importance)}`} />
+                    <span className="memory-dropdown-text">
+                      {isExpanded ? memory.summary : truncated}
+                    </span>
+                    <span className="memory-dropdown-meta">
+                      <Clock size={11} />
+                      <span>{formatDate(memory.createdAt)}</span>
+                    </span>
+                    <ChevronDown
+                      size={14}
+                      className="memory-dropdown-arrow"
+                      style={{ transform: isExpanded ? "rotate(180deg)" : "rotate(0deg)" }}
+                    />
+                  </button>
+                  {isExpanded && (
+                    <div className="memory-dropdown-body">
+                      <div className="memory-detail-grid">
+                        <div className="memory-detail-item">
+                          <Hash size={12} />
+                          <span className="memory-detail-label">目标</span>
+                          <span className="memory-detail-value">{memory.target ?? "memory"}</span>
+                        </div>
+                        <div className="memory-detail-item">
+                          <Star size={12} />
+                          <span className="memory-detail-label">重要性</span>
+                          <span className={`memory-detail-value ${importanceColorClass(memory.importance)}`}>
+                            {importanceLabel(memory.importance)} ({memory.importance}/5)
+                          </span>
+                        </div>
+                        <div className="memory-detail-item">
+                          <Clock size={12} />
+                          <span className="memory-detail-label">创建时间</span>
+                          <span className="memory-detail-value">{new Date(memory.createdAt).toLocaleString("zh-CN")}</span>
+                        </div>
+                        <div className="memory-detail-item">
+                          <RefreshCw size={12} />
+                          <span className="memory-detail-label">更新时间</span>
+                          <span className="memory-detail-value">{new Date(memory.updatedAt).toLocaleString("zh-CN")}</span>
+                        </div>
+                      </div>
+                      <div className="memory-detail-actions">
+                        <button
+                          className="memory-delete-btn"
+                          onClick={() => void removeMemory(memory.id)}
+                          type="button"
+                        >
+                          <Trash2 size={13} />
+                          <span>删除此记忆</span>
+                        </button>
+                      </div>
                     </div>
-                  ) : null}
+                  )}
                 </div>
               );
             })}
@@ -2668,7 +2830,6 @@ export function AgentsPanel() {
   const [catalogModels, setCatalogModels] = useState<ModelCatalogEntry[]>([]);
   const [plannerTraces, setPlannerTraces] = useState<PlannerTraceRecord[]>([]);
   const [routerTraces, setRouterTraces] = useState<ToolRouterTraceRecord[]>([]);
-  const defaultLlmProvider = llmProviders.find((item) => item.enabled) ?? null;
 
   const didInitRef = useRef(false);
   useEffect(() => {
@@ -2753,8 +2914,8 @@ export function AgentsPanel() {
       name: "新智能体",
       description: "",
       workspaceDir: "",
-      llmProvider: defaultLlmProvider?.id ?? "",
-      llmModel: defaultLlmProvider?.model ?? "",
+      llmProvider: "",
+      llmModel: "",
       enabled: true,
       isDefault: false,
       mcpEnabled: true,
@@ -2831,7 +2992,7 @@ export function AgentsPanel() {
 
   const activeAgentCount = agents.filter((a) => a.enabled).length;
   const selectedProvider = draft
-    ? llmProviders.find((item) => item.id === draft.llmProvider && item.enabled) ?? defaultLlmProvider
+    ? llmProviders.find((item) => item.id === draft.llmProvider && item.enabled) ?? null
     : null;
 
   return (
@@ -2884,7 +3045,7 @@ export function AgentsPanel() {
                   <span className="agent-card-icon"><Sparkles size={18} /></span>
                   <div className="agent-card-info">
                     <span className="agent-card-name">{agent.name}{agent.isDefault ? " ★" : ""}</span>
-                    <span className="agent-card-meta">{agent.llmProvider || "默认服务商"} · {agent.llmModel || "默认模型"}</span>
+                    <span className="agent-card-meta">{agent.llmProvider || "跟随角色"} · {agent.llmModel || "未指定模型"}</span>
                   </div>
                   <div className="agent-card-right-col">
                     <span className={`agent-card-badge ${agent.enabled ? "enabled" : "disabled"}`}>
@@ -2977,7 +3138,7 @@ export function AgentsPanel() {
                       } : current);
                     }}
                   >
-                    <option value="">默认</option>
+                    <option value="">跟随通讯录角色</option>
                     {llmProviders.map((p) => (<option key={p.id} value={p.id}>{p.name}</option>))}
                   </select>
                 </div>
@@ -2999,9 +3160,9 @@ export function AgentsPanel() {
                       </select>
                     ) : null}
                     <input
-                      value={draft.llmModel || selectedProvider?.model || ""}
+                      value={draft.llmModel}
                       onChange={(e) => update("llmModel", e.target.value)}
-                      placeholder={catalogModels.length > 0 ? "或手动输入" : "留空使用默认模型"}
+                      placeholder={catalogModels.length > 0 ? "或手动输入" : "模型 ID"}
                     />
                   </div>
                 </div>

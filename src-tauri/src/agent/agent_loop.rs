@@ -863,7 +863,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         Some(id) if !id.trim().is_empty() => store.conversation(id)?,
         _ => store.create_conversation(None, request.persona_id.clone())?,
     };
-    let (persona, mut agent) = resolve_chat_turn_persona_and_agent(store, &conversation, &request)?;
+    let (mut persona, mut agent) = resolve_chat_turn_persona_and_agent(store, &conversation, &request)?;
     let request_source = turn_source_label(&request);
     let assistant_stream_source = if silent_pet_vision {
         "pet-vision"
@@ -892,10 +892,10 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         agent.max_tool_iterations = limit.max(1).min(90);
     }
     if let Some(provider_id) = provider_id_override.filter(|value| !value.trim().is_empty()) {
-        agent.llm_provider = provider_id;
+        persona.llm_provider = provider_id;
     }
     if let Some(model) = model_override.filter(|value| !value.trim().is_empty()) {
-        agent.llm_model = model;
+        persona.llm_model = model;
     }
     if let Some(workspace_dir) = workspace_dir_override.filter(|value| !value.trim().is_empty()) {
         agent.workspace_dir = workspace_dir;
@@ -1043,16 +1043,14 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
 
     let mut history = store.messages(&conversation.id, Some(30))?;
     let mut effective_persona = effective_llm_persona(&persona, &agent);
-    let mut providers = store.provider_candidates(selected_provider_id(&persona, &agent))?;
-    if !effective_persona.llm_provider.trim().is_empty()
-        && providers
-            .first()
-            .map(|provider| provider.id.as_str() != effective_persona.llm_provider.trim())
-            .unwrap_or(false)
-    {
-        effective_persona.llm_provider.clear();
-        effective_persona.llm_model.clear();
+    let selected_provider = selected_provider_id(&persona, &agent)
+        .ok_or_else(|| AppError::BadRequest("请先在通讯录中为当前角色选择对话服务商。".into()))?;
+    if effective_persona.llm_model.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "请先在通讯录中为当前角色选择模型 ID。".into(),
+        ));
     }
+    let mut providers = store.provider_candidates(Some(selected_provider))?;
     if let Some(correction) =
         reconcile_model_family_provider(&mut effective_persona, &mut providers)
     {

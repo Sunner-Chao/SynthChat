@@ -10519,12 +10519,34 @@ impl AppStore {
         preferred_provider_id: Option<&str>,
     ) -> AppResult<Vec<LlmProvider>> {
         self.with_state(|s| {
+            let preferred = preferred_provider_id.unwrap_or_default().trim();
             let enabled: Vec<LlmProvider> = s
                 .llm_providers
                 .iter()
                 .filter(|provider| provider.enabled)
                 .cloned()
                 .collect();
+            if !preferred.is_empty() {
+                let provider = enabled
+                    .into_iter()
+                    .find(|provider| provider.id == preferred)
+                    .ok_or_else(|| AppError::NotFound(format!("enabled llm provider {preferred}")))?;
+                let expanded = expand_llm_provider_credentials(provider);
+                let strategy = s.config.chat.llm_credential_pool_strategy.clone();
+                let usage = s.llm_credential_usage.clone();
+                let expanded = order_llm_provider_credentials(
+                    expanded,
+                    &strategy,
+                    &usage,
+                    &mut s.llm_credential_round_robin,
+                );
+                self.persist(s)?;
+                return Ok(filter_llm_provider_credential_cooldowns(
+                    expanded,
+                    &s.llm_credential_cooldowns,
+                    Utc::now().timestamp(),
+                ));
+            }
             let pool = if enabled.is_empty() {
                 s.llm_providers.clone()
             } else {
@@ -10533,13 +10555,7 @@ impl AppStore {
             if pool.is_empty() {
                 return Err(AppError::NotFound("llm provider".into()));
             }
-            let preferred = preferred_provider_id.unwrap_or_default();
             let mut ordered = Vec::new();
-            if !preferred.is_empty() {
-                if let Some(provider) = pool.iter().find(|provider| provider.id == preferred) {
-                    ordered.push(provider.clone());
-                }
-            }
             for provider in pool {
                 if !ordered
                     .iter()
@@ -11967,6 +11983,7 @@ impl AppStore {
                 return Err(AppError::BadRequest(reason));
             }
             memory.target = match memory.target.trim().to_ascii_lowercase().as_str() {
+                "session" => "session".into(),
                 "user" => "user".into(),
                 _ => "memory".into(),
             };
@@ -11994,6 +12011,9 @@ impl AppStore {
             let mut seen_for_persona = 0usize;
             s.memories.retain(|item| {
                 if item.persona_id != persona_id {
+                    return true;
+                }
+                if !matches!(item.target.as_str(), "memory" | "user") {
                     return true;
                 }
                 seen_for_persona += 1;

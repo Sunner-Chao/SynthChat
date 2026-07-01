@@ -86,8 +86,8 @@ export function AgentsManagerPanel() {
       name: "新智能体 (New Agent)",
       description: "A specialized assistant",
       workspaceDir: "",
-      llmProvider: "openai",
-      llmModel: "gpt-4o",
+      llmProvider: "",
+      llmModel: "",
       enabled: true,
       isDefault: false,
       mcpEnabled: true,
@@ -296,6 +296,7 @@ export function AgentsManagerPanel() {
                 <div className="form-group" style={{ padding: "16px 20px" }}>
                   <label style={{ display: "block", marginBottom: 6, fontSize: "0.85rem", color: "var(--text-2)", fontWeight: 500 }}>LLM 提供商 (Provider)</label>
                   <select className="select-input" value={draft.llmProvider} onChange={e => handleProviderChange(e.target.value)} style={{ width: "100%", maxWidth: "400px" }}>
+                    <option value="">跟随通讯录角色</option>
                     {llmProviders.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
                   </select>
                 </div>
@@ -319,7 +320,7 @@ export function AgentsManagerPanel() {
                     ) : null}
                     <input
                       className="text-input"
-                      value={draft.llmModel || selectedProvider?.model || ""}
+                      value={draft.llmModel}
                       onChange={e => handleChange("llmModel", e.target.value)}
                       placeholder={catalogModels.length > 0 ? "或手动输入模型 ID" : "模型 ID"}
                       style={{ width: "100%" }}

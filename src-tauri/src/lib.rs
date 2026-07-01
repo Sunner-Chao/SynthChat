@@ -4132,11 +4132,16 @@ fn get_memory_status(
 ) -> AppResult<models::MemoryStatus> {
     let persona = store.persona(persona_id.as_deref())?;
     let memories = store.memories(Some(&persona.id))?;
+    let prompt_memories = memories
+        .iter()
+        .filter(|memory| matches!(memory.target.as_str(), "memory" | "user"))
+        .collect::<Vec<_>>();
     let prompt_safe = memories
         .iter()
+        .filter(|memory| matches!(memory.target.as_str(), "memory" | "user"))
         .filter(|memory| store::scan_memory_content(&memory.summary).is_none())
         .count();
-    let blocked_by_security_scan = memories.len().saturating_sub(prompt_safe);
+    let blocked_by_security_scan = prompt_memories.len().saturating_sub(prompt_safe);
     let enabled = persona
         .memory
         .get("enabled")
@@ -4169,7 +4174,7 @@ fn get_memory_status(
         include_in_prompt,
         trigger_rounds,
         max_memories,
-        total: memories.len(),
+        total: prompt_memories.len(),
         prompt_safe,
         blocked_by_security_scan,
         prompt_injected,

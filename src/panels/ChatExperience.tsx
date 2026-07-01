@@ -205,22 +205,33 @@ function useRevealedText(
   const targetTextRef = useRef(text);
   const onDoneRef = useRef(onDone);
   const completedTextRef = useRef("");
+  const visibleCountRef = useRef(enabled ? 0 : text.length);
 
   useEffect(() => {
     if (!enabled) {
       targetTextRef.current = text;
       completedTextRef.current = text;
+      visibleCountRef.current = text.length;
       setVisibleText(text);
       return;
     }
     targetTextRef.current = text;
     if (!text) {
       completedTextRef.current = "";
+      visibleCountRef.current = 0;
       setVisibleText("");
       onDoneRef.current?.();
       return;
     }
-    setVisibleText((current) => text.startsWith(current) ? current : "");
+    setVisibleText((current) => {
+      const next = text.startsWith(current) ? current : "";
+      visibleCountRef.current = next.length;
+      if (next && next.length >= text.length && completedTextRef.current !== text) {
+        completedTextRef.current = text;
+        window.setTimeout(() => onDoneRef.current?.(), 0);
+      }
+      return next;
+    });
   }, [enabled, text]);
 
   useEffect(() => {
@@ -229,15 +240,18 @@ function useRevealedText(
 
   useEffect(() => {
     if (!enabled) return;
-    let visibleCount = 0;
     const stepMs = 48;
-    const charsPerStep = Math.max(1, Math.round(charsPerSecond * (stepMs / 1000)));
+    let lastTickAt = performance.now();
     const timer = window.setInterval(() => {
+      const now = performance.now();
+      const elapsedSeconds = Math.max(0.016, (now - lastTickAt) / 1000);
+      lastTickAt = now;
+      const charsPerStep = Math.max(1, Math.ceil(charsPerSecond * elapsedSeconds));
       setVisibleText((current) => {
         const target = targetTextRef.current;
-        visibleCount = Math.max(current.length, visibleCount);
-        const nextCount = Math.min(target.length, visibleCount + charsPerStep);
-        visibleCount = nextCount;
+        visibleCountRef.current = Math.max(current.length, visibleCountRef.current);
+        const nextCount = Math.min(target.length, visibleCountRef.current + charsPerStep);
+        visibleCountRef.current = nextCount;
         const next = target.slice(0, nextCount);
         if (nextCount >= target.length && completedTextRef.current !== target) {
           completedTextRef.current = target;
@@ -844,7 +858,6 @@ export const ChatExperience = memo(function ChatExperience() {
   const refreshAgentQueue = useAppStore((state) => state.refreshAgentQueue);
   const refreshAgentRuns = useAppStore((state) => state.refreshAgentRuns);
   const savePersona = useAppStore((state) => state.savePersona);
-  const saveAgent = useAppStore((state) => state.saveAgent);
   const [draft, setDraft] = useState("");
   const [composerError, setComposerError] = useState<string | null>(null);
   const [controlCommands, setControlCommands] = useState<AgentControlCommand[]>([]);
@@ -1203,7 +1216,7 @@ export const ChatExperience = memo(function ChatExperience() {
     const providerId = providerBinding.providerId;
     return llmProviders.find((provider) => provider.id === providerId && provider.enabled) ?? null;
   }, [llmProviders, providerBinding.providerId]);
-  const effectiveModelValue = providerBinding.model || currentProvider?.model || "";
+  const effectiveModelValue = providerBinding.model;
   useEffect(() => {
     if (!currentProvider) {
       setCatalogModels([]);
@@ -1221,15 +1234,45 @@ export const ChatExperience = memo(function ChatExperience() {
   }, [currentProvider]);
   const modelOptions = useMemo(() => {
     if (catalogModels.length > 0 && currentProvider) {
-      return catalogModels.map((model) => ({
+      const options = catalogModels.map((model) => ({
         key: `${currentProvider.id}::${model.id}`,
         providerId: currentProvider.id,
         model: model.id,
         label: model.id
       }));
+      const currentModel = effectiveModelValue.trim();
+      if (currentModel && !options.some((option) => option.model === currentModel)) {
+        options.unshift({
+          key: `${currentProvider.id}::${currentModel}`,
+          providerId: currentProvider.id,
+          model: currentModel,
+          label: `${currentModel}（当前）`
+        });
+      }
+      const defaultModel = currentProvider.model.trim();
+      if (defaultModel && !options.some((option) => option.model === defaultModel)) {
+        options.unshift({
+          key: `${currentProvider.id}::${defaultModel}`,
+          providerId: currentProvider.id,
+          model: defaultModel,
+          label: `${defaultModel}（默认）`
+        });
+      }
+      return options;
     }
-    return currentProvider ? providerModelOptions([currentProvider]) : [];
-  }, [catalogModels, currentProvider]);
+    if (!currentProvider) return [];
+    const options = providerModelOptions([currentProvider]);
+    const currentModel = effectiveModelValue.trim();
+    if (currentModel && !options.some((option) => option.model === currentModel)) {
+      options.unshift({
+        key: `${currentProvider.id}::${currentModel}`,
+        providerId: currentProvider.id,
+        model: currentModel,
+        label: `${currentModel}（当前）`
+      });
+    }
+    return options;
+  }, [catalogModels, currentProvider, effectiveModelValue]);
   const selectedModelKey = currentProvider && effectiveModelValue
     ? `${currentProvider.id}::${effectiveModelValue}`
     : "";
@@ -2138,29 +2181,17 @@ export const ChatExperience = memo(function ChatExperience() {
   const switchAgentModel = async (key: string) => {
     if (!key) return;
     const option = modelOptions.find((item) => item.key === key);
-    if (!option) return;
-    if (toolbarPersona) {
-      const savedPersona = await savePersona({
-        ...toolbarPersona,
-        agentId: activeAgent?.id ?? toolbarPersona.agentId,
-        llmProvider: option.providerId,
-        llmModel: option.model
-      });
-      await refreshChatData(activeConversationId, savedPersona.id);
-      return;
-    }
-    let nextAgent = activeAgent;
-    if (nextAgent && (nextAgent.llmProvider !== option.providerId || nextAgent.llmModel !== option.model)) {
-      nextAgent = {
-        ...nextAgent,
-        llmProvider: option.providerId,
-        llmModel: option.model
-      };
-      await saveAgent(nextAgent);
-    }
-    if (activeConversationId) {
-      await refreshChatData(activeConversationId, activeConversation?.personaId);
-    }
+    if (!option || !toolbarPersona || !currentProvider) return;
+    const fixedProviderId = toolbarPersona.llmProvider.trim();
+    if (!fixedProviderId || option.providerId !== fixedProviderId || currentProvider.id !== fixedProviderId) return;
+    if (toolbarPersona.llmModel === option.model) return;
+    const savedPersona = await savePersona({
+      ...toolbarPersona,
+      agentId: activeAgent?.id ?? toolbarPersona.agentId,
+      llmProvider: fixedProviderId,
+      llmModel: option.model
+    });
+    await refreshChatData(activeConversationId, savedPersona.id);
   };
 
   const switchConversationAgent = async (agentId: string) => {
@@ -2339,7 +2370,7 @@ export const ChatExperience = memo(function ChatExperience() {
                   className="claw-session-delete"
                   disabled={Boolean(settlingConversationId)}
                   onClick={() => void deleteConversationWithMemorySettling(conversation.id)}
-                  title="整理长期记忆后删除会话"
+                  title="整理会话记忆后删除会话"
                   type="button"
                 >
                   {settlingConversationId === conversation.id ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
@@ -2387,7 +2418,7 @@ export const ChatExperience = memo(function ChatExperience() {
             <label className="claw-select">
               <ChevronIcon />
               <select disabled={!currentProvider} value={selectedModelKey} onChange={(event) => void switchAgentModel(event.target.value)}>
-                <option value="">{providerBinding.providerDisabled ? "服务商已停用" : "选择模型"}</option>
+                <option value="">{providerBinding.providerDisabled ? "服务商已停用" : currentProvider ? "选择模型" : "先在通讯录选择服务商"}</option>
                 {modelOptions.map((option) => <option key={option.key} value={option.key}>{option.label}</option>)}
               </select>
             </label>
@@ -3057,8 +3088,18 @@ const MessageRow = memo(function MessageRow({
   const processEvent = message.role === "tool" ? parseManagedProcessEvent(message.content) : null;
   const isUser = message.role === "user";
   const text = previewText(renderTextForMessage(message.content.trim()), previewCharLimit);
-  const isStreaming = !isUser && !toolEvent && !processEvent && (message.source === "desktop-stream" || animateText);
-  const displayText = useRevealedText(text, isStreaming, streamCharsPerSecond, onAnimationDone);
+  const canRevealText = !isUser && !toolEvent && !processEvent;
+  const isLiveStreaming = canRevealText && message.source === "desktop-stream";
+  const [settlingAfterStream, setSettlingAfterStream] = useState(isLiveStreaming);
+  useEffect(() => {
+    if (isLiveStreaming) setSettlingAfterStream(true);
+  }, [isLiveStreaming]);
+  const revealText = canRevealText && (isLiveStreaming || animateText || settlingAfterStream);
+  const handleRevealDone = useCallback(() => {
+    if (!isLiveStreaming) setSettlingAfterStream(false);
+    onAnimationDone();
+  }, [isLiveStreaming, onAnimationDone]);
+  const displayText = useRevealedText(text, revealText, streamCharsPerSecond, handleRevealDone);
   if (toolEvent && isCanceledToolEvent(toolEvent)) return null;
   if (toolEvent) return <ToolMessage event={toolEvent} />;
   if (processEvent) return <ManagedProcessMessage event={processEvent} />;
@@ -3074,8 +3115,8 @@ const MessageRow = memo(function MessageRow({
           <span>{isUser ? profileName : personaName}</span>
           <small>{formatTime(message.createdAt)}{message.source === "wechat" ? " · 微信" : ""}</small>
         </div>
-        <div className={isUser ? "claw-bubble user" : isStreaming ? "claw-bubble assistant streaming" : "claw-bubble assistant"}>
-          <MarkdownLite text={displayText} onImageClick={setPreviewSrc} streaming={isStreaming} onFirstChar={onFirstStreamChar} />
+        <div className={isUser ? "claw-bubble user" : revealText ? "claw-bubble assistant streaming" : "claw-bubble assistant"}>
+          <MarkdownLite text={displayText} onImageClick={setPreviewSrc} streaming={revealText} onFirstChar={onFirstStreamChar} />
         </div>
         {!isUser ? (
           <div className="claw-message-actions">

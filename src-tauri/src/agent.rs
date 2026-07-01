@@ -424,16 +424,18 @@ pub(crate) fn snapshot_conversation_memory_before_delete(
             delete_memory_settling_skipped("persona memory disabled"),
         ));
     }
+    let chat_config = store.config()?.chat;
+    if !chat_config.background_memory_review_enabled {
+        return Ok(ConversationMemorySettlingPlan::Skip(
+            delete_memory_settling_skipped("session memory review disabled"),
+        ));
+    }
     let messages = store.messages(conversation_id, None)?;
     let visible_messages = messages
         .iter()
         .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
         .count();
-    let min_messages = store
-        .config()?
-        .chat
-        .background_memory_review_min_messages
-        .max(2);
+    let min_messages = chat_config.background_memory_review_min_messages.max(2);
     if visible_messages < min_messages {
         return Ok(ConversationMemorySettlingPlan::Skip(
             delete_memory_settling_skipped(format!(
@@ -578,7 +580,7 @@ fn delete_memory_settling_skipped(
 }
 
 fn delete_memory_review_system_prompt() -> String {
-    "You review a soon-to-be-deleted chat session for long-term persona memory. Return only valid JSON. Store less, not more. Extract only durable user facts, preferences, routines, ongoing projects, constraints, important decisions, and explicit requests to remember. Do not store temporary tasks, implementation chatter, assistant behavior, duplicate facts, or private/secrets. JSON schema: {\"memories\":[{\"summary\":\"...\",\"importance\":1-5,\"target\":\"memory|user\"}]}.".into()
+    "You review a soon-to-be-deleted chat session for concise session memory. Return only valid JSON. Store less, not more. Extract only facts, preferences, decisions, unresolved context, and useful continuity signals that would help future chats with this persona. Do not store secrets, credentials, transient implementation chatter, duplicate facts, or generic assistant behavior. JSON schema: {\"memories\":[{\"summary\":\"...\",\"importance\":1-5}]}.".into()
 }
 
 fn delete_memory_review_prompt(conversation: &Conversation, transcript: &str) -> String {
@@ -616,21 +618,10 @@ fn parse_delete_memory_candidates(raw: &str) -> AppResult<Vec<DeleteMemoryCandid
             .and_then(Value::as_u64)
             .unwrap_or(4)
             .clamp(1, 5) as u8;
-        let target = match item
-            .get("target")
-            .and_then(Value::as_str)
-            .unwrap_or("memory")
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "user" => "user".into(),
-            _ => "memory".into(),
-        };
         candidates.push(DeleteMemoryCandidate {
             summary,
             importance,
-            target,
+            target: "session".into(),
         });
     }
     Ok(candidates)
@@ -673,8 +664,8 @@ mod delete_memory_review_tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].summary, "User prefers concise answers.");
         assert_eq!(parsed[0].importance, 5);
-        assert_eq!(parsed[0].target, "user");
-        assert_eq!(parsed[1].target, "memory");
+        assert_eq!(parsed[0].target, "session");
+        assert_eq!(parsed[1].target, "session");
     }
 }
 use security_tools::{osv_check_tool, security_scan_tool};

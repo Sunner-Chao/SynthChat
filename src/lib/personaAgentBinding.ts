@@ -19,10 +19,6 @@ function providerVisible(provider: LlmProvider | null | undefined) {
   return Boolean(provider?.enabled);
 }
 
-function defaultVisibleProvider(providers: LlmProvider[]) {
-  return providers.find((provider) => providerVisible(provider)) ?? null;
-}
-
 export function resolvePersonaBoundAgent(
   persona: Persona | null | undefined,
   agents: AgentDefinition[],
@@ -43,39 +39,27 @@ export function resolvePersonaAgentBinding(
   fallbackAgentId?: string | null
 ): PersonaAgentBinding {
   const agent = resolvePersonaBoundAgent(persona, agents, fallbackAgentId);
-  const agentProviderId = trimmed(agent?.llmProvider);
   const personaProviderId = trimmed(persona?.llmProvider);
-  const defaultProvider = defaultVisibleProvider(llmProviders);
   const personaProvider = personaProviderId
     ? llmProviders.find((item) => item.id === personaProviderId) ?? null
     : null;
-  const agentProvider = agentProviderId
-    ? llmProviders.find((item) => item.id === agentProviderId) ?? null
-    : null;
-  const provider = personaProviderId
-    ? providerVisible(personaProvider) ? personaProvider : null
-    : agentProviderId
-      ? providerVisible(agentProvider) ? agentProvider : null
-      : providerVisible(defaultProvider) ? defaultProvider : null;
-  const configuredProvider = personaProviderId ? personaProvider : agentProviderId ? agentProvider : defaultProvider;
+  const provider = providerVisible(personaProvider) ? personaProvider : null;
+  const configuredProvider = personaProviderId ? personaProvider : null;
   const providerId = trimmed(provider?.id);
   const providerName = provider?.name?.trim() ?? "";
   const personaModel = trimmed(persona?.llmModel);
-  const agentModel = trimmed(agent?.llmModel);
-  const model = provider?.id === personaProviderId
-    ? personaModel || trimmed(provider?.model) || ""
-    : provider?.id === agentProviderId
-      ? agentModel || trimmed(provider?.model) || ""
-      : trimmed(provider?.model) || "";
+  const model = provider?.id === personaProviderId ? personaModel : "";
   let infoText = "";
-  const providerMissing = Boolean((personaProviderId || agentProviderId) && !configuredProvider);
+  const providerMissing = Boolean(personaProviderId && !configuredProvider);
   const providerDisabled = Boolean(providerMissing || (configuredProvider && !configuredProvider.enabled && !provider));
   if (providerDisabled) {
     infoText = "服务商已停用";
   } else if (providerName || model) {
     infoText = [providerName, model].filter(Boolean).join(" · ");
+  } else if (!personaProviderId) {
+    infoText = "请选择通讯录服务商";
   } else if (llmProviders.length > 0) {
-    infoText = "请选择服务商";
+    infoText = "请选择模型";
   } else {
     infoText = "未配置服务商";
   }
@@ -89,7 +73,7 @@ export function resolvePersonaAgentBinding(
     providerDisabled ? "" : configuredProvider?.id,
     model,
     providerDisabled ? "" : personaProviderId,
-    providerDisabled ? "" : trimmed(persona?.llmModel)
+    providerDisabled ? "" : personaModel
   ]
     .filter(Boolean)
     .join(" ")

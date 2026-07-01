@@ -52,6 +52,7 @@ const PET_STARTUP_MAX_VISIBLE_MS = 8600;
 const PET_STARTUP_EXIT_MS = 920;
 const PET_STARTUP_REVEAL_AFTER_EXIT_MS = 180;
 const PET_CLOUD_STREAM_INTERVAL_MS = 34;
+const PET_THINKING_CLOUD_TEXT = "正在思考...";
 
 const AVAILABLE_MODELS = [
   { id: "tororo", name: "Tororo", path: "/pet/model/Tororo/tororo.model3.json", greeting: "Tororo 到啦。", headX: 0.5, headY: 0.24, tailGap: 28 },
@@ -222,6 +223,11 @@ type PetAssistantStreamRuntime = {
   attachments?: PetCloudBubble["attachments"];
   text: string;
   finalized: boolean;
+};
+
+type PetThinkingCloudRuntime = {
+  conversationId: string;
+  bubbleId: string;
 };
 
 function formatCloudText(text: string) {
@@ -588,6 +594,7 @@ export function PetWindow() {
   const voiceAudioRef = useRef<HTMLAudioElement | null>(null);
   const activeVoiceReplyRequestRef = useRef<string | null>(null);
   const assistantStreamRef = useRef<PetAssistantStreamRuntime | null>(null);
+  const thinkingCloudRef = useRef<PetThinkingCloudRuntime | null>(null);
   const streamedAssistantMessageIdsRef = useRef<Set<string>>(new Set());
   const petVoiceReplyEnabledRef = useRef(false);
   const petVoiceReplyConfigRef = useRef<NonNullable<Persona["voiceReply"]>>(defaultPetVoiceReplyConfig());
@@ -1109,7 +1116,16 @@ export function PetWindow() {
         return;
       }
       if (payload.type === "assistant_stream_done" && payload.message) {
-        finalizeAssistantStream(payload.conversationId, payload.message);
+        const runtime = assistantStreamRef.current;
+        if (
+          runtime
+          && runtime.messageId === payload.message.id
+          && runtime.conversationId === payload.conversationId
+        ) {
+          finalizeAssistantStream(payload.conversationId, payload.message);
+        } else {
+          showAssistantCloud(payload.message, payload.conversationId);
+        }
         return;
       }
       if (!payload.message) return;
@@ -1140,11 +1156,12 @@ export function PetWindow() {
       personaId?: string;
       conversationId?: string;
       message?: ChatMessage;
+      ok?: boolean;
     }>("synthchat-chat-event", (event) => {
-      // The chat stream only keeps the pet's send target/context in sync.
-      // Bubble display is driven by the dedicated synthchat-pet-event path.
+      // The chat stream keeps the pet's target/context in sync and owns the
+      // pre-reply thinking cloud. Reply text still flows through pet events.
       const payload = event.payload;
-      const relevantTypes = ["new_message", "assistant_message", "conversation_updated"];
+      const relevantTypes = ["turn_started", "turn_finished", "new_message", "assistant_message", "conversation_updated"];
       if (!relevantTypes.includes(payload.type) || !payload.conversationId) return;
 
       const context = activeContextRef.current ?? readStoredPetActiveContext();
@@ -1170,6 +1187,24 @@ export function PetWindow() {
           source: shouldFollowIncomingWechat ? "wechat" : (eventSource || "desktop")
         };
         setPetContext(nextContext);
+      }
+      const currentAfterFollow = activeContextRef.current ?? readStoredPetActiveContext();
+      const isActiveConversation = currentAfterFollow?.conversationId === payload.conversationId;
+      if (!isActiveConversation) return;
+      if (payload.type === "turn_started") {
+        showThinkingCloud(payload.conversationId);
+        return;
+      }
+      if (payload.type === "turn_finished") {
+        if (payload.message && assistantMessageVisibleInCloud(payload.message)) {
+          showAssistantCloud(payload.message, payload.conversationId);
+          return;
+        }
+        clearThinkingCloud(payload.conversationId);
+        if (payload.ok === false) {
+          showCloud("思考中断了。", "error", 3200);
+          playPetBehavior("error");
+        }
       }
     }).then((handler) => {
       unlisten = handler;
@@ -1586,6 +1621,7 @@ export function PetWindow() {
     const formatted = formatCloudText(text);
     if (!formatted && !attachments?.length) return;
     assistantStreamRef.current = null;
+    thinkingCloudRef.current = null;
     clearCloudTimer();
     clearCloudStreamTimer();
     setBrokenCloudImages({});
@@ -1602,6 +1638,53 @@ export function PetWindow() {
       cloudTextDraftsRef.current.delete(bubbleId);
       cloudTimerRef.current = null;
     }, durationMs);
+  }
+
+  function showThinkingCloud(conversationId: string) {
+    if (!conversationId) return;
+    const current = thinkingCloudRef.current;
+    if (current?.conversationId === conversationId) {
+      clearCloudTimer();
+      setCloudBubble((bubble) => {
+        if (bubble?.id === current.bubbleId) return bubble;
+        const bubbleId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        thinkingCloudRef.current = { conversationId, bubbleId };
+        cloudTextDraftsRef.current.set(bubbleId, PET_THINKING_CLOUD_TEXT);
+        return {
+          id: bubbleId,
+          text: PET_THINKING_CLOUD_TEXT,
+          tone: "soft"
+        };
+      });
+      return;
+    }
+    stopPetVoicePlayback({ clearCloudStream: true, clearAssistantStream: false });
+    clearCloudTimer();
+    clearCloudStreamTimer();
+    setBrokenCloudImages({});
+    const bubbleId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    thinkingCloudRef.current = { conversationId, bubbleId };
+    cloudTextDraftsRef.current.set(bubbleId, PET_THINKING_CLOUD_TEXT);
+    setCloudBubble({
+      id: bubbleId,
+      text: PET_THINKING_CLOUD_TEXT,
+      tone: "soft"
+    });
+    playPetBehavior("thinking", { durationMs: 1800 });
+  }
+
+  function clearThinkingCloud(
+    conversationId?: string | null,
+    options: { clearBubble?: boolean } = {}
+  ) {
+    const current = thinkingCloudRef.current;
+    if (!current) return false;
+    if (conversationId && current.conversationId !== conversationId) return false;
+    thinkingCloudRef.current = null;
+    cloudTextDraftsRef.current.delete(current.bubbleId);
+    if (options.clearBubble === false) return true;
+    setCloudBubble((bubble) => (bubble?.id === current.bubbleId ? null : bubble));
+    return true;
   }
 
   function scheduleCloudDismiss(bubbleId: string, durationMs: number) {
@@ -1621,6 +1704,7 @@ export function PetWindow() {
   ) {
     const formatted = formatCloudText(text);
     if (!formatted && !attachments?.length) return "";
+    thinkingCloudRef.current = null;
     clearCloudTimer();
     clearCloudStreamTimer();
     setBrokenCloudImages({});
@@ -1660,6 +1744,7 @@ export function PetWindow() {
   ) {
     const formatted = formatCloudText(text);
     if (!formatted && !attachments?.length) return null;
+    thinkingCloudRef.current = null;
     clearCloudTimer();
     clearCloudStreamTimer();
     setBrokenCloudImages({});
@@ -1697,9 +1782,9 @@ export function PetWindow() {
     });
   }
 
-  function stopPetVoicePlayback(options: { clearCloudStream?: boolean } = {}) {
+  function stopPetVoicePlayback(options: { clearCloudStream?: boolean; clearAssistantStream?: boolean } = {}) {
     activeVoiceReplyRequestRef.current = null;
-    assistantStreamRef.current = null;
+    if (options.clearAssistantStream !== false) assistantStreamRef.current = null;
     if (options.clearCloudStream) clearCloudStreamTimer();
     setPetVoicePlaybackActive(false);
     if (isTauri()) {
@@ -1722,13 +1807,16 @@ export function PetWindow() {
   function appendAssistantStreamDelta(conversationId: string, message: ChatMessage, delta: string) {
     const visibleDelta = delta;
     if (!visibleDelta) return;
+    const replacedThinkingCloud = petVoiceReplyEnabledRef.current
+      ? false
+      : clearThinkingCloud(conversationId, { clearBubble: false });
     let runtime = assistantStreamRef.current;
     if (!runtime || runtime.messageId !== message.id || runtime.conversationId !== conversationId) {
       stopPetVoicePlayback({ clearCloudStream: true });
       clearCloudTimer();
       clearCloudStreamTimer();
       setBrokenCloudImages({});
-      setCloudBubble(null);
+      if (!replacedThinkingCloud) setCloudBubble(null);
       const bubbleId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const requestKey = `stream:${message.id}`;
       runtime = {
@@ -1751,9 +1839,9 @@ export function PetWindow() {
   }
 
   function finalizeAssistantStream(conversationId: string, message: ChatMessage) {
+    clearThinkingCloud(conversationId, { clearBubble: false });
     const runtime = assistantStreamRef.current;
     if (!runtime || runtime.messageId !== message.id || runtime.conversationId !== conversationId) {
-      if (message.id) streamedAssistantMessageIdsRef.current.add(message.id);
       return;
     }
     const payload = assistantCloudPayload(message);
@@ -1906,7 +1994,15 @@ export function PetWindow() {
     conversationId = message.conversationId,
     durationMs = assistantCloudDurationMsRef.current
   ) {
-    if (message.id && streamedAssistantMessageIdsRef.current.has(message.id)) {
+    clearThinkingCloud(conversationId, { clearBubble: false });
+    const runtime = assistantStreamRef.current;
+    if (
+      message.id
+      && streamedAssistantMessageIdsRef.current.has(message.id)
+      && runtime
+      && runtime.messageId === message.id
+      && runtime.conversationId === conversationId
+    ) {
       finalizeAssistantStream(conversationId, message);
       return;
     }
@@ -2072,6 +2168,9 @@ export function PetWindow() {
 
   async function refreshLatestAssistant(conversationId: string, showChanged = true) {
     if (!conversationId || activeContextRef.current?.conversationId !== conversationId) {
+      return null;
+    }
+    if (showChanged && thinkingCloudRef.current?.conversationId === conversationId) {
       return null;
     }
     try {
@@ -2335,7 +2434,7 @@ export function PetWindow() {
           showAssistantCloud(assistant, context.conversationId);
         }
       } else {
-        showCloud("处理中...", "soft", 2600);
+        showThinkingCloud(context.conversationId);
         playPetBehavior("thinking", { durationMs: 1600 });
       }
     } catch (error) {

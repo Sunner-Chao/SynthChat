@@ -206,6 +206,7 @@ pub(super) fn builtin_memory_prefetch(
     let mut ranked = store
         .memories(Some(&persona.id))?
         .into_iter()
+        .filter(|memory| matches!(memory.target.as_str(), "memory" | "user"))
         .filter(|memory| crate::store::scan_memory_content(&memory.summary).is_none())
         .map(|memory| (memory_prefetch_score(&memory, query), memory))
         .filter(|(score, _)| *score > 0)

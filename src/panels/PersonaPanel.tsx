@@ -4,7 +4,7 @@ import { Camera, Check, FileAudio, FolderOpen, Image, ImagePlus, Mic, Pencil, Pl
 import { api } from "../lib/api";
 import { resolvePersonaAgentBinding } from "../lib/personaAgentBinding";
 import { useAppStore } from "../lib/store";
-import type { ChatConfig, ModelCatalogEntry, Persona } from "../lib/types";
+import type { ModelCatalogEntry, Persona } from "../lib/types";
 import { Avatar } from "../components/common";
 
 type VoiceReplyConfig = NonNullable<Persona["voiceReply"]>;
@@ -149,9 +149,7 @@ export function PersonaPanel() {
     llmProviders,
     imageProviders,
     agents,
-    config,
     savePersona,
-    saveConfig,
     deletePersona,
     uploadPersonaAvatar,
     clearPersonaAvatar,
@@ -268,8 +266,7 @@ export function PersonaPanel() {
     void refreshProactiveStatuses();
   }, [refreshProactiveStatuses, personas.length]);
 
-  const defaultLlmProvider = llmProviders.find((item) => item.enabled) ?? null;
-  const provider = llmProviders.find((item) => item.id === draft.llmProvider && item.enabled) ?? defaultLlmProvider;
+  const provider = llmProviders.find((item) => item.id === draft.llmProvider && item.enabled) ?? null;
   const proactiveStatus = proactiveStatuses.find((status) => status.personaId === draft.id);
   const selectedImageProvider = useMemo(() => {
     const providerId = draft.imageGeneration?.provider ?? "";
@@ -300,15 +297,14 @@ export function PersonaPanel() {
     const nextModel = (provider?.model || catalogModels[0]?.id || "").trim();
     if (!nextModel) return;
     setDraft((current) => {
-      const currentProviderId = current.llmProvider || defaultLlmProvider?.id || "";
+      const currentProviderId = current.llmProvider || "";
       const activeProviderId = provider?.id || "";
       if (currentProviderId !== activeProviderId && current.llmProvider) return current;
       const currentModel = current.llmModel.trim();
-      const currentModelInCatalog = catalogModels.some((model) => model.id === currentModel);
-      if (currentModel && (currentModel === nextModel || currentModelInCatalog)) return current;
+      if (currentModel) return current;
       return { ...current, llmModel: nextModel };
     });
-  }, [catalogModels, defaultLlmProvider?.id, provider?.id, provider?.model]);
+  }, [catalogModels, provider?.id, provider?.model]);
 
   const updateDraft = <K extends keyof Persona>(key: K, value: Persona[K]) => {
     setDraft((current) => ({ ...current, [key]: value }));
@@ -443,7 +439,7 @@ export function PersonaPanel() {
       };
       const saved = await savePersona({
         ...draftSnapshot,
-        llmProvider: draftSnapshot.llmProvider || defaultLlmProvider?.id || "",
+        llmProvider: draftSnapshot.llmProvider,
         llmModel: effectiveLlmModelId || draftSnapshot.llmModel,
         imageGeneration
       });
@@ -490,15 +486,10 @@ export function PersonaPanel() {
   };
 
   const avatarSrc = draft.avatarPath ? api.assetUrl(draft.avatarPath) : "";
-  const chatConfig = config?.chat ?? null;
   const personaBindings = useMemo(
     () => new Map(personas.map((persona) => [persona.id, resolvePersonaAgentBinding(persona, agents, llmProviders)])),
     [agents, llmProviders, personas]
   );
-  const saveChatConfig = async (patch: Partial<ChatConfig>) => {
-    if (!config) return;
-    await saveConfig({ ...config, chat: { ...config.chat, ...patch } });
-  };
 
   return (
     <section className="panel-grid persona-workbench">
@@ -614,7 +605,7 @@ export function PersonaPanel() {
                 />
               </div>
               <p className="form-hint" style={{ marginTop: 6, marginBottom: 0 }}>
-                自动从当前服务商模型目录或服务商默认模型获取；切换服务商时会同步刷新。
+                模型为空时会填入当前服务商默认模型或目录首个模型；保存后以通讯录中的模型 ID 为准。
               </p>
             </label>
             <label>
@@ -696,45 +687,6 @@ export function PersonaPanel() {
                 />
               </label>
             </div>
-            <div className="form-section-title">长期记忆</div>
-            <label className="checkbox-row">
-              <input
-                checked={draft.memory?.enabled ?? true}
-                onChange={(event) => setDraft((current) => ({
-                  ...current,
-                  memory: { ...(current.memory ?? defaultMemoryConfig()), enabled: event.target.checked }
-                }))}
-                type="checkbox"
-              />
-              启用长期记忆
-            </label>
-            <label>
-              长期记忆注入上限
-              <input
-                min={1}
-                type="number"
-                value={draft.memory?.maxMemories ?? 50}
-                onChange={(event) => setDraft((current) => ({
-                  ...current,
-                  memory: { ...(current.memory ?? defaultMemoryConfig()), maxMemories: Number(event.target.value) }
-                }))}
-              />
-            </label>
-            <label className="checkbox-row">
-              <input
-                checked={draft.memory?.includeInPrompt ?? true}
-                onChange={(event) => setDraft((current) => ({
-                  ...current,
-                  memory: { ...(current.memory ?? defaultMemoryConfig()), includeInPrompt: event.target.checked }
-                }))}
-                type="checkbox"
-              />
-              将记忆注入提示词
-            </label>
-            <div className="form-hint">这里是角色级长期记忆：控制是否注入长期记忆、以及最多注入多少条。</div>
-            {chatConfig ? (
-              <ShortMemorySettings config={chatConfig} onSave={saveChatConfig} />
-            ) : null}
             <div className="form-section-title">主动消息</div>
             <label className="checkbox-row">
               <input
@@ -1406,81 +1358,6 @@ export function PersonaPanel() {
         </div>
       </article>
     </section>
-  );
-}
-
-function ShortMemorySettings({
-  config,
-  onSave
-}: {
-  config: ChatConfig;
-  onSave: (patch: Partial<ChatConfig>) => Promise<void>;
-}) {
-  const [mode, setMode] = useState<"messages" | "tokens">(config.shortContextMode ?? "tokens");
-  const [messages, setMessages] = useState(config.maxContextRounds);
-  const [tokenK, setTokenK] = useState(Math.max(1, Math.round((config.shortContextTokenBudget ?? 8000) / 1000)));
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
-
-  useEffect(() => {
-    setMode(config.shortContextMode ?? "messages");
-    setMessages(config.maxContextRounds);
-    setTokenK(Math.max(1, Math.round((config.shortContextTokenBudget ?? 8000) / 1000)));
-  }, [config.maxContextRounds, config.shortContextMode, config.shortContextTokenBudget]);
-
-  const save = async () => {
-    setSaving(true);
-    try {
-      await onSave({
-        shortContextMode: mode,
-        maxContextRounds: messages,
-        shortContextTokenBudget: tokenK * 1000
-      });
-      setSaved(true);
-      window.setTimeout(() => setSaved(false), 1600);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <>
-      <div className="form-section-title">短时记忆</div>
-      <label>
-        短时记忆策略
-        <select value={mode} onChange={(event) => setMode(event.target.value === "tokens" ? "tokens" : "messages")}>
-          <option value="tokens">按 token 预算</option>
-          <option value="messages">按消息数</option>
-        </select>
-      </label>
-      {mode === "messages" ? (
-        <label>
-          消息窗口
-          <input
-            min={1}
-            max={500}
-            type="number"
-            value={messages}
-            onChange={(event) => setMessages(Math.min(500, Math.max(1, Number(event.target.value) || 1)))}
-          />
-        </label>
-      ) : (
-        <label>
-          Token 预算（K）
-          <input
-            min={1}
-            max={200}
-            type="number"
-            value={tokenK}
-            onChange={(event) => setTokenK(Math.min(200, Math.max(1, Number(event.target.value) || 1)))}
-          />
-        </label>
-      )}
-      <button className="ghost-button" disabled={saving} onClick={() => void save()} type="button">
-        {saved ? "短时记忆已保存" : saving ? "保存中..." : "保存短时记忆设置"}
-      </button>
-      <div className="form-hint">按 token 预算时使用 K 单位预算；按消息数时使用消息窗口。达到瓶颈后旧片段会压缩为短时摘要继续参与当前会话。</div>
-    </>
   );
 }
 

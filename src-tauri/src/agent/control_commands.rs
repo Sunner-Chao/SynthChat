@@ -225,7 +225,7 @@ const AGENT_CONTROL_COMMANDS: &[AgentControlCommandSpec] = &[
     AgentControlCommandSpec {
         name: "model",
         aliases: &["models"],
-        description: "查看或切换当前 agent 的 LLM provider/model",
+        description: "查看或切换当前角色的模型 ID",
         category: "Config",
     },
     AgentControlCommandSpec {
@@ -3343,7 +3343,8 @@ pub(super) fn handle_model_control_command(
     persona: &Persona,
     argument_raw: &str,
 ) -> AppResult<String> {
-    let mut agent = store.agent(Some(&conversation.agent_id))?;
+    let agent = store.agent(Some(&conversation.agent_id))?;
+    let mut next_persona = persona.clone();
     let providers = store.providers()?;
     let argument = argument_raw.trim();
     if argument.is_empty() || matches!(argument.to_lowercase().as_str(), "list" | "status" | "show")
@@ -3351,14 +3352,13 @@ pub(super) fn handle_model_control_command(
         return format_model_control_reply(&agent, persona, &providers, None);
     }
     if matches!(argument.to_lowercase().as_str(), "reset" | "clear") {
-        agent.llm_provider.clear();
-        agent.llm_model.clear();
-        let saved = store.save_agent(agent)?;
+        next_persona.llm_model.clear();
+        let saved = store.save_persona(next_persona)?;
         return format_model_control_reply(
+            &agent,
             &saved,
-            persona,
             &providers,
-            Some("已清除当前 agent 的模型覆盖。"),
+            Some("已清除当前角色的模型 ID；服务商仍由通讯录固定。"),
         );
     }
 
@@ -3383,7 +3383,7 @@ pub(super) fn handle_model_control_command(
     }
     let model = model_parts.join(" ");
     if provider_selector.is_none() && model.trim().is_empty() {
-        return Ok("用法：/model [model] [--provider <provider>] 或 /model reset".into());
+        return Ok("用法：/model [model] 或 /model reset。服务商由通讯录固定。".into());
     }
 
     let mut resolved_alias: Option<String> = None;
@@ -3395,9 +3395,8 @@ pub(super) fn handle_model_control_command(
                 provider.id
             )));
         }
-        agent.llm_provider = provider.id.clone();
-        if model.trim().is_empty() {
-            agent.llm_model.clear();
+        if next_persona.llm_provider.trim() != provider.id {
+            return Ok("服务商由通讯录配置固定；请到通讯录修改对话服务商。这里仅切换模型 ID。".into());
         }
     } else if !model.trim().is_empty() {
         if let Ok(provider) = select_llm_provider(&providers, model.trim()) {
@@ -3407,100 +3406,73 @@ pub(super) fn handle_model_control_command(
                     provider.id
                 )));
             }
-            agent.llm_provider = provider.id.clone();
-            agent.llm_model.clear();
-            let saved = store.save_agent(agent)?;
-            return format_model_control_reply(
-                &saved,
-                persona,
-                &providers,
-                Some("已切换当前 agent 的 LLM provider。"),
-            );
+            return Ok("服务商由通讯录配置固定；请到通讯录修改对话服务商。这里仅切换模型 ID。".into());
         }
     }
     if !model.trim().is_empty() {
-        let active_provider = if !agent.llm_provider.trim().is_empty() {
-            select_llm_provider(&providers, &agent.llm_provider)?
-        } else if let Some(provider_id) = selected_provider_id(persona, &agent) {
-            select_llm_provider(&providers, provider_id)?
-        } else {
-            providers
-                .iter()
-                .find(|provider| provider.enabled)
-                .or_else(|| providers.first())
-                .ok_or_else(|| AppError::NotFound("llm provider".into()))?
-        };
+        let active_provider_id = next_persona.llm_provider.trim();
+        if active_provider_id.is_empty() {
+            return Err(AppError::BadRequest(
+                "请先在通讯录中为当前角色选择对话服务商。".into(),
+            ));
+        }
+        let active_provider = select_llm_provider(&providers, active_provider_id)?;
+        if !active_provider.enabled {
+            return Err(AppError::BadRequest(format!(
+                "llm provider {} is disabled",
+                active_provider.id
+            )));
+        }
         if let Some(alias) = resolve_model_alias(model.trim(), active_provider, &providers) {
-            let alias_matches_explicit_provider = provider_selector.is_none()
-                || alias
-                    .provider_id
-                    .as_deref()
-                    .map(|provider_id| provider_id == active_provider.id)
-                    .unwrap_or(true);
-            if !alias_matches_explicit_provider {
-                agent.llm_model = model.trim().to_string();
-            } else {
-                if provider_selector.is_none() {
-                    if let Some(provider_id) = alias.provider_id.as_deref() {
-                        agent.llm_provider = provider_id.to_string();
-                    }
-                }
-                agent.llm_model = alias.model;
+            let alias_matches_active_provider = alias
+                .provider_id
+                .as_deref()
+                .map(|provider_id| provider_id == active_provider.id)
+                .unwrap_or(true);
+            if alias_matches_active_provider {
+                next_persona.llm_model = alias.model;
                 resolved_alias = Some(alias.alias);
+            } else {
+                next_persona.llm_model = model.trim().to_string();
             }
         } else if let Some(route) =
             resolve_model_family_route(model.trim(), active_provider, &providers)
         {
-            let route_matches_explicit_provider = provider_selector.is_none()
-                || route
-                    .provider_id
-                    .as_deref()
-                    .map(|provider_id| provider_id == active_provider.id)
-                    .unwrap_or(true);
-            if !route_matches_explicit_provider {
-                agent.llm_model = model.trim().to_string();
+            let route_matches_active_provider = route
+                .provider_id
+                .as_deref()
+                .map(|provider_id| provider_id == active_provider.id)
+                .unwrap_or(true);
+            if route_matches_active_provider {
+                next_persona.llm_model = route.model;
             } else {
-                if provider_selector.is_none() {
-                    if let Some(provider_id) = route.provider_id.as_deref() {
-                        agent.llm_provider = provider_id.to_string();
-                    }
-                }
-                agent.llm_model = route.model;
+                next_persona.llm_model = model.trim().to_string();
             }
         } else {
-            agent.llm_model = model.trim().to_string();
+            next_persona.llm_model = model.trim().to_string();
         }
     }
-    let saved = store.save_agent(agent)?;
+    let saved = store.save_persona(next_persona)?;
     let prefix = resolved_alias
         .as_deref()
-        .map(|alias| format!("已更新当前 agent 的模型设置。resolvedAlias: {alias}"))
-        .unwrap_or_else(|| "已更新当前 agent 的模型设置。".into());
-    format_model_control_reply(&saved, persona, &providers, Some(&prefix))
+        .map(|alias| format!("已更新当前角色的模型设置。resolvedAlias: {alias}"))
+        .unwrap_or_else(|| "已更新当前角色的模型设置。".into());
+    format_model_control_reply(&agent, &saved, &providers, Some(&prefix))
 }
 
 pub(super) fn selected_provider_id<'a>(
     persona: &'a Persona,
-    agent: &'a AgentDefinition,
+    _agent: &'a AgentDefinition,
 ) -> Option<&'a str> {
     if !persona.llm_provider.trim().is_empty() {
         Some(persona.llm_provider.as_str())
-    } else if !agent.llm_provider.trim().is_empty() {
-        Some(agent.llm_provider.as_str())
     } else {
         None
     }
 }
 
-pub(super) fn effective_llm_persona(persona: &Persona, agent: &AgentDefinition) -> Persona {
-    let mut effective = persona.clone();
-    if effective.llm_provider.trim().is_empty() && !agent.llm_provider.trim().is_empty() {
-        effective.llm_provider = agent.llm_provider.clone();
-    }
-    if effective.llm_model.trim().is_empty() && !agent.llm_model.trim().is_empty() {
-        effective.llm_model = agent.llm_model.clone();
-    }
-    effective
+pub(super) fn effective_llm_persona(persona: &Persona, _agent: &AgentDefinition) -> Persona {
+    persona.clone()
 }
 
 pub(super) fn select_llm_provider<'a>(
@@ -3784,23 +3756,17 @@ pub(super) fn format_model_control_reply(
     providers: &[LlmProvider],
     prefix: Option<&str>,
 ) -> AppResult<String> {
-    let provider = if let Some(provider_id) = selected_provider_id(persona, agent) {
-        select_llm_provider(providers, provider_id)?
-    } else {
-        providers
-            .iter()
-            .find(|provider| provider.enabled)
-            .or_else(|| providers.first())
-            .ok_or_else(|| AppError::NotFound("llm provider".into()))?
-    };
+    let provider = selected_provider_id(persona, agent)
+        .map(|provider_id| select_llm_provider(providers, provider_id))
+        .transpose()?;
     let effective_persona = effective_llm_persona(persona, agent);
     let effective_model = if !effective_persona.llm_model.trim().is_empty() {
         effective_persona.llm_model.trim()
     } else {
-        provider.model.trim()
+        ""
     };
-    let persona_note = if !persona.llm_provider.trim().is_empty() || !persona.llm_model.trim().is_empty() {
-        "\n- note: 当前 persona 有 LLM 覆盖，优先级高于 agent。"
+    let persona_note = if !persona.llm_provider.trim().is_empty() {
+        "\n- note: 当前对话使用通讯录角色的服务商/模型；绑定 agent 会跟随该角色配置。"
     } else {
         ""
     };
@@ -3827,39 +3793,31 @@ pub(super) fn format_model_control_reply(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let fallback_chain = providers
-        .iter()
-        .filter(|provider| provider.enabled)
-        .map(|provider| provider.id.as_str())
-        .collect::<Vec<_>>()
-        .join(" -> ");
     let prefix = prefix.map(|value| format!("{value}\n")).unwrap_or_default();
     Ok(format!(
-        "{}当前模型设置：\n- agent: {} ({})\n- agentProviderOverride: {}\n- agentModelOverride: {}\n- activeProvider: {} ({})\n- effectiveModel: {}\n- fallbackProviderChain: {}{}\n\n可用 providers：\n{}",
+        "{}当前模型设置：\n- persona: {} ({})\n- boundAgent: {} ({})\n- personaProvider: {}\n- personaModel: {}\n- activeProvider: {}\n- effectiveModel: {}\n- providerFallback: disabled{}\n\n可用 providers：\n{}",
         prefix,
+        persona.name,
+        persona.id,
         agent.name,
         agent.id,
-        if agent.llm_provider.trim().is_empty() {
+        if persona.llm_provider.trim().is_empty() {
             "-"
         } else {
-            agent.llm_provider.trim()
+            persona.llm_provider.trim()
         },
-        if agent.llm_model.trim().is_empty() {
+        if persona.llm_model.trim().is_empty() {
             "-"
         } else {
-            agent.llm_model.trim()
+            persona.llm_model.trim()
         },
-        provider.name,
-        provider.id,
+        provider
+            .map(|provider| format!("{} ({})", provider.name, provider.id))
+            .unwrap_or_else(|| "-".into()),
         if effective_model.is_empty() {
             "-"
         } else {
             effective_model
-        },
-        if fallback_chain.is_empty() {
-            "-"
-        } else {
-            fallback_chain.as_str()
         },
         persona_note,
         if provider_rows.is_empty() {

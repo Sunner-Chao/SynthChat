@@ -645,7 +645,7 @@ function AgentSettings({
               <span className="agent-summary-icon indigo"><Bot size={18} /></span>
               <div className="agent-summary-text">
                 <strong style={{ fontSize: 14 }}>{agent.name}{agent.isDefault ? " ★" : ""}</strong>
-                <small>{agent.llmProvider || "默认"} · {agent.llmModel || "默认"}</small>
+                <small>{agent.llmProvider || "跟随角色"} · {agent.llmModel || "未指定模型"}</small>
               </div>
             </div>
           ))}
@@ -1282,7 +1282,6 @@ function ProviderSettings({
   const [draft, setDraft] = useState<LlmProvider | null>(null);
   const [showTypeSheet, setShowTypeSheet] = useState(false);
   const selected = providers.find((provider) => provider.id === selectedId);
-  const defaultProviderId = providers.find((provider) => provider.enabled)?.id ?? "";
   const [tokenStats, setTokenStats] = useState<Record<string, TokenUsageStats>>({});
   const emptyTokenStats: TokenUsageStats = { promptTokens: 0, completionTokens: 0, totalTokens: 0, callCount: 0 };
   useEffect(() => {
@@ -1411,7 +1410,6 @@ function ProviderSettings({
               const typeLabel = provider.providerType === "anthropic" ? "Anthropic" :
                 provider.providerType === "gemini" ? "Gemini" :
                 provider.providerType === "openai_responses" ? "Responses" : "OpenAI";
-              const isDefaultProvider = provider.enabled && provider.id === defaultProviderId;
               return (
                 <div className="card provider-item-card" key={provider.id}>
                   <button className="provider-card-btn" onClick={() => selectProvider(provider.id)} type="button">
@@ -1421,7 +1419,6 @@ function ProviderSettings({
                           <span className={`provider-type-badge ${provider.providerType ?? "openai_compatible"}`}>
                             {typeLabel}
                           </span>
-                          {isDefaultProvider ? <span className="provider-default-badge">默认</span> : null}
                         </div>
                         <div className="provider-card-info">
                           <strong className="provider-card-name">{provider.name}</strong>
@@ -2643,8 +2640,6 @@ function ChatSettings({
   const [guardExactLimit, setGuardExactLimit] = useState(config.toolGuardrailExactFailureLimit ?? 5);
   const [guardSameToolLimit, setGuardSameToolLimit] = useState(config.toolGuardrailSameToolFailureLimit ?? 8);
   const [guardNoProgressLimit, setGuardNoProgressLimit] = useState(config.toolGuardrailNoProgressLimit ?? 5);
-  const [backgroundMemoryReviewEnabled, setBackgroundMemoryReviewEnabled] = useState(config.backgroundMemoryReviewEnabled !== false);
-  const [backgroundMemoryReviewMinMessages, setBackgroundMemoryReviewMinMessages] = useState(config.backgroundMemoryReviewMinMessages ?? 4);
   const [backgroundSkillReviewEnabled, setBackgroundSkillReviewEnabled] = useState(config.backgroundSkillReviewEnabled !== false);
   const [backgroundSkillReviewAutoCreateEnabled, setBackgroundSkillReviewAutoCreateEnabled] = useState(config.backgroundSkillReviewAutoCreateEnabled === true);
   const [backgroundSkillCuratorEnabled, setBackgroundSkillCuratorEnabled] = useState(config.backgroundSkillCuratorEnabled !== false);
@@ -2713,8 +2708,6 @@ function ChatSettings({
     setGuardExactLimit(config.toolGuardrailExactFailureLimit ?? 5);
     setGuardSameToolLimit(config.toolGuardrailSameToolFailureLimit ?? 8);
     setGuardNoProgressLimit(config.toolGuardrailNoProgressLimit ?? 5);
-    setBackgroundMemoryReviewEnabled(config.backgroundMemoryReviewEnabled !== false);
-    setBackgroundMemoryReviewMinMessages(config.backgroundMemoryReviewMinMessages ?? 4);
     setBackgroundSkillReviewEnabled(config.backgroundSkillReviewEnabled !== false);
     setBackgroundSkillReviewAutoCreateEnabled(config.backgroundSkillReviewAutoCreateEnabled === true);
     setBackgroundSkillCuratorEnabled(config.backgroundSkillCuratorEnabled !== false);
@@ -2726,7 +2719,7 @@ function ChatSettings({
     setStoredMessages(config.maxStoredMessagesPerConversation ?? 300);
     setStoredRuns(config.maxStoredAgentRuns ?? 50);
     setStoredTraces(config.maxStoredToolTraces ?? 100);
-  }, [config.activePollIntervalMs, config.agentRunTimeoutSeconds, config.artifactScanLimit, config.autoTitleEnabled, config.backgroundMemoryReviewEnabled, config.backgroundMemoryReviewMinMessages, config.backgroundSkillCuratorEnabled, config.backgroundSkillCuratorIntervalHours, config.backgroundSkillReviewAutoCreateEnabled, config.backgroundSkillReviewEnabled, config.bottomFollowThresholdPx, config.busyInputMode, config.delegationInheritMcpToolsets, config.delegationMaxConcurrentChildren, config.delegationOrchestratorEnabled, config.delegationStrategy, config.delegationSubagentAutoApprove, config.delegationSubagentModel, config.delegationSubagentProviderId, config.historyCleanupEnabled, config.historyRetentionDays, config.idlePollIntervalMs, config.intentAnalyzerMode, config.intentAnalyzerModel, config.intentAnalyzerProviderId, config.intentEmbeddingMinConfidence, config.intentLlmMaxTokens, config.intentLlmMinConfidence, config.intentLlmPrompt, config.intentLlmTimeoutSeconds, config.llmCredentialPoolStrategy, config.llmRetryBackoffMs, config.llmRetryCount, config.maxStoredAgentRuns, config.maxStoredMessagesPerConversation, config.maxStoredToolTraces, config.messageDedupEnabled, config.messageDedupWindowSeconds, config.petCloudDurationSeconds, config.queueWaitSeconds, config.responsesReasoningReplayEnabled, config.sendMessageToolEnabled, config.shortContextAbortOnSummaryFailure, config.shortContextSummaryModel, config.shortContextSummaryProviderId, config.skillHotReloadEnabled, config.skillHotReloadIntervalSeconds, config.thinkingMinVisibleMs, config.toolApprovalMode, config.toolCallRetryBackoffMs, config.toolCallRetryCount, config.toolEnvPassthrough, config.toolGuardrailExactFailureLimit, config.toolGuardrailExactFailureWarnAfter, config.toolGuardrailHardStopEnabled, config.toolGuardrailNoProgressLimit, config.toolGuardrailNoProgressWarnAfter, config.toolGuardrailSameToolFailureLimit, config.toolGuardrailSameToolFailureWarnAfter, config.toolGuardrailWarningsEnabled, config.toolParallelEnabled, config.toolParallelLimit, config.toolRouterLlmEnabled, config.toolRouterLlmMaxTokens, config.toolRouterLlmMinConfidence, config.toolRouterLlmPrompt, config.toolRouterLlmTimeoutSeconds, config.toolUseEnforcement, config.trustedCommandPatterns, config.trustedToolPatterns, config.uiMessageLimit, config.uiMessagePreviewChars, config.uiStreamCharsPerSecond]);
+  }, [config.activePollIntervalMs, config.agentRunTimeoutSeconds, config.artifactScanLimit, config.autoTitleEnabled, config.backgroundSkillCuratorEnabled, config.backgroundSkillCuratorIntervalHours, config.backgroundSkillReviewAutoCreateEnabled, config.backgroundSkillReviewEnabled, config.bottomFollowThresholdPx, config.busyInputMode, config.delegationInheritMcpToolsets, config.delegationMaxConcurrentChildren, config.delegationOrchestratorEnabled, config.delegationStrategy, config.delegationSubagentAutoApprove, config.delegationSubagentModel, config.delegationSubagentProviderId, config.historyCleanupEnabled, config.historyRetentionDays, config.idlePollIntervalMs, config.intentAnalyzerMode, config.intentAnalyzerModel, config.intentAnalyzerProviderId, config.intentEmbeddingMinConfidence, config.intentLlmMaxTokens, config.intentLlmMinConfidence, config.intentLlmPrompt, config.intentLlmTimeoutSeconds, config.llmCredentialPoolStrategy, config.llmRetryBackoffMs, config.llmRetryCount, config.maxStoredAgentRuns, config.maxStoredMessagesPerConversation, config.maxStoredToolTraces, config.messageDedupEnabled, config.messageDedupWindowSeconds, config.petCloudDurationSeconds, config.queueWaitSeconds, config.responsesReasoningReplayEnabled, config.sendMessageToolEnabled, config.shortContextAbortOnSummaryFailure, config.shortContextSummaryModel, config.shortContextSummaryProviderId, config.skillHotReloadEnabled, config.skillHotReloadIntervalSeconds, config.thinkingMinVisibleMs, config.toolApprovalMode, config.toolCallRetryBackoffMs, config.toolCallRetryCount, config.toolEnvPassthrough, config.toolGuardrailExactFailureLimit, config.toolGuardrailExactFailureWarnAfter, config.toolGuardrailHardStopEnabled, config.toolGuardrailNoProgressLimit, config.toolGuardrailNoProgressWarnAfter, config.toolGuardrailSameToolFailureLimit, config.toolGuardrailSameToolFailureWarnAfter, config.toolGuardrailWarningsEnabled, config.toolParallelEnabled, config.toolParallelLimit, config.toolRouterLlmEnabled, config.toolRouterLlmMaxTokens, config.toolRouterLlmMinConfidence, config.toolRouterLlmPrompt, config.toolRouterLlmTimeoutSeconds, config.toolUseEnforcement, config.trustedCommandPatterns, config.trustedToolPatterns, config.uiMessageLimit, config.uiMessagePreviewChars, config.uiStreamCharsPerSecond]);
 
   const save = () => void onSave({
     busyInputMode: busyInputMode,
@@ -2786,8 +2779,6 @@ function ChatSettings({
     toolGuardrailExactFailureLimit: guardExactLimit,
     toolGuardrailSameToolFailureLimit: guardSameToolLimit,
     toolGuardrailNoProgressLimit: guardNoProgressLimit,
-    backgroundMemoryReviewEnabled: backgroundMemoryReviewEnabled,
-    backgroundMemoryReviewMinMessages: backgroundMemoryReviewMinMessages,
     backgroundSkillReviewEnabled: backgroundSkillReviewEnabled,
     backgroundSkillReviewAutoCreateEnabled: backgroundSkillReviewAutoCreateEnabled,
     backgroundSkillCuratorEnabled: backgroundSkillCuratorEnabled,
@@ -3230,10 +3221,6 @@ function ChatSettings({
         <div className="card-header">后台复盘</div>
         <div className="form-group">
           <div className="form-row">
-            <label>自动记忆复盘</label>
-            <input checked={backgroundMemoryReviewEnabled} onChange={(event) => setBackgroundMemoryReviewEnabled(event.target.checked)} type="checkbox" />
-          </div>
-          <div className="form-row">
             <label>技能建议复盘</label>
             <input checked={backgroundSkillReviewEnabled} onChange={(event) => setBackgroundSkillReviewEnabled(event.target.checked)} type="checkbox" />
           </div>
@@ -3253,16 +3240,8 @@ function ChatSettings({
               <button onClick={() => setBackgroundSkillCuratorIntervalHours(Math.min(2160, backgroundSkillCuratorIntervalHours + 24))} type="button">+</button>
             </div>
           </div>
-          <div className="form-row">
-            <label>最少消息数</label>
-            <div className="stepper">
-              <button onClick={() => setBackgroundMemoryReviewMinMessages(Math.max(2, backgroundMemoryReviewMinMessages - 1))} type="button">−</button>
-              <span className="stepper-val">{backgroundMemoryReviewMinMessages}</span>
-              <button onClick={() => setBackgroundMemoryReviewMinMessages(Math.min(40, backgroundMemoryReviewMinMessages + 1))} type="button">+</button>
-            </div>
-          </div>
         </div>
-        <div className="form-hint">完成一次 agent run 后异步检查稳定用户事实、偏好和技能库改进建议；记忆复盘可写入 memory。自动整理报告按间隔生成 curator dry-run 报告，不会自动归档。</div>
+        <div className="form-hint">完成一次 agent run 后异步检查技能库改进建议；自动整理报告按间隔生成 curator dry-run 报告，不会自动归档。记忆复盘请在通讯录的记忆管理中配置。</div>
       </div>
       <div className="card" style={{ margin: "0 16px 12px" }}>
         <div className="card-header">界面性能</div>

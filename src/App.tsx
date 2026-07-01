@@ -24,7 +24,6 @@ import {
   Palette,
   PlugZap,
   Puzzle,
-  RefreshCw,
   Search,
   Send,
   Settings,
@@ -44,6 +43,7 @@ import { api } from "./lib/api";
 import { listen } from "@tauri-apps/api/event";
 import { emit } from "@tauri-apps/api/event";
 import { Avatar, MenuRow } from "./components/common";
+import { PersonaMemoryManager } from "./components/PersonaMemoryManager";
 import { resolvePersonaAgentBinding } from "./lib/personaAgentBinding";
 import { SettingsPanel } from "./panels/SettingsPanel";
 import { MemoryPanel, WorldbooksPanel, PluginsPanel } from "./panels/ToolPanels";
@@ -398,7 +398,16 @@ export function App() {
           scheduleWechatFallbackRefresh(payload.conversationId, payload.personaId ?? null);
           return;
         }
-        void refreshChatData(payload.conversationId ?? null, payload.personaId ?? null);
+        if (
+          payload.message
+          && isVisibleChatEventMessage(payload.message)
+          && (payload.message.role === "assistant" || payload.message.role === "tool")
+        ) {
+          upsertIncomingMessage(payload.message, { final: payload.message.role === "assistant" });
+        }
+        window.setTimeout(() => {
+          void refreshChatData(payload.conversationId ?? null, payload.personaId ?? null);
+        }, 180);
         return;
       }
       const isMessageEvent =
@@ -438,7 +447,13 @@ export function App() {
             incrementConversationUnread(payload.conversationId);
           }
         }
-        upsertIncomingMessage(payload.message);
+        upsertIncomingMessage(payload.message, {
+          streaming: payload.type === "assistant_stream" && payload.message.role === "assistant" && !payload.isLast,
+          final: (
+            (payload.type === "assistant_message" || (payload.type === "assistant_stream" && payload.isLast))
+            && payload.message.role === "assistant"
+          )
+        });
         appliedInlineVisibleMessage = true;
         if (isWechatUserMessage) {
           flushDeferredWechatMessages(payload.conversationId);
@@ -452,13 +467,12 @@ export function App() {
       }
       if (
         appliedInlineVisibleMessage
-        && messageSource === "pet"
+        && (messageSource === "pet" || payload.message?.role === "assistant")
         && (payload.type === "new_message" || payload.type === "assistant_message")
       ) {
-        // Pet turns already inserted the live message into the active chat view.
-        // A same-tick refresh can read a stale backend snapshot and temporarily
-        // wipe that just-rendered bubble before turn_finished does the
-        // authoritative reload.
+        // The live message has already been inserted. A same-tick refresh can
+        // read a stale backend snapshot and temporarily wipe or downgrade the
+        // streaming bubble before the final event catches up.
         return;
       }
       if (
@@ -734,7 +748,13 @@ function ContactsPanel() {
   const {
     personas,
     accounts,
+    config,
+    memories,
     setSection,
+    saveConfig,
+    savePersona,
+    refreshMemories,
+    deleteMemory,
     openPersonaConversation,
     linkWechatAccount,
     unlinkWechatAccount,
@@ -744,6 +764,7 @@ function ContactsPanel() {
   const llmProviders = useAppStore((state) => state.llmProviders);
   const [query, setQuery] = useState("");
   const [selectedPersonaId, setSelectedPersonaId] = useState(personas[0]?.id ?? "");
+  const [detailView, setDetailView] = useState<"profile" | "memory">("profile");
   const [showWechatSheet, setShowWechatSheet] = useState(false);
   const [pollStatus, setPollStatus] = useState("");
   const personaBindings = useMemo(
@@ -760,6 +781,29 @@ function ContactsPanel() {
   );
   const selectedPersona = visiblePersonas.find((p) => p.id === selectedPersonaId) ?? visiblePersonas[0] ?? null;
   const linkedAccount = selectedPersona ? accounts.find((account) => account.linkedPersona === selectedPersona.id) : null;
+  const selectedBinding = selectedPersona ? personaBindings.get(selectedPersona.id) : null;
+  const selectedMemories = selectedPersona ? memories.filter((memory) => memory.personaId === selectedPersona.id) : [];
+  const persistentMemories = selectedMemories.filter((memory) => (memory.target ?? "memory") !== "session");
+  const sessionMemories = selectedMemories.filter((memory) => (memory.target ?? "memory") === "session");
+  const saveChatConfig = async (patch: Partial<NonNullable<typeof config>["chat"]>) => {
+    if (!config) return;
+    await saveConfig({ ...config, chat: { ...config.chat, ...patch } });
+  };
+  const updatePersonaMemory = async (memory: NonNullable<Persona["memory"]>) => {
+    if (!selectedPersona) return;
+    await savePersona({ ...selectedPersona, memory });
+  };
+  const removeMemoryEntry = async (memoryId: string) => {
+    await deleteMemory(memoryId);
+    if (selectedPersona) await refreshMemories(selectedPersona.id);
+  };
+  useEffect(() => {
+    if (!selectedPersona) return;
+    void refreshMemories(selectedPersona.id);
+  }, [refreshMemories, selectedPersona?.id]);
+  useEffect(() => {
+    setDetailView("profile");
+  }, [selectedPersonaId]);
   const syncLinkedWechat = async () => {
     if (!linkedAccount) return;
     setPollStatus("正在同步微信消息...");
@@ -825,30 +869,53 @@ function ContactsPanel() {
           <strong>{selectedPersona?.name ?? "角色详情"}</strong>
         </div>
         {selectedPersona ? (
-          <div className="profile-detail">
-            <Avatar name={selectedPersona.name} src={selectedPersona.avatarPath ? api.assetUrl(selectedPersona.avatarPath) : ""} size="large" />
-            <h2>{selectedPersona.name}</h2>
-            <p className="persona-id-text">{selectedPersona.id}</p>
-            <div className="menu-card">
-              <MenuRow
-                icon={MessageSquareText}
-                label="发消息"
-                value="进入会话"
-                onClick={() => {
-                  void openPersonaConversation(selectedPersona.id).then(() => setSection("chat"));
-                }}
+          detailView === "memory" ? (
+            <div className="contact-memory-detail">
+              <div className="panel-title action-title contact-memory-title">
+                <button className="icon-only-btn" onClick={() => setDetailView("profile")} title="返回资料" type="button">
+                  <ChevronRight size={19} style={{ transform: "rotate(180deg)" }} />
+                </button>
+                <div className="panel-title-text"><span>{selectedPersona.name}</span><strong>记忆管理</strong></div>
+              </div>
+              <PersonaMemoryManager
+                bindingModel={selectedBinding?.model ?? ""}
+                bindingProviderName={selectedBinding?.providerName ?? ""}
+                chatConfig={config?.chat ?? null}
+                onDeleteMemory={removeMemoryEntry}
+                onRefresh={() => void refreshMemories(selectedPersona.id)}
+                onSaveChatConfig={saveChatConfig}
+                onUpdateMemory={updatePersonaMemory}
+                onViewAll={() => setSection("memory")}
+                persistentMemories={persistentMemories}
+                personaMemory={selectedPersona.memory}
+                sessionMemories={sessionMemories}
               />
-              <MenuRow
-                icon={Smartphone}
-                label="链接微信"
-                value={linkedAccount ? (linkedAccount.note || "已链接") : "未链接"}
-                onClick={() => setShowWechatSheet(true)}
-                iconColor="green"
-              />
-              <MenuRow icon={Brain} label="长期记忆" value="管理记忆" onClick={() => setSection("memory")} />
-              <MenuRow icon={BookOpen} label="世界书" value="绑定与查看" onClick={() => setSection("worldbooks")} />
-              <MenuRow icon={Edit3} label="编辑角色" value="人设与模型" onClick={() => setSection("personas")} />
             </div>
+          ) : (
+            <div className="profile-detail">
+              <Avatar name={selectedPersona.name} src={selectedPersona.avatarPath ? api.assetUrl(selectedPersona.avatarPath) : ""} size="large" />
+              <h2>{selectedPersona.name}</h2>
+              <p className="persona-id-text">{selectedPersona.id}</p>
+              <div className="menu-card">
+                <MenuRow
+                  icon={MessageSquareText}
+                  label="发消息"
+                  value="进入会话"
+                  onClick={() => {
+                    void openPersonaConversation(selectedPersona.id).then(() => setSection("chat"));
+                  }}
+                />
+                <MenuRow
+                  icon={Smartphone}
+                  label="链接微信"
+                  value={linkedAccount ? (linkedAccount.note || "已链接") : "未链接"}
+                  onClick={() => setShowWechatSheet(true)}
+                  iconColor="green"
+                />
+                <MenuRow icon={Brain} label="记忆管理" value="长期与会话" onClick={() => setDetailView("memory")} />
+                <MenuRow icon={BookOpen} label="世界书" value="绑定与查看" onClick={() => setSection("worldbooks")} />
+                <MenuRow icon={Edit3} label="编辑角色" value="人设与模型" onClick={() => setSection("personas")} />
+              </div>
             {pollStatus ? <p className="form-hint">{pollStatus}</p> : null}
             {showWechatSheet ? (
               <div className="sheet-backdrop" onClick={() => setShowWechatSheet(false)}>
@@ -897,7 +964,8 @@ function ContactsPanel() {
                 </div>
               </div>
             ) : null}
-          </div>
+            </div>
+          )
         ) : (
           <div className="empty-state">
             <Users size={36} />

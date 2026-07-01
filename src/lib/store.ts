@@ -150,14 +150,21 @@ function limitMessages(messages: ChatMessage[], limit: number) {
   return messages.length > limit ? messages.slice(-limit) : messages;
 }
 
+function messageDisplayRoleRank(message: ChatMessage) {
+  if (message.role === "user") return 0;
+  if (message.role === "tool") return 1;
+  if (message.role === "assistant") return 2;
+  return 3;
+}
+
 function sortMessagesForDisplay(messages: ChatMessage[]) {
   return messages
     .map((message, index) => ({ message, index }))
     .sort((left, right) => {
       const timeDelta = messageTime(left.message) - messageTime(right.message);
       if (timeDelta !== 0) return timeDelta;
-      const leftRoleRank = left.message.role === "user" ? 0 : left.message.role === "assistant" ? 1 : 2;
-      const rightRoleRank = right.message.role === "user" ? 0 : right.message.role === "assistant" ? 1 : 2;
+      const leftRoleRank = messageDisplayRoleRank(left.message);
+      const rightRoleRank = messageDisplayRoleRank(right.message);
       const roleDelta = leftRoleRank - rightRoleRank;
       return roleDelta === 0 ? left.index - right.index : roleDelta;
     })
@@ -198,6 +205,11 @@ function isLocalStatusMessage(message: ChatMessage) {
   return message.source?.startsWith("desktop-local-") ?? false;
 }
 
+interface IncomingMessageUpsertOptions {
+  streaming?: boolean;
+  final?: boolean;
+}
+
 function messageTime(message: ChatMessage) {
   const timestamp = Date.parse(message.createdAt);
   return Number.isFinite(timestamp) ? timestamp : 0;
@@ -234,9 +246,53 @@ function matchesPersistedUserMessage(liveMessage: ChatMessage, backendMessage: C
   );
 }
 
-function mergeLocalUiMessages(backendMessages: ChatMessage[], currentMessages: ChatMessage[], conversationId: string | null, limit: number) {
+function isTrackedStreamingAssistantMessage(
+  message: ChatMessage,
+  conversationId: string | null,
+  streamedAssistantIds: Set<string>
+) {
+  return Boolean(
+    conversationId
+    && message.conversationId === conversationId
+    && message.role === "assistant"
+    && streamedAssistantIds.has(message.id)
+    && isVisibleChatMessage(message)
+    && !isLocalUiMessage(message)
+    && !isLocalStatusMessage(message)
+  );
+}
+
+function shouldPreferLiveStreamingAssistant(
+  liveMessage: ChatMessage,
+  backendMessage: ChatMessage,
+  conversationId: string | null,
+  streamedAssistantIds: Set<string>
+) {
+  if (!isTrackedStreamingAssistantMessage(liveMessage, conversationId, streamedAssistantIds)) return false;
+  if (backendMessage.role !== "assistant") return false;
+  if (!backendMessage.content && liveMessage.content) return true;
+  return (
+    liveMessage.content.length > backendMessage.content.length
+    && liveMessage.content.startsWith(backendMessage.content)
+  );
+}
+
+function mergeLocalUiMessages(
+  backendMessages: ChatMessage[],
+  currentMessages: ChatMessage[],
+  conversationId: string | null,
+  limit: number,
+  streamedAssistantIds: Set<string> = new Set()
+) {
   if (!conversationId) return displayMessages(backendMessages, limit);
-  const backendIds = new Set(backendMessages.map((message) => message.id));
+  const currentById = new Map(currentMessages.map((message) => [message.id, message]));
+  const backendMessagesWithLiveStreams = backendMessages.map((backend) => {
+    const live = currentById.get(backend.id);
+    return live && shouldPreferLiveStreamingAssistant(live, backend, conversationId, streamedAssistantIds)
+      ? live
+      : backend;
+  });
+  const backendIds = new Set(backendMessagesWithLiveStreams.map((message) => message.id));
   const localMessages = currentMessages.filter((message) => {
     if (message.conversationId !== conversationId || !isLocalUiMessage(message) || backendIds.has(message.id)) {
       return false;
@@ -254,6 +310,10 @@ function mergeLocalUiMessages(backendMessages: ChatMessage[], currentMessages: C
     }
     return false;
   });
+  const streamingAssistantMessages = currentMessages.filter((message) =>
+    isTrackedStreamingAssistantMessage(message, conversationId, streamedAssistantIds)
+    && !backendIds.has(message.id)
+  );
   const transientLiveMessages = currentMessages.filter((message) => {
     if (message.conversationId !== conversationId || backendIds.has(message.id)) {
       return false;
@@ -269,11 +329,11 @@ function mergeLocalUiMessages(backendMessages: ChatMessage[], currentMessages: C
     }
     return !backendMessages.some((backend) => matchesPersistedUserMessage(message, backend));
   });
-  if (localMessages.length === 0 && transientLiveMessages.length === 0) {
-    return displayMessages(backendMessages, limit);
+  if (localMessages.length === 0 && transientLiveMessages.length === 0 && streamingAssistantMessages.length === 0) {
+    return displayMessages(backendMessagesWithLiveStreams, limit);
   }
   return displayMessages(
-    [...backendMessages, ...localMessages, ...transientLiveMessages],
+    [...backendMessagesWithLiveStreams, ...localMessages, ...transientLiveMessages, ...streamingAssistantMessages],
     limit
   );
 }
@@ -409,28 +469,6 @@ function personaWithAgentRuntime(persona: Persona, agent: AgentDefinition): Pers
       ...persona.toolPolicy,
       maxIterations: clampToolIterations(agent.maxToolIterations)
     }
-  };
-}
-
-function defaultChatProvider(providers: LlmProvider[]) {
-  return providers.find((provider) => provider.enabled) ?? null;
-}
-
-function personaWithDefaultChatProvider(persona: Persona, provider: LlmProvider | null): Persona {
-  if (!provider || persona.llmProvider?.trim()) return persona;
-  return {
-    ...persona,
-    llmProvider: provider.id,
-    llmModel: persona.llmModel?.trim() || provider.model || ""
-  };
-}
-
-function agentWithDefaultChatProvider(agent: AgentDefinition, provider: LlmProvider | null): AgentDefinition {
-  if (!provider || agent.llmProvider?.trim()) return agent;
-  return {
-    ...agent,
-    llmProvider: provider.id,
-    llmModel: agent.llmModel?.trim() || provider.model || ""
   };
 }
 
@@ -588,7 +626,7 @@ interface AppState {
   setConversationProcessing: (conversationId: string, processing: boolean) => void;
   incrementConversationUnread: (conversationId: string, amount?: number) => void;
   markConversationRead: (conversationId: string) => void;
-  upsertIncomingMessage: (message: ChatMessage) => void;
+  upsertIncomingMessage: (message: ChatMessage, options?: IncomingMessageUpsertOptions) => void;
   createConversation: (personaId?: string) => Promise<void>;
   openPersonaConversation: (personaId: string) => Promise<void>;
   deleteConversation: (conversationId: string) => Promise<ConversationDeleteMemorySettlingResult>;
@@ -613,7 +651,7 @@ interface AppState {
   saveEmojiGroups: (groups: EmojiGroup[]) => Promise<void>;
   uploadEmojiImage: (groupId: string, emotion: string, file: File) => Promise<void>;
   refreshMemories: (personaId?: string) => Promise<void>;
-  saveMemory: (memory: Partial<MemoryEntry> & { personaId: string; summary: string; importance: number }) => Promise<void>;
+  saveMemory: (memory: Partial<MemoryEntry> & { personaId: string; summary: string; importance: number; target?: string }) => Promise<void>;
   deleteMemory: (id: string) => Promise<void>;
   saveWorldbook: (book: Worldbook) => Promise<void>;
   deleteWorldbook: (id: string) => Promise<void>;
@@ -912,7 +950,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       ? visibleChatMessages(await api.listMessages(activeConversationId, messageLimit, previewChars))
       : [];
     const liveState = get();
-    const messages = mergeLocalUiMessages(backendMessages, liveState.messages, activeConversationId, messageLimit);
+    const messages = mergeLocalUiMessages(
+      backendMessages,
+      liveState.messages,
+      activeConversationId,
+      messageLimit,
+      liveState.streamedAssistantIds
+    );
     const latestMessage = messages.at(-1);
     const shouldClearProcessing =
       Boolean(activeConversationId && latestMessage?.role === "assistant")
@@ -954,7 +998,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
     const previewChars = uiMessagePreviewChars(state.config);
     const backendMessages = visibleChatMessages(await api.listMessages(targetConversationId, nextLimit, previewChars));
-    const messages = mergeLocalUiMessages(backendMessages, state.messages, targetConversationId, nextLimit);
+    const messages = mergeLocalUiMessages(
+      backendMessages,
+      state.messages,
+      targetConversationId,
+      nextLimit,
+      state.streamedAssistantIds
+    );
     if (get().activeConversationId === targetConversationId) {
       set((current) => ({
         conversationMessageLimits: {
@@ -1031,7 +1081,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       return { conversationUnreadCounts: unreadCounts };
     });
   },
-  upsertIncomingMessage: (message) => {
+  upsertIncomingMessage: (message, options) => {
     if (!isVisibleChatMessage(message)) return;
     set((state) => {
       if (state.activeConversationId && message.conversationId !== state.activeConversationId) {
@@ -1039,10 +1089,38 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       const index = state.messages.findIndex((item) => item.id === message.id);
       const messageLimit = conversationMessageLimit(state.config, message.conversationId, state.conversationMessageLimits);
+      const previousMessage = index >= 0 ? state.messages[index] : null;
+      const shouldKeepStreamingPresentation =
+        message.role === "assistant"
+        && !options?.final
+        && (
+          options?.streaming
+          || (
+            previousMessage?.source === "desktop-stream"
+            && (state.streamedAssistantIds.has(message.id) || options?.final)
+            && (
+              message.content.startsWith(previousMessage.content)
+              || previousMessage.content.startsWith(message.content)
+            )
+          )
+        );
+      const nextMessage = shouldKeepStreamingPresentation
+        ? { ...message, source: options?.streaming ? "desktop-stream" : previousMessage?.source ?? "desktop-stream" }
+        : message;
       const messages = index >= 0
-        ? state.messages.map((item) => (item.id === message.id ? message : item))
-        : [...state.messages, message];
-      return { messages: displayMessages(messages, messageLimit) };
+        ? state.messages.map((item) => (item.id === message.id ? nextMessage : item))
+        : [...state.messages, nextMessage];
+      let streamedAssistantIds = state.streamedAssistantIds;
+      if (message.role === "assistant") {
+        if (options?.streaming) {
+          streamedAssistantIds = new Set(streamedAssistantIds);
+          streamedAssistantIds.add(message.id);
+        } else if (options?.final && streamedAssistantIds.has(message.id)) {
+          streamedAssistantIds = new Set(streamedAssistantIds);
+          streamedAssistantIds.delete(message.id);
+        }
+      }
+      return { messages: displayMessages(messages, messageLimit), streamedAssistantIds };
     });
   },
   createConversation: async (personaId) => {
@@ -1313,28 +1391,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   saveLlmProviders: async (llmProviders) => {
     await api.saveLlmProviders(llmProviders);
-    const defaultProvider = defaultChatProvider(llmProviders);
-    const state = get();
-    const agentsToSave = state.agents
-      .map((agent) => agentWithDefaultChatProvider(agent, defaultProvider))
-      .filter((agent, index) => agent !== state.agents[index]);
-    const personasToSave = state.personas
-      .map((persona) => personaWithDefaultChatProvider(persona, defaultProvider))
-      .filter((persona, index) => persona !== state.personas[index]);
-    await Promise.all([
-      ...agentsToSave.map((agent) => api.saveAgent(agent)),
-      ...personasToSave.map((persona) => api.savePersona(persona))
-    ]);
-    const [agents, personas] = await Promise.all([
-      agentsToSave.length > 0 ? api.listAgents() : Promise.resolve(state.agents),
-      personasToSave.length > 0 ? api.listPersonas() : Promise.resolve(state.personas)
-    ]);
-    set((current) => ({
-      llmProviders,
-      agents: sortAgents(agents),
-      personas: sortPersonas(personas),
-      focusedAgentId: normalizeFocusedAgentId(agents, current.focusedAgentId)
-    }));
+    set({ llmProviders });
   },
   saveProfile: async (profile) => {
     const saved = await api.saveProfile(profile);
