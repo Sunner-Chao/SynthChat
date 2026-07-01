@@ -16,7 +16,7 @@ use crate::{
     error::AppResult,
     models::{
         AgentCheckpointRecord, AgentDefinition, AgentQueuedRequest, AgentRunPhaseRecord,
-        AgentRunRecord, ChatMessage, Conversation, Persona, SendChatRequest,
+        AgentRunRecord, ChatMessage, Conversation, LlmProvider, Persona, SendChatRequest,
     },
     skills as skill_library,
     store::AppStore,
@@ -103,6 +103,8 @@ struct DesktopVisibleStreamState {
     thinking_buffer: Arc<Mutex<String>>,
     emitted_any_delta: Arc<AtomicBool>,
     emitted_answer_text: Arc<AtomicBool>,
+    passthrough_answer: Arc<AtomicBool>,
+    suppress_thinking: Arc<AtomicBool>,
     conversation_id: String,
     source: String,
 }
@@ -120,16 +122,27 @@ impl DesktopVisibleStreamState {
             thinking_buffer: Arc::new(Mutex::new(String::new())),
             emitted_any_delta: Arc::new(AtomicBool::new(false)),
             emitted_answer_text: Arc::new(AtomicBool::new(false)),
+            passthrough_answer: Arc::new(AtomicBool::new(false)),
+            suppress_thinking: Arc::new(AtomicBool::new(false)),
             conversation_id: conversation_id.to_string(),
             source: source.to_string(),
         }
     }
 
     fn reset_for_next_llm_call(&self) {
-        if !self.emitted_any_delta.swap(false, Ordering::SeqCst) {
+        let emitted_any_delta = self.emitted_any_delta.swap(false, Ordering::SeqCst);
+        self.emitted_answer_text.store(false, Ordering::SeqCst);
+        self.passthrough_answer.store(false, Ordering::SeqCst);
+        self.suppress_thinking.store(false, Ordering::SeqCst);
+        if let Ok(mut parser) = self.parser.lock() {
+            *parser = PlannerVisibleContentStream::default();
+        }
+        if let Ok(mut buffer) = self.thinking_buffer.lock() {
+            buffer.clear();
+        }
+        if !emitted_any_delta {
             return;
         }
-        self.emitted_answer_text.store(false, Ordering::SeqCst);
         if let Ok(mut message) = self.message.lock() {
             *message = ChatMessage::new(
                 self.conversation_id.clone(),
@@ -138,12 +151,14 @@ impl DesktopVisibleStreamState {
                 &self.source,
             );
         }
-        if let Ok(mut parser) = self.parser.lock() {
-            *parser = PlannerVisibleContentStream::default();
-        }
-        if let Ok(mut buffer) = self.thinking_buffer.lock() {
-            buffer.clear();
-        }
+    }
+
+    fn set_passthrough_answer(&self, enabled: bool) {
+        self.passthrough_answer.store(enabled, Ordering::SeqCst);
+    }
+
+    fn set_suppress_thinking(&self, enabled: bool) {
+        self.suppress_thinking.store(enabled, Ordering::SeqCst);
     }
 
     fn emit_provider_thinking_if_idle(
@@ -203,6 +218,8 @@ fn desktop_visible_stream_callback(
     let callback_message = Arc::clone(&stream_state.message);
     let callback_started = Arc::clone(&stream_state.emitted_any_delta);
     let callback_answer_started = Arc::clone(&stream_state.emitted_answer_text);
+    let callback_passthrough_answer = Arc::clone(&stream_state.passthrough_answer);
+    let callback_suppress_thinking = Arc::clone(&stream_state.suppress_thinking);
     let callback_existing = existing.clone();
     let callback_parser = Arc::clone(&stream_state.parser);
     let callback_thinking_buffer = Arc::clone(&stream_state.thinking_buffer);
@@ -210,10 +227,13 @@ fn desktop_visible_stream_callback(
     let persona_id = persona_id.to_string();
     let source = source.to_string();
     let callback: crate::llm::LlmDeltaCallback = Arc::new(move |kind, delta| {
-        if let Some(existing) = callback_existing.as_ref() {
-            existing(kind, delta)?;
-        }
         if kind == crate::llm::LlmStreamDeltaKind::Thinking {
+            if callback_suppress_thinking.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            if let Some(existing) = callback_existing.as_ref() {
+                existing(kind, delta)?;
+            }
             if delta.is_empty() {
                 return Ok(());
             }
@@ -249,10 +269,17 @@ fn desktop_visible_stream_callback(
             );
             return Ok(());
         }
-        let visible_delta = callback_parser
-            .lock()
-            .map(|mut parser| parser.push(delta))
-            .unwrap_or_default();
+        if let Some(existing) = callback_existing.as_ref() {
+            existing(kind, delta)?;
+        }
+        let visible_delta = if callback_passthrough_answer.load(Ordering::SeqCst) {
+            delta.to_string()
+        } else {
+            callback_parser
+                .lock()
+                .map(|mut parser| parser.push(delta))
+                .unwrap_or_default()
+        };
         if visible_delta.is_empty() {
             return Ok(());
         }
@@ -297,6 +324,342 @@ fn desktop_visible_stream_callback(
         Ok(())
     });
     (Some(callback), stream_state)
+}
+
+async fn append_intermediate_assistant_after_tools(
+    store: &AppStore,
+    run_id: &str,
+    conversation_id: &str,
+    persona_id: &str,
+    providers: &[LlmProvider],
+    persona: &Persona,
+    history: &mut Vec<ChatMessage>,
+    user_request: &str,
+    request_source: &str,
+    request_provider_data: Option<&Value>,
+    latest_observations: &[String],
+    iteration: u32,
+    stream_delta_callback: Option<crate::llm::LlmDeltaCallback>,
+    desktop_stream_state: &DesktopVisibleStreamState,
+    desktop_app: Option<&AppHandle>,
+    silent_pet_vision: bool,
+) -> AppResult<Option<ChatMessage>> {
+    if latest_observations.is_empty() {
+        return Ok(None);
+    }
+    desktop_stream_state.reset_for_next_llm_call();
+    desktop_stream_state.set_passthrough_answer(true);
+    desktop_stream_state.set_suppress_thinking(true);
+
+    let prompt = tool_progress_user_prompt(user_request, latest_observations, iteration);
+    let progress_history = vec![ChatMessage::new(
+        conversation_id.to_string(),
+        "user",
+        prompt.clone(),
+        "internal-tool-progress",
+    )];
+    let mut progress_persona = persona.clone();
+    progress_persona.max_tokens = progress_persona.max_tokens.max(64).min(512);
+    progress_persona.temperature = progress_persona.temperature.min(0.7);
+
+    let reply = match complete_chat_with_provider_failover_options(
+        store,
+        Some(run_id),
+        providers,
+        &progress_persona,
+        TOOL_PROGRESS_SYSTEM_PROMPT.to_string(),
+        progress_history,
+        &prompt,
+        None,
+        stream_delta_callback,
+        crate::llm::LlmCallOptions {
+            responses_reasoning_replay_enabled: false,
+            fast_mode_enabled: true,
+            thinking_enabled: false,
+            ..crate::llm::LlmCallOptions::default()
+        },
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(error) => {
+            desktop_stream_state.set_passthrough_answer(false);
+            desktop_stream_state.set_suppress_thinking(false);
+            let _ = append_parent_phase_event(
+                store,
+                run_id,
+                "tool_progress_reply_failed",
+                json!({
+                    "iteration": iteration,
+                    "error": error.to_string(),
+                }),
+            );
+            desktop_stream_state.reset_for_next_llm_call();
+            return Ok(None);
+        }
+    };
+    desktop_stream_state.set_passthrough_answer(false);
+    desktop_stream_state.set_suppress_thinking(false);
+
+    let cleaned_text = clean_intermediate_assistant_text(&reply.content);
+    let text = if cleaned_text.trim().is_empty()
+        || intermediate_assistant_text_is_generic(&cleaned_text)
+    {
+        fallback_intermediate_assistant_text(user_request, latest_observations, iteration)
+    } else {
+        ensure_intermediate_progress_label(user_request, &cleaned_text)
+    };
+    if text.trim().is_empty() {
+        desktop_stream_state.reset_for_next_llm_call();
+        return Ok(None);
+    }
+
+    let mut assistant_message = ChatMessage::new(
+        conversation_id.to_string(),
+        "assistant",
+        text.clone(),
+        "desktop-agent-progress",
+    );
+    assistant_message.provider_data = Some(json!({
+        "reactStep": {
+            "kind": "intermediate",
+            "iteration": iteration,
+            "observationCount": latest_observations.len(),
+            "final": false
+        }
+    }));
+    if desktop_stream_state
+        .emitted_answer_text
+        .load(Ordering::SeqCst)
+    {
+        if let Ok(streaming_message) = desktop_stream_state.message.lock() {
+            assistant_message.id = streaming_message.id.clone();
+            assistant_message.created_at = streaming_message.created_at.clone();
+        }
+    }
+    if silent_pet_vision {
+        assistant_message.source = "pet-vision".into();
+        mark_message_visible_for_pet_vision(&mut assistant_message);
+    }
+    let assistant = store.append_message(assistant_message)?;
+    history.push(assistant.clone());
+    append_parent_phase_event(
+        store,
+        run_id,
+        "tool_progress_reply",
+        json!({
+            "iteration": iteration,
+            "messageId": assistant.id,
+            "observations": latest_observations.len(),
+            "model": reply.model,
+            "providerId": reply.provider_id,
+        }),
+    )?;
+    if let Some(app) = desktop_app {
+        let progress_event_source = intermediate_progress_event_source(request_source, &assistant);
+        let _ = app.emit(
+            "synthchat-chat-event",
+            json!({
+                "type": "assistant_progress",
+                "source": progress_event_source,
+                "personaId": persona_id,
+                "conversationId": conversation_id,
+                "message": &assistant,
+                "isLast": false,
+            }),
+        );
+        if !silent_pet_vision && should_emit_pet_thinking_event(progress_event_source) {
+            emit_pet_event(
+                app,
+                json!({
+                    "type": "assistant_progress",
+                    "source": progress_event_source,
+                    "personaId": persona_id,
+                    "conversationId": conversation_id,
+                    "message": &assistant,
+                }),
+            );
+        }
+    }
+    if !silent_pet_vision && request_source.trim() != "proactive-internal" {
+        crate::wechat_settings::dispatch_progress_to_wechat(
+            store,
+            conversation_id,
+            request_provider_data,
+            &assistant.content,
+        );
+    }
+    desktop_stream_state.reset_for_next_llm_call();
+    Ok(Some(assistant))
+}
+
+fn intermediate_progress_event_source<'a>(
+    request_source: &'a str,
+    assistant: &'a ChatMessage,
+) -> &'a str {
+    let source = request_source.trim();
+    if source.is_empty() || source == "desktop" {
+        assistant.source.as_str()
+    } else {
+        source
+    }
+}
+
+const TOOL_PROGRESS_SYSTEM_PROMPT: &str = r#"You write the visible middle body for an in-progress SynthChat agent turn.
+Return plain assistant-facing text only. Do not return JSON, tool calls, hidden reasoning, markdown fences, or metadata.
+Use the same language as the user's request.
+This is not the final answer. Briefly state what the latest tool results established and, when useful, what remains to be done next.
+If the latest tool result already makes an immediate final answer preferable, return an empty string."#;
+
+fn tool_progress_user_prompt(
+    user_request: &str,
+    latest_observations: &[String],
+    iteration: u32,
+) -> String {
+    let observations = latest_observations.join("\n\n");
+    format!(
+        r#"Original user request:
+{user_request}
+
+Latest tool observations from ReAct iteration {iteration}:
+{observations}
+
+Write one concise visible progress update for the chat timeline before the agent continues. Keep it grounded in the observations. If no useful middle update is needed, return an empty string."#
+    )
+}
+
+fn clean_intermediate_assistant_text(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(text) = value
+            .get("content")
+            .or_else(|| value.get("answer"))
+            .or_else(|| value.get("message"))
+            .and_then(Value::as_str)
+        {
+            return sanitize_visible_assistant_reply(text);
+        }
+        if let Some(text) = value.as_str() {
+            return sanitize_visible_assistant_reply(text);
+        }
+        return String::new();
+    }
+    sanitize_visible_assistant_reply(trimmed)
+        .trim_matches('"')
+        .trim()
+        .to_string()
+}
+
+fn intermediate_assistant_text_is_generic(text: &str) -> bool {
+    let normalized = text
+        .trim()
+        .trim_matches(|ch| matches!(ch, '。' | '.' | '！' | '!'))
+        .to_ascii_lowercase();
+    if normalized.is_empty() {
+        return true;
+    }
+    [
+        "请稍候",
+        "稍等",
+        "正在执行",
+        "我正在执行相关操作",
+        "已收到您的继续指令",
+        "please wait",
+        "working on it",
+        "i am working on it",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(&needle.to_ascii_lowercase()))
+}
+
+fn ensure_intermediate_progress_label(user_request: &str, text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("progress:")
+        || trimmed.starts_with("阶段进展")
+        || trimmed.starts_with("中间进展")
+    {
+        return trimmed.to_string();
+    }
+    if text_contains_cjk(user_request) {
+        format!("阶段进展：{trimmed}")
+    } else {
+        format!("Progress: {trimmed}")
+    }
+}
+
+fn fallback_intermediate_assistant_text(
+    user_request: &str,
+    latest_observations: &[String],
+    iteration: u32,
+) -> String {
+    let Some(summary) = latest_observations
+        .iter()
+        .rev()
+        .find_map(|observation| compact_observation_for_progress(observation))
+    else {
+        return String::new();
+    };
+    let has_error = latest_observations.iter().any(|observation| {
+        let lower = observation.to_ascii_lowercase();
+        lower.contains(" error:")
+            || lower.contains(" failed")
+            || lower.contains("requires payload")
+            || lower.contains("bad request")
+    });
+    if text_contains_cjk(user_request) {
+        if has_error {
+            format!("阶段进展：第 {iteration} 轮工具调用遇到问题：{summary}。我会调整方式继续推进。")
+        } else {
+            format!("阶段进展：第 {iteration} 轮工具调用已完成，结果显示：{summary}。我会继续处理后续步骤。")
+        }
+    } else if has_error {
+        format!("Progress: iteration {iteration} hit a tool issue: {summary}. I will adjust and continue.")
+    } else {
+        format!("Progress: iteration {iteration} completed a tool step: {summary}. I will continue with the remaining work.")
+    }
+}
+
+fn compact_observation_for_progress(observation: &str) -> Option<String> {
+    let mut text = observation
+        .replace('\r', " ")
+        .replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for marker in [" result:", " error:", " guardrail:"] {
+        if let Some(index) = text.find(marker) {
+            text = text[index + marker.len()..].trim().to_string();
+            break;
+        }
+    }
+    let text = text
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'))
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return None;
+    }
+    let mut truncated = text.chars().take(180).collect::<String>();
+    if text.chars().count() > 180 {
+        truncated.push('…');
+    }
+    Some(truncated)
+}
+
+fn text_contains_cjk(text: &str) -> bool {
+    text.chars().any(|ch| {
+        ('\u{4e00}'..='\u{9fff}').contains(&ch)
+            || ('\u{3400}'..='\u{4dbf}').contains(&ch)
+            || ('\u{3040}'..='\u{30ff}').contains(&ch)
+            || ('\u{ac00}'..='\u{d7af}').contains(&ch)
+    })
 }
 
 #[derive(Debug, Default)]
@@ -1603,6 +1966,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                     store,
                     tool_context,
                 )?;
+                let observation_start = observations.len();
                 if should_parallelize {
                     for (tool_name, payload) in &requests {
                         let guardrail_payload = payload.clone();
@@ -1789,6 +2153,27 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                     if !assistant_text.trim().is_empty() {
                         break;
                     }
+                    let latest_observations = observations[observation_start..].to_vec();
+                    let _ = append_intermediate_assistant_after_tools(
+                        store,
+                        &saved_run.run_id,
+                        &conversation.id,
+                        &persona.id,
+                        &providers,
+                        &effective_persona,
+                        &mut history,
+                        &effective_request_content,
+                        &request_source,
+                        request.provider_data.as_ref(),
+                        &latest_observations,
+                        iteration + 1,
+                        stream_delta_callback.clone(),
+                        &desktop_stream_state,
+                        desktop_app,
+                        silent_pet_vision,
+                    )
+                    .await?;
+                    run = store.agent_run(&saved_run.run_id)?;
                     if refund_iteration_for_execute_code_only {
                         iteration_budget.refund();
                     }
@@ -2484,6 +2869,27 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                 if !assistant_text.trim().is_empty() {
                     break;
                 }
+                let latest_observations = observations[observation_start..].to_vec();
+                let _ = append_intermediate_assistant_after_tools(
+                    store,
+                    &saved_run.run_id,
+                    &conversation.id,
+                    &persona.id,
+                    &providers,
+                    &effective_persona,
+                    &mut history,
+                    &effective_request_content,
+                    &request_source,
+                    request.provider_data.as_ref(),
+                    &latest_observations,
+                    iteration + 1,
+                    stream_delta_callback.clone(),
+                    &desktop_stream_state,
+                    desktop_app,
+                    silent_pet_vision,
+                )
+                .await?;
+                run = store.agent_run(&saved_run.run_id)?;
                 if refund_iteration_for_execute_code_only {
                     iteration_budget.refund();
                 }

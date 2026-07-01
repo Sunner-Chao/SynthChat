@@ -5491,6 +5491,45 @@ fn normalize_stale_landed_write_file_runs(state: &mut PersistedState) -> bool {
     let completed_at = now_iso();
     let mut changed = false;
     for run_index in 0..state.agent_runs.len() {
+        let completed_recovered_events = {
+            let run = &state.agent_runs[run_index];
+            if run.state == "completed"
+                && run.last_activity_desc.as_deref()
+                    == Some("recovered landed write_file tool event")
+            {
+                run.tool_events
+                    .iter()
+                    .filter(|event| completed_recovered_write_file_event(event))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        };
+        if !completed_recovered_events.is_empty() {
+            let (conversation_id, run_id, run_started_at, message_at) = {
+                let run = &state.agent_runs[run_index];
+                (
+                    run.conversation_id.clone(),
+                    run.run_id.clone(),
+                    run.started_at.clone(),
+                    run.completed_at
+                        .clone()
+                        .unwrap_or_else(|| completed_at.clone()),
+                )
+            };
+            if append_landed_write_file_recovery_message(
+                state,
+                &conversation_id,
+                &run_id,
+                &run_started_at,
+                &completed_recovered_events,
+                &message_at,
+            ) {
+                changed = true;
+            }
+            continue;
+        }
         if !matches!(
             state.agent_runs[run_index].state.as_str(),
             "started" | "running"
@@ -5547,14 +5586,176 @@ fn normalize_stale_landed_write_file_runs(state: &mut PersistedState) -> bool {
             });
         }
         let conversation_id = state.agent_runs[run_index].conversation_id.clone();
+        let run_id = state.agent_runs[run_index].run_id.clone();
+        let run_started_at = state.agent_runs[run_index].started_at.clone();
         if let Some(messages) = state.messages.get_mut(&conversation_id) {
             for recovered in &recovered_events {
                 replace_matching_tool_event_messages(messages, recovered);
             }
         }
+        append_landed_write_file_recovery_message(
+            state,
+            &conversation_id,
+            &run_id,
+            &run_started_at,
+            &recovered_events,
+            &completed_at,
+        );
         changed = true;
     }
     changed
+}
+
+fn append_landed_write_file_recovery_message(
+    state: &mut PersistedState,
+    conversation_id: &str,
+    run_id: &str,
+    run_started_at: &str,
+    recovered_events: &[Value],
+    completed_at: &str,
+) -> bool {
+    let paths = recovered_write_file_paths(recovered_events);
+    if paths.is_empty() {
+        return false;
+    }
+    let saved_message = {
+        let messages = state.messages.entry(conversation_id.to_string()).or_default();
+        if messages.iter().any(|message| {
+            message
+                .provider_data
+                .as_ref()
+                .and_then(|data| data.get("recoveredWriteFileRunId"))
+                .and_then(Value::as_str)
+                == Some(run_id)
+        }) {
+            return false;
+        }
+        if let Some(last_visible) = messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message_at_or_after(&message.created_at, run_started_at)
+                    && conversation_preview_message(message)
+            })
+        {
+            if last_visible.role == "user" {
+                return false;
+            }
+            if last_visible.role == "assistant"
+                && last_visible.source != "desktop-agent-progress"
+                && last_visible.source != "desktop-stream"
+            {
+                return false;
+            }
+        }
+        let content = recovered_write_file_completion_content(&paths);
+        let mut message = ChatMessage::new(
+            conversation_id.to_string(),
+            "assistant",
+            content,
+            "desktop-agent-recovered",
+        );
+        message.created_at = completed_at.to_string();
+        message.provider_data = Some(json!({
+            "recoveredWriteFileRunId": run_id,
+            "source": "stale_landed_write_file_recovery",
+            "reactStep": {
+                "kind": "final",
+                "recovered": true
+            },
+            "recoveredWriteFile": {
+                "paths": paths,
+                "reason": "stale_landed_write_file"
+            }
+        }));
+        messages.push(message.clone());
+        message
+    };
+    if let Some(conversation) = state
+        .conversations
+        .iter_mut()
+        .find(|conversation| conversation.id == conversation_id)
+    {
+        conversation.updated_at = saved_message.created_at.clone();
+        let preview = recovered_message_visible_preview(&saved_message.content);
+        conversation.last_message = preview.chars().take(120).collect();
+    }
+    true
+}
+
+fn recovered_write_file_paths(recovered_events: &[Value]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    recovered_events
+        .iter()
+        .filter_map(recovered_write_file_path)
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
+}
+
+fn recovered_write_file_path(event: &Value) -> Option<String> {
+    string_path_if_file(event.get("path").and_then(Value::as_str)).or_else(|| {
+        string_path_if_file(
+            event
+                .pointer("/raw/payload/path")
+                .and_then(Value::as_str),
+        )
+    })
+}
+
+fn recovered_write_file_completion_content(paths: &[String]) -> String {
+    let mut lines = vec![
+        "任务已完成：文件已经写入本地。刚才运行在收尾阶段被恢复，我把生成的文件补在这里。".to_string(),
+    ];
+    for path in paths {
+        let marker_path = path.replace('"', "'");
+        lines.push(format!(
+            "[media attached: \"{}\" ({})]",
+            marker_path,
+            recovered_write_file_mime_type(path)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn recovered_write_file_mime_type(path: &str) -> &'static str {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "md" | "markdown" => "text/markdown",
+        "txt" | "log" => "text/plain",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
+fn completed_recovered_write_file_event(event: &Value) -> bool {
+    event.get("status").and_then(Value::as_str) == Some("completed")
+        && event
+            .get("toolName")
+            .or_else(|| event.get("tool_name"))
+            .and_then(Value::as_str)
+            == Some("write_file")
+        && (event.get("recoveredAt").is_some()
+            || event
+                .get("text")
+                .and_then(Value::as_str)
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .and_then(|value| {
+                    value
+                        .get("recoveredFromStaleRunning")
+                        .and_then(Value::as_bool)
+                })
+                == Some(true))
 }
 
 fn landed_write_file_recovery_event(

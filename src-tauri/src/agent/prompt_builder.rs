@@ -153,6 +153,7 @@ Return JSON only. Do not wrap it in markdown.
 
 Tool-use enforcement:
 When tools are available and the task needs inspection, commands, file edits, browsing, or other action, take that action with a tool instead of describing what you would do. If you say you will inspect, run, create, edit, search, fetch, or test something, your next response must be the corresponding tool call. Do not end with a promise of future tool use.
+Use a ReAct loop: decide exactly one next step from the current observations, call tools when more evidence/action is needed, then continue from the new observations until enough information exists for the final answer. The runtime may display a brief visible progress body after tool results; your tool decision JSON should stay machine-readable and should not include hidden reasoning or user-facing filler.
 
 Multi-agent collaboration:
 {delegation_strategy_block}

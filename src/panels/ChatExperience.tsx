@@ -98,6 +98,11 @@ type ThinkingCard = {
   streaming: boolean;
 };
 
+type ReactStepMarker = {
+  kind: string;
+  iteration?: number;
+};
+
 type MessageRenderMode = "normal" | "thinking" | "content";
 
 type MessageRenderItem = {
@@ -905,7 +910,7 @@ function arrayValue(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
 }
 
-function thinkingCardsFromProviderData(providerData: unknown): ThinkingCard[] {
+function thinkingCardsFromProviderData(providerData: unknown, liveStreaming = false): ThinkingCard[] {
   const root = recordValue(providerData);
   if (!root) return [];
   const candidates = [
@@ -920,7 +925,7 @@ function thinkingCardsFromProviderData(providerData: unknown): ThinkingCard[] {
       const summary = typeof card.summary === "string" ? card.summary.trim() : "";
       const redacted = card.redacted === true;
       const encrypted = card.encrypted === true || card.signature === true;
-      const streaming = card.streaming === true;
+      const streaming = liveStreaming && card.streaming === true;
       if (!summary && !redacted && !encrypted) return null;
       const provider = typeof card.provider === "string" && card.provider.trim() ? card.provider.trim() : "";
       const kind = typeof card.kind === "string" && card.kind.trim() ? card.kind.trim() : "thinking";
@@ -940,7 +945,28 @@ function thinkingCardsFromProviderData(providerData: unknown): ThinkingCard[] {
 }
 
 function messageThinkingCards(message: ChatMessage) {
-  return thinkingCardsFromProviderData(message.providerData);
+  return thinkingCardsFromProviderData(message.providerData, message.source === "desktop-stream");
+}
+
+function messageReactStep(message: ChatMessage): ReactStepMarker | null {
+  const root = recordValue(message.providerData);
+  const step = recordValue(root?.reactStep);
+  const kindValue = step?.kind;
+  const kind = typeof kindValue === "string" && kindValue.trim() ? kindValue.trim() : "";
+  if (!kind) {
+    return message.source === "desktop-agent-progress" ? { kind: "intermediate" } : null;
+  }
+  const iterationValue = step?.iteration;
+  const iteration = typeof iterationValue === "number" && Number.isFinite(iterationValue)
+    ? iterationValue
+    : undefined;
+  return { kind, iteration };
+}
+
+function isIntermediateAssistantMessage(message: ChatMessage) {
+  if (message.role !== "assistant") return false;
+  const step = messageReactStep(message);
+  return step?.kind === "intermediate" || message.source === "desktop-agent-progress";
 }
 
 function stripThinkingCardsFromText(text: string, cards: ThinkingCard[]): string {
@@ -3346,6 +3372,8 @@ const MessageRow = memo(function MessageRow({
     : null;
   const processEvent = mode !== "thinking" && message.role === "tool" ? parseManagedProcessEvent(message.content) : null;
   const isUser = message.role === "user";
+  const reactStep = messageReactStep(message);
+  const isIntermediate = !isUser && isIntermediateAssistantMessage(message);
   const rawThinkingCards = thinkingCardsOverride ?? messageThinkingCards(message);
   const thinkingCards = mode !== "content" ? rawThinkingCards : [];
   const visibleText = !isUser && rawThinkingCards.length > 0
@@ -3364,6 +3392,12 @@ const MessageRow = memo(function MessageRow({
     onAnimationDone();
   }, [isLiveStreaming, onAnimationDone]);
   const displayText = useRevealedText(text, revealText, streamCharsPerSecond, handleRevealDone);
+  const assistantBubbleClass = [
+    "claw-bubble",
+    "assistant",
+    revealText ? "streaming" : "",
+    isIntermediate ? "progress" : ""
+  ].filter(Boolean).join(" ");
   if (toolEvent && isCanceledToolEvent(toolEvent)) return null;
   if (toolEvent) return <ToolMessage event={toolEvent} />;
   if (processEvent) return <ManagedProcessMessage event={processEvent} />;
@@ -3378,10 +3412,15 @@ const MessageRow = memo(function MessageRow({
         <div className="claw-message-meta">
           <span>{isUser ? profileName : personaName}</span>
           <small>{formatTime(message.createdAt)}{message.source === "wechat" ? " · 微信" : ""}</small>
+          {isIntermediate ? (
+            <small className="claw-react-step-badge">
+              阶段进展{reactStep?.iteration ? ` · 第 ${reactStep.iteration} 轮` : ""}
+            </small>
+          ) : null}
         </div>
         {thinkingCards.length > 0 ? <ThinkingCards cards={thinkingCards} /> : null}
         {text ? (
-          <div className={isUser ? "claw-bubble user" : revealText ? "claw-bubble assistant streaming" : "claw-bubble assistant"}>
+          <div className={isUser ? "claw-bubble user" : assistantBubbleClass}>
             <MarkdownLite
               text={displayText}
               onImageClick={setPreviewSrc}
@@ -3427,7 +3466,9 @@ const ThinkingCardView = memo(function ThinkingCardView({ card }: { card: Thinki
     ? "Anthropic"
     : card.provider === "openai_responses"
       ? "Responses"
-      : "Reasoning";
+      : card.provider === "llm"
+        ? "模型"
+        : "Reasoning";
   const detail = card.summary || (card.redacted ? "服务商返回了受保护的思考内容，当前仅展示占位，不显示原始链路。" : "");
   return (
     <div className={`claw-thinking-card${expanded ? " claw-thinking-card--expanded" : ""}`}>

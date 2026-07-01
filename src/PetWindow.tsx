@@ -1194,6 +1194,7 @@ export function PetWindow() {
         && payload.type !== "thinking_finished"
         && payload.type !== "assistant_stream_delta"
         && payload.type !== "assistant_stream_done"
+        && payload.type !== "assistant_progress"
         && payload.type !== "assistant_final"
         && payload.type !== "proactive_message"
       ) return;
@@ -1264,7 +1265,7 @@ export function PetWindow() {
       }
       if (!payload.message) return;
       if (
-        payload.type === "assistant_final"
+        (payload.type === "assistant_final" || payload.type === "assistant_progress")
         && payload.message.id
         && streamedAssistantMessageIdsRef.current.has(payload.message.id)
       ) {

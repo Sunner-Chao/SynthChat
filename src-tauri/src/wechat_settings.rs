@@ -4620,10 +4620,18 @@ fn emit_wechat_pet_event(app: &AppHandle, payload: Value) {
 }
 
 fn is_wechat_deliverable_assistant_message(message: &ChatMessage) -> bool {
+    let is_intermediate_progress = message
+        .provider_data
+        .as_ref()
+        .and_then(|data| data.pointer("/reactStep/kind"))
+        .and_then(Value::as_str)
+        == Some("intermediate");
     message.role == "assistant"
         && message.source != "desktop-agent-error"
         && message.source != "desktop-control"
         && message.source != "desktop-diagnosis"
+        && message.source != "desktop-agent-progress"
+        && !is_intermediate_progress
         && !message.source.starts_with("desktop-local-")
 }
 
@@ -4793,6 +4801,99 @@ pub fn dispatch_desktop_reply_to_wechat(
     {
         eprintln!("SynthChat failed to spawn wechat desktop delivery thread: {error}");
     }
+}
+
+pub fn dispatch_progress_to_wechat(
+    store: &AppStore,
+    conversation_id: &str,
+    provider_data: Option<&Value>,
+    text: &str,
+) {
+    let progress = strip_wechat_media_marker_lines(text).trim().to_string();
+    if progress.is_empty() {
+        return;
+    }
+    let Some((account, user_id, context_token)) =
+        wechat_progress_target(store, conversation_id, provider_data)
+    else {
+        return;
+    };
+    if let Err(error) = thread::Builder::new()
+        .name("synthchat-wechat-progress-delivery".to_string())
+        .stack_size(wechat_chat_thread_stack_size())
+        .spawn(move || {
+            let result = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(async {
+                    let token = context_token
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    send_wechat_text_message_with_retry(&account, &user_id, &progress, token)
+                        .await
+                        .map(|_| ())
+                }),
+                Err(error) => Err(AppError::BadRequest(format!(
+                    "failed to create wechat progress delivery runtime: {error}"
+                ))),
+            };
+            if let Err(error) = result {
+                eprintln!("SynthChat wechat progress delivery failed: {error}");
+            }
+        })
+    {
+        eprintln!("SynthChat failed to spawn wechat progress delivery thread: {error}");
+    }
+}
+
+fn wechat_progress_target(
+    store: &AppStore,
+    conversation_id: &str,
+    provider_data: Option<&Value>,
+) -> Option<(AccountConfig, String, Option<String>)> {
+    let accounts = list_accounts().ok()?;
+    let provider_source = provider_data_string(provider_data, &["source"]).unwrap_or_default();
+    if provider_source == "wechat" {
+        if let (Some(account_id), Some(user_id)) = (
+            provider_data_string(provider_data, &["accountId", "account_id"]),
+            provider_data_string(provider_data, &["userId", "user_id"]),
+        ) {
+            if let Some(account) = accounts
+                .iter()
+                .find(|account| account.id == account_id)
+                .cloned()
+            {
+                let context_token =
+                    provider_data_string(provider_data, &["contextToken", "context_token"]);
+                return Some((account, user_id, context_token));
+            }
+        }
+    }
+    let conversation = store.conversation(conversation_id).ok()?;
+    let account_id = conversation
+        .wechat_account_id
+        .as_deref()
+        .map(str::to_string)
+        .or_else(|| {
+            conversation
+                .metadata
+                .get("wechatAccountId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })?;
+    let account = accounts.into_iter().find(|account| account.id == account_id)?;
+    let user_id = account.last_wechat_user_id.trim().to_string();
+    if user_id.is_empty() {
+        return None;
+    }
+    let context_token = if account.last_context_token.trim().is_empty() {
+        None
+    } else {
+        Some(account.last_context_token.trim().to_string())
+    };
+    Some((account, user_id, context_token))
 }
 
 #[allow(dead_code)]

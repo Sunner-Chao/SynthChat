@@ -464,6 +464,7 @@ export function App() {
         || payload.type === "assistant_thinking_stream"
         || payload.type === "new_message"
         || payload.type === "tool_message"
+        || payload.type === "assistant_progress"
         || payload.type === "assistant_message";
       const isVisibleMessageEvent =
         Boolean(payload.conversationId && payload.message && isVisibleChatEventMessage(payload.message));
@@ -485,7 +486,7 @@ export function App() {
           deferWechatTurnMessage(payload.conversationId, payload.personaId, payload.message);
           return;
         }
-        if (payload.type === "assistant_message" || payload.type === "new_message") {
+        if (payload.type === "assistant_message" || payload.type === "assistant_progress" || payload.type === "new_message") {
           const state = useAppStore.getState();
           const shouldMarkUnread =
             payload.conversationId !== state.activeConversationId
@@ -504,7 +505,7 @@ export function App() {
             && !payload.isLast
           ),
           final: (
-            (payload.type === "assistant_message" || (payload.type === "assistant_stream" && payload.isLast))
+            (payload.type === "assistant_message" || payload.type === "assistant_progress" || (payload.type === "assistant_stream" && payload.isLast))
             && payload.message.role === "assistant"
           )
         });

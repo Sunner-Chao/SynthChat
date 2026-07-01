@@ -172,23 +172,13 @@ function limitMessages(messages: ChatMessage[], limit: number) {
   return messages.length > limit ? messages.slice(-limit) : messages;
 }
 
-function messageDisplayRoleRank(message: ChatMessage) {
-  if (message.role === "user") return 0;
-  if (message.role === "tool") return 1;
-  if (message.role === "assistant") return 2;
-  return 3;
-}
-
 function sortMessagesForDisplay(messages: ChatMessage[]) {
   return messages
     .map((message, index) => ({ message, index }))
     .sort((left, right) => {
       const timeDelta = messageTime(left.message) - messageTime(right.message);
       if (timeDelta !== 0) return timeDelta;
-      const leftRoleRank = messageDisplayRoleRank(left.message);
-      const rightRoleRank = messageDisplayRoleRank(right.message);
-      const roleDelta = leftRoleRank - rightRoleRank;
-      return roleDelta === 0 ? left.index - right.index : roleDelta;
+      return left.index - right.index;
     })
     .map((item) => item.message);
 }
@@ -231,13 +221,43 @@ function finalizedThinkingCards(cards: unknown[]) {
   });
 }
 
+function finalizedProviderDataThinkingCards(providerData: unknown) {
+  const root = providerDataRecord(providerData);
+  if (!root) return providerData;
+  let changed = false;
+  const next: Record<string, unknown> = { ...root };
+  const rootCards = providerDataArray(root.thinkingCards);
+  if (rootCards.length > 0) {
+    next.thinkingCards = finalizedThinkingCards(rootCards);
+    changed = true;
+  }
+  for (const key of ["responses", "anthropic"]) {
+    const nested = providerDataRecord(root[key]);
+    if (!nested) continue;
+    const nestedCards = providerDataArray(nested.thinkingCards);
+    if (nestedCards.length === 0) continue;
+    next[key] = {
+      ...nested,
+      thinkingCards: finalizedThinkingCards(nestedCards)
+    };
+    changed = true;
+  }
+  return changed ? next : providerData;
+}
+
 function preserveLiveThinkingCardsForFinalMessage(
   message: ChatMessage,
   previousMessage: ChatMessage | null,
   options?: IncomingMessageUpsertOptions
 ) {
-  if (!options?.final || message.role !== "assistant" || !previousMessage) return message;
-  if (providerDataThinkingCards(message.providerData).length > 0) return message;
+  if (!options?.final || message.role !== "assistant") return message;
+  if (providerDataThinkingCards(message.providerData).length > 0) {
+    return {
+      ...message,
+      providerData: finalizedProviderDataThinkingCards(message.providerData)
+    };
+  }
+  if (!previousMessage) return message;
   const liveCards = providerDataThinkingCards(previousMessage.providerData);
   if (liveCards.length === 0) return message;
   const root = providerDataRecord(message.providerData);
