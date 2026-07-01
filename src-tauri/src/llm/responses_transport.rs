@@ -26,11 +26,16 @@ pub(super) async fn complete_responses_compatible(
     let api_key = resolve_api_key(provider);
     let url = responses_url(provider);
     let issuer_kind = responses_issuer_kind(provider);
-    let (instructions, input) = build_responses_payload(
+    let tool_name_map = native_tools
+        .filter(|tools| !tools.is_empty())
+        .map(provider_tool_name_map)
+        .unwrap_or_default();
+    let (instructions, input) = build_responses_payload_with_tool_name_map(
         system_prompt,
         history,
         Some(issuer_kind.as_str()),
         options.responses_reasoning_replay_enabled,
+        &tool_name_map,
     );
 
     let mut headers = HeaderMap::new();
@@ -129,7 +134,7 @@ pub(super) async fn complete_responses_compatible(
                 retry_count,
                 retry_reason,
             };
-            return parse_responses_compatible(payload)
+            return parse_responses_compatible_with_tool_name_map(payload, &tool_name_map)
                 .map(|reply| stamp_responses_provider_data_issuer(reply, &issuer_kind))
                 .map(|reply| {
                     with_reply_metadata_and_transport(
@@ -161,6 +166,7 @@ pub(super) async fn complete_responses_compatible(
             response,
             callback,
             provider_stream_stale_timeout_duration(provider, model),
+            &tool_name_map,
         )
         .await?;
         return Ok(with_reply_metadata_and_transport(
@@ -182,7 +188,7 @@ pub(super) async fn complete_responses_compatible(
             invalid_response_body_detail(&text, &response_headers)
         ))
     })?;
-    parse_responses_compatible(payload)
+    parse_responses_compatible_with_tool_name_map(payload, &tool_name_map)
         .map(|reply| stamp_responses_provider_data_issuer(reply, &issuer_kind))
         .map(|reply| {
             with_reply_metadata_and_transport(
@@ -199,6 +205,7 @@ async fn read_responses_sse_stream(
     response: reqwest::Response,
     callback: &LlmDeltaCallback,
     stale_timeout: Option<std::time::Duration>,
+    tool_name_map: &serde_json::Map<String, Value>,
 ) -> AppResult<LlmReply> {
     let mut buffer = String::new();
     let mut content = String::new();
@@ -265,7 +272,7 @@ async fn read_responses_sse_stream(
 
     if let Some(mut payload) = final_response {
         merge_responses_stream_fallback_output(&mut payload, &output_items, &content);
-        let mut reply = parse_responses_compatible(payload)?;
+        let mut reply = parse_responses_compatible_with_tool_name_map(payload, tool_name_map)?;
         if !content.trim().is_empty() {
             reply.content = scrub_reasoning_blocks(&content);
             reply.completion_tokens = if completion_tokens == 0 {
@@ -287,7 +294,7 @@ async fn read_responses_sse_stream(
                 }
             }
         });
-        if let Ok(reply) = parse_responses_compatible(payload) {
+        if let Ok(reply) = parse_responses_compatible_with_tool_name_map(payload, tool_name_map) {
             return Ok(reply);
         }
     }
@@ -620,8 +627,12 @@ pub(super) fn is_responses_compatible(provider: &LlmProvider) -> bool {
         || provider_id.contains("xai")
         || provider_id.contains("grok")
         || provider_id.contains("copilot-acp")
+        || provider_type == "openai_responses"
+        || provider_type == "openai-responses"
         || provider_type.contains("responses")
         || provider_type.contains("codex")
+        || preset == "openai_responses"
+        || preset == "openai-responses"
         || preset.contains("xai")
         || preset.contains("grok")
         || preset.contains("copilot-acp")
@@ -638,6 +649,22 @@ pub(super) fn build_responses_payload(
     current_issuer_kind: Option<&str>,
     reasoning_replay_enabled: bool,
 ) -> (String, Vec<Value>) {
+    build_responses_payload_with_tool_name_map(
+        system_prompt,
+        history,
+        current_issuer_kind,
+        reasoning_replay_enabled,
+        &serde_json::Map::new(),
+    )
+}
+
+fn build_responses_payload_with_tool_name_map(
+    system_prompt: String,
+    history: Vec<ChatMessage>,
+    current_issuer_kind: Option<&str>,
+    reasoning_replay_enabled: bool,
+    tool_name_map: &serde_json::Map<String, Value>,
+) -> (String, Vec<Value>) {
     let mut instructions = sanitize_provider_text(&system_prompt);
     let mut input = Vec::new();
     for item in history {
@@ -651,7 +678,9 @@ pub(super) fn build_responses_payload(
             }
             continue;
         }
-        if let Some(tool_replay) = tool_replay_message(&item) {
+        if let Some(mut tool_replay) = tool_replay_message(&item) {
+            tool_replay.name =
+                safe_provider_tool_name_for_original(&tool_replay.name, tool_name_map);
             input.push(json!({
                 "type": "function_call",
                 "call_id": tool_replay.call_id,
@@ -835,6 +864,13 @@ pub(super) fn responses_url(provider: &LlmProvider) -> String {
 }
 
 pub(super) fn parse_responses_compatible(payload: Value) -> AppResult<LlmReply> {
+    parse_responses_compatible_with_tool_name_map(payload, &serde_json::Map::new())
+}
+
+fn parse_responses_compatible_with_tool_name_map(
+    payload: Value,
+    tool_name_map: &serde_json::Map<String, Value>,
+) -> AppResult<LlmReply> {
     if let Some(status) = payload.get("status").and_then(Value::as_str) {
         let normalized = status.trim().to_ascii_lowercase();
         if matches!(normalized.as_str(), "failed" | "cancelled") {
@@ -850,7 +886,7 @@ pub(super) fn parse_responses_compatible(payload: Value) -> AppResult<LlmReply> 
         .map(str::to_string)
         .filter(|text| !text.trim().is_empty())
         .unwrap_or_else(|| responses_output_text(&payload));
-    let tool_calls = responses_tool_calls(&payload);
+    let tool_calls = responses_tool_calls(&payload, tool_name_map);
     let finish_reason =
         responses_finish_reason(&payload, !content.trim().is_empty(), !tool_calls.is_empty());
     let provider_data = responses_provider_data(&payload);
@@ -974,7 +1010,10 @@ fn responses_output_text(payload: &Value) -> String {
         .join("")
 }
 
-fn responses_tool_calls(payload: &Value) -> Vec<Value> {
+fn responses_tool_calls(
+    payload: &Value,
+    tool_name_map: &serde_json::Map<String, Value>,
+) -> Vec<Value> {
     payload
         .get("output")
         .and_then(Value::as_array)
@@ -997,12 +1036,13 @@ fn responses_tool_calls(payload: &Value) -> Vec<Value> {
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|name| !name.is_empty())?;
+            let name = original_provider_tool_name(name, tool_name_map);
             let arguments = if item_type == "custom_tool_call" {
                 item.get("input").cloned().unwrap_or_else(|| json!({}))
             } else {
                 item.get("arguments").cloned().unwrap_or_else(|| json!({}))
             };
-            let arguments = normalize_provider_tool_arguments(arguments, name);
+            let arguments = normalize_provider_tool_arguments(arguments, &name);
             Some(json!({
                 "type": "function",
                 "id": item.get("id").cloned().unwrap_or(Value::Null),

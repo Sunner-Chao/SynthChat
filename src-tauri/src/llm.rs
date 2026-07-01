@@ -51,6 +51,7 @@ pub(super) struct ToolReplayMessage {
 #[derive(Debug, Clone)]
 pub struct LlmFailoverAttempt {
     pub provider_id: String,
+    pub model: String,
     pub kind: String,
     pub message: String,
 }
@@ -328,6 +329,20 @@ fn build_openai_wire_messages(
     history: Vec<ChatMessage>,
     cache_policy: Option<&PromptCachePolicy>,
 ) -> Vec<Value> {
+    build_openai_wire_messages_with_tool_name_map(
+        system_prompt,
+        history,
+        cache_policy,
+        &serde_json::Map::new(),
+    )
+}
+
+fn build_openai_wire_messages_with_tool_name_map(
+    system_prompt: String,
+    history: Vec<ChatMessage>,
+    cache_policy: Option<&PromptCachePolicy>,
+    tool_name_map: &serde_json::Map<String, Value>,
+) -> Vec<Value> {
     let mut system_content = sanitize_provider_text(&system_prompt);
     let mut conversation_messages = Vec::new();
     for item in history {
@@ -341,7 +356,9 @@ fn build_openai_wire_messages(
             }
             continue;
         }
-        if let Some(tool_replay) = tool_replay_message(&item) {
+        if let Some(mut tool_replay) = tool_replay_message(&item) {
+            tool_replay.name =
+                safe_provider_tool_name_for_original(&tool_replay.name, tool_name_map);
             conversation_messages.push(openai_assistant_tool_call_message(&tool_replay));
             conversation_messages.push(openai_tool_result_message(&tool_replay));
             continue;
@@ -2139,6 +2156,26 @@ mod tests {
             gemini[0]["functionDeclarations"][0]["parameters"]["properties"]["command"]
                 .get("pattern")
                 .is_none()
+        );
+
+        let mut mcp_tool = schema_test_tool(json!({"type": "object"}));
+        mcp_tool.name = "ai.exa/exa.search-docs".into();
+        mcp_tool.display_name = "search-docs".into();
+        mcp_tool.source = "mcp".into();
+        mcp_tool.server_id = "ai.exa/exa".into();
+        mcp_tool.tool_name = "search-docs".into();
+        let mcp_tools = vec![mcp_tool];
+        assert_eq!(
+            openai_tool_schemas(&mcp_tools)[0]["function"]["name"],
+            "ai_exa_exa_search-docs"
+        );
+        assert_eq!(
+            responses_tool_schemas(&mcp_tools)[0]["name"],
+            "ai_exa_exa_search-docs"
+        );
+        assert_eq!(
+            anthropic_tool_schemas(&mcp_tools)[0]["name"],
+            "ai_exa_exa_search-docs"
         );
     }
 

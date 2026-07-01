@@ -796,12 +796,12 @@ const MessageList = memo(function MessageList({
 
 function providerModelOptions(providers: LlmProvider[]) {
   return providers
-    .filter((provider) => provider.enabled || provider.model)
+    .filter((provider) => provider.enabled)
     .map((provider) => ({
       key: `${provider.id}::${provider.model}`,
       providerId: provider.id,
       model: provider.model,
-      label: `${provider.name || provider.id}${provider.model ? ` / ${provider.model}` : ""}`
+      label: provider.model || "未配置模型"
     }));
 }
 
@@ -939,11 +939,22 @@ export const ChatExperience = memo(function ChatExperience() {
   }, [activeConversation?.personaId, selectedPersonaId]);
 
   const personaById = useMemo(() => new Map(personas.map((persona) => [persona.id, persona])), [personas]);
-  const selectedPersona = personaById.get(selectedPersonaId) ?? personas[0] ?? null;
+  const visiblePersonas = personas;
+  const selectedPersona = visiblePersonas.find((persona) => persona.id === selectedPersonaId) ?? visiblePersonas[0] ?? null;
   const activeConversationPersona = useMemo(
     () => (activeConversation?.personaId ? personaById.get(activeConversation.personaId) ?? null : null),
     [activeConversation?.personaId, personaById]
   );
+  const toolbarPersona = selectedPersona ?? activeConversationPersona;
+  useEffect(() => {
+    if (!selectedPersonaId && visiblePersonas[0]) {
+      setSelectedPersonaId(visiblePersonas[0].id);
+      return;
+    }
+    if (selectedPersonaId && !visiblePersonas.some((persona) => persona.id === selectedPersonaId)) {
+      setSelectedPersonaId(visiblePersonas[0]?.id ?? "");
+    }
+  }, [selectedPersonaId, visiblePersonas]);
   const defaultAgent = useMemo(() => agents.find((agent) => agent.isDefault) ?? agents[0] ?? null, [agents]);
   const renderLimit = clampCount(chatConfig?.uiMessageLimit, DEFAULT_RENDERED_MESSAGES, 40, 1000);
   const artifactScanLimit = clampCount(chatConfig?.artifactScanLimit, DEFAULT_ARTIFACT_SCAN_LIMIT, 20, renderLimit);
@@ -1048,9 +1059,9 @@ export const ChatExperience = memo(function ChatExperience() {
     return stats;
   }, [chatConfig?.maxContextRounds, chatConfig?.shortContextMode, messages]);
   const activeAgent = useMemo(() => {
-    return resolvePersonaBoundAgent(activeConversationPersona, agents, activeConversation?.agentId) ?? defaultAgent;
-  }, [activeConversation?.agentId, activeConversationPersona, agents, defaultAgent]);
-  const activeToolIterationBudget = activeConversationPersona?.toolPolicy?.maxIterations
+    return resolvePersonaBoundAgent(toolbarPersona, agents, activeConversation?.agentId) ?? defaultAgent;
+  }, [activeConversation?.agentId, agents, defaultAgent, toolbarPersona]);
+  const activeToolIterationBudget = toolbarPersona?.toolPolicy?.maxIterations
     ?? selectedPersona?.toolPolicy?.maxIterations
     ?? activeAgent?.maxToolIterations
     ?? agentConfig?.maxToolIterations
@@ -1185,12 +1196,12 @@ export const ChatExperience = memo(function ChatExperience() {
     .filter((event): event is ToolEvent => event !== null)), [recentMessages, runStates]);
   const graphEvents = activeToolEvents.length > 0 ? selectVisibleToolEvents(activeToolEvents) : messageToolEvents;
   const providerBinding = useMemo(
-    () => resolvePersonaAgentBinding(activeConversationPersona, agents, llmProviders, activeConversation?.agentId),
-    [activeConversation?.agentId, activeConversationPersona, agents, llmProviders]
+    () => resolvePersonaAgentBinding(toolbarPersona, agents, llmProviders, activeConversation?.agentId),
+    [activeConversation?.agentId, agents, llmProviders, toolbarPersona]
   );
   const currentProvider = useMemo(() => {
     const providerId = providerBinding.providerId;
-    return llmProviders.find((provider) => provider.id === providerId) ?? llmProviders[0] ?? null;
+    return llmProviders.find((provider) => provider.id === providerId && provider.enabled) ?? null;
   }, [llmProviders, providerBinding.providerId]);
   const effectiveModelValue = providerBinding.model || currentProvider?.model || "";
   useEffect(() => {
@@ -1214,7 +1225,7 @@ export const ChatExperience = memo(function ChatExperience() {
         key: `${currentProvider.id}::${model.id}`,
         providerId: currentProvider.id,
         model: model.id,
-        label: model.name || model.id
+        label: model.id
       }));
     }
     return currentProvider ? providerModelOptions([currentProvider]) : [];
@@ -2128,10 +2139,10 @@ export const ChatExperience = memo(function ChatExperience() {
     if (!key) return;
     const option = modelOptions.find((item) => item.key === key);
     if (!option) return;
-    if (activeConversationPersona) {
+    if (toolbarPersona) {
       const savedPersona = await savePersona({
-        ...activeConversationPersona,
-        agentId: activeAgent?.id ?? activeConversationPersona.agentId,
+        ...toolbarPersona,
+        agentId: activeAgent?.id ?? toolbarPersona.agentId,
         llmProvider: option.providerId,
         llmModel: option.model
       });
@@ -2155,8 +2166,8 @@ export const ChatExperience = memo(function ChatExperience() {
   const switchConversationAgent = async (agentId: string) => {
     if (!agentId || activeAgent?.id === agentId) return;
     setFocusedAgentId(agentId);
-    if (activeConversationPersona) {
-      const savedPersona = await savePersona({ ...activeConversationPersona, agentId });
+    if (toolbarPersona) {
+      const savedPersona = await savePersona({ ...toolbarPersona, agentId });
       await refreshChatData(activeConversationId, savedPersona.id);
       return;
     }
@@ -2362,8 +2373,9 @@ export const ChatExperience = memo(function ChatExperience() {
           <div className="claw-toolbar-actions">
             <label className="claw-select">
               <Bot size={14} />
-              <select value={selectedPersona?.id ?? ""} onChange={(event) => setSelectedPersonaId(event.target.value)}>
-                {personas.map((persona) => <option key={persona.id} value={persona.id}>{persona.name}</option>)}
+              <select value={toolbarPersona?.id ?? selectedPersona?.id ?? ""} onChange={(event) => setSelectedPersonaId(event.target.value)}>
+                {!toolbarPersona && visiblePersonas.length === 0 ? <option value="">无可用角色</option> : null}
+                {visiblePersonas.map((persona) => <option key={persona.id} value={persona.id}>{persona.name}</option>)}
               </select>
             </label>
             <label className="claw-select">
@@ -2374,8 +2386,8 @@ export const ChatExperience = memo(function ChatExperience() {
             </label>
             <label className="claw-select">
               <ChevronIcon />
-              <select value={selectedModelKey} onChange={(event) => void switchAgentModel(event.target.value)}>
-                <option value="">选择模型</option>
+              <select disabled={!currentProvider} value={selectedModelKey} onChange={(event) => void switchAgentModel(event.target.value)}>
+                <option value="">{providerBinding.providerDisabled ? "服务商已停用" : "选择模型"}</option>
                 {modelOptions.map((option) => <option key={option.key} value={option.key}>{option.label}</option>)}
               </select>
             </label>

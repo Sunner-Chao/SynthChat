@@ -58031,6 +58031,7 @@ fn llm_failure_diagnostic_artifact_captures_failover_context() {
     };
     let attempts = vec![crate::llm::LlmFailoverAttempt {
         provider_id: provider.id.clone(),
+        model: provider.model.clone(),
         kind: "transport".into(),
         message: "llm error: invalid llm response: error decoding response body sk-secret-test"
             .into(),

@@ -40,7 +40,11 @@ pub(super) async fn complete_anthropic_compatible(
         append_anthropic_beta_header(&mut headers, "fast-mode-2026-02-01")?;
     }
 
-    let messages = build_anthropic_messages(history);
+    let tool_name_map = native_tools
+        .filter(|tools| !tools.is_empty())
+        .map(anthropic_tool_name_map)
+        .unwrap_or_default();
+    let messages = build_anthropic_messages(history, &tool_name_map);
 
     let cache_policy = prompt_cache_policy(provider, model);
     let system_value = anthropic_system_value(system_prompt, cache_policy.as_ref());
@@ -107,6 +111,7 @@ pub(super) async fn complete_anthropic_compatible(
             response,
             callback,
             provider_stream_stale_timeout_duration(provider, model),
+            &tool_name_map,
         )
         .await?;
         return Ok(with_reply_metadata_and_transport(
@@ -129,7 +134,7 @@ pub(super) async fn complete_anthropic_compatible(
         ))
     })?;
 
-    parse_anthropic_compatible(payload).map(|reply| {
+    parse_anthropic_compatible_with_tool_name_map(payload, &tool_name_map).map(|reply| {
         with_reply_metadata_and_transport(
             reply,
             provider,
@@ -144,6 +149,7 @@ async fn read_anthropic_sse_stream(
     response: reqwest::Response,
     callback: &LlmDeltaCallback,
     stale_timeout: Option<std::time::Duration>,
+    tool_name_map: &serde_json::Map<String, Value>,
 ) -> AppResult<LlmReply> {
     let mut buffer = String::new();
     let mut content = String::new();
@@ -211,7 +217,7 @@ async fn read_anthropic_sse_stream(
         )?;
     }
 
-    let stream_tool_calls = anthropic_stream_tool_calls(tool_calls)?;
+    let stream_tool_calls = anthropic_stream_tool_calls(tool_calls, tool_name_map)?;
     let has_tool_calls = !stream_tool_calls.is_empty();
     if has_tool_calls {
         let tool_json = json!({"tool_calls": stream_tool_calls}).to_string();
@@ -434,18 +440,20 @@ fn track_anthropic_stream_replay_block(
 
 fn anthropic_stream_tool_calls(
     tool_calls: BTreeMap<usize, AnthropicStreamToolCall>,
+    tool_name_map: &serde_json::Map<String, Value>,
 ) -> AppResult<Vec<Value>> {
     tool_calls
         .into_values()
         .filter(|call| !call.name.trim().is_empty())
         .map(|call| {
+            let name = original_anthropic_tool_name(&call.name, tool_name_map);
             let arguments = if call.input_json.trim().is_empty() {
                 json!({})
             } else {
                 serde_json::from_str::<Value>(&call.input_json).map_err(|error| {
                     AppError::Llm(format!(
                         "invalid anthropic streamed tool arguments for {}: {error}; body: {}",
-                        call.name,
+                        name,
                         response_preview(&call.input_json)
                     ))
                 })?
@@ -454,7 +462,7 @@ fn anthropic_stream_tool_calls(
                 "type": "function",
                 "id": if call.id.trim().is_empty() { Value::Null } else { json!(call.id) },
                 "function": {
-                    "name": call.name,
+                    "name": name,
                     "arguments": arguments
                 }
             }))
@@ -462,7 +470,10 @@ fn anthropic_stream_tool_calls(
         .collect()
 }
 
-pub(super) fn build_anthropic_messages(history: Vec<ChatMessage>) -> Vec<Value> {
+pub(super) fn build_anthropic_messages(
+    history: Vec<ChatMessage>,
+    tool_name_map: &serde_json::Map<String, Value>,
+) -> Vec<Value> {
     let mut messages = Vec::new();
     for item in history {
         if let Some(tool_replay) = tool_replay_message(&item) {
@@ -470,7 +481,7 @@ pub(super) fn build_anthropic_messages(history: Vec<ChatMessage>) -> Vec<Value> 
             content.push(json!({
                 "type": "tool_use",
                 "id": tool_replay.call_id,
-                "name": tool_replay.name,
+                "name": safe_anthropic_tool_name_for_original(&tool_replay.name, tool_name_map),
                 "input": tool_replay.arguments,
             }));
             messages.push(json!({
@@ -890,6 +901,13 @@ fn normalized_url_text(value: &str) -> String {
 }
 
 pub(super) fn parse_anthropic_compatible(payload: Value) -> AppResult<LlmReply> {
+    parse_anthropic_compatible_with_tool_name_map(payload, &serde_json::Map::new())
+}
+
+fn parse_anthropic_compatible_with_tool_name_map(
+    payload: Value,
+    tool_name_map: &serde_json::Map<String, Value>,
+) -> AppResult<LlmReply> {
     let content_blocks = payload
         .get("content")
         .and_then(Value::as_array)
@@ -907,7 +925,7 @@ pub(super) fn parse_anthropic_compatible(payload: Value) -> AppResult<LlmReply> 
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    let tool_calls = anthropic_tool_calls(content_blocks);
+    let tool_calls = anthropic_tool_calls(content_blocks, tool_name_map);
     let has_tool_calls = !tool_calls.is_empty();
     if !tool_calls.is_empty() {
         let tool_json = json!({"tool_calls": tool_calls}).to_string();
@@ -982,7 +1000,10 @@ fn anthropic_provider_data(content_blocks: &[Value]) -> Option<Value> {
     }
 }
 
-fn anthropic_tool_calls(content_blocks: &[Value]) -> Vec<Value> {
+fn anthropic_tool_calls(
+    content_blocks: &[Value],
+    tool_name_map: &serde_json::Map<String, Value>,
+) -> Vec<Value> {
     content_blocks
         .iter()
         .filter_map(|block| {
@@ -994,6 +1015,7 @@ fn anthropic_tool_calls(content_blocks: &[Value]) -> Vec<Value> {
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|name| !name.is_empty())?;
+            let name = original_anthropic_tool_name(name, tool_name_map);
             let arguments = block.get("input").cloned().unwrap_or_else(|| json!({}));
             Some(json!({
                 "type": "function",
@@ -1126,7 +1148,7 @@ mod tests {
             }
         }));
 
-        let messages = build_anthropic_messages(vec![message]);
+        let messages = build_anthropic_messages(vec![message], &serde_json::Map::new());
         assert_eq!(messages[0]["role"], "assistant");
         assert_eq!(messages[0]["content"][0]["type"], "thinking");
         assert_eq!(messages[0]["content"][1]["type"], "tool_use");
@@ -1161,7 +1183,7 @@ mod tests {
             &mut tool_calls,
         );
 
-        let calls = anthropic_stream_tool_calls(tool_calls).unwrap();
+        let calls = anthropic_stream_tool_calls(tool_calls, &serde_json::Map::new()).unwrap();
         assert_eq!(calls[0]["id"], "toolu_123");
         assert_eq!(calls[0]["function"]["name"], "terminal");
         assert_eq!(calls[0]["function"]["arguments"], json!({"command": "pwd"}));

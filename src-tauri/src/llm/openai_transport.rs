@@ -31,8 +31,17 @@ pub(super) async fn complete_openai_compatible(
     } else {
         provider.model.trim()
     };
+    let tool_name_map = native_tools
+        .filter(|tools| !tools.is_empty())
+        .map(provider_tool_name_map)
+        .unwrap_or_default();
     let cache_policy = prompt_cache_policy(provider, model);
-    let messages = build_openai_wire_messages(system_prompt, history, cache_policy.as_ref());
+    let messages = build_openai_wire_messages_with_tool_name_map(
+        system_prompt,
+        history,
+        cache_policy.as_ref(),
+        &tool_name_map,
+    );
     let url = chat_url(provider);
     let api_key = resolve_api_key(provider);
 
@@ -124,7 +133,7 @@ pub(super) async fn complete_openai_compatible(
                 retry_count,
                 retry_reason,
             };
-            return parse_openai_compatible(payload).map(|reply| {
+            return parse_openai_compatible_with_tool_name_map(payload, &tool_name_map).map(|reply| {
                 with_reply_metadata_and_transport(
                     reply,
                     provider,
@@ -155,6 +164,7 @@ pub(super) async fn complete_openai_compatible(
             response,
             callback,
             provider_stream_stale_timeout_duration(provider, model),
+            &tool_name_map,
         )
         .await?;
         return Ok(with_reply_metadata_and_transport(
@@ -173,7 +183,7 @@ pub(super) async fn complete_openai_compatible(
     let payload: Value = match serde_json::from_str(&text) {
         Ok(payload) => payload,
         Err(error) => {
-            if let Some(reply) = parse_openai_sse(&text) {
+            if let Some(reply) = parse_openai_sse(&text, &tool_name_map) {
                 return Ok(with_reply_metadata_and_transport(
                     reply,
                     provider,
@@ -189,7 +199,7 @@ pub(super) async fn complete_openai_compatible(
         }
     };
 
-    parse_openai_compatible(payload).map(|reply| {
+    parse_openai_compatible_with_tool_name_map(payload, &tool_name_map).map(|reply| {
         with_reply_metadata_and_transport(
             reply,
             provider,
@@ -204,6 +214,7 @@ async fn read_openai_sse_stream(
     response: reqwest::Response,
     callback: &LlmDeltaCallback,
     stale_timeout: Option<std::time::Duration>,
+    tool_name_map: &serde_json::Map<String, Value>,
 ) -> AppResult<LlmReply> {
     let mut buffer = String::new();
     let mut content = String::new();
@@ -261,7 +272,7 @@ async fn read_openai_sse_stream(
         )?;
     }
 
-    let stream_tool_calls = openai_stream_tool_calls(tool_calls)?;
+    let stream_tool_calls = openai_stream_tool_calls(tool_calls, tool_name_map)?;
     let has_tool_calls = !stream_tool_calls.is_empty();
     if has_tool_calls {
         let tool_json = json!({"tool_calls": stream_tool_calls}).to_string();
@@ -401,28 +412,30 @@ fn track_openai_stream_tool_calls(
 
 fn openai_stream_tool_calls(
     tool_calls: BTreeMap<usize, OpenAiStreamToolCall>,
+    tool_name_map: &serde_json::Map<String, Value>,
 ) -> AppResult<Vec<Value>> {
     tool_calls
         .into_values()
         .filter(|call| !call.name.trim().is_empty())
         .map(|call| {
+            let name = original_provider_tool_name(&call.name, tool_name_map);
             let arguments = if call.arguments.trim().is_empty() {
                 json!({})
             } else {
                 let parsed = serde_json::from_str::<Value>(&call.arguments).map_err(|error| {
                     AppError::Llm(format!(
                         "invalid openai streamed tool arguments for {}: {error}; body: {}",
-                        call.name,
+                        name,
                         response_preview(&call.arguments)
                     ))
                 })?;
-                normalize_provider_tool_arguments(parsed, &call.name)
+                normalize_provider_tool_arguments(parsed, &name)
             };
             Ok(json!({
                 "type": "function",
                 "id": call.id.map(Value::String).unwrap_or(Value::Null),
                 "function": {
-                    "name": call.name,
+                    "name": name,
                     "arguments": arguments
                 }
             }))
@@ -430,7 +443,10 @@ fn openai_stream_tool_calls(
         .collect()
 }
 
-fn parse_openai_sse(text: &str) -> Option<LlmReply> {
+fn parse_openai_sse(
+    text: &str,
+    _tool_name_map: &serde_json::Map<String, Value>,
+) -> Option<LlmReply> {
     let mut content = String::new();
     let mut prompt_tokens = 0;
     let mut completion_tokens = 0;
@@ -504,13 +520,20 @@ fn parse_openai_sse(text: &str) -> Option<LlmReply> {
 }
 
 pub(super) fn parse_openai_compatible(payload: Value) -> AppResult<LlmReply> {
+    parse_openai_compatible_with_tool_name_map(payload, &serde_json::Map::new())
+}
+
+fn parse_openai_compatible_with_tool_name_map(
+    payload: Value,
+    tool_name_map: &serde_json::Map<String, Value>,
+) -> AppResult<LlmReply> {
     let content_value = payload
         .pointer("/choices/0/message/content")
         .or_else(|| payload.pointer("/message/content"));
     let mut content = content_value
         .and_then(extract_openai_message_content)
         .unwrap_or_default();
-    let tool_calls = openai_tool_calls(&payload);
+    let tool_calls = openai_tool_calls(&payload, tool_name_map);
     let has_tool_calls = !tool_calls.is_empty();
     if !tool_calls.is_empty() {
         let tool_json = json!({"tool_calls": tool_calls}).to_string();
@@ -623,7 +646,10 @@ fn provider_data_value_present(value: &Value) -> bool {
     }
 }
 
-fn openai_tool_calls(payload: &Value) -> Vec<Value> {
+fn openai_tool_calls(
+    payload: &Value,
+    tool_name_map: &serde_json::Map<String, Value>,
+) -> Vec<Value> {
     payload
         .pointer("/choices/0/message/tool_calls")
         .and_then(Value::as_array)
@@ -636,11 +662,12 @@ fn openai_tool_calls(payload: &Value) -> Vec<Value> {
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|name| !name.is_empty())?;
+            let name = original_provider_tool_name(name, tool_name_map);
             let arguments = function
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let arguments = normalize_provider_tool_arguments(arguments, name);
+            let arguments = normalize_provider_tool_arguments(arguments, &name);
             let mut call = json!({
                 "type": "function",
                 "id": item.get("id").cloned().unwrap_or(Value::Null),
@@ -788,7 +815,7 @@ mod tests {
             &mut tool_calls,
         );
 
-        let calls = openai_stream_tool_calls(tool_calls).unwrap();
+        let calls = openai_stream_tool_calls(tool_calls, &serde_json::Map::new()).unwrap();
         assert_eq!(calls[0]["id"], "call_123");
         assert_eq!(calls[0]["function"]["name"], "terminal");
         assert_eq!(calls[0]["function"]["arguments"], json!({"command": "pwd"}));

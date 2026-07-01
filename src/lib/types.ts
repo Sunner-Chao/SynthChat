@@ -649,7 +649,7 @@ export interface SendChatRequest {
 export interface LlmProvider {
   id: string;
   name: string;
-  providerType?: "openai_compatible" | "anthropic" | "gemini" | string;
+  providerType?: "openai_compatible" | "openai_responses" | "anthropic" | "gemini" | string;
   preset?: string;
   baseUrl: string;
   appendChatPath?: boolean;

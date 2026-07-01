@@ -61,6 +61,31 @@ fn persona_with_max_tokens_override(
     persona
 }
 
+fn provider_base_id(provider_id: &str) -> &str {
+    provider_id
+        .split_once(":cred-")
+        .map(|(base, _)| base)
+        .unwrap_or(provider_id)
+}
+
+fn provider_ids_match(left: &str, right: &str) -> bool {
+    provider_base_id(left.trim()) == provider_base_id(right.trim())
+}
+
+fn persona_for_provider_attempt(
+    persona: &Persona,
+    provider: &LlmProvider,
+    max_tokens_override: Option<u32>,
+) -> Persona {
+    let mut attempt_persona = persona_with_max_tokens_override(persona, max_tokens_override);
+    let requested_provider = attempt_persona.llm_provider.trim();
+    if !requested_provider.is_empty() && !provider_ids_match(requested_provider, &provider.id) {
+        attempt_persona.llm_provider = provider_base_id(&provider.id).to_string();
+        attempt_persona.llm_model.clear();
+    }
+    attempt_persona
+}
+
 pub(super) fn next_max_tokens_override(
     current_override: Option<u32>,
     configured_max_tokens: u32,
@@ -2097,10 +2122,20 @@ pub(super) async fn complete_chat_with_provider_failover(
         let credential_source = credential_binding.source;
         let mut attempt_index = 0usize;
         let mut max_tokens_override = None;
+        let mut last_attempt_model = None::<String>;
         let result = loop {
             let attempt_number = attempt_index + 1;
             let attempt_started = Instant::now();
-            let attempt_persona = persona_with_max_tokens_override(persona, max_tokens_override);
+            let attempt_persona =
+                persona_for_provider_attempt(persona, &attempt_provider, max_tokens_override);
+            let attempt_model = if attempt_persona.llm_model.trim().is_empty() {
+                attempt_provider.model.trim().to_string()
+            } else {
+                attempt_persona.llm_model.trim().to_string()
+            };
+            last_attempt_model = Some(attempt_model.clone());
+            let mut attempt_event_provider = attempt_provider.clone();
+            attempt_event_provider.model = attempt_model.clone();
             let attempt_history =
                 history_with_native_image_attachments(
                     store,
@@ -2159,7 +2194,7 @@ pub(super) async fn complete_chat_with_provider_failover(
                         append_llm_attempt_event(
                             store,
                             run_id,
-                            provider,
+                            &attempt_event_provider,
                             attempt_number,
                             retry_count,
                             elapsed_ms,
@@ -2190,7 +2225,7 @@ pub(super) async fn complete_chat_with_provider_failover(
                         append_llm_attempt_event(
                             store,
                             run_id,
-                            provider,
+                            &attempt_event_provider,
                             attempt_number,
                             retry_count,
                             elapsed_ms,
@@ -2202,6 +2237,7 @@ pub(super) async fn complete_chat_with_provider_failover(
                     }
                     attempts.push(crate::llm::LlmFailoverAttempt {
                         provider_id: provider.id.clone(),
+                        model: attempt_model.clone(),
                         kind: kind.to_string(),
                         message: message.clone(),
                     });
@@ -2224,7 +2260,7 @@ pub(super) async fn complete_chat_with_provider_failover(
                                 json!({
                                     "providerId": provider.id.clone(),
                                     "providerType": provider.provider_type.clone(),
-                                    "model": provider.model.clone(),
+                                    "model": attempt_model.clone(),
                                     "kind": kind,
                                     "attempt": attempt_index,
                                     "maxRetries": retry_count,
@@ -2266,7 +2302,7 @@ pub(super) async fn complete_chat_with_provider_failover(
                                 json!({
                                     "providerId": provider.id.clone(),
                                     "providerType": provider.provider_type.clone(),
-                                    "model": provider.model.clone(),
+                                    "model": attempt_model.clone(),
                                     "kind": kind,
                                     "message": message,
                                 }),
@@ -2297,7 +2333,7 @@ pub(super) async fn complete_chat_with_provider_failover(
                             json!({
                                 "providerId": provider.id.clone(),
                                 "providerType": provider.provider_type.clone(),
-                                "model": provider.model.clone(),
+                                "model": attempt_model.clone(),
                                 "kind": kind,
                                 "attempt": attempt_index,
                                 "maxRetries": retry_count,
@@ -2317,7 +2353,7 @@ pub(super) async fn complete_chat_with_provider_failover(
                                 json!({
                                     "providerId": provider.id.clone(),
                                     "providerType": provider.provider_type.clone(),
-                                    "model": provider.model.clone(),
+                                    "model": attempt_model.clone(),
                                     "kind": kind,
                                     "attempt": attempt_index,
                                     "delayMs": delay_ms,
@@ -2366,7 +2402,9 @@ pub(super) async fn complete_chat_with_provider_failover(
                 failed_providers.push(json!({
                     "providerId": provider.id.clone(),
                     "providerType": provider.provider_type.clone(),
-                    "model": provider.model.clone(),
+                    "model": last_attempt_model
+                        .clone()
+                        .unwrap_or_else(|| provider.model.clone()),
                     "kind": kind,
                     "message": message,
                 }));
@@ -2449,6 +2487,7 @@ pub(super) fn save_llm_failure_diagnostic_artifact(
         .map(|attempt| {
             json!({
                 "providerId": attempt.provider_id,
+                "model": attempt.model,
                 "kind": attempt.kind,
                 "message": truncate_for_prompt(&redact_sensitive_text(&attempt.message), 2000)
             })

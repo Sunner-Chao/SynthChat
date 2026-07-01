@@ -914,10 +914,10 @@ pub async fn detect_provider_models(provider: LlmProvider) -> AppResult<Detected
     let provider_type = provider.provider_type.trim().to_ascii_lowercase();
     let base_url = live_model_base_url(&provider);
     let api_key = live_model_api_key(&provider);
-    let static_provider_id = if provider_type.is_empty() {
-        provider_id.as_str()
-    } else {
-        provider_type.as_str()
+    let static_provider_id = match provider_type.as_str() {
+        "openai_responses" | "openai-responses" => "openai",
+        "" => provider_id.as_str(),
+        _ => provider_type.as_str(),
     };
     let fallback = list_agentic_models(static_provider_id);
 
@@ -979,7 +979,9 @@ fn live_model_base_url(provider: &LlmProvider) -> String {
     match provider.provider_type.trim().to_ascii_lowercase().as_str() {
         "anthropic" => "https://api.anthropic.com".into(),
         "gemini" | "google" => "https://generativelanguage.googleapis.com/v1beta".into(),
-        "openai" | "openai_compatible" => "https://api.openai.com/v1".into(),
+        "openai" | "openai_compatible" | "openai_responses" | "openai-responses" => {
+            "https://api.openai.com/v1".into()
+        }
         _ => String::new(),
     }
 }

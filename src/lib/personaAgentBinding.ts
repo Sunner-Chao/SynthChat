@@ -8,10 +8,15 @@ export type PersonaAgentBinding = {
   model: string;
   infoText: string;
   searchText: string;
+  providerDisabled: boolean;
 };
 
 function trimmed(value?: string | null) {
   return value?.trim() ?? "";
+}
+
+function providerVisible(provider: LlmProvider | null | undefined) {
+  return Boolean(provider?.enabled);
 }
 
 export function resolvePersonaBoundAgent(
@@ -36,16 +41,31 @@ export function resolvePersonaAgentBinding(
   const agent = resolvePersonaBoundAgent(persona, agents, fallbackAgentId);
   const agentProviderId = trimmed(agent?.llmProvider);
   const personaProviderId = trimmed(persona?.llmProvider);
-  const providerId = personaProviderId || agentProviderId;
-  const provider = providerId
-    ? llmProviders.find((item) => item.id === providerId) ?? null
+  const personaProvider = personaProviderId
+    ? llmProviders.find((item) => item.id === personaProviderId) ?? null
     : null;
+  const agentProvider = agentProviderId
+    ? llmProviders.find((item) => item.id === agentProviderId) ?? null
+    : null;
+  const provider = personaProviderId
+    ? providerVisible(personaProvider) ? personaProvider : null
+    : providerVisible(agentProvider) ? agentProvider : null;
+  const configuredProvider = personaProviderId ? personaProvider : agentProvider;
+  const providerId = trimmed(provider?.id);
   const providerName = provider?.name?.trim() ?? "";
   const personaModel = trimmed(persona?.llmModel);
   const agentModel = trimmed(agent?.llmModel);
-  const model = personaModel || agentModel || trimmed(provider?.model) || "";
+  const model = provider?.id === personaProviderId
+    ? personaModel || trimmed(provider?.model) || ""
+    : provider?.id === agentProviderId
+      ? agentModel || trimmed(provider?.model) || ""
+      : "";
   let infoText = "";
-  if (providerName || model) {
+  const providerMissing = Boolean((personaProviderId || agentProviderId) && !configuredProvider);
+  const providerDisabled = Boolean(providerMissing || (configuredProvider && !configuredProvider.enabled && !provider));
+  if (providerDisabled) {
+    infoText = "服务商已停用";
+  } else if (providerName || model) {
     infoText = [providerName, model].filter(Boolean).join(" · ");
   } else if (llmProviders.length > 0) {
     infoText = "请选择服务商";
@@ -59,9 +79,10 @@ export function resolvePersonaAgentBinding(
     agent?.id,
     providerName,
     providerId,
+    providerDisabled ? "" : configuredProvider?.id,
     model,
-    personaProviderId,
-    trimmed(persona?.llmModel)
+    providerDisabled ? "" : personaProviderId,
+    providerDisabled ? "" : trimmed(persona?.llmModel)
   ]
     .filter(Boolean)
     .join(" ")
@@ -73,6 +94,7 @@ export function resolvePersonaAgentBinding(
     providerName,
     model,
     infoText,
-    searchText
+    searchText,
+    providerDisabled
   };
 }

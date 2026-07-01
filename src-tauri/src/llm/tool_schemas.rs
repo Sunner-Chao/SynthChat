@@ -1,15 +1,19 @@
+use std::collections::HashSet;
+
 use serde_json::{json, Map, Value};
 
 use crate::models::ToolDefinition;
 
 pub(super) fn openai_tool_schemas(tools: &[ToolDefinition]) -> Vec<Value> {
+    let mut used_names = HashSet::new();
     tools
         .iter()
         .map(|tool| {
+            let name = provider_safe_tool_name(tool, &mut used_names);
             json!({
                 "type": "function",
                 "function": {
-                    "name": tool.name,
+                    "name": name,
                     "description": tool.description,
                     "parameters": normalize_tool_parameters(&tool.input_schema)
                 }
@@ -19,12 +23,14 @@ pub(super) fn openai_tool_schemas(tools: &[ToolDefinition]) -> Vec<Value> {
 }
 
 pub(super) fn responses_tool_schemas(tools: &[ToolDefinition]) -> Vec<Value> {
+    let mut used_names = HashSet::new();
     tools
         .iter()
         .map(|tool| {
+            let name = provider_safe_tool_name(tool, &mut used_names);
             json!({
                 "type": "function",
-                "name": tool.name,
+                "name": name,
                 "description": tool.description,
                 "parameters": normalize_tool_parameters(&tool.input_schema)
             })
@@ -33,16 +39,181 @@ pub(super) fn responses_tool_schemas(tools: &[ToolDefinition]) -> Vec<Value> {
 }
 
 pub(super) fn anthropic_tool_schemas(tools: &[ToolDefinition]) -> Vec<Value> {
+    let mut used_names = HashSet::new();
     tools
         .iter()
         .map(|tool| {
+            let name = provider_safe_tool_name(tool, &mut used_names);
             json!({
-                "name": tool.name,
+                "name": name,
                 "description": tool.description,
                 "input_schema": normalize_tool_parameters(&tool.input_schema)
             })
         })
         .collect()
+}
+
+pub(super) fn provider_safe_tool_name(
+    tool: &ToolDefinition,
+    used_names: &mut HashSet<String>,
+) -> String {
+    let mut name = sanitize_provider_tool_name(&tool.name);
+    if name.is_empty() {
+        name = sanitize_provider_tool_name(&tool.display_name);
+    }
+    if name.is_empty() {
+        name = sanitize_provider_tool_name(&tool.tool_name);
+    }
+    if name.is_empty() {
+        name = "tool".into();
+    }
+    if used_names.insert(name.clone()) {
+        return name;
+    }
+
+    let base = name;
+    let hash = stable_tool_name_hash(tool);
+    for suffix in [
+        format!("_{hash:08x}"),
+        format!("_{}", sanitize_provider_tool_name(&tool.server_id)),
+        format!("_{}", sanitize_provider_tool_name(&tool.tool_name)),
+    ] {
+        let suffix = sanitize_provider_tool_suffix(&suffix);
+        let candidate = truncate_tool_name_with_suffix(&base, &suffix);
+        if used_names.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+
+    let mut index = 2usize;
+    loop {
+        let suffix = format!("_{hash:08x}_{index}");
+        let candidate = truncate_tool_name_with_suffix(&base, &suffix);
+        if used_names.insert(candidate.clone()) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+pub(super) fn provider_tool_name_map(tools: &[ToolDefinition]) -> Map<String, Value> {
+    let mut used_names = HashSet::new();
+    tools
+        .iter()
+        .filter_map(|tool| {
+            let safe = provider_safe_tool_name(tool, &mut used_names);
+            (safe != tool.name).then(|| (safe, json!(tool.name)))
+        })
+        .collect()
+}
+
+pub(super) fn anthropic_tool_name_map(tools: &[ToolDefinition]) -> Map<String, Value> {
+    provider_tool_name_map(tools)
+}
+
+pub(super) fn original_anthropic_tool_name(name: &str, name_map: &Map<String, Value>) -> String {
+    original_provider_tool_name(name, name_map)
+}
+
+pub(super) fn original_provider_tool_name(name: &str, name_map: &Map<String, Value>) -> String {
+    name_map
+        .get(name)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(name)
+        .to_string()
+}
+
+pub(super) fn safe_anthropic_tool_name_for_original(
+    original: &str,
+    name_map: &Map<String, Value>,
+) -> String {
+    safe_provider_tool_name_for_original(original, name_map)
+}
+
+pub(super) fn safe_provider_tool_name_for_original(
+    original: &str,
+    name_map: &Map<String, Value>,
+) -> String {
+    name_map
+        .iter()
+        .find_map(|(safe, value)| {
+            (value.as_str() == Some(original)).then(|| safe.clone())
+        })
+        .unwrap_or_else(|| original.to_string())
+}
+
+fn sanitize_provider_tool_name(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
+fn sanitize_provider_tool_suffix(value: &str) -> String {
+    let suffix = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_end_matches('_')
+        .to_string();
+    if suffix.starts_with('_') {
+        suffix
+    } else {
+        format!("_{suffix}")
+    }
+}
+
+fn truncate_tool_name_with_suffix(base: &str, suffix: &str) -> String {
+    const MAX_TOOL_NAME_LEN: usize = 64;
+    if suffix.is_empty() {
+        return base.chars().take(MAX_TOOL_NAME_LEN).collect();
+    }
+    let suffix_len = suffix.chars().count();
+    if suffix_len >= MAX_TOOL_NAME_LEN {
+        return suffix
+            .chars()
+            .take(MAX_TOOL_NAME_LEN)
+            .collect::<String>()
+            .trim_matches('_')
+            .to_string();
+    }
+    let base_len = MAX_TOOL_NAME_LEN - suffix_len;
+    format!(
+        "{}{}",
+        base.chars().take(base_len).collect::<String>(),
+        suffix
+    )
+}
+
+fn stable_tool_name_hash(tool: &ToolDefinition) -> u32 {
+    let mut hash = 0x811c9dc5u32;
+    for byte in format!(
+        "{}\0{}\0{}\0{}",
+        tool.source, tool.server_id, tool.tool_name, tool.name
+    )
+    .bytes()
+    {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
 }
 
 pub(super) fn bedrock_tool_config(tools: &[ToolDefinition]) -> Option<Value> {

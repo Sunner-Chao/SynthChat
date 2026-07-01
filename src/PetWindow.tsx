@@ -31,6 +31,11 @@ const MAX_PET_ASSISTANT_CLOUD_DURATION_SECONDS = 120;
 const PET_EDGE_SNAP_THRESHOLD_PX = 64;
 const PET_EDGE_POINTER_THRESHOLD_PX = 96;
 const PET_ORB_CLICK_MOVE_TOLERANCE_PX = 5;
+const PET_MODEL_INPUT_WAKE_PADDING_PX = 28;
+const PET_INPUT_HOT_ZONE_X_PADDING_PX = 24;
+const PET_INPUT_HOT_ZONE_TOP_PADDING_PX = 34;
+const PET_INPUT_HOT_ZONE_BOTTOM_PADDING_PX = 26;
+const PET_INPUT_FALLBACK_HOT_ZONE_HEIGHT_PX = 116;
 const PET_DEFAULT_MODEL_STORAGE_KEY = "synthchat.pet.defaultModelId";
 const PET_VISION_INTERVAL_STORAGE_KEY = "synthchat.pet.visionIntervalSeconds";
 const PET_VOICE_REPLY_ENABLED_STORAGE_KEY = "synthchat.pet.voiceReplyEnabled";
@@ -603,6 +608,8 @@ export function PetWindow() {
   const isNearModelRef = useRef(false);
   const modelMenuOpenRef = useRef(false);
   const showInputRef = useRef(true);
+  const inputShellHoverRef = useRef(false);
+  const inputDraftActiveRef = useRef(false);
   const [brokenCloudImages, setBrokenCloudImages] = useState<Record<string, true>>({});
   const [emojiGroups, setEmojiGroups] = useState<EmojiGroup[]>([]);
   const [visionEnabled, setVisionEnabled] = useState(false);
@@ -721,6 +728,10 @@ export function PetWindow() {
   const [dockEdge, setDockEdge] = useState<PetDockEdge>("right");
   const [composerAttachments, setComposerAttachments] = useState<PetComposerAttachment[]>([]);
   const [inputDragActive, setInputDragActive] = useState(false);
+
+  useEffect(() => {
+    inputDraftActiveRef.current = input.trim().length > 0 || composerAttachments.length > 0 || sending;
+  }, [composerAttachments.length, input, sending]);
 
   const renderedCloudAttachments = useMemo(() => {
     const attachments = cloudBubble?.attachments ?? [];
@@ -1201,32 +1212,30 @@ export function PetWindow() {
         if (!point) return;
         const { clientX, clientY } = point;
         const overModel = pointNearModel(clientX, clientY);
+        const onModelSurface = pointInsideModelSurface(clientX, clientY);
         const inPetUi = isPointerInPetUi(clientX, clientY);
-        const isNear = overModel || inPetUi || modelMenuOpenRef.current;
+        const inInputHotZone = isPointInsidePetInputHotZone(clientX, clientY);
+        const inputFocused = document.activeElement === inputRef.current;
+        const focusShouldKeepInputVisible = inputFocused && inputDraftActiveRef.current;
+        const pointerInInputShell = onModelSurface || inInputHotZone || inPetUi || modelMenuOpenRef.current;
+        if (!pointerInInputShell && inputShellHoverRef.current) {
+          inputShellHoverRef.current = false;
+        }
+        const keepWindowInteractive = inputFocused || overModel || inPetUi || inInputHotZone || modelMenuOpenRef.current;
+        const keepInputVisible = onModelSurface || focusShouldKeepInputVisible || inputShellHoverRef.current || inPetUi || modelMenuOpenRef.current;
 
-        void syncPetPointerPassthrough(!isNear);
+        void syncPetPointerPassthrough(!keepWindowInteractive);
 
-        if (isNear) {
+        if (keepInputVisible) {
           clearInputHideTimer();
-          if (!isNearModelRef.current) {
+          if (!isNearModelRef.current || !showInputRef.current) {
             isNearModelRef.current = true;
+            showInputRef.current = true;
             setShowInput(true);
           }
         } else {
-          if (isNearModelRef.current && !modelMenuOpenRef.current) {
-            isNearModelRef.current = false;
-            if (hideTimeoutRef.current !== null) {
-              window.clearTimeout(hideTimeoutRef.current);
-            }
-            hideTimeoutRef.current = window.setTimeout(() => {
-              if (!modelMenuOpenRef.current) {
-                inputRef.current?.blur();
-                showInputRef.current = false;
-                setShowInput(false);
-              }
-              hideTimeoutRef.current = null;
-            }, 800);
-          }
+          isNearModelRef.current = false;
+          queueInputHide();
         }
       }).catch(() => {
         void syncPetPointerPassthrough(false);
@@ -1293,6 +1302,9 @@ export function PetWindow() {
             width: message.width,
             height: message.height
           };
+        }
+        if (message.type === "model_hover" && message.hovering) {
+          revealPetInputShell();
         }
         return;
       }
@@ -1414,11 +1426,17 @@ export function PetWindow() {
   }
 
   function scheduleInputHide() {
-    if (modelMenuOpenRef.current) return;
+    inputShellHoverRef.current = false;
     isNearModelRef.current = false;
     clearInputHideTimer();
+    queueInputHide();
+  }
+
+  function queueInputHide() {
+    if (modelMenuOpenRef.current || !showInputRef.current || hideTimeoutRef.current !== null) return;
     hideTimeoutRef.current = window.setTimeout(() => {
-      if (!modelMenuOpenRef.current) {
+      const focusedWithDraft = document.activeElement === inputRef.current && inputDraftActiveRef.current;
+      if (!modelMenuOpenRef.current && !focusedWithDraft) {
         inputRef.current?.blur();
         showInputRef.current = false;
         setShowInput(false);
@@ -1427,10 +1445,44 @@ export function PetWindow() {
     }, 800);
   }
 
+  function revealPetInputSurface() {
+    revealInput();
+    void syncPetPointerPassthrough(false);
+  }
+
+  function revealPetInputShell() {
+    inputShellHoverRef.current = true;
+    revealPetInputSurface();
+  }
+
+  function activatePetInputHotZone(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    revealPetInputShell();
+    window.requestAnimationFrame(() => inputRef.current?.focus());
+  }
+
+  function isPointInsidePetInputHotZone(clientX: number, clientY: number) {
+    const rect = inputShellRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) {
+      return clientX >= PET_INPUT_HOT_ZONE_X_PADDING_PX
+        && clientX <= window.innerWidth - PET_INPUT_HOT_ZONE_X_PADDING_PX
+        && clientY >= window.innerHeight - PET_INPUT_FALLBACK_HOT_ZONE_HEIGHT_PX
+        && clientY <= window.innerHeight;
+    }
+    const top = showInputRef.current
+      ? rect.top - PET_INPUT_HOT_ZONE_TOP_PADDING_PX
+      : Math.min(rect.top - PET_INPUT_HOT_ZONE_TOP_PADDING_PX, window.innerHeight - PET_INPUT_FALLBACK_HOT_ZONE_HEIGHT_PX);
+    return clientX >= rect.left - PET_INPUT_HOT_ZONE_X_PADDING_PX
+      && clientX <= rect.right + PET_INPUT_HOT_ZONE_X_PADDING_PX
+      && clientY >= top
+      && clientY <= rect.bottom + PET_INPUT_HOT_ZONE_BOTTOM_PADDING_PX;
+  }
+
   function isPointInsidePetInput(clientX: number, clientY: number) {
     const rect = inputShellRef.current?.getBoundingClientRect();
     if (!rect) return true;
-    return clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
+    return isPointInsidePetInputHotZone(clientX, clientY);
   }
 
   function isNativePetDropInsideInput(position: NativeFileDropPayload["position"]) {
@@ -2372,6 +2424,17 @@ export function PetWindow() {
     );
   }
 
+  function pointInsideModelSurface(clientX: number, clientY: number) {
+    const bounds = modelBoundsRef.current;
+    if (!bounds) return false;
+    return (
+      clientX >= bounds.x - PET_MODEL_INPUT_WAKE_PADDING_PX
+      && clientX <= bounds.x + bounds.width + PET_MODEL_INPUT_WAKE_PADDING_PX
+      && clientY >= bounds.y - PET_MODEL_INPUT_WAKE_PADDING_PX
+      && clientY <= bounds.y + bounds.height + PET_MODEL_INPUT_WAKE_PADDING_PX
+    );
+  }
+
   function normalizeCursorPosition(position: PetCursorPosition) {
     const rawClientX = typeof position.clientX === "number" ? position.clientX : Number.NaN;
     const rawClientY = typeof position.clientY === "number" ? position.clientY : Number.NaN;
@@ -2490,14 +2553,9 @@ export function PetWindow() {
     if (!showInputRef.current && !modelMenuOpenRef.current) {
       return Boolean(rectContainsPoint(modelMenuRef.current, clientX, clientY, 8));
     }
-    if (
-      rectContainsPoint(inputShellRef.current, clientX, clientY, 8)
-      || rectContainsPoint(modelMenuRef.current, clientX, clientY, 8)
-    ) {
-      return true;
-    }
+    if (rectContainsPoint(modelMenuRef.current, clientX, clientY, 8)) return true;
     const element = document.elementFromPoint(clientX, clientY);
-    return Boolean(element?.closest(".pet-input-shell"));
+    return Boolean(element?.closest(".pet-input-wrap, .pet-input-model-menu, .pet-input-attachment-row, .pet-file-drop-overlay"));
   }
 
   async function startModelDrag(screenX?: number, screenY?: number) {
@@ -2961,13 +3019,15 @@ export function PetWindow() {
         onDragOver={handlePetFileDragOver}
         onDragLeave={handlePetFileDragLeave}
         onDrop={handlePetFileDrop}
-        onMouseEnter={revealInput}
+        onMouseEnter={revealPetInputShell}
         onMouseLeave={scheduleInputHide}
-        onPointerDown={() => {
-          revealInput();
-          void syncPetPointerPassthrough(false);
-        }}
+        onPointerDown={revealPetInputShell}
       >
+        <div
+          className="pet-input-hot-zone"
+          aria-hidden="true"
+          onPointerDown={activatePetInputHotZone}
+        />
         <div className="pet-input-wrap">
           <button
             className="pet-input-model-button"

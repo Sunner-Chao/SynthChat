@@ -1044,6 +1044,15 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
     let mut history = store.messages(&conversation.id, Some(30))?;
     let mut effective_persona = effective_llm_persona(&persona, &agent);
     let mut providers = store.provider_candidates(selected_provider_id(&persona, &agent))?;
+    if !effective_persona.llm_provider.trim().is_empty()
+        && providers
+            .first()
+            .map(|provider| provider.id.as_str() != effective_persona.llm_provider.trim())
+            .unwrap_or(false)
+    {
+        effective_persona.llm_provider.clear();
+        effective_persona.llm_model.clear();
+    }
     if let Some(correction) =
         reconcile_model_family_provider(&mut effective_persona, &mut providers)
     {

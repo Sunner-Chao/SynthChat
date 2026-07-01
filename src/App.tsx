@@ -142,6 +142,7 @@ function maskSecret(value?: string | null) {
 function providerPresetLabel(id: string) {
   const labels: Record<string, string> = {
     openai: "OpenAI (GPT)",
+    openaiResponses: "OpenAI Responses",
     anthropic: "Anthropic (Claude)",
     google: "Google (Gemini)",
     deepseek: "DeepSeek",
@@ -154,6 +155,7 @@ function providerPresetLabel(id: string) {
 function providerPresetDefaults(id: string) {
   const defaults: Record<string, { providerType: string; baseUrl: string; appendChatPath: boolean }> = {
     openai: { providerType: "openai_compatible", baseUrl: "https://api.openai.com/v1", appendChatPath: true },
+    openaiResponses: { providerType: "openai_responses", baseUrl: "https://api.openai.com/v1", appendChatPath: true },
     anthropic: { providerType: "anthropic", baseUrl: "https://api.anthropic.com/v1", appendChatPath: true },
     google: { providerType: "gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta", appendChatPath: true },
     deepseek: { providerType: "openai_compatible", baseUrl: "https://api.deepseek.com", appendChatPath: true },
@@ -748,10 +750,15 @@ function ContactsPanel() {
     () => new Map(personas.map((persona) => [persona.id, resolvePersonaAgentBinding(persona, agents, llmProviders)])),
     [agents, llmProviders, personas]
   );
-  const filtered = personas.filter((persona) =>
+  const visiblePersonas = personas;
+  useEffect(() => {
+    if (visiblePersonas.some((persona) => persona.id === selectedPersonaId)) return;
+    setSelectedPersonaId(visiblePersonas[0]?.id ?? "");
+  }, [selectedPersonaId, visiblePersonas]);
+  const filtered = visiblePersonas.filter((persona) =>
     (personaBindings.get(persona.id)?.searchText ?? `${persona.name} ${persona.id}`.toLowerCase()).includes(query.toLowerCase())
   );
-  const selectedPersona = personas.find((p) => p.id === selectedPersonaId) ?? personas[0] ?? null;
+  const selectedPersona = visiblePersonas.find((p) => p.id === selectedPersonaId) ?? visiblePersonas[0] ?? null;
   const linkedAccount = selectedPersona ? accounts.find((account) => account.linkedPersona === selectedPersona.id) : null;
   const syncLinkedWechat = async () => {
     if (!linkedAccount) return;

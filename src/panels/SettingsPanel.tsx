@@ -170,6 +170,7 @@ function formatCapabilitySource(source?: string) {
 function providerPresetLabel(id: string) {
   const labels: Record<string, string> = {
     openai: "OpenAI (GPT)",
+    openaiResponses: "OpenAI Responses",
     anthropic: "Anthropic (Claude)",
     google: "Google (Gemini)",
     deepseek: "DeepSeek",
@@ -182,6 +183,7 @@ function providerPresetLabel(id: string) {
 function providerPresetDefaults(id: string) {
   const defaults: Record<string, { providerType: string; baseUrl: string; appendChatPath: boolean }> = {
     openai: { providerType: "openai_compatible", baseUrl: "https://api.openai.com/v1", appendChatPath: true },
+    openaiResponses: { providerType: "openai_responses", baseUrl: "https://api.openai.com/v1", appendChatPath: true },
     anthropic: { providerType: "anthropic", baseUrl: "https://api.anthropic.com/v1", appendChatPath: true },
     google: { providerType: "gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta", appendChatPath: true },
     deepseek: { providerType: "openai_compatible", baseUrl: "https://api.deepseek.com", appendChatPath: true },
@@ -1403,7 +1405,8 @@ function ProviderSettings({
             {providers.map((provider) => {
               const stats = tokenStats[provider.id] ?? emptyTokenStats;
               const typeLabel = provider.providerType === "anthropic" ? "Anthropic" :
-                provider.providerType === "gemini" ? "Gemini" : "OpenAI";
+                provider.providerType === "gemini" ? "Gemini" :
+                provider.providerType === "openai_responses" ? "Responses" : "OpenAI";
               return (
                 <div className="card provider-item-card" key={provider.id}>
                   <button className="provider-card-btn" onClick={() => selectProvider(provider.id)} type="button">
@@ -1475,12 +1478,15 @@ function ProviderSettings({
             <label>名称<input value={draft.name} onChange={(event) => setDraft((d) => d ? { ...d, name: event.target.value } : d)} /></label>
             <label>类型<select value={draft.providerType ?? "openai_compatible"} onChange={(event) => setDraft((d) => d ? { ...d, providerType: event.target.value } : d)}>
               <option value="openai_compatible">OpenAI Compatible</option>
+              <option value="openai_responses">OpenAI Responses</option>
               <option value="anthropic">Anthropic</option>
               <option value="gemini">Google Gemini</option>
             </select></label>
             <label>Base URL<input value={draft.baseUrl} onChange={(event) => setDraft((d) => d ? { ...d, baseUrl: event.target.value } : d)} placeholder={(draft.providerType ?? "openai_compatible") === "gemini" ? "https://generativelanguage.googleapis.com/v1beta" : "https://api.example.com/v1"} /></label>
             {(draft.providerType ?? "openai_compatible") === "openai_compatible" ? (
               <label className="checkbox-row"><input checked={draft.appendChatPath ?? true} onChange={(event) => setDraft((d) => d ? { ...d, appendChatPath: event.target.checked } : d)} type="checkbox" />拼接 /chat/completions</label>
+            ) : (draft.providerType ?? "openai_compatible") === "openai_responses" ? (
+              <label className="checkbox-row"><input checked={draft.appendChatPath ?? true} onChange={(event) => setDraft((d) => d ? { ...d, appendChatPath: event.target.checked } : d)} type="checkbox" />拼接 /responses</label>
             ) : null}
             <label>模型
               <div className="model-select-row">
@@ -1617,7 +1623,7 @@ function ProviderSettings({
         <div className="sheet-backdrop" onClick={() => setShowTypeSheet(false)}>
           <div className="action-sheet" onClick={(event) => event.stopPropagation()}>
             <div className="sheet-title">选择对话服务商类型</div>
-            {["openai", "anthropic", "google", "deepseek", "siliconflow", "custom"].map((preset) => (
+            {["openai", "openaiResponses", "anthropic", "google", "deepseek", "siliconflow", "custom"].map((preset) => (
               <button className="sheet-item" key={preset} onClick={() => void addProvider(preset)} type="button">{providerPresetLabel(preset)}</button>
             ))}
             <button className="sheet-cancel" onClick={() => setShowTypeSheet(false)} type="button">取消</button>
