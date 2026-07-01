@@ -1208,11 +1208,17 @@ export function PetWindow() {
       }
       const eventSource = payload.source ?? payload.message?.source ?? "";
       const isThinkingStart = payload.type === "thinking_started";
+      const isAssistantProgress = payload.type === "assistant_progress";
       const shouldShowThinking =
         isThinkingStart
         && petShouldFollowThinkingTurn(eventSource)
         && petShouldShowThinkingCloud(eventSource);
-      const shouldAdoptConversation = !isCurrentConversation && (isWechat || shouldShowThinking || !hasContext);
+      const shouldShowProgress =
+        isAssistantProgress
+        && petShouldFollowThinkingTurn(eventSource)
+        && Boolean(payload.message && assistantMessageVisibleInCloud(payload.message));
+      const shouldAdoptConversation =
+        !isCurrentConversation && (isWechat || shouldShowThinking || shouldShowProgress || !hasContext);
       if (shouldAdoptConversation) {
         setPetContext({
           conversationId: payload.conversationId,

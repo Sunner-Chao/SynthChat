@@ -711,13 +711,13 @@ fn validate_expected_file_state(path: &Path, payload: &Value) -> AppResult<()> {
     if expected_sha.is_none() && expected_modified.is_none() {
         return Ok(());
     }
-    let content = fs::read_to_string(path).map_err(|error| {
+    let content = fs::read(path).map_err(|error| {
         AppError::BadRequest(format!(
             "file state precondition failed for {}: cannot read current file ({error})",
             path.display()
         ))
     })?;
-    let current = file_state(path, &content)?;
+    let current = file_byte_state(path, &content)?;
     if let Some(expected) = expected_sha {
         if current.sha256 != expected.trim().to_ascii_lowercase() {
             return Err(AppError::BadRequest(format!(
@@ -775,13 +775,13 @@ fn validate_registered_file_state(store: &AppStore, path: &Path, payload: &Value
     let Some(registered) = store.registered_file_state(&path_key)? else {
         return Ok(());
     };
-    let content = fs::read_to_string(path).map_err(|error| {
+    let content = fs::read(path).map_err(|error| {
         AppError::BadRequest(format!(
             "file registry stale check failed for {}: cannot read current file ({error}). Re-read the file before modifying it.",
             path.display()
         ))
     })?;
-    let current = file_state(path, &content)?;
+    let current = file_byte_state(path, &content)?;
     if registered.sha256 != current.sha256
         || registered.modified_unix_ms != current.modified_unix_ms
         || registered.partial
@@ -809,8 +809,8 @@ fn record_registered_write(
     writer: &str,
     payload: &Value,
 ) -> AppResult<()> {
-    let content = fs::read_to_string(path)?;
-    let state = file_state(path, &content)?;
+    let content = fs::read(path)?;
+    let state = file_byte_state(path, &content)?;
     let (actor, run_id) = file_state_actor(payload, writer);
     store.record_file_write_state(
         &path.to_string_lossy(),
@@ -1082,6 +1082,7 @@ pub(super) fn move_file_tool(
             fs::create_dir_all(parent)?;
         }
         fs::rename(&source, &target)?;
+        let bytes_moved = fs::metadata(&target).map(|metadata| metadata.len()).unwrap_or(0);
         store.remove_file_state(&source.to_string_lossy())?;
         record_registered_write(store, &target, "move_file", payload)?;
         let lsp_cleared_baseline = lsp_clear_baseline_for_path(&root, &source);
@@ -1092,6 +1093,8 @@ pub(super) fn move_file_tool(
             "src": source.to_string_lossy(),
             "dst": target.to_string_lossy(),
             "moved": true,
+            "bytes_moved": bytes_moved,
+            "bytesMoved": bytes_moved,
             "lspBaseline": lsp_baseline,
             "lspClearedBaseline": lsp_cleared_baseline,
             "lspDeltaDiagnostics": lsp_delta_diagnostics

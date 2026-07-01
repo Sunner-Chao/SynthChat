@@ -351,7 +351,7 @@ async fn append_intermediate_assistant_after_tools(
     desktop_stream_state.set_passthrough_answer(true);
     desktop_stream_state.set_suppress_thinking(true);
 
-    let prompt = tool_progress_user_prompt(user_request, latest_observations, iteration);
+    let prompt = tool_progress_user_prompt(persona, user_request, latest_observations, iteration);
     let progress_history = vec![ChatMessage::new(
         conversation_id.to_string(),
         "user",
@@ -367,7 +367,7 @@ async fn append_intermediate_assistant_after_tools(
         Some(run_id),
         providers,
         &progress_persona,
-        TOOL_PROGRESS_SYSTEM_PROMPT.to_string(),
+        tool_progress_system_prompt(persona),
         progress_history,
         &prompt,
         None,
@@ -405,7 +405,7 @@ async fn append_intermediate_assistant_after_tools(
     let text = if cleaned_text.trim().is_empty()
         || intermediate_assistant_text_is_generic(&cleaned_text)
     {
-        fallback_intermediate_assistant_text(user_request, latest_observations, iteration)
+        fallback_intermediate_assistant_text(persona, user_request, latest_observations)
     } else {
         ensure_intermediate_progress_label(user_request, &cleaned_text)
     };
@@ -505,26 +505,66 @@ fn intermediate_progress_event_source<'a>(
     }
 }
 
-const TOOL_PROGRESS_SYSTEM_PROMPT: &str = r#"You write the visible middle body for an in-progress SynthChat agent turn.
+fn tool_progress_system_prompt(persona: &Persona) -> String {
+    let persona_context = persona_progress_context(persona);
+    format!(
+        r#"You write the visible middle body for an in-progress SynthChat agent turn.
 Return plain assistant-facing text only. Do not return JSON, tool calls, hidden reasoning, markdown fences, or metadata.
 Use the same language as the user's request.
-This is not the final answer. Briefly state what the latest tool results established and, when useful, what remains to be done next.
-If the latest tool result already makes an immediate final answer preferable, return an empty string."#;
+Speak in the current persona's natural voice, but keep the update short and grounded. Persona context:
+{persona_context}
+
+This is not the final answer. It is a warm progress update shown between tool cards and later answer text.
+State what the latest tool results changed, confirmed, or blocked. If a tool failed, name the concrete snag and the next adjustment.
+Do not repeat a generic "I'm working on it" update. Do not restate the full task. Do not pretend the task is done.
+Do not add labels such as "进展同步：" or "Progress update:". Write only the natural update sentence itself.
+If the latest tool result already makes an immediate final answer preferable, return an empty string."#
+    )
+}
+
+fn persona_progress_context(persona: &Persona) -> String {
+    let mut parts = Vec::new();
+    if !persona.name.trim().is_empty() {
+        parts.push(format!("Name: {}", persona.name.trim()));
+    }
+    if !persona.character_prompt.trim().is_empty() {
+        parts.push(format!(
+            "Character profile: {}",
+            one_line_truncate(&persona.character_prompt, 700)
+        ));
+    }
+    if !persona.system_prompt.trim().is_empty() {
+        parts.push(format!(
+            "System prompt: {}",
+            one_line_truncate(&persona.system_prompt, 700)
+        ));
+    }
+    if parts.is_empty() {
+        "No persona details were provided; use a calm, helpful assistant voice.".into()
+    } else {
+        parts.join("\n")
+    }
+}
 
 fn tool_progress_user_prompt(
+    persona: &Persona,
     user_request: &str,
     latest_observations: &[String],
     iteration: u32,
 ) -> String {
     let observations = latest_observations.join("\n\n");
+    let persona_context = persona_progress_context(persona);
     format!(
         r#"Original user request:
 {user_request}
 
+Current persona voice:
+{persona_context}
+
 Latest tool observations from ReAct iteration {iteration}:
 {observations}
 
-Write one concise visible progress update for the chat timeline before the agent continues. Keep it grounded in the observations. If no useful middle update is needed, return an empty string."#
+Write one concise visible progress update for the chat timeline before the agent continues. Keep it grounded in the newest observations, make it feel like a real update from the persona, and avoid repeating generic prior wording. If no useful middle update is needed, return an empty string."#
     )
 }
 
@@ -582,22 +622,20 @@ fn ensure_intermediate_progress_label(user_request: &str, text: &str) -> String 
     }
     let lower = trimmed.to_ascii_lowercase();
     if lower.starts_with("progress:")
+        || lower.starts_with("progress update:")
+        || trimmed.starts_with("进展同步")
         || trimmed.starts_with("阶段进展")
         || trimmed.starts_with("中间进展")
     {
-        return trimmed.to_string();
+        return normalize_intermediate_progress_marker(user_request, trimmed);
     }
-    if text_contains_cjk(user_request) {
-        format!("阶段进展：{trimmed}")
-    } else {
-        format!("Progress: {trimmed}")
-    }
+    trimmed.to_string()
 }
 
 fn fallback_intermediate_assistant_text(
+    persona: &Persona,
     user_request: &str,
     latest_observations: &[String],
-    iteration: u32,
 ) -> String {
     let Some(summary) = latest_observations
         .iter()
@@ -614,16 +652,229 @@ fn fallback_intermediate_assistant_text(
             || lower.contains("bad request")
     });
     if text_contains_cjk(user_request) {
+        let subject = persona_progress_subject(persona);
         if has_error {
-            format!("阶段进展：第 {iteration} 轮工具调用遇到问题：{summary}。我会调整方式继续推进。")
+            format!("{subject}看到这一步卡在：{summary}。我会换个更稳的办法继续推进。")
         } else {
-            format!("阶段进展：第 {iteration} 轮工具调用已完成，结果显示：{summary}。我会继续处理后续步骤。")
+            format!("{subject}已经确认：{summary}。接下来我继续把后面的步骤接上。")
         }
     } else if has_error {
-        format!("Progress: iteration {iteration} hit a tool issue: {summary}. I will adjust and continue.")
+        format!("I found the snag: {summary}. I will switch approach and keep going.")
     } else {
-        format!("Progress: iteration {iteration} completed a tool step: {summary}. I will continue with the remaining work.")
+        format!("I confirmed {summary}. I will keep moving through the next step.")
     }
+}
+
+fn normalize_intermediate_progress_marker(user_request: &str, text: &str) -> String {
+    let trimmed = text.trim();
+    if text_contains_cjk(user_request) {
+        let body = trimmed
+            .strip_prefix("阶段进展：")
+            .or_else(|| trimmed.strip_prefix("阶段进展:"))
+            .or_else(|| trimmed.strip_prefix("中间进展："))
+            .or_else(|| trimmed.strip_prefix("中间进展:"))
+            .or_else(|| trimmed.strip_prefix("进展同步："))
+            .or_else(|| trimmed.strip_prefix("进展同步:"))
+            .unwrap_or(trimmed)
+            .trim();
+        if body.is_empty() {
+            String::new()
+        } else {
+            body.to_string()
+        }
+    } else if trimmed.to_ascii_lowercase().starts_with("progress update:") {
+        trimmed
+            .split_once(':')
+            .map(|(_, body)| body.trim().to_string())
+            .unwrap_or_else(|| trimmed.to_string())
+    } else {
+        let body = trimmed
+            .strip_prefix("Progress:")
+            .or_else(|| trimmed.strip_prefix("progress:"))
+            .unwrap_or(trimmed)
+            .trim();
+        if body.is_empty() {
+            String::new()
+        } else {
+            body.to_string()
+        }
+    }
+}
+
+fn persona_progress_subject(persona: &Persona) -> String {
+    let name = persona.name.trim();
+    if name.is_empty() || name == "用户" || name.chars().count() > 12 {
+        "我这边".into()
+    } else {
+        format!("{name}这边")
+    }
+}
+
+fn final_response_should_continue_for_delivery(
+    user_request: &str,
+    assistant_text: &str,
+    observations: &[String],
+) -> bool {
+    delivery_request_needs_tool(user_request)
+        && !observations_indicate_delivery_landed(observations)
+        && !assistant_text_has_delivery_marker(assistant_text)
+        && final_text_is_future_delivery_promise(assistant_text)
+}
+
+fn delivery_request_needs_tool(user_request: &str) -> bool {
+    let lower = user_request.to_ascii_lowercase();
+    [
+        "整理到桌面",
+        "放到桌面",
+        "放桌面",
+        "桌面上",
+        "保存到",
+        "生成文档",
+        "整理成文档",
+        "做成文档",
+        "导出",
+        "发给我",
+        "发送给我",
+        "传给我",
+        "发我",
+        "文件",
+        "文档",
+        "报告",
+        "docx",
+        "xlsx",
+        "pptx",
+        "pdf",
+    ]
+    .iter()
+    .any(|needle| user_request.contains(*needle))
+        || [
+            "desktop", "save", "send me", "send it", "attach", "attachment", "file",
+            "document", "report", "export", "download",
+        ]
+        .iter()
+        .any(|needle| lower.contains(*needle))
+}
+
+fn observations_indicate_delivery_landed(observations: &[String]) -> bool {
+    observations.iter().any(|observation| {
+        let lower = observation.to_ascii_lowercase();
+        lower.contains(" tool document result:")
+            || lower.contains(" tool artifact result:")
+            || lower.contains(" tool write_file result:")
+            || lower.contains(" tool move_file result:")
+            || lower.contains(" tool send_message result:")
+            || lower.contains("\"tool\": \"document\"")
+            || lower.contains("\"tool\":\"document\"")
+            || lower.contains("\"tool\": \"artifact\"")
+            || lower.contains("\"tool\":\"artifact\"")
+            || lower.contains("\"mediatag\"")
+            || lower.contains("media:")
+            || lower.contains("\"moved\": true")
+            || lower.contains("\"moved\":true")
+            || lower.contains("\"bytes_written\"")
+            || lower.contains("\"byteswritten\"")
+    })
+}
+
+fn assistant_text_has_delivery_marker(assistant_text: &str) -> bool {
+    let lower = assistant_text.to_ascii_lowercase();
+    lower.contains("media:")
+        || lower.contains("[media attached:")
+        || lower.contains("已发送")
+        || lower.contains("已经发送")
+        || lower.contains("发送完成")
+}
+
+fn final_text_is_future_delivery_promise(assistant_text: &str) -> bool {
+    let lower = assistant_text.to_ascii_lowercase();
+    let has_future_marker = [
+        "现在帮你",
+        "马上",
+        "稍后",
+        "稍等",
+        "接下来",
+        "下一步",
+        "我会",
+        "我将",
+        "我来",
+        "正在",
+        "准备",
+        "再把",
+    ]
+    .iter()
+    .any(|needle| assistant_text.contains(*needle))
+        || [
+            "i will",
+            "i'll",
+            "i’m going to",
+            "i'm going to",
+            "next i",
+            "now i'll",
+            "will send",
+            "will save",
+        ]
+        .iter()
+        .any(|needle| lower.contains(*needle));
+    if !has_future_marker {
+        return false;
+    }
+    [
+        "整理",
+        "生成",
+        "写成",
+        "保存",
+        "放到桌面",
+        "放桌面",
+        "移动到桌面",
+        "发给你",
+        "发送",
+        "上传",
+        "文档",
+        "文件",
+        "报告",
+        "docx",
+        "xlsx",
+        "pptx",
+        "pdf",
+    ]
+    .iter()
+    .any(|needle| assistant_text.contains(*needle))
+        || [
+            "save", "send", "attach", "upload", "file", "document", "report", "desktop",
+            "export",
+        ]
+        .iter()
+        .any(|needle| lower.contains(*needle))
+}
+
+fn compact_text_for_observation(text: &str, max_chars: usize) -> String {
+    let normalized = text
+        .replace('\r', " ")
+        .replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut truncated = normalized.chars().take(max_chars).collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn one_line_truncate(text: &str, max_chars: usize) -> String {
+    let single_line = text
+        .replace('\r', " ")
+        .replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if single_line.chars().count() <= max_chars {
+        return single_line;
+    }
+    let mut truncated = single_line.chars().take(max_chars).collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 fn compact_observation_for_progress(observation: &str) -> Option<String> {
@@ -2895,12 +3146,40 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                 }
             }
             _ => {
-                assistant_text = decision
+                let candidate_text = decision
                     .get("content")
                     .or_else(|| decision.get("answer"))
                     .and_then(Value::as_str)
                     .unwrap_or(reply.content.trim())
                     .to_string();
+                if iteration_budget.remaining() > 0
+                    && final_response_should_continue_for_delivery(
+                        &effective_request_content,
+                        &candidate_text,
+                        &observations,
+                    )
+                {
+                    let note = "Planner tried to finish with a future delivery promise before producing or attaching the requested file. Continue the ReAct loop with concrete tool calls such as document/artifact/write_file/move_file, then final only after the deliverable exists and any requested send step is represented.";
+                    observations.push(format!(
+                        "Iteration {} final guardrail: {} Candidate final: {}",
+                        iteration + 1,
+                        note,
+                        compact_text_for_observation(&candidate_text, 240)
+                    ));
+                    append_parent_phase_event(
+                        store,
+                        &saved_run.run_id,
+                        "final_delivery_promise_rejected",
+                        json!({
+                            "iteration": iteration + 1,
+                            "note": note,
+                            "candidate": compact_text_for_observation(&candidate_text, 500),
+                            "remainingIterations": iteration_budget.remaining(),
+                        }),
+                    )?;
+                    continue;
+                }
+                assistant_text = candidate_text;
                 assistant_provider_data = reply.provider_data.clone();
                 desktop_stream_state.emit_provider_thinking_if_idle(
                     desktop_app,

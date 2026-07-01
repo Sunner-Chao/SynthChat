@@ -5486,7 +5486,7 @@ fn normalize_interrupted_runs(state: &mut PersistedState) {
     }
 }
 
-fn normalize_stale_landed_write_file_runs(state: &mut PersistedState) -> bool {
+fn normalize_stale_landed_file_mutation_runs(state: &mut PersistedState) -> bool {
     let now = Utc::now();
     let completed_at = now_iso();
     let mut changed = false;
@@ -5494,12 +5494,15 @@ fn normalize_stale_landed_write_file_runs(state: &mut PersistedState) -> bool {
         let completed_recovered_events = {
             let run = &state.agent_runs[run_index];
             if run.state == "completed"
-                && run.last_activity_desc.as_deref()
-                    == Some("recovered landed write_file tool event")
+                && matches!(
+                    run.last_activity_desc.as_deref(),
+                    Some("recovered landed write_file tool event")
+                        | Some("recovered landed file mutation tool event")
+                )
             {
                 run.tool_events
                     .iter()
-                    .filter(|event| completed_recovered_write_file_event(event))
+                    .filter(|event| completed_recovered_file_mutation_event(event))
                     .cloned()
                     .collect::<Vec<_>>()
             } else {
@@ -5518,7 +5521,7 @@ fn normalize_stale_landed_write_file_runs(state: &mut PersistedState) -> bool {
                         .unwrap_or_else(|| completed_at.clone()),
                 )
             };
-            if append_landed_write_file_recovery_message(
+            if append_landed_file_mutation_recovery_message(
                 state,
                 &conversation_id,
                 &run_id,
@@ -5544,7 +5547,7 @@ fn normalize_stale_landed_write_file_runs(state: &mut PersistedState) -> bool {
         let recovered_events = state.agent_runs[run_index]
             .tool_events
             .iter()
-            .filter_map(|event| landed_write_file_recovery_event(event, &completed_at, activity_at))
+            .filter_map(|event| landed_file_mutation_recovery_event(event, &completed_at, activity_at))
             .collect::<Vec<_>>();
         if recovered_events.is_empty() {
             continue;
@@ -5565,13 +5568,13 @@ fn normalize_stale_landed_write_file_runs(state: &mut PersistedState) -> bool {
             }
             run.updated_at = completed_at.clone();
             run.last_activity_at = Some(completed_at.clone());
-            run.last_activity_desc = Some("recovered landed write_file tool event".into());
+            run.last_activity_desc = Some("recovered landed file mutation tool event".into());
             run.checkpoints.push(AgentCheckpointRecord {
                 checkpoint_id: new_id("ckpt"),
                 run_id: run.run_id.clone(),
                 iteration: run.checkpoints.len() as u32 + 1,
                 created_at: completed_at.clone(),
-                state: "recovered_landed_write_file".into(),
+                state: "recovered_landed_file_mutation".into(),
                 completed_call_ids: recovered_events
                     .iter()
                     .filter_map(|event| tool_event_provider_call_id(event).map(str::to_string))
@@ -5581,7 +5584,7 @@ fn normalize_stale_landed_write_file_runs(state: &mut PersistedState) -> bool {
                     .filter_map(|event| tool_event_provider_call_id(event).map(str::to_string))
                     .collect(),
                 summary:
-                    "Recovered stale running write_file event after verified file write landed."
+                    "Recovered stale running file mutation event after verified file operation landed."
                         .into(),
             });
         }
@@ -5593,7 +5596,7 @@ fn normalize_stale_landed_write_file_runs(state: &mut PersistedState) -> bool {
                 replace_matching_tool_event_messages(messages, recovered);
             }
         }
-        append_landed_write_file_recovery_message(
+        append_landed_file_mutation_recovery_message(
             state,
             &conversation_id,
             &run_id,
@@ -5606,7 +5609,7 @@ fn normalize_stale_landed_write_file_runs(state: &mut PersistedState) -> bool {
     changed
 }
 
-fn append_landed_write_file_recovery_message(
+fn append_landed_file_mutation_recovery_message(
     state: &mut PersistedState,
     conversation_id: &str,
     run_id: &str,
@@ -5614,7 +5617,7 @@ fn append_landed_write_file_recovery_message(
     recovered_events: &[Value],
     completed_at: &str,
 ) -> bool {
-    let paths = recovered_write_file_paths(recovered_events);
+    let paths = recovered_file_mutation_paths(recovered_events);
     if paths.is_empty() {
         return false;
     }
@@ -5624,7 +5627,10 @@ fn append_landed_write_file_recovery_message(
             message
                 .provider_data
                 .as_ref()
-                .and_then(|data| data.get("recoveredWriteFileRunId"))
+                .and_then(|data| {
+                    data.get("recoveredFileMutationRunId")
+                        .or_else(|| data.get("recoveredWriteFileRunId"))
+                })
                 .and_then(Value::as_str)
                 == Some(run_id)
         }) {
@@ -5648,7 +5654,7 @@ fn append_landed_write_file_recovery_message(
                 return false;
             }
         }
-        let content = recovered_write_file_completion_content(&paths);
+        let content = recovered_file_mutation_completion_content(&paths);
         let mut message = ChatMessage::new(
             conversation_id.to_string(),
             "assistant",
@@ -5657,15 +5663,20 @@ fn append_landed_write_file_recovery_message(
         );
         message.created_at = completed_at.to_string();
         message.provider_data = Some(json!({
+            "recoveredFileMutationRunId": run_id,
             "recoveredWriteFileRunId": run_id,
-            "source": "stale_landed_write_file_recovery",
+            "source": "stale_landed_file_mutation_recovery",
             "reactStep": {
                 "kind": "final",
                 "recovered": true
             },
+            "recoveredFileMutation": {
+                "paths": paths.clone(),
+                "reason": "stale_landed_file_mutation"
+            },
             "recoveredWriteFile": {
                 "paths": paths,
-                "reason": "stale_landed_write_file"
+                "reason": "stale_landed_file_mutation"
             }
         }));
         messages.push(message.clone());
@@ -5683,28 +5694,53 @@ fn append_landed_write_file_recovery_message(
     true
 }
 
-fn recovered_write_file_paths(recovered_events: &[Value]) -> Vec<String> {
+fn recovered_file_mutation_paths(recovered_events: &[Value]) -> Vec<String> {
     let mut seen = HashSet::new();
     recovered_events
         .iter()
-        .filter_map(recovered_write_file_path)
+        .filter_map(recovered_file_mutation_path)
         .filter(|path| seen.insert(path.clone()))
         .collect()
 }
 
-fn recovered_write_file_path(event: &Value) -> Option<String> {
-    string_path_if_file(event.get("path").and_then(Value::as_str)).or_else(|| {
-        string_path_if_file(
-            event
-                .pointer("/raw/payload/path")
-                .and_then(Value::as_str),
-        )
-    })
+fn recovered_file_mutation_path(event: &Value) -> Option<String> {
+    let text_payload = event
+        .get("text")
+        .and_then(Value::as_str)
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+    string_path_if_file(event.get("path").and_then(Value::as_str))
+        .or_else(|| string_path_if_file(event.get("dst").and_then(Value::as_str)))
+        .or_else(|| {
+            text_payload
+                .as_ref()
+                .and_then(|payload| string_path_if_file(payload.get("path").and_then(Value::as_str)))
+        })
+        .or_else(|| {
+            text_payload
+                .as_ref()
+                .and_then(|payload| string_path_if_file(payload.get("dst").and_then(Value::as_str)))
+        })
+        .or_else(|| {
+            string_path_if_file(
+                event
+                    .pointer("/raw/payload/path")
+                    .and_then(Value::as_str),
+            )
+        })
+        .or_else(|| {
+            string_path_if_file(
+                event
+                    .pointer("/raw/payload/dst")
+                    .or_else(|| event.pointer("/raw/payload/target"))
+                    .or_else(|| event.pointer("/raw/payload/to"))
+                    .and_then(Value::as_str),
+            )
+        })
 }
 
-fn recovered_write_file_completion_content(paths: &[String]) -> String {
+fn recovered_file_mutation_completion_content(paths: &[String]) -> String {
     let mut lines = vec![
-        "任务已完成：文件已经写入本地。刚才运行在收尾阶段被恢复，我把生成的文件补在这里。".to_string(),
+        "任务已完成：文件已经落到本地。刚才运行在收尾阶段被恢复，我把相关文件补在这里。".to_string(),
     ];
     for path in paths {
         let marker_path = path.replace('"', "'");
@@ -5738,13 +5774,13 @@ fn recovered_write_file_mime_type(path: &str) -> &'static str {
     }
 }
 
-fn completed_recovered_write_file_event(event: &Value) -> bool {
+fn completed_recovered_file_mutation_event(event: &Value) -> bool {
     event.get("status").and_then(Value::as_str) == Some("completed")
         && event
             .get("toolName")
             .or_else(|| event.get("tool_name"))
             .and_then(Value::as_str)
-            == Some("write_file")
+            .is_some_and(|tool| matches!(tool, "write_file" | "move_file"))
         && (event.get("recoveredAt").is_some()
             || event
                 .get("text")
@@ -5758,7 +5794,7 @@ fn completed_recovered_write_file_event(event: &Value) -> bool {
                 == Some(true))
 }
 
-fn landed_write_file_recovery_event(
+fn landed_file_mutation_recovery_event(
     event: &Value,
     completed_at: &str,
     fallback_started_at: DateTime<Utc>,
@@ -5770,9 +5806,18 @@ fn landed_write_file_recovery_event(
         .get("toolName")
         .or_else(|| event.get("tool_name"))
         .and_then(Value::as_str)?;
-    if tool_name != "write_file" {
-        return None;
+    match tool_name {
+        "write_file" => landed_write_file_recovery_event(event, completed_at, fallback_started_at),
+        "move_file" => landed_move_file_recovery_event(event, completed_at, fallback_started_at),
+        _ => None,
     }
+}
+
+fn landed_write_file_recovery_event(
+    event: &Value,
+    completed_at: &str,
+    fallback_started_at: DateTime<Utc>,
+) -> Option<Value> {
     let payload = event.get("raw")?.get("payload")?;
     let path = payload.get("path").and_then(Value::as_str)?.trim();
     let content = payload.get("content").and_then(Value::as_str)?;
@@ -5820,6 +5865,85 @@ fn landed_write_file_recovery_event(
         object.insert(
             "path".into(),
             Value::String(full_path.to_string_lossy().to_string()),
+        );
+        object.insert("exists".into(), Value::Bool(true));
+        object.insert(
+            "recoveredAt".into(),
+            Value::String(completed_at.to_string()),
+        );
+    }
+    Some(recovered)
+}
+
+fn landed_move_file_recovery_event(
+    event: &Value,
+    completed_at: &str,
+    fallback_started_at: DateTime<Utc>,
+) -> Option<Value> {
+    let payload = event.get("raw")?.get("payload")?;
+    let src = payload
+        .get("src")
+        .or_else(|| payload.get("source"))
+        .or_else(|| payload.get("from"))
+        .and_then(Value::as_str)?
+        .trim();
+    let dst = payload
+        .get("dst")
+        .or_else(|| payload.get("target"))
+        .or_else(|| payload.get("to"))
+        .and_then(Value::as_str)?
+        .trim();
+    if src.is_empty() || dst.is_empty() {
+        return None;
+    }
+    let source = PathBuf::from(src);
+    let target = PathBuf::from(dst);
+    if !target.is_absolute() || !target.is_file() {
+        return None;
+    }
+    if source.is_absolute() && source != target && source.exists() {
+        return None;
+    }
+    let bytes_moved = fs::metadata(&target).ok().map(|metadata| metadata.len()).unwrap_or(0);
+    let mut recovered = event.clone();
+    let elapsed_ms = recovered_tool_elapsed_ms(event, completed_at, fallback_started_at);
+    if let Some(object) = recovered.as_object_mut() {
+        object.insert("status".into(), Value::String("completed".into()));
+        object.insert("ok".into(), Value::Bool(true));
+        object.insert("timedOut".into(), Value::Bool(false));
+        object.insert("elapsedMs".into(), json!(elapsed_ms));
+        object.insert(
+            "summary".into(),
+            Value::String("文件已移动；已从卡住的 move_file 状态恢复。".into()),
+        );
+        object.insert(
+            "text".into(),
+            Value::String(
+                serde_json::to_string_pretty(&json!({
+                    "success": true,
+                    "tool": "move_file",
+                    "src": source.to_string_lossy(),
+                    "dst": target.to_string_lossy(),
+                    "moved": true,
+                    "bytes_moved": bytes_moved,
+                    "bytesMoved": bytes_moved,
+                    "recoveredFromStaleRunning": true
+                }))
+                .unwrap_or_else(|_| "{\"success\":true}".into()),
+            ),
+        );
+        object.insert("error".into(), Value::Null);
+        object.insert(
+            "src".into(),
+            Value::String(source.to_string_lossy().to_string()),
+        );
+        object.insert(
+            "dst".into(),
+            Value::String(target.to_string_lossy().to_string()),
+        );
+        object.insert(
+            "path".into(),
+            Value::String(target.to_string_lossy().to_string()),
         );
         object.insert("exists".into(), Value::Bool(true));
         object.insert(
@@ -11273,7 +11397,7 @@ impl AppStore {
         self.with_state(|s| {
             let now = Utc::now();
             let mut expired = false;
-            let recovered = normalize_stale_landed_write_file_runs(s);
+            let recovered = normalize_stale_landed_file_mutation_runs(s);
             let mut expired_conversations = HashSet::new();
             let mut closed_tool_messages: Vec<(String, Vec<Value>)> = Vec::new();
             for run in s.agent_runs.iter_mut().filter(|run| {
@@ -11358,7 +11482,7 @@ impl AppStore {
         self.with_state(|s| {
             let now = Utc::now();
             let mut expired = false;
-            let recovered = normalize_stale_landed_write_file_runs(s);
+            let recovered = normalize_stale_landed_file_mutation_runs(s);
             let mut expired_conversations = HashSet::new();
             let mut closed_tool_messages: Vec<(String, Vec<Value>)> = Vec::new();
             for run in s.agent_runs.iter_mut().filter(|run| {
