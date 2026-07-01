@@ -82,12 +82,27 @@ fn stream_thinking_provider_data(summary: &str) -> Value {
     })
 }
 
+fn provider_data_has_thinking_cards(provider_data: &Option<Value>) -> bool {
+    let Some(root) = provider_data.as_ref() else {
+        return false;
+    };
+    [
+        root.get("thinkingCards"),
+        root.pointer("/responses/thinkingCards"),
+        root.pointer("/anthropic/thinkingCards"),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| value.as_array().is_some_and(|items| !items.is_empty()))
+}
+
 #[derive(Clone)]
 struct DesktopVisibleStreamState {
     message: Arc<Mutex<ChatMessage>>,
     parser: Arc<Mutex<PlannerVisibleContentStream>>,
     thinking_buffer: Arc<Mutex<String>>,
-    emitted_visible_text: Arc<AtomicBool>,
+    emitted_any_delta: Arc<AtomicBool>,
+    emitted_answer_text: Arc<AtomicBool>,
     conversation_id: String,
     source: String,
 }
@@ -103,16 +118,18 @@ impl DesktopVisibleStreamState {
             ))),
             parser: Arc::new(Mutex::new(PlannerVisibleContentStream::default())),
             thinking_buffer: Arc::new(Mutex::new(String::new())),
-            emitted_visible_text: Arc::new(AtomicBool::new(false)),
+            emitted_any_delta: Arc::new(AtomicBool::new(false)),
+            emitted_answer_text: Arc::new(AtomicBool::new(false)),
             conversation_id: conversation_id.to_string(),
             source: source.to_string(),
         }
     }
 
     fn reset_for_next_llm_call(&self) {
-        if !self.emitted_visible_text.swap(false, Ordering::SeqCst) {
+        if !self.emitted_any_delta.swap(false, Ordering::SeqCst) {
             return;
         }
+        self.emitted_answer_text.store(false, Ordering::SeqCst);
         if let Ok(mut message) = self.message.lock() {
             *message = ChatMessage::new(
                 self.conversation_id.clone(),
@@ -127,6 +144,44 @@ impl DesktopVisibleStreamState {
         if let Ok(mut buffer) = self.thinking_buffer.lock() {
             buffer.clear();
         }
+    }
+
+    fn emit_provider_thinking_if_idle(
+        &self,
+        app: Option<&AppHandle>,
+        persona_id: &str,
+        provider_data: &Option<Value>,
+    ) {
+        if self.emitted_any_delta.load(Ordering::SeqCst)
+            || !provider_data_has_thinking_cards(provider_data)
+        {
+            return;
+        }
+        let Some(app) = app else {
+            return;
+        };
+        self.emitted_any_delta.store(true, Ordering::SeqCst);
+        let message = {
+            let mut message = self
+                .message
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            message.created_at = now_iso();
+            message.provider_data = provider_data.clone();
+            message.clone()
+        };
+        let _ = app.emit(
+            "synthchat-chat-event",
+            json!({
+                "type": "assistant_thinking_stream",
+                "source": &self.source,
+                "personaId": persona_id,
+                "conversationId": &self.conversation_id,
+                "message": message,
+                "delta": "",
+                "isLast": false,
+            }),
+        );
     }
 }
 
@@ -146,7 +201,8 @@ fn desktop_visible_stream_callback(
         return (existing, stream_state);
     };
     let callback_message = Arc::clone(&stream_state.message);
-    let callback_started = Arc::clone(&stream_state.emitted_visible_text);
+    let callback_started = Arc::clone(&stream_state.emitted_any_delta);
+    let callback_answer_started = Arc::clone(&stream_state.emitted_answer_text);
     let callback_existing = existing.clone();
     let callback_parser = Arc::clone(&stream_state.parser);
     let callback_thinking_buffer = Arc::clone(&stream_state.thinking_buffer);
@@ -201,6 +257,7 @@ fn desktop_visible_stream_callback(
             return Ok(());
         }
         let is_first_visible_delta = !callback_started.swap(true, Ordering::SeqCst);
+        callback_answer_started.store(true, Ordering::SeqCst);
         let message = {
             let mut message = callback_message
                 .lock()
@@ -1523,6 +1580,11 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
             .unwrap_or("final")
         {
             "tool" => {
+                desktop_stream_state.emit_provider_thinking_if_idle(
+                    desktop_app,
+                    &persona.id,
+                    &reply.provider_data,
+                );
                 let requests = planned_tool_requests_from_decision(&decision);
                 if requests.is_empty() {
                     observations.push(format!(
@@ -2434,6 +2496,11 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
                     .unwrap_or(reply.content.trim())
                     .to_string();
                 assistant_provider_data = reply.provider_data.clone();
+                desktop_stream_state.emit_provider_thinking_if_idle(
+                    desktop_app,
+                    &persona.id,
+                    &assistant_provider_data,
+                );
                 assistant_model = reply.model.clone();
                 assistant_provider_id = reply.provider_id.clone();
                 assistant_prompt_tokens = reply.prompt_tokens;
@@ -2507,8 +2574,11 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         assistant_text.clone(),
         "desktop-agent",
     );
-    if assistant_streamed_visible_text.load(Ordering::SeqCst) {
-        if let Ok(streaming_message) = streaming_assistant_message.lock() {
+    if desktop_stream_state
+        .emitted_answer_text
+        .load(Ordering::SeqCst)
+    {
+        if let Ok(streaming_message) = desktop_stream_state.message.lock() {
             assistant_message.id = streaming_message.id.clone();
             assistant_message.created_at = streaming_message.created_at.clone();
         }
@@ -2636,7 +2706,10 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         );
     }
     if let Some(app) = app.filter(|_| pet_event_source != "wechat") {
-        if assistant_streamed_visible_text.load(Ordering::SeqCst) {
+        if desktop_stream_state
+            .emitted_answer_text
+            .load(Ordering::SeqCst)
+        {
             emit_assistant_stream_event(
                 app,
                 &conversation.id,

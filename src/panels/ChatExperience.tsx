@@ -993,8 +993,52 @@ function materializeMessageRenderItem(message: ChatMessage): MessageRenderItem[]
   return items;
 }
 
+function thinkingCardsSignature(cards: ThinkingCard[]) {
+  return cards
+    .map((card) => [
+      card.provider,
+      card.kind,
+      card.summary.trim(),
+      card.redacted ? "redacted" : "",
+      card.encrypted ? "encrypted" : ""
+    ].filter(Boolean).join(":"))
+    .filter(Boolean)
+    .join("|");
+}
+
 function materializeMessageRenderItems(messages: ChatMessage[]): MessageRenderItem[] {
-  return messages.flatMap(materializeMessageRenderItem);
+  const items: MessageRenderItem[] = [];
+  let lastThinkingSignature = "";
+  let previousItemWasThinking = false;
+  for (const message of messages) {
+    const nextItems = materializeMessageRenderItem(message);
+    const first = nextItems[0];
+    if (first?.mode === "thinking") {
+      const signature = thinkingCardsSignature(first.cards ?? []);
+      if (
+        signature
+        && (
+          previousItemWasThinking
+          || (first.message.role === "tool" && signature === lastThinkingSignature)
+        )
+      ) {
+        nextItems.shift();
+      }
+    }
+    for (const item of nextItems) {
+      items.push(item);
+      if (item.mode === "thinking") {
+        lastThinkingSignature = thinkingCardsSignature(item.cards ?? []);
+        previousItemWasThinking = true;
+      } else {
+        previousItemWasThinking = false;
+        if (item.message.role !== "tool") {
+          lastThinkingSignature = "";
+        }
+      }
+    }
+  }
+  return items;
 }
 
 export const ChatExperience = memo(function ChatExperience() {
@@ -3296,11 +3340,11 @@ const MessageRow = memo(function MessageRow({
   emojiPathIndexes: EmojiPathIndexes;
 }) {
   const [previewSrc, setPreviewSrc] = useState<string | null>(null);
-  const parsedToolEvent = message.role === "tool" ? parseToolEvent(message.content) : null;
+  const parsedToolEvent = mode !== "thinking" && message.role === "tool" ? parseToolEvent(message.content) : null;
   const toolEvent = parsedToolEvent
     ? materializeToolEvent(withToolEventStartedAt(parsedToolEvent, message.createdAt), parsedToolEvent.runId ? runStates.get(parsedToolEvent.runId) : null)
     : null;
-  const processEvent = message.role === "tool" ? parseManagedProcessEvent(message.content) : null;
+  const processEvent = mode !== "thinking" && message.role === "tool" ? parseManagedProcessEvent(message.content) : null;
   const isUser = message.role === "user";
   const rawThinkingCards = thinkingCardsOverride ?? messageThinkingCards(message);
   const thinkingCards = mode !== "content" ? rawThinkingCards : [];
