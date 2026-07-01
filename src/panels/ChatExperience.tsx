@@ -1,5 +1,5 @@
 import { memo, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { emit, emitTo, listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
@@ -43,8 +43,9 @@ import {
 import { api, isTauri } from "../lib/api";
 import { displayTextForMessage, renderTextForMessage, speechTextForMessage } from "../lib/messageText";
 import { resolvePersonaAgentBinding, resolvePersonaBoundAgent } from "../lib/personaAgentBinding";
+import { PET_THINKING_STATE_EVENT, publishPetThinkingState, type PetThinkingState } from "../lib/petContext";
 import { useAppStore } from "../lib/store";
-import type { AgentControlCommand, AgentDefinition, AgentRunPhase, AgentRunRecord, AgentRuntimeEvent, ChatAttachment, ChatMessage, LlmProvider, ManagedProcessEvent, ModelCatalogEntry, ToolEvent, ToolEventEnvelope } from "../lib/types";
+import type { AgentControlCommand, AgentDefinition, AgentRunPhase, AgentRunRecord, AgentRuntimeEvent, ChatAttachment, ChatMessage, EmojiGroup, LlmProvider, ManagedProcessEvent, ModelCatalogEntry, ToolEvent, ToolEventEnvelope } from "../lib/types";
 import { Avatar } from "../components/common";
 
 type ComposerAttachment = ChatAttachment & {
@@ -76,9 +77,35 @@ type ArtifactTarget = {
   source: string;
 };
 
+type EmojiPathIndexes = {
+  byPath: Map<string, string>;
+  byFile: Map<string, string>;
+};
+
 type ShortMemoryMessageStat = {
   label: string;
   tone: "tokens" | "messages";
+};
+
+type ThinkingCard = {
+  key: string;
+  provider: string;
+  kind: string;
+  title: string;
+  summary: string;
+  redacted: boolean;
+  encrypted: boolean;
+  streaming: boolean;
+};
+
+type MessageRenderMode = "normal" | "thinking" | "content";
+
+type MessageRenderItem = {
+  key: string;
+  elementId: string;
+  message: ChatMessage;
+  mode: MessageRenderMode;
+  cards?: ThinkingCard[];
 };
 
 const DEFAULT_RENDERED_MESSAGES = 180;
@@ -669,6 +696,47 @@ function fileNameFromPath(path: string) {
   return path.split(/[\\/]/).pop() || path;
 }
 
+function normalizeEmojiPathKey(path: string): string {
+  return path.replace(/\//g, "\\").toLowerCase();
+}
+
+function isEmojiAssetPath(path: string): boolean {
+  return normalizeEmojiPathKey(path).includes("\\emoji\\");
+}
+
+function buildEmojiPathIndexes(groups: EmojiGroup[]): EmojiPathIndexes {
+  const byPath = new Map<string, string>();
+  const byFile = new Map<string, string>();
+  for (const group of groups) {
+    const imagePaths = Object.values(group.emotionImages ?? {}).flat();
+    const candidates = imagePaths.length > 0 ? imagePaths : group.images;
+    for (const imagePath of candidates) {
+      byPath.set(normalizeEmojiPathKey(imagePath), imagePath);
+      const normalized = normalizeEmojiPathKey(imagePath);
+      const markerIndex = normalized.indexOf("\\emoji\\");
+      if (markerIndex < 0) continue;
+      const segments = normalized.slice(markerIndex + "\\emoji\\".length).split("\\").filter(Boolean);
+      if (segments.length < 3) continue;
+      const [groupId, emotionId, fileName] = segments;
+      byFile.set(`${groupId}::${emotionId}::${fileName}`, imagePath);
+    }
+  }
+  return { byPath, byFile };
+}
+
+function repairEmojiAssetPath(path: string, indexes: EmojiPathIndexes): string {
+  const normalized = normalizeEmojiPathKey(path);
+  const exact = indexes.byPath.get(normalized);
+  if (exact) return exact;
+  const marker = "\\emoji\\";
+  const markerIndex = normalized.indexOf(marker);
+  if (markerIndex < 0) return path;
+  const segments = normalized.slice(markerIndex + marker.length).split("\\").filter(Boolean);
+  if (segments.length < 3) return path;
+  const [groupId, emotionId, fileName] = segments;
+  return indexes.byFile.get(`${groupId}::${emotionId}::${fileName}`) ?? path;
+}
+
 function artifactKind(path: string, mimeType?: string | null): ArtifactTarget["kind"] {
   const lower = path.toLowerCase();
   if (mimeType?.startsWith("image/")) return "image";
@@ -720,7 +788,8 @@ const MessageList = memo(function MessageList({
   streamCharsPerSecond,
   onMessageAnimationDone,
   memoryStats,
-  runStates
+  runStates,
+  emojiPathIndexes
 }: {
   messages: ChatMessage[];
   profileName: string;
@@ -736,8 +805,9 @@ const MessageList = memo(function MessageList({
   onMessageAnimationDone: (messageId: string) => void;
   memoryStats: Map<string, ShortMemoryMessageStat>;
   runStates: Map<string, string>;
+  emojiPathIndexes: EmojiPathIndexes;
 }) {
-  const visibleMessages = useMemo(() => {
+  const renderItems = useMemo(() => {
     const sliced = messages;
     const selectedToolMessages = new Map<string, { index: number; event: ToolEvent; message: ChatMessage }>();
     const toolKeys = new Map<string, string>();
@@ -781,27 +851,33 @@ const MessageList = memo(function MessageList({
       }
       deduped.push(msg);
     }
-    return deduped;
+    return materializeMessageRenderItems(deduped);
   }, [messages, runStates]);
   return (
     <>
-      {visibleMessages.map((message) => (
+      {renderItems.map((item) => (
         <MessageRow
-          key={message.id}
-          message={message}
+          key={item.key}
+          message={item.message}
+          mode={item.mode}
+          elementId={item.elementId}
+          thinkingCardsOverride={item.cards}
           profileName={profileName}
           profileAvatar={profileAvatar}
           personaName={personaName}
           personaAvatar={personaAvatar}
-          copied={copiedMessageId === message.id}
-          onCopy={() => onCopy(message)}
+          copied={item.mode !== "thinking" && copiedMessageId === item.message.id}
+          onCopy={() => onCopy(item.message)}
           previewCharLimit={previewCharLimit}
-          onFirstStreamChar={onFirstStreamChar}
-          animateText={animatedMessageIds.has(message.id)}
+          onFirstStreamChar={item.mode === "thinking" ? undefined : onFirstStreamChar}
+          animateText={item.mode !== "thinking" && animatedMessageIds.has(item.message.id)}
           streamCharsPerSecond={streamCharsPerSecond}
-          onAnimationDone={() => onMessageAnimationDone(message.id)}
-          memoryStat={memoryStats.get(message.id) ?? null}
+          onAnimationDone={() => {
+            if (item.mode !== "thinking") onMessageAnimationDone(item.message.id);
+          }}
+          memoryStat={item.mode === "thinking" ? null : memoryStats.get(item.message.id) ?? null}
           runStates={runStates}
+          emojiPathIndexes={emojiPathIndexes}
         />
       ))}
     </>
@@ -817,6 +893,108 @@ function providerModelOptions(providers: LlmProvider[]) {
       model: provider.model,
       label: provider.model || "未配置模型"
     }));
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function arrayValue(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function thinkingCardsFromProviderData(providerData: unknown): ThinkingCard[] {
+  const root = recordValue(providerData);
+  if (!root) return [];
+  const candidates = [
+    ...arrayValue(root.thinkingCards),
+    ...arrayValue(recordValue(root.responses)?.thinkingCards),
+    ...arrayValue(recordValue(root.anthropic)?.thinkingCards)
+  ];
+  return candidates
+    .map((item, index) => {
+      const card = recordValue(item);
+      if (!card) return null;
+      const summary = typeof card.summary === "string" ? card.summary.trim() : "";
+      const redacted = card.redacted === true;
+      const encrypted = card.encrypted === true || card.signature === true;
+      const streaming = card.streaming === true;
+      if (!summary && !redacted && !encrypted) return null;
+      const provider = typeof card.provider === "string" && card.provider.trim() ? card.provider.trim() : "";
+      const kind = typeof card.kind === "string" && card.kind.trim() ? card.kind.trim() : "thinking";
+      const title = typeof card.title === "string" && card.title.trim() ? card.title.trim() : "模型思考";
+      return {
+        key: `${provider || "provider"}:${kind}:${index}`,
+        provider,
+        kind,
+        title,
+        summary,
+        redacted,
+        encrypted,
+        streaming
+      };
+    })
+    .filter((card): card is ThinkingCard => card !== null);
+}
+
+function messageThinkingCards(message: ChatMessage) {
+  return thinkingCardsFromProviderData(message.providerData);
+}
+
+function stripThinkingCardsFromText(text: string, cards: ThinkingCard[]): string {
+  let output = text;
+  for (const card of cards) {
+    const summary = card.summary.trim();
+    if (summary.length < 8) continue;
+    output = output.split(summary).join("");
+  }
+  return output
+    .split(/\n/)
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function visibleMessageText(message: ChatMessage): string {
+  const base = message.content.trim();
+  if (message.role === "user" || message.role === "tool" || message.role === "system") return base;
+  const cards = messageThinkingCards(message);
+  return cards.length > 0 ? stripThinkingCardsFromText(base, cards) : base;
+}
+
+function messageRenderItem(message: ChatMessage, mode: MessageRenderMode = "normal", cards?: ThinkingCard[]): MessageRenderItem {
+  const suffix = mode === "normal" ? "" : `:${mode}`;
+  return {
+    key: `${message.id}${suffix}`,
+    elementId: `${message.id}${suffix}`,
+    message,
+    mode,
+    cards
+  };
+}
+
+function materializeMessageRenderItem(message: ChatMessage): MessageRenderItem[] {
+  if (message.role === "tool") {
+    const cards = messageThinkingCards(message);
+    return cards.length > 0
+      ? [messageRenderItem(message, "thinking", cards), messageRenderItem(message)]
+      : [messageRenderItem(message)];
+  }
+  if (message.role !== "assistant") return [messageRenderItem(message)];
+  const cards = messageThinkingCards(message);
+  if (cards.length === 0) return [messageRenderItem(message)];
+  const items = [messageRenderItem(message, "thinking", cards)];
+  if (visibleMessageText(message)) {
+    items.push(messageRenderItem(message, "content"));
+  }
+  return items;
+}
+
+function materializeMessageRenderItems(messages: ChatMessage[]): MessageRenderItem[] {
+  return messages.flatMap(materializeMessageRenderItem);
 }
 
 export const ChatExperience = memo(function ChatExperience() {
@@ -841,6 +1019,7 @@ export const ChatExperience = memo(function ChatExperience() {
   const profile = useAppStore((state) => state.profile);
   const createConversation = useAppStore((state) => state.createConversation);
   const deleteConversation = useAppStore((state) => state.deleteConversation);
+  const refreshMemories = useAppStore((state) => state.refreshMemories);
   const selectConversation = useAppStore((state) => state.selectConversation);
   const sendMessage = useAppStore((state) => state.sendMessage);
   const setConversationProcessing = useAppStore((state) => state.setConversationProcessing);
@@ -1003,7 +1182,7 @@ export const ChatExperience = memo(function ChatExperience() {
       }
       const roundMessages = dialogueMessages.slice(startIndex);
       if (mode === "tokens") {
-        const roundTokens = roundMessages.reduce((t, m) => t + estimateMessageTokens(m.content), state?.summaryTokens ?? 0);
+        const roundTokens = roundMessages.reduce((t, m) => t + estimateMessageTokens(visibleMessageText(m)), state?.summaryTokens ?? 0);
         if (roundTokens >= budget) {
           setCompactionTipVisible(true);
           setCompactionRoundTokens(roundTokens);
@@ -1025,7 +1204,7 @@ export const ChatExperience = memo(function ChatExperience() {
       // fallback: full count
       if (cancelled) return;
       if (mode === "tokens") {
-        const total = dialogueMessages.reduce((t, m) => t + estimateMessageTokens(m.content), 0);
+        const total = dialogueMessages.reduce((t, m) => t + estimateMessageTokens(visibleMessageText(m)), 0);
         if (total >= budget) {
           setCompactionTipVisible(true);
           setCompactionRoundTokens(total);
@@ -1276,6 +1455,7 @@ export const ChatExperience = memo(function ChatExperience() {
   const selectedModelKey = currentProvider && effectiveModelValue
     ? `${currentProvider.id}::${effectiveModelValue}`
     : "";
+  const emojiPathIndexes = useMemo(() => buildEmojiPathIndexes(emojiGroups), [emojiGroups]);
   const artifacts = useMemo(() => {
     const results: ArtifactTarget[] = [];
     const seen = new Set<string>();
@@ -1346,6 +1526,27 @@ export const ChatExperience = memo(function ChatExperience() {
     return () => window.clearTimeout(timer);
   }, [isProcessing, hasStreamingContent, thinkingMinVisibleMs, firstCharShown]);
 
+  useEffect(() => {
+    if (!activeConversationId) return;
+    const state: PetThinkingState = {
+      conversationId: activeConversationId,
+      personaId: activeConversation?.personaId ?? selectedPersona?.id ?? null,
+      source: "desktop-ui",
+      thinking: showThinking,
+      updatedAt: new Date().toISOString()
+    };
+    publishPetThinkingState(state);
+    void emit(PET_THINKING_STATE_EVENT, state).catch(() => undefined);
+    void emitTo("pet", PET_THINKING_STATE_EVENT, state).catch(() => undefined);
+    void emitTo("pet", "synthchat-pet-event", {
+      type: showThinking ? "thinking_started" : "thinking_finished",
+      source: state.source,
+      personaId: state.personaId,
+      conversationId: activeConversationId,
+      ok: !showThinking
+    }).catch(() => undefined);
+  }, [activeConversation?.personaId, activeConversationId, selectedPersona?.id, showThinking]);
+
   // Drive mount/unmount with an exit animation: mount immediately when
   // showThinking turns on; when it turns off keep the node mounted with the
   // leaving class long enough for the exit transition to finish, then unmount.
@@ -1378,9 +1579,10 @@ export const ChatExperience = memo(function ChatExperience() {
     const next = new Map<string, string>();
     const changedAssistantIds: string[] = [];
     for (const message of messages) {
-      next.set(message.id, message.content);
-      if (message.role !== "assistant" || !message.content.trim()) continue;
-      if (previous.size > 0 && previous.get(message.id) !== message.content) {
+      const visibleContent = visibleMessageText(message);
+      next.set(message.id, visibleContent);
+      if (message.role !== "assistant" || !visibleContent.trim()) continue;
+      if (previous.size > 0 && previous.get(message.id) !== visibleContent) {
         changedAssistantIds.push(message.id);
       }
     }
@@ -1626,11 +1828,15 @@ export const ChatExperience = memo(function ChatExperience() {
       const result = await deleteConversation(conversationId);
       if (result.status === "failed") {
         console.warn("Conversation deleted, but memory settling failed:", result.reason);
+      } else if (result.status === "scheduled") {
+        window.setTimeout(() => void refreshMemories(), 1500);
+      } else {
+        void refreshMemories();
       }
     } finally {
       setSettlingConversationId((current) => current === conversationId ? null : current);
     }
-  }, [deleteConversation, settlingConversationId]);
+  }, [deleteConversation, refreshMemories, settlingConversationId]);
 
   // Mark conversation switch for instant scroll
   useEffect(() => {
@@ -2272,7 +2478,7 @@ export const ChatExperience = memo(function ChatExperience() {
   };
 
   const copyMessage = async (message: ChatMessage) => {
-    const text = displayTextForMessage(message.content.trim());
+    const text = displayTextForMessage(visibleMessageText(message));
     if (text) await navigator.clipboard?.writeText(text);
     setCopiedMessageId(message.id);
     window.setTimeout(() => setCopiedMessageId(null), 1200);
@@ -2314,7 +2520,7 @@ export const ChatExperience = memo(function ChatExperience() {
 
   const sendEmojiImage = (path: string) => {
     const mime = imageMimeType(path);
-    const marker = `[media attached: ${path} (${mime})]`;
+    const marker = `[media attached: "${path}" (${mime})]`;
     setDraft((current) => [current.trim(), marker].filter(Boolean).join("\n\n"));
     setEmojiPickerOpen(false);
   };
@@ -2526,6 +2732,7 @@ export const ChatExperience = memo(function ChatExperience() {
                     onMessageAnimationDone={handleMessageAnimationDone}
                     memoryStats={shortMemoryStats}
                     runStates={runStates}
+                    emojiPathIndexes={emojiPathIndexes}
                   />
                 </>
               )}
@@ -3051,6 +3258,9 @@ const EmojiPicker = memo(function EmojiPicker({
 
 const MessageRow = memo(function MessageRow({
   message,
+  mode,
+  elementId,
+  thinkingCardsOverride,
   profileName,
   profileAvatar,
   personaName,
@@ -3063,9 +3273,13 @@ const MessageRow = memo(function MessageRow({
   streamCharsPerSecond,
   onAnimationDone,
   memoryStat,
-  runStates
+  runStates,
+  emojiPathIndexes
 }: {
   message: ChatMessage;
+  mode: MessageRenderMode;
+  elementId: string;
+  thinkingCardsOverride?: ThinkingCard[];
   profileName: string;
   profileAvatar: string;
   personaName: string;
@@ -3079,6 +3293,7 @@ const MessageRow = memo(function MessageRow({
   onAnimationDone: () => void;
   memoryStat: ShortMemoryMessageStat | null;
   runStates: Map<string, string>;
+  emojiPathIndexes: EmojiPathIndexes;
 }) {
   const [previewSrc, setPreviewSrc] = useState<string | null>(null);
   const parsedToolEvent = message.role === "tool" ? parseToolEvent(message.content) : null;
@@ -3087,8 +3302,13 @@ const MessageRow = memo(function MessageRow({
     : null;
   const processEvent = message.role === "tool" ? parseManagedProcessEvent(message.content) : null;
   const isUser = message.role === "user";
-  const text = previewText(renderTextForMessage(message.content.trim()), previewCharLimit);
-  const canRevealText = !isUser && !toolEvent && !processEvent;
+  const rawThinkingCards = thinkingCardsOverride ?? messageThinkingCards(message);
+  const thinkingCards = mode !== "content" ? rawThinkingCards : [];
+  const visibleText = !isUser && rawThinkingCards.length > 0
+    ? stripThinkingCardsFromText(message.content.trim(), rawThinkingCards)
+    : message.content.trim();
+  const text = mode === "thinking" ? "" : previewText(renderTextForMessage(visibleText), previewCharLimit);
+  const canRevealText = mode !== "thinking" && !isUser && !toolEvent && !processEvent;
   const isLiveStreaming = canRevealText && message.source === "desktop-stream";
   const [settlingAfterStream, setSettlingAfterStream] = useState(isLiveStreaming);
   useEffect(() => {
@@ -3103,9 +3323,9 @@ const MessageRow = memo(function MessageRow({
   if (toolEvent && isCanceledToolEvent(toolEvent)) return null;
   if (toolEvent) return <ToolMessage event={toolEvent} />;
   if (processEvent) return <ManagedProcessMessage event={processEvent} />;
-  if (!text) return null;
+  if (!text && thinkingCards.length === 0) return null;
   return (
-    <div className={isUser ? "claw-message-row user" : "claw-message-row assistant"} data-message-id={message.id}>
+    <div className={isUser ? "claw-message-row user" : "claw-message-row assistant"} data-message-id={elementId}>
       <Avatar
         name={isUser ? profileName : personaName}
         src={isUser && profileAvatar ? api.assetUrl(profileAvatar) : !isUser && personaAvatar ? api.assetUrl(personaAvatar) : ""}
@@ -3115,10 +3335,19 @@ const MessageRow = memo(function MessageRow({
           <span>{isUser ? profileName : personaName}</span>
           <small>{formatTime(message.createdAt)}{message.source === "wechat" ? " · 微信" : ""}</small>
         </div>
-        <div className={isUser ? "claw-bubble user" : revealText ? "claw-bubble assistant streaming" : "claw-bubble assistant"}>
-          <MarkdownLite text={displayText} onImageClick={setPreviewSrc} streaming={revealText} onFirstChar={onFirstStreamChar} />
-        </div>
-        {!isUser ? (
+        {thinkingCards.length > 0 ? <ThinkingCards cards={thinkingCards} /> : null}
+        {text ? (
+          <div className={isUser ? "claw-bubble user" : revealText ? "claw-bubble assistant streaming" : "claw-bubble assistant"}>
+            <MarkdownLite
+              text={displayText}
+              onImageClick={setPreviewSrc}
+              streaming={revealText}
+              onFirstChar={onFirstStreamChar}
+              emojiPathIndexes={emojiPathIndexes}
+            />
+          </div>
+        ) : null}
+        {!isUser && mode !== "thinking" ? (
           <div className="claw-message-actions">
             {memoryStat ? (
               <span className={`claw-memory-stat ${memoryStat.tone}`}>
@@ -3134,6 +3363,43 @@ const MessageRow = memo(function MessageRow({
         ) : null}
       </div>
       {previewSrc ? <ImagePreviewModal src={previewSrc} onClose={() => setPreviewSrc(null)} /> : null}
+    </div>
+  );
+});
+
+const ThinkingCards = memo(function ThinkingCards({ cards }: { cards: ThinkingCard[] }) {
+  return (
+    <div className="claw-thinking-card-stack">
+      {cards.map((card) => (
+        <ThinkingCardView card={card} key={card.key} />
+      ))}
+    </div>
+  );
+});
+
+const ThinkingCardView = memo(function ThinkingCardView({ card }: { card: ThinkingCard }) {
+  const [expanded, setExpanded] = useState(card.streaming);
+  const providerLabel = card.provider === "anthropic"
+    ? "Anthropic"
+    : card.provider === "openai_responses"
+      ? "Responses"
+      : "Reasoning";
+  const detail = card.summary || (card.redacted ? "服务商返回了受保护的思考内容，当前仅展示占位，不显示原始链路。" : "");
+  return (
+    <div className={`claw-thinking-card${expanded ? " claw-thinking-card--expanded" : ""}`}>
+      <button className="claw-thinking-card-head" onClick={() => setExpanded((value) => !value)} type="button">
+        <Brain size={15} />
+        <strong>{card.title}</strong>
+        <small>{[providerLabel, card.streaming ? "思考中" : card.redacted ? "已隐藏" : "摘要"].filter(Boolean).join(" · ")}</small>
+        <span className={`claw-tool-chevron${expanded ? " claw-tool-chevron--open" : ""}`}>
+          <ChevronRight size={14} />
+        </span>
+      </button>
+      <div className={`claw-thinking-card-body${expanded ? " claw-thinking-card-body--open" : ""}`}>
+        <div className="claw-thinking-card-inner">
+          <p>{detail}</p>
+        </div>
+      </div>
     </div>
   );
 });
@@ -3195,11 +3461,33 @@ function imageMimeType(path: string): string {
   return "image/png";
 }
 
-const InlineImage = memo(function InlineImage({ path, onClick }: { path: string; onClick: (path: string) => void }) {
+const InlineImage = memo(function InlineImage({
+  path,
+  onClick,
+  emojiPathIndexes
+}: {
+  path: string;
+  onClick: (path: string) => void;
+  emojiPathIndexes: EmojiPathIndexes;
+}) {
+  const isEmojiAsset = isEmojiAssetPath(path);
+  const repairedPath = isEmojiAsset ? repairEmojiAssetPath(path, emojiPathIndexes) : path;
+  const repairedKnown = emojiPathIndexes.byPath.has(normalizeEmojiPathKey(repairedPath));
+  const [failedPath, setFailedPath] = useState<string | null>(null);
+  useEffect(() => {
+    setFailedPath(null);
+  }, [repairedPath]);
+  if (isEmojiAsset && !repairedKnown) return null;
+  if (failedPath === repairedPath) return null;
   return (
-    <div className="claw-inline-image" onClick={() => onClick(path)} role="button" tabIndex={0}
-      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onClick(path); }}>
-      <img src={api.assetUrl(path)} alt={fileNameFromPath(path)} loading="lazy" />
+    <div className="claw-inline-image" onClick={() => onClick(repairedPath)} role="button" tabIndex={0}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onClick(repairedPath); }}>
+      <img
+        src={api.assetUrl(repairedPath)}
+        alt={fileNameFromPath(repairedPath)}
+        loading="lazy"
+        onError={() => setFailedPath(repairedPath)}
+      />
     </div>
   );
 });
@@ -3214,7 +3502,19 @@ const InlineFile = memo(function InlineFile({ path, mimeType }: { path: string; 
   );
 });
 
-const MarkdownLite = memo(function MarkdownLite({ text, onImageClick, streaming, onFirstChar }: { text: string; onImageClick?: (path: string) => void; streaming?: boolean; onFirstChar?: () => void }) {
+const MarkdownLite = memo(function MarkdownLite({
+  text,
+  onImageClick,
+  streaming,
+  onFirstChar,
+  emojiPathIndexes
+}: {
+  text: string;
+  onImageClick?: (path: string) => void;
+  streaming?: boolean;
+  onFirstChar?: () => void;
+  emojiPathIndexes: EmojiPathIndexes;
+}) {
   const firstCharFiredRef = useRef(false);
 
   useEffect(() => {
@@ -3234,7 +3534,7 @@ const MarkdownLite = memo(function MarkdownLite({ text, onImageClick, streaming,
     <>
       {segments.map((seg, i) => {
         if (seg.kind === "image") {
-          return <InlineImage key={i} path={seg.path} onClick={handleClick} />;
+          return <InlineImage key={i} path={seg.path} onClick={handleClick} emojiPathIndexes={emojiPathIndexes} />;
         }
         if (seg.kind === "file") {
           return <InlineFile key={i} path={seg.path} mimeType={seg.mimeType} />;

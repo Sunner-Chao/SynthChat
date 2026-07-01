@@ -59,6 +59,10 @@ pub(super) async fn complete_openai_compatible(
         "temperature": persona.temperature,
         "max_tokens": persona.max_tokens
     });
+    if !options.thinking_enabled {
+        body["reasoning_effort"] = json!("none");
+        body["enable_thinking"] = json!(false);
+    }
     if options.fast_mode_enabled {
         body["service_tier"] = json!("priority");
     }
@@ -348,7 +352,7 @@ fn handle_openai_sse_line(
         .filter(|delta| !delta.is_empty())
     {
         content.push_str(delta);
-        callback(delta)?;
+        callback(LlmStreamDeltaKind::Answer, delta)?;
     }
     track_openai_stream_tool_calls(&payload, tool_calls);
     if let Some(reason) = payload
@@ -718,6 +722,14 @@ pub(super) fn openai_unsupported_parameter_retry_body(
         Some("service_tier") => {
             object.remove("service_tier")?;
         }
+        Some("reasoning_effort") => {
+            object.remove("reasoning_effort")?;
+            object.remove("enable_thinking");
+        }
+        Some("enable_thinking") => {
+            object.remove("enable_thinking")?;
+            object.remove("reasoning_effort");
+        }
         _ => {
             if unsupported_parameter_error_mentions(&lower, "temperature") {
                 object.remove("temperature")?;
@@ -732,6 +744,12 @@ pub(super) fn openai_unsupported_parameter_retry_body(
                 object.remove("parallel_tool_calls")?;
             } else if unsupported_parameter_error_mentions(&lower, "service_tier") {
                 object.remove("service_tier")?;
+            } else if unsupported_parameter_error_mentions(&lower, "reasoning_effort") {
+                object.remove("reasoning_effort")?;
+                object.remove("enable_thinking");
+            } else if unsupported_parameter_error_mentions(&lower, "enable_thinking") {
+                object.remove("enable_thinking")?;
+                object.remove("reasoning_effort");
             } else {
                 return None;
             }

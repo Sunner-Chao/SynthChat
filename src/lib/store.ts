@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { emit, emitTo } from "@tauri-apps/api/event";
 import { api } from "./api";
 import type {
   AgentDefinition,
@@ -61,6 +62,27 @@ function withinProcessingGrace(conversationId: string | null): boolean {
   const markedAt = processingMarkedAtCache.get(conversationId);
   return markedAt !== undefined && Date.now() - markedAt < PROCESSING_MARK_GRACE_MS;
 }
+
+function emitPetThinkingEvent(
+  type: "thinking_started" | "thinking_finished",
+  conversationId: string | null | undefined,
+  personaId: string | null | undefined,
+  ok?: boolean,
+  message?: ChatMessage | null
+) {
+  if (!conversationId) return;
+  const payload = {
+    type,
+    source: "desktop",
+    personaId: personaId ?? null,
+    conversationId,
+    ok,
+    message: message ?? undefined
+  };
+  void emit("synthchat-pet-event", payload).catch(() => undefined);
+  void emitTo("pet", "synthchat-pet-event", payload).catch(() => undefined);
+}
+
 export function consumePendingSettingsView(): string | null {
   const v = pendingSettingsViewRef;
   pendingSettingsViewRef = null;
@@ -182,6 +204,52 @@ function messageProviderDataRecord(message: ChatMessage): Record<string, unknown
     : null;
 }
 
+function providerDataRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function providerDataArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function providerDataThinkingCards(providerData: unknown): unknown[] {
+  const root = providerDataRecord(providerData);
+  if (!root) return [];
+  return [
+    ...providerDataArray(root.thinkingCards),
+    ...providerDataArray(providerDataRecord(root.responses)?.thinkingCards),
+    ...providerDataArray(providerDataRecord(root.anthropic)?.thinkingCards)
+  ];
+}
+
+function finalizedThinkingCards(cards: unknown[]) {
+  return cards.map((card) => {
+    const record = providerDataRecord(card);
+    return record ? { ...record, streaming: false } : card;
+  });
+}
+
+function preserveLiveThinkingCardsForFinalMessage(
+  message: ChatMessage,
+  previousMessage: ChatMessage | null,
+  options?: IncomingMessageUpsertOptions
+) {
+  if (!options?.final || message.role !== "assistant" || !previousMessage) return message;
+  if (providerDataThinkingCards(message.providerData).length > 0) return message;
+  const liveCards = providerDataThinkingCards(previousMessage.providerData);
+  if (liveCards.length === 0) return message;
+  const root = providerDataRecord(message.providerData);
+  return {
+    ...message,
+    providerData: {
+      ...(root ?? {}),
+      thinkingCards: finalizedThinkingCards(liveCards)
+    }
+  };
+}
+
 function isSilentPetOnlyMessage(message: ChatMessage) {
   const providerData = messageProviderDataRecord(message);
   return providerData?.silent === true
@@ -190,6 +258,7 @@ function isSilentPetOnlyMessage(message: ChatMessage) {
 
 function isVisibleChatMessage(message: ChatMessage) {
   if (isSilentPetOnlyMessage(message)) return false;
+  if (message.source === "desktop-agent-error") return false;
   return !(message.role === "user" && message.source === "proactive-internal");
 }
 
@@ -354,57 +423,6 @@ function hasPendingAgentWork(state: AppState, conversationId: string | null) {
       && !run.parentRunId
       && !TERMINAL_AGENT_STATES.has(run.state)
     );
-}
-
-function appendLocalAssistantNotice(
-  setState: (updater: (current: AppState) => Partial<AppState> | AppState) => void,
-  conversationId: string | null,
-  content: string,
-  source = "desktop-local-status"
-) {
-  if (!conversationId || !content.trim()) return;
-  setState((current) => {
-    if (current.messages.some((message) =>
-      message.conversationId === conversationId
-      && message.role === "assistant"
-      && message.source === source
-      && message.content === content
-    )) {
-      return current;
-    }
-    const now = new Date().toISOString();
-    const message: ChatMessage = {
-      id: `local-status-${crypto.randomUUID()}`,
-      conversationId,
-      role: "assistant",
-      content,
-      createdAt: now,
-      source,
-      accountId: null
-    };
-    return {
-      messages: displayMessages(
-        [...current.messages, message],
-        conversationMessageLimit(current.config, conversationId, current.conversationMessageLimits)
-      ),
-      conversations: current.conversations.map((conversation) =>
-        conversation.id === conversationId
-          ? { ...conversation, lastMessage: content, updatedAt: now }
-          : conversation
-      )
-    };
-  });
-}
-
-function compactErrorMessage(error: unknown) {
-  const raw = error instanceof Error
-    ? error.message
-    : typeof error === "string"
-      ? error
-      : String(error ?? "");
-  const text = raw.replace(/^bad request:\s*/i, "").trim();
-  if (!text) return "发送失败。";
-  return `发送失败：${text.length > 90 ? `${text.slice(0, 90)}...` : text}`;
 }
 
 function sameConversations(left: Conversation[], right: Conversation[]) {
@@ -1090,34 +1108,35 @@ export const useAppStore = create<AppState>((set, get) => ({
       const index = state.messages.findIndex((item) => item.id === message.id);
       const messageLimit = conversationMessageLimit(state.config, message.conversationId, state.conversationMessageLimits);
       const previousMessage = index >= 0 ? state.messages[index] : null;
+      const incomingMessage = preserveLiveThinkingCardsForFinalMessage(message, previousMessage, options);
       const shouldKeepStreamingPresentation =
-        message.role === "assistant"
+        incomingMessage.role === "assistant"
         && !options?.final
         && (
           options?.streaming
           || (
             previousMessage?.source === "desktop-stream"
-            && (state.streamedAssistantIds.has(message.id) || options?.final)
+            && (state.streamedAssistantIds.has(incomingMessage.id) || options?.final)
             && (
-              message.content.startsWith(previousMessage.content)
-              || previousMessage.content.startsWith(message.content)
+              incomingMessage.content.startsWith(previousMessage.content)
+              || previousMessage.content.startsWith(incomingMessage.content)
             )
           )
         );
       const nextMessage = shouldKeepStreamingPresentation
-        ? { ...message, source: options?.streaming ? "desktop-stream" : previousMessage?.source ?? "desktop-stream" }
-        : message;
+        ? { ...incomingMessage, source: options?.streaming ? "desktop-stream" : previousMessage?.source ?? "desktop-stream" }
+        : incomingMessage;
       const messages = index >= 0
-        ? state.messages.map((item) => (item.id === message.id ? nextMessage : item))
+        ? state.messages.map((item) => (item.id === incomingMessage.id ? nextMessage : item))
         : [...state.messages, nextMessage];
       let streamedAssistantIds = state.streamedAssistantIds;
-      if (message.role === "assistant") {
+      if (incomingMessage.role === "assistant") {
         if (options?.streaming) {
           streamedAssistantIds = new Set(streamedAssistantIds);
-          streamedAssistantIds.add(message.id);
-        } else if (options?.final && streamedAssistantIds.has(message.id)) {
+          streamedAssistantIds.add(incomingMessage.id);
+        } else if (options?.final && streamedAssistantIds.has(incomingMessage.id)) {
           streamedAssistantIds = new Set(streamedAssistantIds);
-          streamedAssistantIds.delete(message.id);
+          streamedAssistantIds.delete(incomingMessage.id);
         }
       }
       return { messages: displayMessages(messages, messageLimit), streamedAssistantIds };
@@ -1302,6 +1321,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const agentIdForSend = requestedAgentId && state.agents.some((item) => item.id === requestedAgentId)
       ? requestedAgentId
       : null;
+    emitPetThinkingEvent("thinking_started", conversationIdForSend, personaIdForSend);
     // 异步发送消息，不阻塞 UI
     void (async () => {
       try {
@@ -1315,8 +1335,15 @@ export const useAppStore = create<AppState>((set, get) => ({
           get().refreshAgentQueue(),
           get().refreshAgentRuns()
         ]);
-        const visibleResponseMessages = visibleChatMessages(responseMessages ?? []);
+        const visibleResponseMessages = visibleChatMessages(responseMessages ?? [])
+          .filter((message) => message.source !== "desktop-agent-error");
         const hasAssistantReply = visibleResponseMessages.some((m) => m.role === "assistant" && m.content.trim());
+        const assistantReply = visibleResponseMessages
+          .filter((m) => m.role === "assistant" && m.content.trim())
+          .at(-1) ?? null;
+        if (assistantReply) {
+          emitPetThinkingEvent("thinking_finished", conversationIdForSend, personaIdForSend, true, assistantReply);
+        }
         if (visibleResponseMessages.length > 0) {
           const currentState = get();
           const messageLimit = conversationMessageLimit(currentState.config, conversationIdForSend, currentState.conversationMessageLimits);
@@ -1360,8 +1387,11 @@ export const useAppStore = create<AppState>((set, get) => ({
         if (!hasNewerLocalUser && (hasAssistantReply || hasVisibleAssistant || !pendingWork)) {
           current.setConversationProcessing(conversationIdForSend ?? "", false);
         }
+        if (!hasNewerLocalUser && !assistantReply && !pendingWork) {
+          emitPetThinkingEvent("thinking_finished", conversationIdForSend, personaIdForSend, true);
+        }
         if (!hasNewerLocalUser && !hasAssistantReply && !hasVisibleAssistant && !pendingWork) {
-          appendLocalAssistantNotice(set, conversationIdForSend, "本轮对话没有返回。", "desktop-local-empty");
+          current.setConversationProcessing(conversationIdForSend ?? "", false);
         }
       } catch (error) {
         console.error("发送消息失败:", error);
@@ -1381,7 +1411,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         if (!hasNewerLocalUser) {
           current.setConversationProcessing(conversationIdForSend ?? "", false);
         }
-        appendLocalAssistantNotice(set, conversationIdForSend, compactErrorMessage(error), "desktop-local-error");
+        emitPetThinkingEvent("thinking_finished", conversationIdForSend, personaIdForSend, false);
+        // Keep transient transport errors out of the chat timeline. The backend
+        // owns visible assistant/error messages through synthchat-chat-event,
+        // and successful retries can still arrive as live stream events.
       }
     })();
   },

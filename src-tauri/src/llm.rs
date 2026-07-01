@@ -84,12 +84,20 @@ pub struct LlmReply {
     pub failover_attempts: Vec<LlmFailoverAttempt>,
 }
 
-pub type LlmDeltaCallback = Arc<dyn Fn(&str) -> AppResult<()> + Send + Sync>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmStreamDeltaKind {
+    Answer,
+    Thinking,
+}
+
+pub type LlmDeltaCallback =
+    Arc<dyn Fn(LlmStreamDeltaKind, &str) -> AppResult<()> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct LlmCallOptions {
     pub responses_reasoning_replay_enabled: bool,
     pub fast_mode_enabled: bool,
+    pub thinking_enabled: bool,
     pub stream_delta_callback: Option<LlmDeltaCallback>,
 }
 
@@ -101,6 +109,7 @@ impl std::fmt::Debug for LlmCallOptions {
                 &self.responses_reasoning_replay_enabled,
             )
             .field("fast_mode_enabled", &self.fast_mode_enabled)
+            .field("thinking_enabled", &self.thinking_enabled)
             .field(
                 "stream_delta_callback",
                 &self.stream_delta_callback.as_ref().map(|_| true),
@@ -114,6 +123,7 @@ impl Default for LlmCallOptions {
         Self {
             responses_reasoning_replay_enabled: true,
             fast_mode_enabled: false,
+            thinking_enabled: true,
             stream_delta_callback: None,
         }
     }
@@ -293,6 +303,111 @@ fn coerce_timeout_value(value: Option<&Value>) -> Option<f64> {
         }),
         _ => None,
     }
+}
+
+pub(super) fn provider_supports_responses_thinking(provider: &LlmProvider) -> bool {
+    if provider_supports_chat_completions_fallback_for_responses(provider) {
+        return false;
+    }
+    let base = provider_base_url(provider).to_ascii_lowercase();
+    let provider_type = provider.provider_type.to_ascii_lowercase();
+    let preset = provider
+        .preset
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let id = provider.id.to_ascii_lowercase();
+    let haystack = format!("{id} {provider_type} {preset} {base}");
+    haystack.contains("openai")
+        || haystack.contains("chatgpt.com")
+        || haystack.contains("x.ai")
+        || haystack.contains("api.x.ai")
+}
+
+pub(super) fn provider_supports_chat_completions_fallback_for_responses(provider: &LlmProvider) -> bool {
+    let base = provider_base_url(provider).to_ascii_lowercase();
+    let provider_type = provider.provider_type.to_ascii_lowercase();
+    let preset = provider
+        .preset
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let id = provider.id.to_ascii_lowercase();
+    let model = provider.model.to_ascii_lowercase();
+    let haystack = format!("{id} {provider_type} {preset} {base} {model}");
+    haystack.contains("deepseek") || base.contains("api.deepseek.com")
+}
+
+pub(super) fn provider_thinking_enabled(provider: &LlmProvider) -> bool {
+    provider
+        .models
+        .pointer("/__provider/thinkingEnabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+pub(super) fn strip_thinking_cards_from_visible_content(
+    content: &str,
+    provider_data: &Option<Value>,
+) -> String {
+    let mut output = content.to_string();
+    for summary in thinking_card_summaries(provider_data) {
+        output = strip_exact_thinking_summary(&output, &summary);
+    }
+    output
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("\n\n\n", "\n\n")
+        .trim()
+        .to_string()
+}
+
+fn thinking_card_summaries(provider_data: &Option<Value>) -> Vec<String> {
+    let Some(data) = provider_data.as_ref() else {
+        return Vec::new();
+    };
+    let mut summaries = Vec::new();
+    collect_thinking_card_summaries(data.get("thinkingCards"), &mut summaries);
+    collect_thinking_card_summaries(data.pointer("/responses/thinkingCards"), &mut summaries);
+    collect_thinking_card_summaries(data.pointer("/anthropic/thinkingCards"), &mut summaries);
+    summaries
+}
+
+fn collect_thinking_card_summaries(value: Option<&Value>, summaries: &mut Vec<String>) {
+    let Some(cards) = value.and_then(Value::as_array) else {
+        return;
+    };
+    for card in cards {
+        let Some(summary) = card
+            .get("summary")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if summary.chars().count() >= 8 && !summaries.iter().any(|item| item == summary) {
+            summaries.push(summary.to_string());
+        }
+    }
+}
+
+fn strip_exact_thinking_summary(content: &str, summary: &str) -> String {
+    let summary = summary.trim();
+    if summary.is_empty() {
+        return content.to_string();
+    }
+    if content.trim() == summary {
+        return String::new();
+    }
+    let mut output = content.to_string();
+    while let Some(index) = output.find(summary) {
+        let end = index + summary.len();
+        output.replace_range(index..end, "");
+    }
+    output
 }
 
 pub async fn complete_text_prompt(

@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 
 use crate::{
     error::AppResult,
-    models::{ChatMessage, Conversation},
+    models::{ChatMessage, Conversation, MemoryEntry},
     store::AppStore,
 };
 
@@ -90,6 +90,9 @@ pub(super) fn execute_session_search(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if query.is_empty() {
+        if kind == "session_memory" {
+            return execute_session_memory_browse(store, conversation, limit, offset);
+        }
         return execute_session_browse(store, conversation, limit, offset);
     }
 
@@ -251,6 +254,18 @@ pub(super) fn execute_session_search(
         }
     }
 
+    if session_search_kind_matches(&kind, "session_memory") {
+        let session_memories = store
+            .memories(None)?
+            .into_iter()
+            .filter(|memory| memory.target == "session")
+            .collect::<Vec<_>>();
+        for memory in session_memories {
+            push_session_memory_candidate(&mut candidates, query.as_str(), recency, memory);
+            recency += 1;
+        }
+    }
+
     sort_session_search_candidates(&mut candidates, &sort);
     let total = candidates.len();
     let rows = candidates
@@ -268,9 +283,14 @@ pub(super) fn execute_session_search(
                     .as_deref()
                     .map(|id| format!(" messageId={id}"))
                     .unwrap_or_default();
+                let conversation = if row.conversation_id.is_empty() {
+                    " deletedConversation=true".into()
+                } else {
+                    format!(" conversationId={}", row.conversation_id)
+                };
                 format!(
-                    "- [{} score={} conversationId={}{}] {}",
-                    row.source, row.score, row.conversation_id, anchor, row.content
+                    "- [{} score={}{}{}] {}",
+                    row.source, row.score, conversation, anchor, row.content
                 )
             })
             .collect::<Vec<_>>()
@@ -279,10 +299,12 @@ pub(super) fn execute_session_search(
     let raw_results = rows
         .iter()
         .map(|row| {
+            let conversation_deleted = row.conversation_id.is_empty();
             json!({
                 "source": row.source,
                 "kind": row.kind,
                 "score": row.score,
+                "conversationDeleted": conversation_deleted,
                 "conversationId": row.conversation_id,
                 "session_id": row.conversation_id,
                 "messageId": row.message_id,
@@ -355,6 +377,41 @@ fn push_session_search_candidate(
     });
 }
 
+fn push_session_memory_candidate(
+    candidates: &mut Vec<SessionSearchCandidate>,
+    query: &str,
+    recency: usize,
+    memory: MemoryEntry,
+) {
+    let content = format!(
+        "deleted_session_memory personaId={} importance={} updated={} summary={}",
+        memory.persona_id, memory.importance, memory.updated_at, memory.summary
+    );
+    push_session_search_candidate(
+        candidates,
+        query,
+        recency,
+        29,
+        "session_memory".into(),
+        String::new(),
+        None,
+        format!("session_memory:{}:{}", memory.id, memory.updated_at),
+        content,
+        700,
+        Some(json!({
+            "memoryId": memory.id,
+            "target": memory.target,
+            "personaId": memory.persona_id,
+            "importance": memory.importance,
+            "createdAt": memory.created_at,
+            "updatedAt": memory.updated_at,
+            "summary": memory.summary,
+            "source": "deleted_conversation_memory",
+            "conversationDeleted": true
+        })),
+    );
+}
+
 fn execute_session_browse(
     store: &AppStore,
     current_conversation: &Conversation,
@@ -416,6 +473,72 @@ fn execute_session_browse(
             "count": raw_results.len(),
             "results": raw_results,
             "message": format!("Showing {} most recent sessions. Pass query to search, or session_id + around_message_id to scroll.", raw_results.len())
+        }),
+    ))
+}
+
+fn execute_session_memory_browse(
+    store: &AppStore,
+    _current_conversation: &Conversation,
+    limit: usize,
+    offset: usize,
+) -> AppResult<(String, Value)> {
+    let rows = store
+        .memories(None)?
+        .into_iter()
+        .filter(|memory| memory.target == "session")
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let text = if rows.is_empty() {
+        "暂无已整理的删除会话记忆。".into()
+    } else {
+        rows.iter()
+            .map(|memory| {
+                format!(
+                    "- [session_memory memoryId={} importance={} updated={}] {}",
+                    memory.id,
+                    memory.importance,
+                    memory.updated_at,
+                    truncate_for_prompt(&memory.summary, 240)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let raw_results = rows
+        .iter()
+        .map(|memory| {
+            json!({
+                "source": "session_memory",
+                "kind": "session_memory",
+                "memoryId": memory.id,
+                "target": memory.target,
+                "personaId": memory.persona_id,
+                "importance": memory.importance,
+                "createdAt": memory.created_at,
+                "updatedAt": memory.updated_at,
+                "summary": memory.summary,
+                "content": memory.summary,
+                "conversationDeleted": true,
+                "metadata": {
+                    "source": "deleted_conversation_memory",
+                    "conversationDeleted": true
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok((
+        text,
+        json!({
+            "success": true,
+            "mode": "browse_session_memory",
+            "kind": "session_memory",
+            "limit": limit,
+            "offset": offset,
+            "count": raw_results.len(),
+            "results": raw_results,
+            "message": format!("Showing {} deleted-session memory summaries. Pass query to search within them.", raw_results.len())
         }),
     ))
 }
@@ -572,6 +695,11 @@ fn normalize_session_search_kind(kind: &str) -> String {
         "artifact" | "artifacts" | "tool_artifact" | "tool_artifacts" | "file" | "files" => {
             "artifact".into()
         }
+        "memory" | "memories" | "session_memory" | "session_memories"
+        | "deleted_session_memory" | "deleted_session_memories"
+        | "conversation_memory" | "conversation_memories" | "session_summary"
+        | "session_summaries" | "short_memory" | "short_memories" | "short_term_memory"
+        | "short_term_memories" => "session_memory".into(),
         _ => "all".into(),
     }
 }

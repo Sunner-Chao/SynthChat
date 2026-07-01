@@ -7701,7 +7701,10 @@ pub(super) async fn api_server_chat_tab_gateway_prompt_submit(
     let session_id_for_callback = session_id.clone();
     let run_id_for_callback = run_id.clone();
     let message_id_for_callback = message_id.clone();
-    let callback: crate::llm::LlmDeltaCallback = Arc::new(move |delta| {
+    let callback: crate::llm::LlmDeltaCallback = Arc::new(move |kind, delta| {
+        if kind != crate::llm::LlmStreamDeltaKind::Answer {
+            return Ok(());
+        }
         if !delta.is_empty() {
             emitted_delta_for_callback.store(true, std::sync::atomic::Ordering::SeqCst);
             let seq = sequence_for_callback.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -12581,7 +12584,10 @@ fn api_server_write_live_chat_completion_sse<'a>(
         let emitted_delta = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let emitted_delta_for_callback = Arc::clone(&emitted_delta);
         let tx_for_callback = tx.clone();
-        let callback: crate::llm::LlmDeltaCallback = Arc::new(move |delta| {
+        let callback: crate::llm::LlmDeltaCallback = Arc::new(move |kind, delta| {
+            if kind != crate::llm::LlmStreamDeltaKind::Answer {
+                return Ok(());
+            }
             if !delta.is_empty() {
                 emitted_delta_for_callback.store(true, std::sync::atomic::Ordering::SeqCst);
                 let _ = tx_for_callback.send(api_server_sse_chat_content_chunk(
@@ -12679,7 +12685,10 @@ fn api_server_write_live_session_chat_sse<'a>(
         let session_id_for_callback = effective_session_id.clone();
         let run_id_for_callback = run_id.clone();
         let message_id_for_callback = message_id.clone();
-        let callback: crate::llm::LlmDeltaCallback = Arc::new(move |delta| {
+        let callback: crate::llm::LlmDeltaCallback = Arc::new(move |kind, delta| {
+            if kind != crate::llm::LlmStreamDeltaKind::Answer {
+                return Ok(());
+            }
             if !delta.is_empty() {
                 emitted_delta_for_callback.store(true, std::sync::atomic::Ordering::SeqCst);
                 let seq = sequence_for_callback.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -12984,7 +12993,10 @@ fn api_server_write_live_responses_sse<'a>(
         let tx_for_callback = tx.clone();
         let response_id_for_callback = response_id_for_task.clone();
         let message_item_id_for_callback = message_item_id_for_task.clone();
-        let callback: crate::llm::LlmDeltaCallback = Arc::new(move |delta| {
+        let callback: crate::llm::LlmDeltaCallback = Arc::new(move |kind, delta| {
+            if kind != crate::llm::LlmStreamDeltaKind::Answer {
+                return Ok(());
+            }
             if !delta.is_empty() {
                 emitted_delta_for_callback.store(true, std::sync::atomic::Ordering::SeqCst);
                 let sequence_number =
@@ -21314,7 +21326,10 @@ pub(super) fn api_server_process_sse_request<'a>(
                 let request = api_server_request_with_stream_disabled(request)?;
                 let delta_parts = Arc::new(Mutex::new(Vec::<String>::new()));
                 let callback_parts = Arc::clone(&delta_parts);
-                let callback: crate::llm::LlmDeltaCallback = Arc::new(move |delta| {
+                let callback: crate::llm::LlmDeltaCallback = Arc::new(move |kind, delta| {
+                    if kind != crate::llm::LlmStreamDeltaKind::Answer {
+                        return Ok(());
+                    }
                     if !delta.is_empty() {
                         if let Ok(mut parts) = callback_parts.lock() {
                             parts.push(delta.to_string());

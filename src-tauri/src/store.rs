@@ -9186,12 +9186,20 @@ impl AppStore {
                 .map(|agent| agent.id.clone())
                 .or_else(|| s.agents.first().map(|agent| agent.id.clone()))
                 .ok_or_else(|| AppError::NotFound("agent".into()))?;
+            let resolved_persona_id = s
+                .personas
+                .iter()
+                .find(|persona| persona.agent_id == resolved_agent_id)
+                .map(|persona| persona.id.clone());
             let conv = s
                 .conversations
                 .iter_mut()
                 .find(|c| c.id == id)
                 .ok_or_else(|| AppError::NotFound(format!("conversation {id}")))?;
             conv.agent_id = resolved_agent_id;
+            if let Some(persona_id) = resolved_persona_id {
+                conv.persona_id = Some(persona_id);
+            }
             conv.updated_at = now_iso();
             let saved = conv.clone();
             self.persist(s)?;

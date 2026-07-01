@@ -288,7 +288,7 @@ use memory::{
     execute_manage_memory, external_memory_provider_tool, fact_feedback_tool,
     fact_store_tool_for_run, holographic_memory_prefetch_facts, manage_memory_tool,
     manage_memory_tool_for_run, memory_provider_tool, memory_tool, memory_tool_for_run,
-    recall_memory_tool, remember_fact_tool, remember_fact_tool_for_run,
+    recall_memory_tool, recall_memory_tool_for_run, remember_fact_tool, remember_fact_tool_for_run,
 };
 pub(crate) use memory_manager::sync_builtin_memory_markdown;
 use memory_manager::{
@@ -411,9 +411,7 @@ pub(crate) fn snapshot_conversation_memory_before_delete(
     conversation_id: &str,
 ) -> AppResult<ConversationMemorySettlingPlan> {
     let conversation = store.conversation(conversation_id)?;
-    let persona = store
-        .persona(conversation.persona_id.as_deref())
-        .or_else(|_| store.persona(None))?;
+    let persona = persona_for_conversation_agent(store, &conversation)?;
     let enabled = persona
         .memory
         .get("enabled")
@@ -476,7 +474,7 @@ pub(crate) async fn settle_conversation_memory_snapshot(
         return delete_memory_settling_skipped("no llm provider configured");
     }
     let mut effective_persona = effective_llm_persona(&snapshot.persona, &snapshot.agent);
-    effective_persona.max_tokens = effective_persona.max_tokens.min(1024).max(256);
+    effective_persona.max_tokens = effective_persona.max_tokens.clamp(2048, 4096);
     let prompt = delete_memory_review_prompt(&snapshot.conversation, &transcript);
     let message = ChatMessage::new(
         snapshot.conversation.id.clone(),
@@ -484,7 +482,7 @@ pub(crate) async fn settle_conversation_memory_snapshot(
         prompt.clone(),
         "delete-memory-review",
     );
-    let reply = match complete_chat_with_provider_failover(
+    let reply = match complete_chat_with_provider_failover_options(
         store,
         None,
         &providers,
@@ -494,6 +492,12 @@ pub(crate) async fn settle_conversation_memory_snapshot(
         &prompt,
         None,
         None,
+        crate::llm::LlmCallOptions {
+            responses_reasoning_replay_enabled: false,
+            fast_mode_enabled: true,
+            thinking_enabled: false,
+            stream_delta_callback: None,
+        },
     )
     .await
     {
@@ -580,7 +584,26 @@ fn delete_memory_settling_skipped(
 }
 
 fn delete_memory_review_system_prompt() -> String {
-    "You review a soon-to-be-deleted chat session for concise session memory. Return only valid JSON. Store less, not more. Extract only facts, preferences, decisions, unresolved context, and useful continuity signals that would help future chats with this persona. Do not store secrets, credentials, transient implementation chatter, duplicate facts, or generic assistant behavior. JSON schema: {\"memories\":[{\"summary\":\"...\",\"importance\":1-5}]}.".into()
+    "You review a soon-to-be-deleted chat session for concise session memory. Do not think step by step. Do not explain. Do not include reasoning, analysis, markdown, or prose. Return compact valid JSON only. Store less, not more. Extract only facts, preferences, decisions, unresolved context, and useful continuity signals that would help future chats with this persona. Do not store secrets, credentials, transient implementation chatter, duplicate facts, or generic assistant behavior. JSON schema: {\"memories\":[{\"summary\":\"...\",\"importance\":1-5}]}.".into()
+}
+
+fn persona_for_conversation_agent(
+    store: &AppStore,
+    conversation: &Conversation,
+) -> AppResult<Persona> {
+    let conversation_persona = store.persona(conversation.persona_id.as_deref()).ok();
+    if let Some(persona) = conversation_persona.as_ref() {
+        if persona.agent_id == conversation.agent_id {
+            return Ok(persona.clone());
+        }
+    }
+    store
+        .personas()?
+        .into_iter()
+        .find(|persona| persona.agent_id == conversation.agent_id)
+        .or(conversation_persona)
+        .map(Ok)
+        .unwrap_or_else(|| store.persona(None))
 }
 
 fn delete_memory_review_prompt(conversation: &Conversation, transcript: &str) -> String {

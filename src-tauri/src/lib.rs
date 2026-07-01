@@ -4812,13 +4812,18 @@ fn write_emoji_groups_snapshot(store: &AppStore, groups: &[EmojiGroupConfig]) ->
 }
 
 fn is_supported_emoji_image(path: &std::path::Path) -> bool {
-    matches!(
+    if !matches!(
         path.extension()
             .and_then(|value| value.to_str())
             .map(|value| value.to_ascii_lowercase())
             .as_deref(),
         Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
-    )
+    ) {
+        return false;
+    }
+    path.metadata()
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false)
 }
 
 fn emoji_group_dir(store: &AppStore, group_id: &str) -> AppResult<PathBuf> {
@@ -4958,7 +4963,7 @@ fn apply_persona_emoji(store: &AppStore, persona: &Persona, reply: String) -> St
         return reply;
     };
     let mime = mime_for_image_path(path);
-    format!("{reply}\n\n[media attached: {path} ({mime})]")
+    format!("{reply}\n\n[media attached: \"{path}\" ({mime})]")
 }
 
 fn hash_to_u64(value: &str) -> u64 {

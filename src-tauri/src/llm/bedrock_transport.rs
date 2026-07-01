@@ -278,7 +278,7 @@ fn handle_bedrock_stream_payload(
         .filter(|delta| !delta.is_empty())
     {
         content.push_str(delta);
-        callback(delta)?;
+        callback(LlmStreamDeltaKind::Answer, delta)?;
     }
     track_bedrock_stream_tool_use(payload, tool_uses);
     if let Some(usage) = payload.pointer("/metadata/usage") {

@@ -30,6 +30,8 @@ pub(super) async fn complete_responses_compatible(
         .filter(|tools| !tools.is_empty())
         .map(provider_tool_name_map)
         .unwrap_or_default();
+    let fallback_system_prompt = system_prompt.clone();
+    let fallback_history = history.clone();
     let (instructions, input) = build_responses_payload_with_tool_name_map(
         system_prompt,
         history,
@@ -56,8 +58,23 @@ pub(super) async fn complete_responses_compatible(
     if options.fast_mode_enabled {
         body["service_tier"] = json!("priority");
     }
-    if options.responses_reasoning_replay_enabled {
-        body["include"] = json!(["reasoning.encrypted_content"]);
+    let thinking_enabled = options.thinking_enabled
+        && provider_thinking_enabled(provider)
+        && provider_supports_responses_thinking(provider);
+    if options.responses_reasoning_replay_enabled || thinking_enabled {
+        let mut include = Vec::new();
+        if options.responses_reasoning_replay_enabled {
+            include.push("reasoning.encrypted_content");
+        }
+        if !include.is_empty() {
+            body["include"] = json!(include);
+        }
+    }
+    if thinking_enabled {
+        body["reasoning"] = json!({
+            "effort": "medium",
+            "summary": "auto"
+        });
     }
     if !instructions.trim().is_empty() {
         body["instructions"] = json!(instructions);
@@ -145,6 +162,31 @@ pub(super) async fn complete_responses_compatible(
                         Some(transport),
                     )
                 });
+        }
+        if provider_supports_chat_completions_fallback_for_responses(provider)
+            && responses_failure_allows_chat_completions_fallback(status.as_u16(), &text)
+        {
+            let mut fallback_provider = provider.clone();
+            fallback_provider.provider_type = "openai_compatible".into();
+            fallback_provider.base_url = chat_completions_fallback_base_url_for_responses(provider);
+            fallback_provider.append_chat_path = true;
+            let mut fallback_reply = complete_openai_compatible(
+                &fallback_provider,
+                persona,
+                fallback_system_prompt,
+                fallback_history,
+                native_tools,
+                options,
+            )
+            .await?;
+            fallback_reply.transport_diagnostics =
+                merge_responses_fallback_diagnostics(
+                    fallback_reply.transport_diagnostics.take(),
+                    status.as_u16(),
+                    &url,
+                    &text,
+                );
+            return Ok(fallback_reply);
         }
         return Err(AppError::Llm(format!(
             "provider returned {status}: {}",
@@ -274,7 +316,8 @@ async fn read_responses_sse_stream(
         merge_responses_stream_fallback_output(&mut payload, &output_items, &content);
         let mut reply = parse_responses_compatible_with_tool_name_map(payload, tool_name_map)?;
         if !content.trim().is_empty() {
-            reply.content = scrub_reasoning_blocks(&content);
+            let cleaned = strip_thinking_cards_from_visible_content(&content, &reply.provider_data);
+            reply.content = scrub_reasoning_blocks(&cleaned);
             reply.completion_tokens = if completion_tokens == 0 {
                 estimate_tokens(&reply.content)
             } else {
@@ -358,18 +401,17 @@ fn handle_responses_sse_line(
     if event_type == "error" {
         return Err(AppError::Llm(format_responses_stream_error(&payload)));
     }
-    if let Some(delta) = payload
-        .get("delta")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            payload
-                .pointer("/response/output_text/delta")
-                .and_then(Value::as_str)
-        })
-        .filter(|delta| !delta.is_empty())
-    {
-        content.push_str(delta);
-        callback(delta)?;
+    if responses_stream_event_is_reasoning_delta(event_type) {
+        if let Some(delta) = responses_stream_text_delta(&payload).filter(|delta| !delta.is_empty())
+        {
+            callback(LlmStreamDeltaKind::Thinking, delta)?;
+        }
+    } else if responses_stream_event_is_answer_delta(event_type) {
+        if let Some(delta) = responses_stream_text_delta(&payload).filter(|delta| !delta.is_empty())
+        {
+            content.push_str(delta);
+            callback(LlmStreamDeltaKind::Answer, delta)?;
+        }
     }
     if matches!(
         event_type,
@@ -408,6 +450,31 @@ fn handle_responses_sse_line(
             .unwrap_or(0) as usize;
     }
     Ok(())
+}
+
+fn responses_stream_text_delta(payload: &Value) -> Option<&str> {
+    payload
+        .get("delta")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .pointer("/response/output_text/delta")
+                .and_then(Value::as_str)
+        })
+}
+
+fn responses_stream_event_is_reasoning_delta(event_type: &str) -> bool {
+    event_type.contains("reasoning") && event_type.contains(".delta")
+}
+
+fn responses_stream_event_is_answer_delta(event_type: &str) -> bool {
+    if event_type.is_empty() {
+        return true;
+    }
+    event_type == "response.output_text.delta"
+        || event_type == "response.message.delta"
+        || event_type == "response.content_part.delta"
+        || event_type.ends_with(".output_text.delta")
 }
 
 #[derive(Default)]
@@ -544,6 +611,50 @@ fn merge_responses_stream_fallback_output(
     }
 }
 
+fn responses_failure_allows_chat_completions_fallback(status: u16, body: &str) -> bool {
+    if matches!(status, 404 | 405 | 410) {
+        return true;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("not found")
+        || lower.contains("unsupported")
+        || lower.contains("unknown url")
+        || lower.contains("unknown endpoint")
+        || lower.contains("invalid path")
+        || lower.contains("responses")
+}
+
+fn chat_completions_fallback_base_url_for_responses(provider: &LlmProvider) -> String {
+    let base = provider_base_url(provider);
+    let trimmed = base.trim().trim_end_matches('/');
+    if trimmed.eq_ignore_ascii_case("https://api.deepseek.com") {
+        "https://api.deepseek.com/v1".into()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn merge_responses_fallback_diagnostics(
+    diagnostics: Option<Value>,
+    responses_status: u16,
+    responses_url: &str,
+    responses_body: &str,
+) -> Option<Value> {
+    let mut root = diagnostics
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    root.insert(
+        "responsesFallback".into(),
+        json!({
+            "reason": "responses_request_failed",
+            "status": responses_status,
+            "endpoint": safe_diagnostic_endpoint(responses_url),
+            "preview": response_preview(responses_body),
+        }),
+    );
+    Some(Value::Object(root))
+}
+
 fn format_responses_stream_error(payload: &Value) -> String {
     if let Some(error) = payload.get("error") {
         return format_responses_error(Some(error), "error");
@@ -585,6 +696,10 @@ pub(super) fn responses_unsupported_parameter_retry_body(
         Some("parallel_tool_calls") => {
             object.remove("parallel_tool_calls")?;
         }
+        Some(parameter) if parameter == "reasoning" || parameter.starts_with("reasoning.") => {
+            object.remove("reasoning");
+            remove_reasoning_include_values(object);
+        }
         Some("include") => {
             object.remove("include")?;
         }
@@ -600,8 +715,12 @@ pub(super) fn responses_unsupported_parameter_retry_body(
                 object.remove("tool_choice")?;
             } else if unsupported_parameter_error_mentions(&lower, "parallel_tool_calls") {
                 object.remove("parallel_tool_calls")?;
+            } else if unsupported_parameter_error_mentions(&lower, "reasoning") {
+                object.remove("reasoning");
+                remove_reasoning_include_values(object);
             } else if unsupported_parameter_error_mentions(&lower, "include")
                 || lower.contains("reasoning.encrypted_content")
+                || lower.contains("reasoning.summary")
             {
                 object.remove("include")?;
             } else if unsupported_parameter_error_mentions(&lower, "service_tier") {
@@ -612,6 +731,24 @@ pub(super) fn responses_unsupported_parameter_retry_body(
         }
     }
     (retry != *body).then_some(retry)
+}
+
+fn remove_reasoning_include_values(object: &mut serde_json::Map<String, Value>) {
+    let Some(include) = object.get_mut("include") else {
+        return;
+    };
+    let Some(items) = include.as_array_mut() else {
+        return;
+    };
+    items.retain(|item| {
+        !item
+            .as_str()
+            .map(|value| value.to_ascii_lowercase().starts_with("reasoning."))
+            .unwrap_or(false)
+    });
+    if items.is_empty() {
+        object.remove("include");
+    }
 }
 
 pub(super) fn is_responses_compatible(provider: &LlmProvider) -> bool {
@@ -890,6 +1027,7 @@ fn parse_responses_compatible_with_tool_name_map(
     let finish_reason =
         responses_finish_reason(&payload, !content.trim().is_empty(), !tool_calls.is_empty());
     let provider_data = responses_provider_data(&payload);
+    content = strip_thinking_cards_from_visible_content(&content, &provider_data);
     if !tool_calls.is_empty() {
         let tool_json = json!({"tool_calls": tool_calls}).to_string();
         if content.trim().is_empty() {
@@ -1059,13 +1197,15 @@ fn responses_tool_calls(
 fn responses_provider_data(payload: &Value) -> Option<Value> {
     let reasoning_items = responses_reasoning_replay_items(payload);
     let message_items = responses_message_replay_items(payload);
-    if reasoning_items.is_empty() && message_items.is_empty() {
+    let thinking_cards = responses_thinking_cards(payload);
+    if reasoning_items.is_empty() && message_items.is_empty() && thinking_cards.is_empty() {
         return None;
     }
     Some(json!({
         "responses": {
             "reasoningItems": reasoning_items,
-            "messageItems": message_items
+            "messageItems": message_items,
+            "thinkingCards": thinking_cards
         }
     }))
 }
@@ -1147,6 +1287,68 @@ fn normalized_responses_reasoning_summary(item: &Value) -> Option<Value> {
         })
         .collect::<Vec<_>>();
     (!parts.is_empty()).then(|| json!(parts))
+}
+
+fn responses_thinking_cards(payload: &Value) -> Vec<Value> {
+    payload
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+                return None;
+            }
+            let summary = responses_reasoning_summary_text(item);
+            let encrypted = item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+            if summary.trim().is_empty() && !encrypted {
+                return None;
+            }
+            Some(json!({
+                "provider": "openai_responses",
+                "kind": "reasoning",
+                "title": "模型思考",
+                "summary": summary,
+                "redacted": summary.trim().is_empty(),
+                "encrypted": encrypted,
+                "itemId": item.get("id").cloned().unwrap_or(Value::Null)
+            }))
+        })
+        .collect()
+}
+
+fn responses_reasoning_summary_text(item: &Value) -> String {
+    let mut texts = Vec::new();
+    collect_responses_reasoning_texts(item.get("summary"), &mut texts);
+    collect_responses_reasoning_texts(item.get("content"), &mut texts);
+    collect_responses_reasoning_texts(item.get("text"), &mut texts);
+    texts
+        .into_iter()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn collect_responses_reasoning_texts(value: Option<&Value>, texts: &mut Vec<String>) {
+    match value {
+        Some(Value::String(text)) => texts.push(text.clone()),
+        Some(Value::Array(items)) => {
+            for item in items {
+                collect_responses_reasoning_texts(Some(item), texts);
+            }
+        }
+        Some(Value::Object(object)) => {
+            for key in ["text", "summary", "content"] {
+                collect_responses_reasoning_texts(object.get(key), texts);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn responses_message_replay_items(payload: &Value) -> Vec<Value> {
@@ -1389,7 +1591,7 @@ mod tests {
 
     #[test]
     fn responses_stream_collects_output_item_done_fallback() {
-        let callback: LlmDeltaCallback = Arc::new(|_| Ok(()));
+        let callback: LlmDeltaCallback = Arc::new(|_, _| Ok(()));
         let mut content = String::new();
         let mut final_response = None;
         let mut prompt_tokens = 0;
@@ -1424,7 +1626,7 @@ mod tests {
 
     #[test]
     fn responses_stream_error_event_surfaces_code_and_message() {
-        let callback: LlmDeltaCallback = Arc::new(|_| Ok(()));
+        let callback: LlmDeltaCallback = Arc::new(|_, _| Ok(()));
         let mut content = String::new();
         let mut final_response = None;
         let mut prompt_tokens = 0;
@@ -1453,7 +1655,7 @@ mod tests {
 
     #[test]
     fn responses_stream_failed_terminal_frame_is_not_downgraded_to_empty_text() {
-        let callback: LlmDeltaCallback = Arc::new(|_| Ok(()));
+        let callback: LlmDeltaCallback = Arc::new(|_, _| Ok(()));
         let mut content = String::new();
         let mut final_response = None;
         let mut prompt_tokens = 0;
@@ -1483,7 +1685,7 @@ mod tests {
 
     #[test]
     fn responses_stream_reconstructs_function_call_from_argument_deltas() {
-        let callback: LlmDeltaCallback = Arc::new(|_| Ok(()));
+        let callback: LlmDeltaCallback = Arc::new(|_, _| Ok(()));
         let mut content = String::new();
         let mut final_response = None;
         let mut prompt_tokens = 0;

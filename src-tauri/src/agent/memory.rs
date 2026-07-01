@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use crate::{
     error::{AppError, AppResult},
-    models::{new_id, now_iso, MemoryEntry, Persona},
+    models::{new_id, now_iso, Conversation, MemoryEntry, Persona},
     process_utils::CommandWindowExt,
     store::AppStore,
 };
@@ -19,9 +19,54 @@ use crate::{
 use super::{on_memory_write, string_arg};
 fn persona_for_conversation(store: &AppStore, conversation_id: &str) -> AppResult<Persona> {
     let conversation = store.conversation(conversation_id)?;
+    persona_for_conversation_record(store, &conversation)
+}
+
+fn persona_for_conversation_run(
+    store: &AppStore,
+    conversation_id: &str,
+    run_id: &str,
+) -> AppResult<Persona> {
+    let run_id = run_id.trim();
+    if !run_id.is_empty() {
+        if let Ok(run) = store.agent_run(run_id) {
+            let run_persona = store.persona(Some(&run.persona_id)).ok();
+            if let Some(persona) = run_persona.as_ref() {
+                if persona.agent_id == run.agent_id {
+                    return Ok(persona.clone());
+                }
+            }
+            if let Some(persona) = store
+                .personas()?
+                .into_iter()
+                .find(|persona| persona.agent_id == run.agent_id)
+                .or(run_persona)
+            {
+                return Ok(persona);
+            }
+        }
+    }
+    let conversation = store.conversation(conversation_id)?;
+    persona_for_conversation_record(store, &conversation)
+}
+
+fn persona_for_conversation_record(
+    store: &AppStore,
+    conversation: &Conversation,
+) -> AppResult<Persona> {
+    let conversation_persona = store.persona(conversation.persona_id.as_deref()).ok();
+    if let Some(persona) = conversation_persona.as_ref() {
+        if persona.agent_id == conversation.agent_id {
+            return Ok(persona.clone());
+        }
+    }
     store
-        .persona(conversation.persona_id.as_deref())
-        .or_else(|_| store.persona(None))
+        .personas()?
+        .into_iter()
+        .find(|persona| persona.agent_id == conversation.agent_id)
+        .or(conversation_persona)
+        .map(Ok)
+        .unwrap_or_else(|| store.persona(None))
 }
 
 pub(super) fn recall_memory_tool(
@@ -29,7 +74,16 @@ pub(super) fn recall_memory_tool(
     conversation_id: &str,
     payload: &Value,
 ) -> AppResult<String> {
-    let persona = persona_for_conversation(store, conversation_id)?;
+    recall_memory_tool_for_run(store, conversation_id, "", payload)
+}
+
+pub(super) fn recall_memory_tool_for_run(
+    store: &AppStore,
+    conversation_id: &str,
+    run_id: &str,
+    payload: &Value,
+) -> AppResult<String> {
+    let persona = persona_for_conversation_run(store, conversation_id, run_id)?;
     let mut payload = payload.clone();
     if payload.get("action").is_none() {
         if let Value::Object(map) = &mut payload {
@@ -59,7 +113,7 @@ pub(super) fn remember_fact_tool_for_run(
     run_id: &str,
     payload: &Value,
 ) -> AppResult<String> {
-    let persona = persona_for_conversation(store, conversation_id)?;
+    let persona = persona_for_conversation_run(store, conversation_id, run_id)?;
     let summary = string_arg(payload, &["summary", "content", "fact"])
         .ok_or_else(|| AppError::BadRequest("remember_fact requires payload.summary".into()))?;
     if summary.trim().is_empty() {
@@ -105,7 +159,7 @@ pub(super) fn manage_memory_tool_for_run(
     run_id: &str,
     payload: &Value,
 ) -> AppResult<String> {
-    let persona = persona_for_conversation(store, conversation_id)?;
+    let persona = persona_for_conversation_run(store, conversation_id, run_id)?;
     let (text, raw, ok) = execute_manage_memory_for_run(store, &persona, run_id, payload)?;
     Ok(serde_json::to_string_pretty(&json!({
         "ok": ok,
@@ -130,7 +184,7 @@ pub(super) fn memory_tool_for_run(
     payload: &Value,
 ) -> AppResult<String> {
     let normalized = normalize_memory_payload(payload);
-    let persona = persona_for_conversation(store, conversation_id)?;
+    let persona = persona_for_conversation_run(store, conversation_id, run_id)?;
     let (text, raw, ok) = execute_manage_memory_for_run(store, &persona, run_id, &normalized)?;
     Ok(serde_json::to_string_pretty(&json!({
         "ok": ok,
@@ -187,7 +241,7 @@ pub(super) fn fact_store_tool_for_run(
     run_id: &str,
     payload: &Value,
 ) -> AppResult<String> {
-    let persona = persona_for_conversation(store, conversation_id)?;
+    let persona = persona_for_conversation_run(store, conversation_id, run_id)?;
     let action = string_arg(payload, &["action"])
         .unwrap_or_else(|| "list".into())
         .trim()

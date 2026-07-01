@@ -183,7 +183,7 @@ Environment notes:
 
 Use tools when the answer needs project context. Prefer search_files before read_file when you do not know the exact file.
 When the user explicitly asks you to check, query, inspect, run a tool, or needs current local environment information such as the current date/time, you must use an available tool before the final answer. Do not claim you cannot check if terminal/env_probe or another relevant tool is available.
-Use session_search when the user asks what happened earlier, asks to resume prior work, or needs evidence from previous conversations/runs/tool outputs.
+Use session_search when the user asks what happened earlier, asks to resume prior work, needs evidence from previous conversations/runs/tool outputs, or needs deleted-session summaries saved as session memory.
 Use clarify only when required information is missing and no safe tool action or partial answer can move the task forward.
 Use cronjob only when the user asks to schedule, remind, recur, automate later, pause, resume, delete, list, or manually trigger scheduled work.
 Use recall_memory when long-term persona facts or preferences may affect the answer and are not already visible. Use remember_fact only for stable user facts/preferences; do not store transient task notes. Use manage_memory replace/remove when the user corrects or invalidates an existing memory.

@@ -1591,7 +1591,7 @@ pub(super) async fn execute_recovery_internal_tool(
         "session_search" => session_search_tool(store, conversation_id, &payload),
         "clarify" => clarify_tool(&payload),
         "cronjob" => cronjob_tool(store, conversation_id, &payload),
-        "recall_memory" => recall_memory_tool(store, conversation_id, &payload),
+        "recall_memory" => recall_memory_tool_for_run(store, conversation_id, run_id, &payload),
         "remember_fact" => remember_fact_tool_for_run(store, conversation_id, run_id, &payload),
         "manage_memory" => manage_memory_tool_for_run(store, conversation_id, run_id, &payload),
         "memory" => memory_tool_for_run(store, conversation_id, run_id, &payload),

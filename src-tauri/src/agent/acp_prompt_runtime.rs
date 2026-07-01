@@ -29,7 +29,10 @@ pub(super) async fn acp_run_chat_turn_with_live_tool_notifications(
     let callback_sink = Arc::clone(sink);
     let callback_session_id = session_id.to_string();
     let callback_streamed_text = Arc::clone(&streamed_agent_message);
-    let stream_delta_callback: crate::llm::LlmDeltaCallback = Arc::new(move |delta| {
+    let stream_delta_callback: crate::llm::LlmDeltaCallback = Arc::new(move |kind, delta| {
+        if kind != crate::llm::LlmStreamDeltaKind::Answer {
+            return Ok(());
+        }
         if delta.trim().is_empty() {
             return Ok(());
         }

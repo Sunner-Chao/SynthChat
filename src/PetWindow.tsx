@@ -11,8 +11,13 @@ import type { AgentRunEvent, ChatAttachment, ChatMessage, Conversation, EmojiGro
 import {
   PET_ACTIVE_CONTEXT_EVENT,
   PET_ACTIVE_CONTEXT_STORAGE_KEY,
+  PET_THINKING_STATE_EVENT,
+  PET_THINKING_STATE_STORAGE_KEY,
   parsePetActiveContext,
+  parsePetThinkingState,
   readStoredPetActiveContext,
+  readStoredPetThinkingState,
+  subscribePetThinkingState,
   writeStoredPetActiveContext,
   type PetActiveContext
 } from "./lib/petContext";
@@ -285,6 +290,23 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function textValue(value: unknown) {
   return typeof value === "string" && value.trim() ? value.trim() : "";
+}
+
+function petShouldFollowThinkingTurn(source: string) {
+  const normalized = source.trim();
+  if (!normalized) return true;
+  if (normalized === "pet-vision") return false;
+  if (normalized === "proactive-internal") return false;
+  if (normalized === "desktop-control") return false;
+  if (normalized === "desktop-diagnosis") return false;
+  if (normalized === "desktop-agent-error") return false;
+  if (normalized === "desktop-agent-tool") return false;
+  return !normalized.startsWith("desktop-local-");
+}
+
+function petShouldShowThinkingCloud(source: string) {
+  const normalized = source.trim();
+  return normalized !== "pet-vision" && normalized !== "proactive-internal";
 }
 
 function attachmentName(path: string, fileName?: string) {
@@ -595,6 +617,7 @@ export function PetWindow() {
   const activeVoiceReplyRequestRef = useRef<string | null>(null);
   const assistantStreamRef = useRef<PetAssistantStreamRuntime | null>(null);
   const thinkingCloudRef = useRef<PetThinkingCloudRuntime | null>(null);
+  const desktopUiThinkingRef = useRef<Map<string, boolean>>(new Map());
   const streamedAssistantMessageIdsRef = useRef<Set<string>>(new Set());
   const petVoiceReplyEnabledRef = useRef(false);
   const petVoiceReplyConfigRef = useRef<NonNullable<Persona["voiceReply"]>>(defaultPetVoiceReplyConfig());
@@ -1035,6 +1058,86 @@ export function PetWindow() {
   }, []);
 
   useEffect(() => {
+    const applyThinkingState = (value: unknown, persistContext = true) => {
+      const state = parsePetThinkingState(value);
+      if (!state?.conversationId) return;
+      if (!petShouldShowThinkingCloud(state.source)) return;
+      if (state.source === "desktop-ui") {
+        desktopUiThinkingRef.current.set(state.conversationId, state.thinking);
+      } else if (state.thinking && state.source === "desktop") {
+        desktopUiThinkingRef.current.set(state.conversationId, true);
+      }
+      if (state.thinking) {
+        const current = activeContextRef.current ?? readStoredPetActiveContext();
+        if (current?.conversationId !== state.conversationId) {
+          setPetContext({
+            conversationId: state.conversationId,
+            conversationTitle: null,
+            personaId: state.personaId,
+            personaName: null,
+            agentId: null,
+            updatedAt: state.updatedAt,
+            source: state.source || "desktop"
+          }, persistContext);
+        }
+        showThinkingCloud(state.conversationId);
+        return;
+      }
+      const currentThinking = thinkingCloudRef.current;
+      const keptBubbleId = currentThinking?.conversationId === state.conversationId
+        ? currentThinking.bubbleId
+        : null;
+      const keptThinkingBubble = clearThinkingCloud(state.conversationId, { clearBubble: false });
+      void refreshLatestAssistant(state.conversationId, true).finally(() => {
+        if (!keptThinkingBubble || !keptBubbleId) return;
+        cloudTextDraftsRef.current.delete(keptBubbleId);
+        setCloudBubble((bubble) => (bubble?.id === keptBubbleId ? null : bubble));
+      });
+    };
+
+    const stored = readStoredPetThinkingState();
+    if (stored?.thinking) applyThinkingState(stored, false);
+    const unsubscribeSharedState = subscribePetThinkingState((state) => {
+      applyThinkingState(state);
+    });
+
+    let unlisten: (() => void) | null = null;
+    void listen(PET_THINKING_STATE_EVENT, (event) => {
+      applyThinkingState(event.payload);
+    }).then((handler) => {
+      unlisten = handler;
+    });
+
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== PET_THINKING_STATE_STORAGE_KEY || !event.newValue) return;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(event.newValue);
+      } catch {
+        return;
+      }
+      applyThinkingState(parsed, false);
+    };
+    window.addEventListener("storage", onStorage);
+    let lastStoredSignature = "";
+    const pollStoredThinkingState = () => {
+      const state = readStoredPetThinkingState();
+      if (!state) return;
+      const signature = `${state.conversationId ?? ""}:${state.thinking ? "1" : "0"}:${state.updatedAt}`;
+      if (signature === lastStoredSignature) return;
+      lastStoredSignature = signature;
+      applyThinkingState(state, false);
+    };
+    const pollTimer = window.setInterval(pollStoredThinkingState, 700);
+    return () => {
+      unsubscribeSharedState();
+      if (unlisten) unlisten();
+      window.removeEventListener("storage", onStorage);
+      window.clearInterval(pollTimer);
+    };
+  }, []);
+
+  useEffect(() => {
     let unlisten: (() => void) | null = null;
     void listen<{
       type?: string;
@@ -1080,12 +1183,16 @@ export function PetWindow() {
       conversationId?: string;
       message?: ChatMessage;
       source?: string;
+      personaId?: string;
       delta?: string;
       isLast?: boolean;
+      ok?: boolean;
     }>("synthchat-pet-event", (event) => {
       const payload = event.payload;
       if (
-        payload.type !== "assistant_stream_delta"
+        payload.type !== "thinking_started"
+        && payload.type !== "thinking_finished"
+        && payload.type !== "assistant_stream_delta"
         && payload.type !== "assistant_stream_done"
         && payload.type !== "assistant_final"
         && payload.type !== "proactive_message"
@@ -1098,19 +1205,46 @@ export function PetWindow() {
         if (payload.message && assistantMessageVisibleInCloud(payload.message)) showAssistantCloud(payload.message);
         return;
       }
-      const shouldAdoptConversation = !isCurrentConversation && (isWechat || !hasContext);
+      const eventSource = payload.source ?? payload.message?.source ?? "";
+      const isThinkingStart = payload.type === "thinking_started";
+      const shouldShowThinking =
+        isThinkingStart
+        && petShouldFollowThinkingTurn(eventSource)
+        && petShouldShowThinkingCloud(eventSource);
+      const shouldAdoptConversation = !isCurrentConversation && (isWechat || shouldShowThinking || !hasContext);
       if (shouldAdoptConversation) {
         setPetContext({
           conversationId: payload.conversationId,
           conversationTitle: null,
-          personaId: null,
+          personaId: payload.personaId ?? null,
           personaName: null,
           agentId: null,
           updatedAt: new Date().toISOString(),
-          source: isWechat ? "wechat" : "desktop"
+          source: isWechat ? "wechat" : (eventSource || "desktop")
         });
       }
+      if (payload.type === "thinking_started") {
+        if (shouldShowThinking) {
+          showThinkingCloud(payload.conversationId);
+        }
+        return;
+      }
       if (!isCurrentConversation && !shouldAdoptConversation) return;
+      if (payload.type === "thinking_finished") {
+        if (desktopUiThinkingRef.current.get(payload.conversationId) === true) {
+          return;
+        }
+        if (payload.message && assistantMessageVisibleInCloud(payload.message)) {
+          showAssistantCloud(payload.message, payload.conversationId);
+          return;
+        }
+        clearThinkingCloud(payload.conversationId);
+        if (payload.ok === false) {
+          showCloud("思考中断了。", "error", 3200);
+          playPetBehavior("error");
+        }
+        return;
+      }
       if (payload.type === "assistant_stream_delta" && payload.message) {
         appendAssistantStreamDelta(payload.conversationId, payload.message, payload.delta ?? "");
         return;
@@ -1161,7 +1295,7 @@ export function PetWindow() {
       // The chat stream keeps the pet's target/context in sync and owns the
       // pre-reply thinking cloud. Reply text still flows through pet events.
       const payload = event.payload;
-      const relevantTypes = ["turn_started", "turn_finished", "new_message", "assistant_message", "conversation_updated"];
+      const relevantTypes = ["turn_started", "turn_finished", "processing", "new_message", "assistant_message", "conversation_updated"];
       if (!relevantTypes.includes(payload.type) || !payload.conversationId) return;
 
       const context = activeContextRef.current ?? readStoredPetActiveContext();
@@ -1170,11 +1304,18 @@ export function PetWindow() {
       const hasContext = Boolean(context?.conversationId);
       // Follow rules:
       // - WeChat-originated messages always follow (locked or not).
+      // - Desktop-originated thinking turns follow before the first reply delta
+      //   so the pet can show the same pre-reply state as the main chat.
       // - When the pet has no locked context yet, follow the desktop-active
       //   conversation so the input target stays intuitive.
+      const isThinkingStart = payload.type === "turn_started" || payload.type === "processing";
+      const shouldShowThinking =
+        isThinkingStart
+        && petShouldFollowThinkingTurn(eventSource)
+        && petShouldShowThinkingCloud(eventSource);
       const shouldFollowIncomingWechat = eventSource === "wechat" && (!hasContext || !isCurrentConversation);
       const shouldFollowWhenUnbound = !hasContext;
-      const shouldFollow = shouldFollowIncomingWechat || shouldFollowWhenUnbound;
+      const shouldFollow = shouldShowThinking || shouldFollowIncomingWechat || shouldFollowWhenUnbound;
 
       if (shouldFollow && !isCurrentConversation) {
         const nextContext: PetActiveContext = {
@@ -1190,12 +1331,21 @@ export function PetWindow() {
       }
       const currentAfterFollow = activeContextRef.current ?? readStoredPetActiveContext();
       const isActiveConversation = currentAfterFollow?.conversationId === payload.conversationId;
-      if (!isActiveConversation) return;
-      if (payload.type === "turn_started") {
-        showThinkingCloud(payload.conversationId);
+      if (payload.type === "turn_started" || payload.type === "processing") {
+        const canShowActiveThinking =
+          isActiveConversation
+          && petShouldFollowThinkingTurn(eventSource)
+          && petShouldShowThinkingCloud(eventSource);
+        if (shouldShowThinking || canShowActiveThinking) {
+          showThinkingCloud(payload.conversationId);
+        }
         return;
       }
+      if (!isActiveConversation) return;
       if (payload.type === "turn_finished") {
+        if (desktopUiThinkingRef.current.get(payload.conversationId) === true) {
+          return;
+        }
         if (payload.message && assistantMessageVisibleInCloud(payload.message)) {
           showAssistantCloud(payload.message, payload.conversationId);
           return;
@@ -1653,7 +1803,7 @@ export function PetWindow() {
         return {
           id: bubbleId,
           text: PET_THINKING_CLOUD_TEXT,
-          tone: "soft"
+          tone: "active"
         };
       });
       return;
@@ -1668,7 +1818,7 @@ export function PetWindow() {
     setCloudBubble({
       id: bubbleId,
       text: PET_THINKING_CLOUD_TEXT,
-      tone: "soft"
+      tone: "active"
     });
     playPetBehavior("thinking", { durationMs: 1800 });
   }
@@ -2415,6 +2565,7 @@ export function PetWindow() {
     try {
       const context = await resolvePetSendContext();
       updatePetActiveContext(context);
+      showThinkingCloud(context.conversationId);
       const previousAssistantState = assistantMirrorState(context.conversationId);
       const messages = await api.sendChatMessage({
         conversationId: context.conversationId,

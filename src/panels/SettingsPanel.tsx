@@ -157,6 +157,31 @@ function setCapabilityOverride(
   return { ...provider, models };
 }
 
+function providerThinkingEnabled(provider: LlmProvider | null | undefined): boolean {
+  const models = normalizeProviderModels(provider?.models);
+  return Boolean(models.__provider?.thinkingEnabled);
+}
+
+function setProviderThinkingEnabled(provider: LlmProvider, enabled: boolean): LlmProvider {
+  const models = { ...normalizeProviderModels(provider.models) };
+  const meta = {
+    ...(models.__provider && typeof models.__provider === "object" && !Array.isArray(models.__provider)
+      ? models.__provider
+      : {})
+  };
+  if (enabled) {
+    meta.thinkingEnabled = true;
+  } else {
+    delete meta.thinkingEnabled;
+  }
+  if (Object.keys(meta).length > 0) {
+    models.__provider = meta;
+  } else {
+    delete models.__provider;
+  }
+  return { ...provider, models };
+}
+
 function formatCapabilitySource(source?: string) {
   if (!source) return "unknown";
   if (source === "configured") return "手动覆盖";
@@ -1480,6 +1505,8 @@ function ProviderSettings({
           <div className="settings-form provider-card">
             <div className="panel-title action-title"><button className="icon-only-btn" onClick={() => { setSelectedId(""); setDraft(null); }} title="返回" type="button"><ChevronRight size={19} style={{ transform: "rotate(180deg)" }} /></button><div className="panel-title-text"><span>Edit</span><strong>{draft.name}</strong></div><button onClick={() => void saveDraft()} type="button">完成</button></div>
             <label className="checkbox-row"><input checked={draft.enabled} onChange={(event) => setDraft((d) => d ? { ...d, enabled: event.target.checked } : d)} type="checkbox" />启用当前服务商</label>
+            <label className="checkbox-row"><input checked={providerThinkingEnabled(draft)} onChange={(event) => setDraft((d) => d ? setProviderThinkingEnabled(d, event.target.checked) : d)} type="checkbox" />启用思考卡片</label>
+            <small className="form-hint">该服务商被通讯录/角色实际选中时，才会请求 reasoning/thinking，并把返回内容展示为折叠卡片。</small>
             <label>名称<input value={draft.name} onChange={(event) => setDraft((d) => d ? { ...d, name: event.target.value } : d)} /></label>
             <label>类型<select value={draft.providerType ?? "openai_compatible"} onChange={(event) => setDraft((d) => d ? { ...d, providerType: event.target.value } : d)}>
               <option value="openai_compatible">OpenAI Compatible</option>

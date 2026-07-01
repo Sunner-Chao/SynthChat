@@ -41,6 +41,7 @@ const WECHAT_VOICE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_WECHAT_CHAT_THREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
 const MIN_WECHAT_CHAT_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 const MAX_WECHAT_CHAT_THREAD_STACK_SIZE: usize = 256 * 1024 * 1024;
+const PET_WINDOW_LABEL: &str = "pet";
 const WECHAT_QR_STATUS_TIMEOUT_SECONDS: u64 = 35;
 const DEFAULT_WECHAT_TYPING_REFRESH_SECONDS: u64 = 2;
 const MIN_WECHAT_TYPING_REFRESH_SECONDS: u64 = 1;
@@ -4556,8 +4557,8 @@ fn emit_wechat_assistant_message(
             "isLast": true,
         }),
     );
-    let _ = app.emit(
-        "synthchat-pet-event",
+    emit_wechat_pet_event(
+        app,
         json!({
             "type": "assistant_final",
             "source": "wechat",
@@ -4602,6 +4603,20 @@ fn emit_wechat_processing(
             "conversationId": conversation_id,
         }),
     );
+    emit_wechat_pet_event(
+        app,
+        json!({
+            "type": if processing { "thinking_started" } else { "thinking_finished" },
+            "source": "wechat",
+            "personaId": persona_id,
+            "conversationId": conversation_id,
+        }),
+    );
+}
+
+fn emit_wechat_pet_event(app: &AppHandle, payload: Value) {
+    let _ = app.emit("synthchat-pet-event", payload.clone());
+    let _ = app.emit_to(PET_WINDOW_LABEL, "synthchat-pet-event", payload);
 }
 
 fn is_wechat_deliverable_assistant_message(message: &ChatMessage) -> bool {

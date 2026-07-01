@@ -599,7 +599,7 @@ pub(super) fn internal_tool_prompt_lines() -> Vec<(&'static str, &'static str)> 
         ),
         (
             "session_search",
-            r#"- session_search: payload {"query":"topic","limit":3,"kind":"all|message|run|tool|artifact","sort":"newest|oldest"} discovers matching past sessions; payload {} browses recent sessions; payload {"session_id":"...","around_message_id":"...","window":5} scrolls around an anchor. Results include Hermes-style success/count/session_id/match_message_id/around_message_id aliases plus SynthChat conversationId/messageId fields."#,
+            r#"- session_search: payload {"query":"topic","limit":3,"kind":"all|message|run|tool|artifact|session_memory","sort":"newest|oldest"} discovers matching past sessions, runs, tool events, artifacts, and deleted-conversation session memory summaries; payload {} browses recent sessions; payload {"session_id":"...","around_message_id":"...","window":5} scrolls around an anchor. Use kind=session_memory to search conversation summaries saved when a chat was deleted; those results may have conversationDeleted=true and no scrollable session_id. Results include Hermes-style success/count/session_id/match_message_id/around_message_id aliases plus SynthChat conversationId/messageId fields."#,
         ),
         (
             "clarify",

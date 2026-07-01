@@ -1,4 +1,4 @@
-import { BookOpen, Brain, Database, MessageSquareText, RefreshCw, Trash2 } from "lucide-react";
+import { BookOpen, Brain, Database, MessageSquareText, RefreshCw, Sparkles, Trash2 } from "lucide-react";
 import type { ChatConfig, MemoryEntry, Persona } from "../lib/types";
 
 function defaultMemoryConfig(): NonNullable<Persona["memory"]> {
@@ -35,23 +35,50 @@ export function PersonaMemoryManager({
   const memory = { ...defaultMemoryConfig(), ...(personaMemory ?? {}) };
   const promptLimit = Math.max(1, memory.maxMemories ?? 50);
   const providerLabel = [bindingProviderName, bindingModel].filter(Boolean).join(" / ") || "跟随当前角色服务商";
+  const totalMemories = persistentMemories.length + sessionMemories.length;
 
   return (
     <div className="persona-memory-manager">
       <div className="memory-manager-head">
-        <div>
-          <span>Memory</span>
-          <strong>记忆管理</strong>
+        <div className="memory-manager-head-text">
+          <div className="memory-manager-icon-wrap">
+            <Brain size={18} />
+          </div>
+          <div>
+            <span>Memory</span>
+            <strong>记忆管理</strong>
+          </div>
         </div>
         <div className="row-actions">
-          <button className="ghost-button compact" disabled={isDraftPersona} onClick={onRefresh} type="button"><RefreshCw size={14} />刷新</button>
-          {onViewAll ? <button className="ghost-button compact" onClick={onViewAll} type="button"><BookOpen size={14} />全局记忆</button> : null}
+          <button className="ghost-button compact" disabled={isDraftPersona} onClick={onRefresh} type="button"><RefreshCw size={13} />刷新</button>
+          {onViewAll ? <button className="ghost-button compact" onClick={onViewAll} type="button"><BookOpen size={13} />全局记忆</button> : null}
         </div>
       </div>
+
+      {/* ── Quick Stats ── */}
+      <div className="memory-quick-stats">
+        <div className="memory-quick-stat">
+          <span className="memory-quick-stat-num">{totalMemories}</span>
+          <span className="memory-quick-stat-lbl">总记忆</span>
+        </div>
+        <div className="memory-quick-stat">
+          <span className="memory-quick-stat-num">{persistentMemories.length}</span>
+          <span className="memory-quick-stat-lbl">长期</span>
+        </div>
+        <div className="memory-quick-stat">
+          <span className="memory-quick-stat-num">{sessionMemories.length}</span>
+          <span className="memory-quick-stat-lbl">会话</span>
+        </div>
+        <div className="memory-quick-stat">
+          <span className={`memory-quick-stat-num ${memory.enabled ? "stat-on" : "stat-off"}`}>{memory.enabled ? "ON" : "OFF"}</span>
+          <span className="memory-quick-stat-lbl">注入</span>
+        </div>
+      </div>
+
       <div className="memory-module-grid">
         <section className="memory-module-card persistent">
           <div className="memory-module-title">
-            <Database size={17} />
+            <div className="memory-module-icon mod-icon-db"><Database size={16} /></div>
             <div>
               <strong>长期持久记忆</strong>
               <small>链接 memory 系统，稳定注入角色提示词</small>
@@ -76,7 +103,7 @@ export function PersonaMemoryManager({
         </section>
         <section className="memory-module-card session">
           <div className="memory-module-title">
-            <MessageSquareText size={17} />
+            <div className="memory-module-icon mod-icon-msg"><MessageSquareText size={16} /></div>
             <div>
               <strong>短期会话记忆</strong>
               <small>左侧删除会话时，调用当前服务商整理后存入</small>
@@ -92,7 +119,7 @@ export function PersonaMemoryManager({
         </section>
         <section className="memory-module-card context">
           <div className="memory-module-title">
-            <Brain size={17} />
+            <div className="memory-module-icon mod-icon-brain"><Sparkles size={16} /></div>
             <div>
               <strong>短时上下文记忆</strong>
               <small>控制当前会话历史窗口与摘要压缩策略</small>
@@ -159,6 +186,28 @@ function ShortContextSettings({
   );
 }
 
+function importanceColor(level: number): string {
+  if (level >= 5) return "var(--danger)";
+  if (level >= 4) return "#F97316";
+  if (level >= 3) return "var(--warning)";
+  if (level >= 2) return "var(--primary)";
+  return "#94A3B8";
+}
+
+function relativeTime(iso: string): string {
+  const d = new Date(iso);
+  const now = new Date();
+  const diffMs = now.getTime() - d.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMs / 3600000);
+  const diffDays = Math.floor(diffMs / 86400000);
+  if (diffMins < 1) return "刚刚";
+  if (diffMins < 60) return `${diffMins}分钟前`;
+  if (diffHours < 24) return `${diffHours}小时前`;
+  if (diffDays < 7) return `${diffDays}天前`;
+  return d.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
+}
+
 function MemoryPreviewList({
   emptyText,
   memories,
@@ -170,18 +219,30 @@ function MemoryPreviewList({
 }) {
   const visible = memories.slice(0, 4);
   if (visible.length === 0) {
-    return <div className="memory-preview-empty">{emptyText}</div>;
+    return (
+      <div className="memory-preview-empty">
+        <Brain size={20} />
+        <span>{emptyText}</span>
+      </div>
+    );
   }
   return (
     <div className="memory-preview-list">
       {visible.map((memory) => (
         <div className="memory-preview-item" key={memory.id}>
-          <div>
+          <div className="memory-preview-dot" style={{ background: importanceColor(memory.importance) }} />
+          <div className="memory-preview-body">
             <strong>{memory.summary}</strong>
-            <small>{memory.target ?? "memory"} · 重要度 {memory.importance} · {new Date(memory.updatedAt || memory.createdAt).toLocaleString()}</small>
+            <small>
+              <span>{memory.target ?? "memory"}</span>
+              <span className="memory-preview-sep">·</span>
+              <span style={{ color: importanceColor(memory.importance) }}>重要度 {memory.importance}</span>
+              <span className="memory-preview-sep">·</span>
+              <span>{relativeTime(memory.updatedAt || memory.createdAt)}</span>
+            </small>
           </div>
-          <button className="icon-only-btn subtle" onClick={() => void onDelete(memory.id)} title="删除记忆" type="button">
-            <Trash2 size={14} />
+          <button className="memory-preview-del" onClick={() => void onDelete(memory.id)} title="删除记忆" type="button">
+            <Trash2 size={13} />
           </button>
         </div>
       ))}

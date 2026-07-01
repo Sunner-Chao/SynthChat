@@ -440,7 +440,7 @@ fn handle_gemini_stream_line(
     for item in gemini_stream_payload_items(payload) {
         if let Some(delta) = gemini_payload_text(&item).filter(|delta| !delta.is_empty()) {
             content.push_str(&delta);
-            callback(&delta)?;
+            callback(LlmStreamDeltaKind::Answer, &delta)?;
         }
         update_gemini_usage(
             &item,
@@ -949,7 +949,10 @@ mod tests {
     fn cloudcode_stream_payload_unwraps_response_envelope() {
         let deltas = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let callback_deltas = deltas.clone();
-        let callback: LlmDeltaCallback = std::sync::Arc::new(move |delta| {
+        let callback: LlmDeltaCallback = std::sync::Arc::new(move |kind, delta| {
+            if kind != LlmStreamDeltaKind::Answer {
+                return Ok(());
+            }
             callback_deltas.lock().unwrap().push(delta.to_string());
             Ok(())
         });

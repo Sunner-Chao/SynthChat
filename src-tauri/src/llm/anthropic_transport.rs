@@ -36,6 +36,10 @@ pub(super) async fn complete_anthropic_compatible(
     let url = anthropic_messages_url(provider, api_key.as_deref());
 
     let mut headers = anthropic_headers(provider, api_key.as_deref(), &effective_base_url)?;
+    let thinking_enabled = options.thinking_enabled && provider_thinking_enabled(provider);
+    if thinking_enabled {
+        append_anthropic_beta_header(&mut headers, "interleaved-thinking-2025-05-14")?;
+    }
     if options.fast_mode_enabled {
         append_anthropic_beta_header(&mut headers, "fast-mode-2026-02-01")?;
     }
@@ -48,7 +52,10 @@ pub(super) async fn complete_anthropic_compatible(
 
     let cache_policy = prompt_cache_policy(provider, model);
     let system_value = anthropic_system_value(system_prompt, cache_policy.as_ref());
-    let max_tokens = resolve_anthropic_messages_max_tokens(persona.max_tokens, model);
+    let mut max_tokens = resolve_anthropic_messages_max_tokens(persona.max_tokens, model);
+    if thinking_enabled {
+        max_tokens = max_tokens.max(2048);
+    }
     let mut body = json!({
         "model": model,
         "system": system_value,
@@ -59,6 +66,13 @@ pub(super) async fn complete_anthropic_compatible(
     });
     if options.fast_mode_enabled {
         body["speed"] = json!("fast");
+    }
+    if thinking_enabled {
+        body["thinking"] = json!({
+            "type": "enabled",
+            "budget_tokens": anthropic_thinking_budget_tokens(max_tokens)
+        });
+        body["temperature"] = json!(1.0);
     }
     if anthropic_model_forbids_sampling_params(model) {
         if let Some(object) = body.as_object_mut() {
@@ -76,7 +90,7 @@ pub(super) async fn complete_anthropic_compatible(
         .map_err(|e| AppError::Llm(e.to_string()))?;
 
     let started_at = Instant::now();
-    let response = send_llm_request_with_stale_timeout(
+    let mut response = send_llm_request_with_stale_timeout(
         client.post(url.clone()).json(&body),
         provider,
         model,
@@ -84,17 +98,50 @@ pub(super) async fn complete_anthropic_compatible(
     )
     .await?;
 
-    let status = response.status();
-    let response_headers = response.headers().clone();
+    let mut status = response.status();
+    let mut response_headers = response.headers().clone();
+    let mut retry_count = 0;
+    let mut retry_reason = None;
     if !status.is_success() {
         let text = response
             .text()
             .await
             .map_err(|e| AppError::Llm(format!("failed to read llm response: {e}")))?;
-        return Err(AppError::Llm(format!(
-            "provider returned {status}: {}",
-            response_preview(&text)
-        )));
+        if let Some(retry_body) =
+            anthropic_unsupported_thinking_retry_body(&body, &text, persona.temperature)
+        {
+            retry_count = 1;
+            retry_reason = Some("unsupported_thinking_recovery".to_string());
+            let retry_response = send_llm_request_with_stale_timeout(
+                client
+                    .post(anthropic_messages_url(provider, api_key.as_deref()))
+                    .json(&retry_body),
+                provider,
+                model,
+                "anthropic messages retry request",
+            )
+            .await?;
+            status = retry_response.status();
+            response_headers = retry_response.headers().clone();
+            if !status.is_success() {
+                let text = retry_response
+                    .text()
+                    .await
+                    .map_err(|e| {
+                        AppError::Llm(format!("failed to read recovered llm response: {e}"))
+                    })?;
+                return Err(AppError::Llm(format!(
+                    "provider returned {status}: {}",
+                    response_preview(&text)
+                )));
+            }
+            response = retry_response;
+        } else {
+            return Err(AppError::Llm(format!(
+                "provider returned {status}: {}",
+                response_preview(&text)
+            )));
+        }
     }
 
     let transport = LlmTransportMetadata {
@@ -103,8 +150,8 @@ pub(super) async fn complete_anthropic_compatible(
         endpoint: url,
         status: Some(status.as_u16()),
         elapsed_ms: Some(started_at.elapsed().as_millis().min(u64::MAX as u128) as u64),
-        retry_count: 0,
-        retry_reason: None,
+        retry_count,
+        retry_reason,
     };
     if let Some(callback) = options.stream_delta_callback.as_ref() {
         let reply = read_anthropic_sse_stream(
@@ -143,6 +190,37 @@ pub(super) async fn complete_anthropic_compatible(
             Some(transport),
         )
     })
+}
+
+fn anthropic_thinking_budget_tokens(max_tokens: u32) -> u32 {
+    max_tokens
+        .saturating_div(4)
+        .clamp(1024, 16_000)
+        .min(max_tokens.saturating_sub(1))
+}
+
+fn anthropic_unsupported_thinking_retry_body(
+    body: &Value,
+    error_text: &str,
+    fallback_temperature: f32,
+) -> Option<Value> {
+    let lower = error_text.to_ascii_lowercase();
+    if !lower.contains("thinking")
+        || !(lower.contains("unsupported")
+            || lower.contains("unknown")
+            || lower.contains("invalid")
+            || lower.contains("not supported")
+            || lower.contains("beta"))
+    {
+        return None;
+    }
+    let mut retry = body.clone();
+    let object = retry.as_object_mut()?;
+    object.remove("thinking")?;
+    if object.contains_key("temperature") {
+        object.insert("temperature".into(), json!(fallback_temperature));
+    }
+    (retry != *body).then_some(retry)
 }
 
 async fn read_anthropic_sse_stream(
@@ -227,14 +305,15 @@ async fn read_anthropic_sse_stream(
             content = format!("{content}\n\n{tool_json}");
         }
     }
+    let replay_content_blocks = replay_blocks.into_values().collect::<Vec<_>>();
+    let provider_data = anthropic_provider_data(&replay_content_blocks);
+    let content = strip_thinking_cards_from_visible_content(&content, &provider_data);
     let content = scrub_reasoning_blocks(&content);
     if content.trim().is_empty() {
         return Err(AppError::Llm(
             "anthropic stream produced no visible text".into(),
         ));
     }
-    let replay_content_blocks = replay_blocks.into_values().collect::<Vec<_>>();
-    let provider_data = anthropic_provider_data(&replay_content_blocks);
     Ok(LlmReply {
         prompt_tokens,
         completion_tokens: if completion_tokens == 0 {
@@ -293,7 +372,21 @@ fn handle_anthropic_sse_line(
         .filter(|delta| !delta.is_empty())
     {
         content.push_str(delta);
-        callback(delta)?;
+        callback(LlmStreamDeltaKind::Answer, delta)?;
+    }
+    if let Some(thinking_delta) = payload
+        .get("delta")
+        .filter(|delta| {
+            delta
+                .get("type")
+                .and_then(Value::as_str)
+                == Some("thinking_delta")
+        })
+        .and_then(|delta| delta.get("thinking"))
+        .and_then(Value::as_str)
+        .filter(|delta| !delta.is_empty())
+    {
+        callback(LlmStreamDeltaKind::Thinking, thinking_delta)?;
     }
     track_anthropic_stream_tool_call(&payload, tool_calls);
     track_anthropic_stream_replay_block(&payload, replay_blocks);
@@ -925,6 +1018,8 @@ fn parse_anthropic_compatible_with_tool_name_map(
         })
         .collect::<Vec<_>>()
         .join("\n\n");
+    let provider_data = anthropic_provider_data(content_blocks);
+    content = strip_thinking_cards_from_visible_content(&content, &provider_data);
     let tool_calls = anthropic_tool_calls(content_blocks, tool_name_map);
     let has_tool_calls = !tool_calls.is_empty();
     if !tool_calls.is_empty() {
@@ -959,8 +1054,6 @@ fn parse_anthropic_compatible_with_tool_name_map(
         .pointer("/usage/cache_creation_input_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0) as usize;
-    let provider_data = anthropic_provider_data(content_blocks);
-
     Ok(LlmReply {
         content,
         prompt_tokens,
@@ -993,11 +1086,53 @@ fn anthropic_provider_data(content_blocks: &[Value]) -> Option<Value> {
         .filter(|block| anthropic_replay_block_is_required(block))
         .cloned()
         .collect::<Vec<_>>();
-    if replay_blocks.is_empty() {
+    let thinking_cards = anthropic_thinking_cards(content_blocks);
+    if replay_blocks.is_empty() && thinking_cards.is_empty() {
         None
     } else {
-        Some(json!({ "anthropic": { "content": replay_blocks } }))
+        let mut anthropic = serde_json::Map::new();
+        if !replay_blocks.is_empty() {
+            anthropic.insert("content".into(), json!(replay_blocks));
+        }
+        if !thinking_cards.is_empty() {
+            anthropic.insert("thinkingCards".into(), json!(thinking_cards));
+        }
+        Some(json!({ "anthropic": anthropic }))
     }
+}
+
+fn anthropic_thinking_cards(content_blocks: &[Value]) -> Vec<Value> {
+    content_blocks
+        .iter()
+        .filter_map(|block| {
+            let block_type = block.get("type").and_then(Value::as_str)?;
+            if !matches!(block_type, "thinking" | "redacted_thinking") {
+                return None;
+            }
+            let summary = block
+                .get("thinking")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let redacted_data = block
+                .get("data")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+            if summary.is_empty() && !redacted_data && block_type != "redacted_thinking" {
+                return None;
+            }
+            Some(json!({
+                "provider": "anthropic",
+                "kind": block_type,
+                "title": if block_type == "redacted_thinking" { "模型思考（已隐藏）" } else { "模型思考" },
+                "summary": summary,
+                "redacted": block_type == "redacted_thinking" || summary.trim().is_empty(),
+                "signature": block.get("signature").and_then(Value::as_str).is_some()
+            }))
+        })
+        .collect()
 }
 
 fn anthropic_tool_calls(

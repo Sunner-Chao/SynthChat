@@ -18,6 +18,7 @@ use crate::{
 const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 const MEMORY_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const DEEPSEEK_MODEL_LIST_BASE_URL: &str = "https://api.deepseek.com";
+const XIAOMI_ANTHROPIC_MODEL_LIST_DEFAULT_BASE_URL: &str = "https://token-plan-sgp.xiaomimimo.com";
 
 static MODELS_DEV_CACHE: OnceLock<Mutex<Option<CachedCatalog>>> = OnceLock::new();
 
@@ -914,10 +915,13 @@ pub async fn detect_provider_models(provider: LlmProvider) -> AppResult<Detected
     let provider_id = provider.id.trim().to_string();
     let provider_type = provider.provider_type.trim().to_ascii_lowercase();
     let use_deepseek_model_endpoint = uses_deepseek_model_endpoint(&provider);
+    let use_xiaomi_anthropic_model_endpoint = uses_xiaomi_anthropic_model_endpoint(&provider);
     let base_url = live_model_base_url(&provider);
     let api_key = live_model_api_key(&provider);
     let static_provider_id = if use_deepseek_model_endpoint {
         "deepseek"
+    } else if use_xiaomi_anthropic_model_endpoint {
+        "xiaomi"
     } else {
         match provider_type.as_str() {
             "openai_responses" | "openai-responses" => "openai",
@@ -985,6 +989,9 @@ fn live_model_base_url(provider: &LlmProvider) -> String {
     if uses_deepseek_model_endpoint(provider) {
         return DEEPSEEK_MODEL_LIST_BASE_URL.into();
     }
+    if uses_xiaomi_anthropic_model_endpoint(provider) {
+        return xiaomi_anthropic_model_base_url(provider);
+    }
     let configured = provider.base_url.trim().trim_end_matches('/');
     if !configured.is_empty() {
         return configured.to_string();
@@ -1016,6 +1023,39 @@ fn uses_deepseek_model_endpoint(provider: &LlmProvider) -> bool {
     haystack.contains("deepseek")
         || haystack.contains("deep-seek")
         || haystack.contains("api.deepseek.com")
+}
+
+fn uses_xiaomi_anthropic_model_endpoint(provider: &LlmProvider) -> bool {
+    let provider_type = provider.provider_type.trim().to_ascii_lowercase();
+    if provider_type != "anthropic" {
+        return false;
+    }
+    let preset = provider
+        .preset
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let haystack = format!(
+        "{} {} {} {}",
+        provider.id.to_ascii_lowercase(),
+        provider.name.to_ascii_lowercase(),
+        preset,
+        provider.base_url.to_ascii_lowercase()
+    );
+    haystack.contains("xiaomi")
+        || haystack.contains("mimo")
+        || haystack.contains("xiaomimimo.com")
+}
+
+fn xiaomi_anthropic_model_base_url(provider: &LlmProvider) -> String {
+    let configured = provider.base_url.trim().trim_end_matches('/');
+    if configured.is_empty() {
+        return XIAOMI_ANTHROPIC_MODEL_LIST_DEFAULT_BASE_URL.into();
+    }
+    configured
+        .strip_suffix("/anthropic")
+        .unwrap_or(configured)
+        .to_string()
 }
 
 fn live_model_api_key(provider: &LlmProvider) -> Option<String> {

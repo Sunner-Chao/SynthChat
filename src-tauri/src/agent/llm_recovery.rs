@@ -2092,6 +2092,36 @@ pub(super) async fn complete_chat_with_provider_failover(
     native_tools: Option<&[ToolDefinition]>,
     stream_delta_callback: Option<crate::llm::LlmDeltaCallback>,
 ) -> AppResult<crate::llm::LlmReply> {
+    complete_chat_with_provider_failover_options(
+        store,
+        run_id,
+        providers,
+        persona,
+        system_prompt,
+        history,
+        user_content,
+        native_tools,
+        stream_delta_callback,
+        crate::llm::LlmCallOptions {
+            fast_mode_enabled: true,
+            ..crate::llm::LlmCallOptions::default()
+        },
+    )
+    .await
+}
+
+pub(super) async fn complete_chat_with_provider_failover_options(
+    store: &AppStore,
+    run_id: Option<&str>,
+    providers: &[LlmProvider],
+    persona: &Persona,
+    system_prompt: String,
+    history: Vec<ChatMessage>,
+    user_content: &str,
+    native_tools: Option<&[ToolDefinition]>,
+    stream_delta_callback: Option<crate::llm::LlmDeltaCallback>,
+    base_options: crate::llm::LlmCallOptions,
+) -> AppResult<crate::llm::LlmReply> {
     if providers.is_empty() {
         return Err(AppError::NotFound("llm provider".into()));
     }
@@ -2169,8 +2199,11 @@ pub(super) async fn complete_chat_with_provider_failover(
                     native_tools,
                     &crate::llm::LlmCallOptions {
                         responses_reasoning_replay_enabled: chat_config
-                            .responses_reasoning_replay_enabled,
-                        fast_mode_enabled: chat_config.fast_mode_enabled,
+                            .responses_reasoning_replay_enabled
+                            && base_options.responses_reasoning_replay_enabled,
+                        fast_mode_enabled: chat_config.fast_mode_enabled
+                            && base_options.fast_mode_enabled,
+                        thinking_enabled: base_options.thinking_enabled,
                         stream_delta_callback: stream_delta_callback.clone(),
                     },
                 ),

@@ -40,8 +40,7 @@ import { useAppStore } from "./lib/store";
 
 
 import { api } from "./lib/api";
-import { listen } from "@tauri-apps/api/event";
-import { emit } from "@tauri-apps/api/event";
+import { emit, emitTo, listen } from "@tauri-apps/api/event";
 import { Avatar, MenuRow } from "./components/common";
 import { PersonaMemoryManager } from "./components/PersonaMemoryManager";
 import { resolvePersonaAgentBinding } from "./lib/personaAgentBinding";
@@ -54,7 +53,14 @@ import { MomentsPanel } from "./panels/MomentsPanel";
 import { PersonaPanel } from "./panels/PersonaPanel";
 import { ChatExperience } from "./panels/ChatExperience";
 import { EnvironmentCheck } from "./panels/EnvironmentCheck";
-import { PET_ACTIVE_CONTEXT_EVENT, writeStoredPetActiveContext, type PetActiveContext } from "./lib/petContext";
+import {
+  PET_ACTIVE_CONTEXT_EVENT,
+  PET_THINKING_STATE_EVENT,
+  publishPetThinkingState,
+  writeStoredPetActiveContext,
+  type PetActiveContext,
+  type PetThinkingState
+} from "./lib/petContext";
 import "./styles.css";
 import "./panels-beautiful.css";
 import type {
@@ -119,6 +125,7 @@ function formatTime(value: string) {
 }
 
 function isVisibleChatEventMessage(message: ChatMessage) {
+  if (message.source === "desktop-agent-error") return false;
   const providerData = message.providerData;
   const record = providerData && typeof providerData === "object" && !Array.isArray(providerData)
     ? providerData as Record<string, unknown>
@@ -130,6 +137,12 @@ function isVisibleChatEventMessage(message: ChatMessage) {
     return false;
   }
   return !(message.role === "user" && message.source === "proactive-internal");
+}
+
+function isMemoryWriteToolEvent(event?: ToolEvent | null) {
+  if (!event || event.ok === false || event.status === "running") return false;
+  const toolName = event.toolName.trim();
+  return ["remember_fact", "fact_store", "manage_memory", "memory"].includes(toolName);
 }
 
 function maskSecret(value?: string | null) {
@@ -188,6 +201,7 @@ export function App() {
   const refreshSkills = useAppStore((state) => state.refreshSkills);
   const refreshAgentQueue = useAppStore((state) => state.refreshAgentQueue);
   const refreshAgentRuns = useAppStore((state) => state.refreshAgentRuns);
+  const refreshMemories = useAppStore((state) => state.refreshMemories);
   const setConversationProcessing = useAppStore((state) => state.setConversationProcessing);
   const incrementConversationUnread = useAppStore((state) => state.incrementConversationUnread);
   const handleAgentRunEvent = useAppStore((state) => state.handleAgentRunEvent);
@@ -197,6 +211,7 @@ export function App() {
     const personas = await api.listPersonas();
     useAppStore.setState({ personas });
   }, []);
+  const processingConversationIds = useAppStore((state) => state.processingConversationIds);
   const processingConversationCount = useAppStore((state) => state.processingConversationIds.length);
   const hasChatUnread = useAppStore((state) => Object.values(state.conversationUnreadCounts).some((count) => count > 0));
   const conversations = useAppStore((state) => state.conversations);
@@ -209,6 +224,7 @@ export function App() {
   const visibleWechatUserRef = useRef<Set<string>>(new Set());
   const deferredWechatMessagesRef = useRef<Map<string, Array<{ message: ChatMessage; personaId: string | null }>>>(new Map());
   const deferredWechatTimerRef = useRef<Map<string, number>>(new Map());
+  const bridgedProcessingIdsRef = useRef<Set<string>>(new Set());
 
   const showConversationProcessing = useCallback((
     conversationId: string,
@@ -312,6 +328,38 @@ export function App() {
   }, [activeConversationId, conversations, personas]);
 
   useEffect(() => {
+    const previous = bridgedProcessingIdsRef.current;
+    const next = new Set(processingConversationIds);
+    next.forEach((conversationId) => {
+      if (previous.has(conversationId)) return;
+      const conversation = conversations.find((item) => item.id === conversationId);
+      const payload: PetThinkingState = {
+        source: "desktop",
+        personaId: conversation?.personaId ?? null,
+        conversationId,
+        thinking: true,
+        updatedAt: new Date().toISOString()
+      };
+      publishPetThinkingState(payload);
+      void emit(PET_THINKING_STATE_EVENT, payload).catch(() => undefined);
+      void emitTo("pet", PET_THINKING_STATE_EVENT, payload).catch(() => undefined);
+      void emitTo("pet", "synthchat-pet-event", {
+        type: "thinking_started",
+        source: payload.source,
+        personaId: payload.personaId,
+        conversationId
+      }).catch(() => undefined);
+    });
+    previous.forEach((conversationId) => {
+      if (next.has(conversationId)) return;
+      // The desktop chat row owns the exact hide timing, including its
+      // minimum-visible delay and streaming overlap. Avoid clearing the pet
+      // bubble here before ChatExperience publishes desktop-ui=false.
+    });
+    bridgedProcessingIdsRef.current = next;
+  }, [conversations, processingConversationIds]);
+
+  useEffect(() => {
     const tick = async () => {
       const due = await api.tickScheduledAgentJobs();
       if (due.length > 0) {
@@ -342,6 +390,7 @@ export function App() {
       personaId?: string;
       conversationId?: string;
       message?: ChatMessage;
+      delta?: string;
       isLast?: boolean;
     }>("synthchat-chat-event", (event) => {
       const payload = event.payload;
@@ -412,6 +461,7 @@ export function App() {
       }
       const isMessageEvent =
         payload.type === "assistant_stream"
+        || payload.type === "assistant_thinking_stream"
         || payload.type === "new_message"
         || payload.type === "tool_message"
         || payload.type === "assistant_message";
@@ -448,7 +498,11 @@ export function App() {
           }
         }
         upsertIncomingMessage(payload.message, {
-          streaming: payload.type === "assistant_stream" && payload.message.role === "assistant" && !payload.isLast,
+          streaming: (
+            (payload.type === "assistant_stream" || payload.type === "assistant_thinking_stream")
+            && payload.message.role === "assistant"
+            && !payload.isLast
+          ),
           final: (
             (payload.type === "assistant_message" || (payload.type === "assistant_stream" && payload.isLast))
             && payload.message.role === "assistant"
@@ -459,7 +513,7 @@ export function App() {
           flushDeferredWechatMessages(payload.conversationId);
         }
       }
-      if (payload.type === "assistant_stream") {
+      if (payload.type === "assistant_stream" || payload.type === "assistant_thinking_stream") {
         return;
       }
       if (payload.type === "tool_message") {
@@ -537,6 +591,9 @@ export function App() {
     void listen<AgentRunEvent>("synthchat-agent-run-event", (event) => {
       const payload = event.payload;
       handleAgentRunEvent(payload);
+      if (payload.phase === "memory_write_observed" || isMemoryWriteToolEvent(payload.toolEvent)) {
+        void refreshMemories();
+      }
       // Processing visibility is owned by the authoritative turn_started /
       // turn_finished lifecycle (see synthchat-chat-event handler).
       if (payload.message) {
@@ -555,7 +612,7 @@ export function App() {
     return () => {
       if (unlisten) unlisten();
     };
-  }, [handleAgentRunEvent, refreshAgentQueue, refreshAgentRuns, refreshChatData, setConversationProcessing, upsertIncomingMessage]);
+  }, [handleAgentRunEvent, refreshAgentQueue, refreshAgentRuns, refreshChatData, refreshMemories, setConversationProcessing, upsertIncomingMessage]);
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;

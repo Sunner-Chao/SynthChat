@@ -24,8 +24,15 @@ use crate::{
 
 use super::*;
 
+const PET_WINDOW_LABEL: &str = "pet";
+
 static CHAT_TURN_LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     OnceLock::new();
+
+fn emit_pet_event(app: &AppHandle, payload: Value) {
+    let _ = app.emit("synthchat-pet-event", payload.clone());
+    let _ = app.emit_to(PET_WINDOW_LABEL, "synthchat-pet-event", payload);
+}
 
 fn emit_assistant_stream_event(
     app: &AppHandle,
@@ -48,8 +55,8 @@ fn emit_assistant_stream_event(
             "isLast": is_final,
         }),
     );
-    let _ = app.emit(
-        "synthchat-pet-event",
+    emit_pet_event(
+        app,
         json!({
             "type": if is_final { "assistant_stream_done" } else { "assistant_stream_delta" },
             "source": source,
@@ -62,6 +69,67 @@ fn emit_assistant_stream_event(
     );
 }
 
+fn stream_thinking_provider_data(summary: &str) -> Value {
+    json!({
+        "thinkingCards": [{
+            "provider": "llm",
+            "kind": "thinking",
+            "title": "模型思考",
+            "summary": summary,
+            "redacted": false,
+            "streaming": true
+        }]
+    })
+}
+
+#[derive(Clone)]
+struct DesktopVisibleStreamState {
+    message: Arc<Mutex<ChatMessage>>,
+    parser: Arc<Mutex<PlannerVisibleContentStream>>,
+    thinking_buffer: Arc<Mutex<String>>,
+    emitted_visible_text: Arc<AtomicBool>,
+    conversation_id: String,
+    source: String,
+}
+
+impl DesktopVisibleStreamState {
+    fn new(conversation_id: &str, source: &str) -> Self {
+        Self {
+            message: Arc::new(Mutex::new(ChatMessage::new(
+                conversation_id.to_string(),
+                "assistant",
+                String::new(),
+                source,
+            ))),
+            parser: Arc::new(Mutex::new(PlannerVisibleContentStream::default())),
+            thinking_buffer: Arc::new(Mutex::new(String::new())),
+            emitted_visible_text: Arc::new(AtomicBool::new(false)),
+            conversation_id: conversation_id.to_string(),
+            source: source.to_string(),
+        }
+    }
+
+    fn reset_for_next_llm_call(&self) {
+        if !self.emitted_visible_text.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut message) = self.message.lock() {
+            *message = ChatMessage::new(
+                self.conversation_id.clone(),
+                "assistant",
+                String::new(),
+                &self.source,
+            );
+        }
+        if let Ok(mut parser) = self.parser.lock() {
+            *parser = PlannerVisibleContentStream::default();
+        }
+        if let Ok(mut buffer) = self.thinking_buffer.lock() {
+            buffer.clear();
+        }
+    }
+}
+
 fn desktop_visible_stream_callback(
     existing: Option<crate::llm::LlmDeltaCallback>,
     app: Option<&AppHandle>,
@@ -71,31 +139,61 @@ fn desktop_visible_stream_callback(
     emit_pet_events: bool,
 ) -> (
     Option<crate::llm::LlmDeltaCallback>,
-    Arc<Mutex<ChatMessage>>,
-    Arc<AtomicBool>,
+    DesktopVisibleStreamState,
 ) {
-    let stream_message = Arc::new(Mutex::new(ChatMessage::new(
-        conversation_id.to_string(),
-        "assistant",
-        String::new(),
-        source,
-    )));
-    let emitted_visible_text = Arc::new(AtomicBool::new(false));
+    let stream_state = DesktopVisibleStreamState::new(conversation_id, source);
     let Some(app) = app.cloned() else {
-        return (existing, stream_message, emitted_visible_text);
+        return (existing, stream_state);
     };
-    let parser = Arc::new(Mutex::new(PlannerVisibleContentStream::default()));
-    let callback_message = Arc::clone(&stream_message);
-    let callback_started = Arc::clone(&emitted_visible_text);
+    let callback_message = Arc::clone(&stream_state.message);
+    let callback_started = Arc::clone(&stream_state.emitted_visible_text);
     let callback_existing = existing.clone();
+    let callback_parser = Arc::clone(&stream_state.parser);
+    let callback_thinking_buffer = Arc::clone(&stream_state.thinking_buffer);
     let conversation_id = conversation_id.to_string();
     let persona_id = persona_id.to_string();
     let source = source.to_string();
-    let callback: crate::llm::LlmDeltaCallback = Arc::new(move |delta| {
+    let callback: crate::llm::LlmDeltaCallback = Arc::new(move |kind, delta| {
         if let Some(existing) = callback_existing.as_ref() {
-            existing(delta)?;
+            existing(kind, delta)?;
         }
-        let visible_delta = parser
+        if kind == crate::llm::LlmStreamDeltaKind::Thinking {
+            if delta.is_empty() {
+                return Ok(());
+            }
+            let summary = {
+                let mut buffer = callback_thinking_buffer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                buffer.push_str(delta);
+                buffer.clone()
+            };
+            let is_first_visible_delta = !callback_started.swap(true, Ordering::SeqCst);
+            let message = {
+                let mut message = callback_message
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if is_first_visible_delta {
+                    message.created_at = now_iso();
+                }
+                message.provider_data = Some(stream_thinking_provider_data(&summary));
+                message.clone()
+            };
+            let _ = app.emit(
+                "synthchat-chat-event",
+                json!({
+                    "type": "assistant_thinking_stream",
+                    "source": source,
+                    "personaId": persona_id,
+                    "conversationId": conversation_id,
+                    "message": message,
+                    "delta": delta,
+                    "isLast": false,
+                }),
+            );
+            return Ok(());
+        }
+        let visible_delta = callback_parser
             .lock()
             .map(|mut parser| parser.push(delta))
             .unwrap_or_default();
@@ -126,8 +224,8 @@ fn desktop_visible_stream_callback(
             }),
         );
         if emit_pet_events {
-            let _ = app.emit(
-                "synthchat-pet-event",
+            emit_pet_event(
+                &app,
                 json!({
                     "type": "assistant_stream_delta",
                     "source": source,
@@ -141,7 +239,7 @@ fn desktop_visible_stream_callback(
         }
         Ok(())
     });
-    (Some(callback), stream_message, emitted_visible_text)
+    (Some(callback), stream_state)
 }
 
 #[derive(Debug, Default)]
@@ -310,6 +408,11 @@ fn turn_source_label(request: &SendChatRequest) -> String {
         .filter(|source| !source.is_empty())
         .unwrap_or("desktop")
         .to_string()
+}
+
+fn should_emit_pet_thinking_event(source: &str) -> bool {
+    let source = source.trim();
+    source != "pet-vision" && source != "proactive-internal"
 }
 
 fn pre_persisted_user_message_id(provider_data: Option<&Value>) -> Option<String> {
@@ -744,6 +847,17 @@ pub async fn run_chat_turn(
                 "conversationId": conversation_id,
             }),
         );
+        if should_emit_pet_thinking_event(&source) {
+            emit_pet_event(
+                app,
+                json!({
+                    "type": "thinking_started",
+                    "source": source,
+                    "personaId": persona_id,
+                    "conversationId": conversation_id,
+                }),
+            );
+        }
     }
 
     let result =
@@ -780,6 +894,19 @@ pub async fn run_chat_turn(
                     "message": assistant_message,
                 }),
             );
+            if should_emit_pet_thinking_event(&source) {
+                emit_pet_event(
+                    app,
+                    json!({
+                        "type": "thinking_finished",
+                        "source": source,
+                        "personaId": persona_id,
+                        "conversationId": resolved_conversation_id,
+                        "ok": result.is_ok(),
+                        "message": assistant_message,
+                    }),
+                );
+            }
         }
     }
 
@@ -871,7 +998,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
         "desktop-agent"
     };
     let emit_pet_stream_events = request_source != "wechat";
-    let (stream_delta_callback, streaming_assistant_message, assistant_streamed_visible_text) =
+    let (stream_delta_callback, desktop_stream_state) =
         desktop_visible_stream_callback(
             stream_delta_callback,
             desktop_app,
@@ -1210,6 +1337,7 @@ pub(super) async fn run_chat_turn_with_toolset_policy_and_iteration_limit(
             run_pre_llm_call_hooks(store, &saved_run.run_id, &enriched_user_content).await;
         let llm_user_content =
             inject_pre_llm_hook_context(&enriched_user_content, &pre_llm_contexts);
+        desktop_stream_state.reset_for_next_llm_call();
         let reply_result = await_agent_run_interruptible(
             store,
             &saved_run.run_id,
@@ -3239,12 +3367,6 @@ pub(super) fn resolve_chat_turn_persona_and_agent(
     conversation: &Conversation,
     request: &SendChatRequest,
 ) -> AppResult<(Persona, AgentDefinition)> {
-    let persona = store.persona(
-        conversation
-            .persona_id
-            .as_deref()
-            .or(request.persona_id.as_deref()),
-    )?;
     let agent = store.agent(
         request
             .agent_id
@@ -3252,7 +3374,39 @@ pub(super) fn resolve_chat_turn_persona_and_agent(
             .filter(|id| !id.trim().is_empty())
             .or(Some(conversation.agent_id.as_str())),
     )?;
+    let persona = resolve_chat_turn_persona(store, conversation, request, &agent)?;
     Ok((persona, agent))
+}
+
+fn resolve_chat_turn_persona(
+    store: &AppStore,
+    conversation: &Conversation,
+    request: &SendChatRequest,
+    agent: &AgentDefinition,
+) -> AppResult<Persona> {
+    let requested_persona = request
+        .persona_id
+        .as_deref()
+        .and_then(|id| store.persona(Some(id)).ok());
+    if let Some(persona) = requested_persona.as_ref() {
+        if persona.agent_id == agent.id {
+            return Ok(persona.clone());
+        }
+    }
+    let conversation_persona = store.persona(conversation.persona_id.as_deref()).ok();
+    if let Some(persona) = conversation_persona.as_ref() {
+        if persona.agent_id == agent.id {
+            return Ok(persona.clone());
+        }
+    }
+    store
+        .personas()?
+        .into_iter()
+        .find(|persona| persona.agent_id == agent.id)
+        .or(requested_persona)
+        .or(conversation_persona)
+        .map(Ok)
+        .unwrap_or_else(|| store.persona(None))
 }
 
 pub(super) fn tool_batch_is_execute_code_only(requests: &[(String, Value)]) -> bool {
