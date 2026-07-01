@@ -25,7 +25,7 @@ npm run desktop:build:windows -- -Bundle nsis
 To inject a default GitHub Releases update source into the app:
 
 ```powershell
-npm run desktop:build:windows -- -Bundle nsis -UpdateManifestUrl "https://api.github.com/repos/<owner>/<repo>/releases/latest"
+npm run desktop:build:windows -- -Bundle nsis -UpdateManifestUrl "https://github.com/<owner>/<repo>/releases/latest/download/update-manifest.json"
 ```
 
 If WebView2 `offlineInstaller` bundling times out, build with the bootstrapper fallback:
@@ -41,11 +41,11 @@ The one-click wrapper accepts fresh installer artifacts when Tauri reports `fail
 ## GitHub Releases Update Source
 
 1. Create a GitHub Release whose tag is the app version, for example `v1.1.1`.
-2. Upload the Windows installer asset, for example `SynthChat_1.1.1_x64-setup.exe`.
+2. Upload the Windows installer asset, for example `SynthChat_1.1.1_x64-setup.exe`, and upload `release-dist/update-manifest.json` as a release asset.
 3. In SynthChat Settings -> About, set the update source to:
 
 ```powershell
-https://api.github.com/repos/<owner>/<repo>/releases/latest
+https://github.com/<owner>/<repo>/releases/latest/download/update-manifest.json
 ```
 
 4. Click "检查更新" to detect the latest release.
@@ -77,4 +77,6 @@ For a fresh Windows machine, prepare the external ChatTTS directory and Python e
 
 ## Update Manifest
 
-The checker accepts `docs/update-manifest.example.json` shape, and also accepts GitHub Releases API responses that include `tag_name`, `html_url`, `body`, `published_at`, and `assets`.
+The checker accepts `docs/update-manifest.example.json` shape, and still accepts GitHub Releases API responses that include `tag_name`, `html_url`, `body`, `published_at`, and `assets`. Prefer the static `update-manifest.json` release asset URL to avoid GitHub API anonymous rate limits.
+
+The one-click build writes `release-dist/update-manifest.json` when it can detect a GitHub `origin` remote and a native installer artifact. If the About page reports that a GitHub Release is missing `update-manifest.json`, upload that generated file to the latest release.

@@ -233,21 +233,43 @@ try {
             return @($ReleaseAsset)
         }
 
-        $defaultAssets = @(
-            Get-ChildItem -Path "src-tauri\target\release\bundle\nsis" -Filter "*.exe" -ErrorAction SilentlyContinue |
-                Sort-Object LastWriteTime -Descending |
-                Select-Object -First 1 -ExpandProperty FullName
-        )
-        if ($defaultAssets.Count -gt 0 -and $defaultAssets[0]) {
-            Write-Host "[push-github] 检测到最新安装包：" -ForegroundColor DarkGray
-            Write-Host "  $($defaultAssets[0])" -ForegroundColor DarkGray
-            $choice = Read-Host "是否上传该安装包到 Release？(Y/n)"
-            if (-not $choice -or $choice -match '^(y|yes)$') {
-                return @($defaultAssets[0])
+        $defaultAssets = @()
+        $releaseDist = Join-Path $ProjectRoot 'release-dist'
+        if (Test-Path -LiteralPath $releaseDist) {
+            $defaultAssets += @(
+                Get-ChildItem -LiteralPath $releaseDist -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Extension -in @('.exe', '.msi', '.msix') } |
+                    Sort-Object LastWriteTime -Descending |
+                    Select-Object -First 1 -ExpandProperty FullName
+            )
+
+            $manifestPath = Join-Path $releaseDist 'update-manifest.json'
+            if (Test-Path -LiteralPath $manifestPath) {
+                $defaultAssets += $manifestPath
             }
         }
 
-        $inputAssets = Read-Host "请输入要上传的安装包路径（可留空，仅创建 Release；多个路径用英文逗号分隔）"
+        if ($defaultAssets.Count -eq 0) {
+            $defaultAssets = @(
+                Get-ChildItem -Path "src-tauri\target\release\bundle\nsis" -Filter "*.exe" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 1 -ExpandProperty FullName
+            )
+        }
+
+        $defaultAssets = @($defaultAssets | Where-Object { $_ } | Select-Object -Unique)
+        if ($defaultAssets.Count -gt 0) {
+            Write-Host "[push-github] 检测到 Release 资产：" -ForegroundColor DarkGray
+            foreach ($asset in $defaultAssets) {
+                Write-Host "  $asset" -ForegroundColor DarkGray
+            }
+            $choice = Read-Host "是否上传这些资产到 Release？(Y/n)"
+            if (-not $choice -or $choice -match '^(y|yes)$') {
+                return @($defaultAssets)
+            }
+        }
+
+        $inputAssets = Read-Host "请输入要上传的 Release 资产路径（可留空，仅创建 Release；多个路径用英文逗号分隔）"
         if (-not $inputAssets -or -not $inputAssets.Trim()) {
             return @()
         }

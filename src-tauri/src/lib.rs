@@ -252,10 +252,169 @@ fn sync_runtime_env_from_store(store: &AppStore) {
 }
 
 fn default_app_update_manifest_url() -> String {
-    DEFAULT_APP_UPDATE_MANIFEST_URL
-        .unwrap_or("")
-        .trim()
-        .to_string()
+    normalize_app_update_manifest_url(DEFAULT_APP_UPDATE_MANIFEST_URL.unwrap_or(""))
+        .unwrap_or_else(|| {
+            DEFAULT_APP_UPDATE_MANIFEST_URL
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        })
+}
+
+fn github_latest_manifest_download_url(owner: &str, repo: &str) -> String {
+    format!("https://github.com/{owner}/{repo}/releases/latest/download/update-manifest.json")
+}
+
+fn normalize_app_update_manifest_url(raw_url: &str) -> Option<String> {
+    let value = raw_url.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(value).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let segments: Vec<&str> = parsed.path_segments()?.collect();
+    if host == "api.github.com" {
+        if segments.len() >= 6
+            && segments[0] == "repos"
+            && segments[3] == "releases"
+            && segments[4] == "latest"
+            && segments[5] == "download"
+        {
+            return Some(github_latest_manifest_download_url(segments[1], segments[2]));
+        }
+        if segments.len() >= 5
+            && segments[2] == "releases"
+            && segments[3] == "latest"
+            && segments[4] == "download"
+        {
+            return Some(github_latest_manifest_download_url(segments[0], segments[1]));
+        }
+        if segments.len() >= 5
+            && segments[0] == "repos"
+            && segments[3] == "releases"
+            && segments[4] == "latest"
+        {
+            return Some(value.to_string());
+        }
+        if segments.len() >= 4 && segments[2] == "releases" && segments[3] == "latest" {
+            return Some(format!(
+                "https://api.github.com/repos/{}/{}/releases/latest",
+                segments[0], segments[1]
+            ));
+        }
+    }
+    if host == "github.com" || host == "www.github.com" {
+        if segments.len() >= 4 && segments[2] == "releases" && segments[3] == "latest" {
+            if segments.get(4) == Some(&"download") {
+                return Some(value.to_string());
+            }
+            return Some(github_latest_manifest_download_url(segments[0], segments[1]));
+        }
+    }
+    Some(value.to_string())
+}
+
+fn github_release_api_manifest_fallback(url: &reqwest::Url) -> Option<String> {
+    if url.host_str()?.eq_ignore_ascii_case("api.github.com") {
+        let segments: Vec<&str> = url.path_segments()?.collect();
+        if segments.len() >= 5
+            && segments[0] == "repos"
+            && segments[3] == "releases"
+            && segments[4] == "latest"
+        {
+            return Some(github_latest_manifest_download_url(segments[1], segments[2]));
+        }
+    }
+    None
+}
+
+fn github_missing_update_manifest_message(url: &reqwest::Url) -> Option<String> {
+    let host = url.host_str()?;
+    if !host.eq_ignore_ascii_case("github.com") && !host.eq_ignore_ascii_case("www.github.com")
+    {
+        return None;
+    }
+    let segments: Vec<&str> = url.path_segments()?.collect();
+    if segments.len() >= 5
+        && segments[2] == "releases"
+        && segments[3] == "download"
+        && segments
+            .last()
+            .map(|name| name.eq_ignore_ascii_case("update-manifest.json"))
+            .unwrap_or(false)
+    {
+        return Some(format!(
+            "GitHub Release '{}' is missing update-manifest.json. Upload release-dist/update-manifest.json as a release asset, or use the GitHub Releases API URL while staying under GitHub API rate limits.",
+            segments[4]
+        ));
+    }
+    None
+}
+
+async fn fetch_app_update_manifest_payload(
+    client: &reqwest::Client,
+    parsed_url: &reqwest::Url,
+) -> AppResult<(Value, reqwest::Url)> {
+    let response = client
+        .get(parsed_url.clone())
+        .header("User-Agent", APP_UPDATE_USER_AGENT)
+        .send()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("fetch update manifest failed: {error}")))?;
+    let status = response.status();
+    let final_url = response.url().clone();
+    let response = match response.error_for_status() {
+        Ok(response) => response,
+        Err(error) => {
+            if status == reqwest::StatusCode::NOT_FOUND {
+                if let Some(message) = github_missing_update_manifest_message(&final_url) {
+                    return Err(AppError::BadRequest(message));
+                }
+            }
+            if matches!(
+                status,
+                reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS
+            ) {
+                if let Some(fallback_url) = github_release_api_manifest_fallback(parsed_url) {
+                    let fallback = reqwest::Url::parse(&fallback_url).map_err(|parse_error| {
+                        AppError::BadRequest(format!(
+                            "invalid update manifest fallback URL: {parse_error}"
+                        ))
+                    })?;
+                    let fallback_response = client
+                        .get(fallback.clone())
+                        .header("User-Agent", APP_UPDATE_USER_AGENT)
+                        .send()
+                        .await
+                        .map_err(|fallback_error| {
+                            AppError::BadRequest(format!(
+                                "fetch update manifest failed: {error}; fallback failed: {fallback_error}"
+                            ))
+                        })?;
+                    let fallback_response =
+                        fallback_response.error_for_status().map_err(|fallback_error| {
+                            AppError::BadRequest(format!(
+                                "fetch update manifest failed: {error}; fallback failed: {fallback_error}"
+                            ))
+                        })?;
+                    let payload = fallback_response.json::<Value>().await.map_err(|json_error| {
+                        AppError::BadRequest(format!(
+                            "read update manifest failed from fallback: {json_error}"
+                        ))
+                    })?;
+                    return Ok((payload, fallback));
+                }
+            }
+            return Err(AppError::BadRequest(format!(
+                "fetch update manifest failed: {error}"
+            )));
+        }
+    };
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("read update manifest failed: {error}")))?;
+    Ok((payload, parsed_url.clone()))
 }
 
 fn normalize_version_text(value: &str) -> String {
@@ -578,6 +737,7 @@ async fn check_app_update(manifest_url: Option<String>) -> AppResult<AppUpdateCh
             "update manifest URL is not configured".into(),
         ));
     }
+    let manifest_url = normalize_app_update_manifest_url(&manifest_url).unwrap_or(manifest_url);
     let parsed_url = reqwest::Url::parse(&manifest_url)
         .map_err(|error| AppError::BadRequest(format!("invalid update manifest URL: {error}")))?;
     if !matches!(parsed_url.scheme(), "http" | "https") {
@@ -589,19 +749,7 @@ async fn check_app_update(manifest_url: Option<String>) -> AppResult<AppUpdateCh
         .timeout(Duration::from_secs(APP_UPDATE_FETCH_TIMEOUT_SECS))
         .build()
         .map_err(|error| AppError::BadRequest(format!("create update client failed: {error}")))?;
-    let response = client
-        .get(parsed_url.clone())
-        .header("User-Agent", APP_UPDATE_USER_AGENT)
-        .send()
-        .await
-        .map_err(|error| AppError::BadRequest(format!("fetch update manifest failed: {error}")))?;
-    let response = response
-        .error_for_status()
-        .map_err(|error| AppError::BadRequest(format!("fetch update manifest failed: {error}")))?;
-    let payload = response
-        .json::<Value>()
-        .await
-        .map_err(|error| AppError::BadRequest(format!("read update manifest failed: {error}")))?;
+    let (payload, source_url) = fetch_app_update_manifest_payload(&client, &parsed_url).await?;
     let manifest = parse_app_update_manifest(payload)?;
     let current_version = env!("CARGO_PKG_VERSION").to_string();
     let update_available = compare_app_versions(&manifest.latest_version, &current_version)
@@ -614,7 +762,7 @@ async fn check_app_update(manifest_url: Option<String>) -> AppResult<AppUpdateCh
         release_url: manifest.release_url,
         notes: manifest.notes,
         published_at: manifest.published_at,
-        source_url: parsed_url.to_string(),
+        source_url: source_url.to_string(),
         checked_at: chrono::Utc::now().to_rfc3339(),
     })
 }
@@ -5800,6 +5948,49 @@ mod tests {
         );
         assert_eq!(manifest.notes.as_deref(), Some("Release notes"));
         assert_eq!(manifest.published_at.as_deref(), Some("2026-06-28T00:00:00Z"));
+    }
+
+    #[test]
+    fn app_update_manifest_url_normalizes_common_github_urls() {
+        assert_eq!(
+            normalize_app_update_manifest_url(
+                "https://api.github.com/Sunner-Chao/SynthChat/releases/latest/download/update-manifest.json"
+            )
+            .as_deref(),
+            Some("https://github.com/Sunner-Chao/SynthChat/releases/latest/download/update-manifest.json")
+        );
+        assert_eq!(
+            normalize_app_update_manifest_url(
+                "https://api.github.com/repos/Sunner-Chao/SynthChat/releases/latest/download/update-manifest.json"
+            )
+            .as_deref(),
+            Some("https://github.com/Sunner-Chao/SynthChat/releases/latest/download/update-manifest.json")
+        );
+        assert_eq!(
+            normalize_app_update_manifest_url(
+                "https://api.github.com/Sunner-Chao/SynthChat/releases/latest"
+            )
+            .as_deref(),
+            Some("https://api.github.com/repos/Sunner-Chao/SynthChat/releases/latest")
+        );
+        assert_eq!(
+            normalize_app_update_manifest_url(
+                "https://github.com/Sunner-Chao/SynthChat/releases/latest"
+            )
+            .as_deref(),
+            Some("https://github.com/Sunner-Chao/SynthChat/releases/latest/download/update-manifest.json")
+        );
+    }
+
+    #[test]
+    fn app_update_missing_github_manifest_message_names_release_asset() {
+        let url = reqwest::Url::parse(
+            "https://github.com/Sunner-Chao/SynthChat/releases/download/v1.1.0/update-manifest.json",
+        )
+        .unwrap();
+        let message = github_missing_update_manifest_message(&url).unwrap();
+        assert!(message.contains("v1.1.0"));
+        assert!(message.contains("update-manifest.json"));
     }
 
     #[test]

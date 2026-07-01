@@ -1282,6 +1282,7 @@ function ProviderSettings({
   const [draft, setDraft] = useState<LlmProvider | null>(null);
   const [showTypeSheet, setShowTypeSheet] = useState(false);
   const selected = providers.find((provider) => provider.id === selectedId);
+  const defaultProviderId = providers.find((provider) => provider.enabled)?.id ?? "";
   const [tokenStats, setTokenStats] = useState<Record<string, TokenUsageStats>>({});
   const emptyTokenStats: TokenUsageStats = { promptTokens: 0, completionTokens: 0, totalTokens: 0, callCount: 0 };
   useEffect(() => {
@@ -1295,6 +1296,7 @@ function ProviderSettings({
   const [catalogModels, setCatalogModels] = useState<ModelCatalogEntry[]>([]);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [catalogSource, setCatalogSource] = useState("");
+  const [catalogBaseUrl, setCatalogBaseUrl] = useState("");
   const [catalogError, setCatalogError] = useState("");
   const [draftCapabilities, setDraftCapabilities] = useState<ModelCapabilities | null>(null);
   const [capabilityLoading, setCapabilityLoading] = useState(false);
@@ -1304,10 +1306,12 @@ function ProviderSettings({
       const result = await api.detectProviderModels(provider);
       setCatalogModels(result.models ?? []);
       setCatalogSource(result.source ?? "");
+      setCatalogBaseUrl(result.baseUrl ?? "");
       setCatalogError(result.error ?? "");
     } catch (error) {
       setCatalogModels([]);
       setCatalogSource("");
+      setCatalogBaseUrl("");
       setCatalogError(String(error));
     } finally {
       setCatalogLoading(false);
@@ -1407,14 +1411,18 @@ function ProviderSettings({
               const typeLabel = provider.providerType === "anthropic" ? "Anthropic" :
                 provider.providerType === "gemini" ? "Gemini" :
                 provider.providerType === "openai_responses" ? "Responses" : "OpenAI";
+              const isDefaultProvider = provider.enabled && provider.id === defaultProviderId;
               return (
                 <div className="card provider-item-card" key={provider.id}>
                   <button className="provider-card-btn" onClick={() => selectProvider(provider.id)} type="button">
                     <div className="provider-card-header">
                       <div className="provider-card-left">
-                        <span className={`provider-type-badge ${provider.providerType ?? "openai_compatible"}`}>
-                          {typeLabel}
-                        </span>
+                        <div className="provider-badge-stack">
+                          <span className={`provider-type-badge ${provider.providerType ?? "openai_compatible"}`}>
+                            {typeLabel}
+                          </span>
+                          {isDefaultProvider ? <span className="provider-default-badge">默认</span> : null}
+                        </div>
                         <div className="provider-card-info">
                           <strong className="provider-card-name">{provider.name}</strong>
                           <span className="provider-card-model">{provider.model || "未配置模型"}</span>
@@ -1521,7 +1529,7 @@ function ProviderSettings({
               </div>
               {catalogSource || catalogError ? (
                 <small className="form-hint">
-                  {catalogSource === "live" ? "已通过当前 Base URL/API Key 检测模型" : "使用内置模型目录"}
+                  {catalogSource === "live" ? `已通过模型目录端点/API Key 检测模型${catalogBaseUrl ? `（${catalogBaseUrl}）` : ""}` : "使用内置模型目录"}
                   {catalogError ? `：${catalogError}` : ""}
                 </small>
               ) : null}
@@ -3899,8 +3907,9 @@ function AboutSettings({ onBack, setView }: { onBack?: () => void; setView: (vie
     setUpdateDetail("");
     try {
       const result = await api.checkAppUpdate(url) as AppUpdateCheck;
-      writeUpdateManifestUrl(url);
-      if (url !== manifestUrl) setManifestUrl(url);
+      const normalizedUrl = result.sourceUrl?.trim() || url;
+      writeUpdateManifestUrl(normalizedUrl);
+      if (normalizedUrl !== manifestUrl) setManifestUrl(normalizedUrl);
       if (result.updateAvailable) {
         setAvailableUpdate(result);
         setUpdateStatus(`发现新版本 ${result.latestVersion}`);

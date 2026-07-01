@@ -19,6 +19,10 @@ function providerVisible(provider: LlmProvider | null | undefined) {
   return Boolean(provider?.enabled);
 }
 
+function defaultVisibleProvider(providers: LlmProvider[]) {
+  return providers.find((provider) => providerVisible(provider)) ?? null;
+}
+
 export function resolvePersonaBoundAgent(
   persona: Persona | null | undefined,
   agents: AgentDefinition[],
@@ -41,6 +45,7 @@ export function resolvePersonaAgentBinding(
   const agent = resolvePersonaBoundAgent(persona, agents, fallbackAgentId);
   const agentProviderId = trimmed(agent?.llmProvider);
   const personaProviderId = trimmed(persona?.llmProvider);
+  const defaultProvider = defaultVisibleProvider(llmProviders);
   const personaProvider = personaProviderId
     ? llmProviders.find((item) => item.id === personaProviderId) ?? null
     : null;
@@ -49,8 +54,10 @@ export function resolvePersonaAgentBinding(
     : null;
   const provider = personaProviderId
     ? providerVisible(personaProvider) ? personaProvider : null
-    : providerVisible(agentProvider) ? agentProvider : null;
-  const configuredProvider = personaProviderId ? personaProvider : agentProvider;
+    : agentProviderId
+      ? providerVisible(agentProvider) ? agentProvider : null
+      : providerVisible(defaultProvider) ? defaultProvider : null;
+  const configuredProvider = personaProviderId ? personaProvider : agentProviderId ? agentProvider : defaultProvider;
   const providerId = trimmed(provider?.id);
   const providerName = provider?.name?.trim() ?? "";
   const personaModel = trimmed(persona?.llmModel);
@@ -59,7 +66,7 @@ export function resolvePersonaAgentBinding(
     ? personaModel || trimmed(provider?.model) || ""
     : provider?.id === agentProviderId
       ? agentModel || trimmed(provider?.model) || ""
-      : "";
+      : trimmed(provider?.model) || "";
   let infoText = "";
   const providerMissing = Boolean((personaProviderId || agentProviderId) && !configuredProvider);
   const providerDisabled = Boolean(providerMissing || (configuredProvider && !configuredProvider.enabled && !provider));

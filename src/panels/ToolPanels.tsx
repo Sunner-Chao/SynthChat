@@ -2668,6 +2668,7 @@ export function AgentsPanel() {
   const [catalogModels, setCatalogModels] = useState<ModelCatalogEntry[]>([]);
   const [plannerTraces, setPlannerTraces] = useState<PlannerTraceRecord[]>([]);
   const [routerTraces, setRouterTraces] = useState<ToolRouterTraceRecord[]>([]);
+  const defaultLlmProvider = llmProviders.find((item) => item.enabled) ?? null;
 
   const didInitRef = useRef(false);
   useEffect(() => {
@@ -2752,8 +2753,8 @@ export function AgentsPanel() {
       name: "新智能体",
       description: "",
       workspaceDir: "",
-      llmProvider: llmProviders[0]?.id ?? "",
-      llmModel: llmProviders[0]?.model ?? "",
+      llmProvider: defaultLlmProvider?.id ?? "",
+      llmModel: defaultLlmProvider?.model ?? "",
       enabled: true,
       isDefault: false,
       mcpEnabled: true,
@@ -2830,7 +2831,7 @@ export function AgentsPanel() {
 
   const activeAgentCount = agents.filter((a) => a.enabled).length;
   const selectedProvider = draft
-    ? llmProviders.find((item) => item.id === draft.llmProvider) ?? llmProviders[0] ?? null
+    ? llmProviders.find((item) => item.id === draft.llmProvider && item.enabled) ?? defaultLlmProvider
     : null;
 
   return (

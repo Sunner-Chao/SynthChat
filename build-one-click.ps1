@@ -59,7 +59,7 @@ function Get-GitHubManifestUrlFromRemote {
   if ([string]::IsNullOrWhiteSpace($owner) -or [string]::IsNullOrWhiteSpace($repo)) {
     return ""
   }
-  return "https://api.github.com/repos/$owner/$repo/releases/latest"
+  return "https://github.com/$owner/$repo/releases/latest/download/update-manifest.json"
 }
 
 function Copy-BundleArtifacts {
@@ -91,6 +91,78 @@ function Copy-BundleArtifacts {
   foreach ($path in $copied) {
     Write-Host "  $path"
   }
+
+  Write-UpdateManifest -CopiedArtifacts $copied
+}
+
+function Get-ReleaseAssetBaseUrl {
+  $remote = ""
+  try {
+    $remote = (& git remote get-url origin 2>$null).Trim()
+  } catch {
+    return ""
+  }
+  if ([string]::IsNullOrWhiteSpace($remote)) {
+    return ""
+  }
+  $owner = ""
+  $repo = ""
+  if ($remote -match "^git@github\.com:(?<owner>[^/]+)/(?<repo>[^/.]+)(?:\.git)?$") {
+    $owner = $Matches.owner
+    $repo = $Matches.repo
+  } elseif ($remote -match "^https://github\.com/(?<owner>[^/]+)/(?<repo>[^/.]+)(?:\.git)?$") {
+    $owner = $Matches.owner
+    $repo = $Matches.repo
+  }
+  if ([string]::IsNullOrWhiteSpace($owner) -or [string]::IsNullOrWhiteSpace($repo)) {
+    return ""
+  }
+  return "https://github.com/$owner/$repo/releases/latest/download"
+}
+
+function Get-AppVersion {
+  $config = Get-Content -LiteralPath "src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json
+  $version = [string]$config.version
+  if ([string]::IsNullOrWhiteSpace($version)) {
+    $version = [string](Get-Content -LiteralPath "package.json" -Raw | ConvertFrom-Json).version
+  }
+  return $version.Trim()
+}
+
+function Write-UpdateManifest {
+  param([Parameter(Mandatory = $true)][string[]]$CopiedArtifacts)
+
+  $installer = $CopiedArtifacts |
+    Where-Object { $_ -match '\.(exe|msi|msix)$' } |
+    Sort-Object {
+      if ($_ -match '\.exe$') { 0 } elseif ($_ -match '\.msi$') { 1 } else { 2 }
+    }, { Split-Path -Leaf $_ } |
+    Select-Object -First 1
+
+  if ([string]::IsNullOrWhiteSpace($installer)) {
+    Write-Host "Skipped update-manifest.json: no native installer artifact found." -ForegroundColor Yellow
+    return
+  }
+
+  $assetBaseUrl = Get-ReleaseAssetBaseUrl
+  if ([string]::IsNullOrWhiteSpace($assetBaseUrl)) {
+    Write-Host "Skipped update-manifest.json: GitHub origin remote not detected." -ForegroundColor Yellow
+    return
+  }
+
+  $fileName = Split-Path -Leaf $installer
+  $encodedFileName = [System.Uri]::EscapeDataString($fileName)
+  $version = Get-AppVersion
+  $manifest = [ordered]@{
+    latestVersion = $version
+    downloadUrl = "$assetBaseUrl/$encodedFileName"
+    releaseUrl = $assetBaseUrl -replace "/download$", ""
+    publishedAt = (Get-Date).ToUniversalTime().ToString("o")
+    notes = "SynthChat $version"
+  }
+  $manifestPath = Join-Path $OutputRoot "update-manifest.json"
+  $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+  Write-Host "  $manifestPath"
 }
 
 Write-Step "Checking local toolchain"

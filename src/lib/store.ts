@@ -412,6 +412,28 @@ function personaWithAgentRuntime(persona: Persona, agent: AgentDefinition): Pers
   };
 }
 
+function defaultChatProvider(providers: LlmProvider[]) {
+  return providers.find((provider) => provider.enabled) ?? null;
+}
+
+function personaWithDefaultChatProvider(persona: Persona, provider: LlmProvider | null): Persona {
+  if (!provider || persona.llmProvider?.trim()) return persona;
+  return {
+    ...persona,
+    llmProvider: provider.id,
+    llmModel: persona.llmModel?.trim() || provider.model || ""
+  };
+}
+
+function agentWithDefaultChatProvider(agent: AgentDefinition, provider: LlmProvider | null): AgentDefinition {
+  if (!provider || agent.llmProvider?.trim()) return agent;
+  return {
+    ...agent,
+    llmProvider: provider.id,
+    llmModel: agent.llmModel?.trim() || provider.model || ""
+  };
+}
+
 function agentWithPersonaRuntime(agent: AgentDefinition, persona: Persona): AgentDefinition {
   return {
     ...agent,
@@ -1291,7 +1313,28 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   saveLlmProviders: async (llmProviders) => {
     await api.saveLlmProviders(llmProviders);
-    set({ llmProviders });
+    const defaultProvider = defaultChatProvider(llmProviders);
+    const state = get();
+    const agentsToSave = state.agents
+      .map((agent) => agentWithDefaultChatProvider(agent, defaultProvider))
+      .filter((agent, index) => agent !== state.agents[index]);
+    const personasToSave = state.personas
+      .map((persona) => personaWithDefaultChatProvider(persona, defaultProvider))
+      .filter((persona, index) => persona !== state.personas[index]);
+    await Promise.all([
+      ...agentsToSave.map((agent) => api.saveAgent(agent)),
+      ...personasToSave.map((persona) => api.savePersona(persona))
+    ]);
+    const [agents, personas] = await Promise.all([
+      agentsToSave.length > 0 ? api.listAgents() : Promise.resolve(state.agents),
+      personasToSave.length > 0 ? api.listPersonas() : Promise.resolve(state.personas)
+    ]);
+    set((current) => ({
+      llmProviders,
+      agents: sortAgents(agents),
+      personas: sortPersonas(personas),
+      focusedAgentId: normalizeFocusedAgentId(agents, current.focusedAgentId)
+    }));
   },
   saveProfile: async (profile) => {
     const saved = await api.saveProfile(profile);

@@ -17,6 +17,7 @@ use crate::{
 
 const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 const MEMORY_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+const DEEPSEEK_MODEL_LIST_BASE_URL: &str = "https://api.deepseek.com";
 
 static MODELS_DEV_CACHE: OnceLock<Mutex<Option<CachedCatalog>>> = OnceLock::new();
 
@@ -912,12 +913,17 @@ fn looks_like_noise_model(model_id: &str) -> bool {
 pub async fn detect_provider_models(provider: LlmProvider) -> AppResult<DetectedModelList> {
     let provider_id = provider.id.trim().to_string();
     let provider_type = provider.provider_type.trim().to_ascii_lowercase();
+    let use_deepseek_model_endpoint = uses_deepseek_model_endpoint(&provider);
     let base_url = live_model_base_url(&provider);
     let api_key = live_model_api_key(&provider);
-    let static_provider_id = match provider_type.as_str() {
-        "openai_responses" | "openai-responses" => "openai",
-        "" => provider_id.as_str(),
-        _ => provider_type.as_str(),
+    let static_provider_id = if use_deepseek_model_endpoint {
+        "deepseek"
+    } else {
+        match provider_type.as_str() {
+            "openai_responses" | "openai-responses" => "openai",
+            "" => provider_id.as_str(),
+            _ => provider_type.as_str(),
+        }
     };
     let fallback = list_agentic_models(static_provider_id);
 
@@ -933,11 +939,15 @@ pub async fn detect_provider_models(provider: LlmProvider) -> AppResult<Detected
         });
     }
 
-    let live = match provider_type.as_str() {
-        "anthropic" => fetch_anthropic_models(&provider, &base_url, api_key.as_deref()).await,
-        "gemini" | "google" => fetch_gemini_models(&provider, &base_url, api_key.as_deref()).await,
-        "echo" => Ok(Vec::new()),
-        _ => fetch_openai_compatible_models(&provider, &base_url, api_key.as_deref()).await,
+    let live = if use_deepseek_model_endpoint {
+        fetch_openai_compatible_models(&provider, &base_url, api_key.as_deref()).await
+    } else {
+        match provider_type.as_str() {
+            "anthropic" => fetch_anthropic_models(&provider, &base_url, api_key.as_deref()).await,
+            "gemini" | "google" => fetch_gemini_models(&provider, &base_url, api_key.as_deref()).await,
+            "echo" => Ok(Vec::new()),
+            _ => fetch_openai_compatible_models(&provider, &base_url, api_key.as_deref()).await,
+        }
     };
 
     match live {
@@ -972,6 +982,9 @@ pub async fn detect_provider_models(provider: LlmProvider) -> AppResult<Detected
 }
 
 fn live_model_base_url(provider: &LlmProvider) -> String {
+    if uses_deepseek_model_endpoint(provider) {
+        return DEEPSEEK_MODEL_LIST_BASE_URL.into();
+    }
     let configured = provider.base_url.trim().trim_end_matches('/');
     if !configured.is_empty() {
         return configured.to_string();
@@ -984,6 +997,25 @@ fn live_model_base_url(provider: &LlmProvider) -> String {
         }
         _ => String::new(),
     }
+}
+
+fn uses_deepseek_model_endpoint(provider: &LlmProvider) -> bool {
+    let preset = provider
+        .preset
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let haystack = format!(
+        "{} {} {} {} {}",
+        provider.id.to_ascii_lowercase(),
+        provider.name.to_ascii_lowercase(),
+        provider.provider_type.to_ascii_lowercase(),
+        preset,
+        provider.base_url.to_ascii_lowercase()
+    );
+    haystack.contains("deepseek")
+        || haystack.contains("deep-seek")
+        || haystack.contains("api.deepseek.com")
 }
 
 fn live_model_api_key(provider: &LlmProvider) -> Option<String> {

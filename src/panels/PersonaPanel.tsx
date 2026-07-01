@@ -268,7 +268,8 @@ export function PersonaPanel() {
     void refreshProactiveStatuses();
   }, [refreshProactiveStatuses, personas.length]);
 
-  const provider = llmProviders.find((item) => item.id === draft.llmProvider) ?? llmProviders[0];
+  const defaultLlmProvider = llmProviders.find((item) => item.enabled) ?? null;
+  const provider = llmProviders.find((item) => item.id === draft.llmProvider && item.enabled) ?? defaultLlmProvider;
   const proactiveStatus = proactiveStatuses.find((status) => status.personaId === draft.id);
   const selectedImageProvider = useMemo(() => {
     const providerId = draft.imageGeneration?.provider ?? "";
@@ -299,7 +300,7 @@ export function PersonaPanel() {
     const nextModel = (provider?.model || catalogModels[0]?.id || "").trim();
     if (!nextModel) return;
     setDraft((current) => {
-      const currentProviderId = current.llmProvider || llmProviders[0]?.id || "";
+      const currentProviderId = current.llmProvider || defaultLlmProvider?.id || "";
       const activeProviderId = provider?.id || "";
       if (currentProviderId !== activeProviderId && current.llmProvider) return current;
       const currentModel = current.llmModel.trim();
@@ -307,7 +308,7 @@ export function PersonaPanel() {
       if (currentModel && (currentModel === nextModel || currentModelInCatalog)) return current;
       return { ...current, llmModel: nextModel };
     });
-  }, [catalogModels, llmProviders, provider?.id, provider?.model]);
+  }, [catalogModels, defaultLlmProvider?.id, provider?.id, provider?.model]);
 
   const updateDraft = <K extends keyof Persona>(key: K, value: Persona[K]) => {
     setDraft((current) => ({ ...current, [key]: value }));
@@ -442,6 +443,7 @@ export function PersonaPanel() {
       };
       const saved = await savePersona({
         ...draftSnapshot,
+        llmProvider: draftSnapshot.llmProvider || defaultLlmProvider?.id || "",
         llmModel: effectiveLlmModelId || draftSnapshot.llmModel,
         imageGeneration
       });
