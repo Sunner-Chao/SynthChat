@@ -1,4 +1,14 @@
 # SynthChat V1.0.0
++
+
+## 项目事实速览
+
+React/Vite/Tauri 桌面聊天/桌宠应用原型。
+
+**运行与开发**：Node.js；`npm install && npm run dev`，桌面使用 `npm run desktop:dev`。
+
+**边界与安全**：模型、第三方 API、支付渠道、桌面自动化、OCR 和外部数据源均受其自身授权、限额和兼容性约束；不要把演示数据或测试通过当作生产 SLA。禁止提交密钥、令牌、个人数据、模型文件和生产日志。许可证以仓库 LICENSE/NOTICE 及第三方组件声明为准。
+
 
 SynthChat 前端框架 - 独立运行版本
 
